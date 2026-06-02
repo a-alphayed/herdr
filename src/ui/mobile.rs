@@ -143,11 +143,13 @@ pub(crate) fn mobile_switcher_target_at(
     let agents_end = cursor + agents.len() * 2;
     if doc_row >= cursor && doc_row < agents_end {
         let idx = (doc_row - cursor) / 2;
-        return agents.get(idx).map(|entry| MobileSwitcherTarget::Agent {
-            ws_idx: entry.ws_idx,
-            tab_idx: entry.tab_idx,
-            pane_id: entry.pane_id,
-        });
+        return agents.get(idx).and_then(|entry| entry.local_target()).map(
+            |(ws_idx, tab_idx, pane_id)| MobileSwitcherTarget::Agent {
+                ws_idx,
+                tab_idx,
+                pane_id,
+            },
+        );
     }
     cursor = agents_end;
 
@@ -560,7 +562,9 @@ fn render_mobile_switcher_content(
     doc_y += 1;
     for entry in &entries {
         let active = focused_agent.is_some_and(|(ws_idx, tab_idx, pane_id)| {
-            entry.ws_idx == ws_idx && entry.tab_idx == tab_idx && entry.pane_id == pane_id
+            entry
+                .local_target()
+                .is_some_and(|target| target == (ws_idx, tab_idx, pane_id))
         });
         let bg = mobile_item_bg(false, active, p);
         let (icon, icon_style) = agent_icon(entry.state, entry.seen, app.spinner_tick, p);
@@ -938,9 +942,11 @@ mod tests {
 
     fn agent_entry(primary_tab_label: Option<&str>, agent_label: Option<&str>) -> AgentPanelEntry {
         AgentPanelEntry {
-            ws_idx: 0,
-            tab_idx: 0,
-            pane_id: PaneId::from_raw(1),
+            location: crate::ui::sidebar::AgentPanelEntryLocation::Local {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id: PaneId::from_raw(1),
+            },
             primary_label: "herdr".into(),
             primary_tab_label: primary_tab_label.map(str::to_string),
             agent_label: agent_label.map(str::to_string),

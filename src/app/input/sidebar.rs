@@ -468,7 +468,7 @@ impl AppState {
                 break;
             }
             if row == row_y || row == row_y + 1 {
-                return Some((detail.ws_idx, detail.tab_idx, detail.pane_id));
+                return detail.local_target();
             }
             row_y = row_y.saturating_add(2);
             if row_y < body.y + body.height {
@@ -481,17 +481,40 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{collections::HashMap, fs};
 
     use crossterm::event::{MouseButton, MouseEventKind};
     use ratatui::layout::Rect;
 
     use super::super::{app_for_mouse_test, capture_snapshot, mouse, unique_temp_path};
     use crate::{
+        api::schema::{AgentInfo, AgentStatus},
         app::state::{AgentPanelScope, DragTarget, Mode},
         detect::Agent,
+        remote_source::RemoteHostKey,
         workspace::Workspace,
     };
+
+    fn remote_agent(terminal_id: &str, label: &str) -> AgentInfo {
+        AgentInfo {
+            terminal_id: terminal_id.to_string(),
+            name: None,
+            agent: Some(label.to_string()),
+            title: None,
+            display_agent: Some(label.to_string()),
+            agent_status: AgentStatus::Working,
+            custom_status: None,
+            state_labels: HashMap::new(),
+            agent_session: None,
+            workspace_id: "remote-ws".to_string(),
+            tab_id: "remote-tab".to_string(),
+            pane_id: "remote-pane".to_string(),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+            revision: 1,
+        }
+    }
 
     #[test]
     fn clicking_launcher_opens_global_menu() {
@@ -700,6 +723,29 @@ mod tests {
             snapshot.workspaces[0].tabs[first_tab].focused,
             Some(second_pane.raw())
         );
+    }
+
+    #[test]
+    fn remote_agent_panel_row_has_no_local_click_target() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = Vec::new();
+        app.state.active = None;
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![remote_agent("remote-term", "smoke-agent")],
+        );
+
+        let detail_area = app.state.agent_panel_rect();
+        let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, detail_area);
+        let body = crate::ui::agent_panel_body_rect(
+            detail_area,
+            crate::ui::should_show_scrollbar(metrics),
+        );
+
+        assert_eq!(app.state.agent_detail_target_at(body.y), None);
     }
 
     #[test]

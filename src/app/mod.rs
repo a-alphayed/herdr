@@ -398,6 +398,7 @@ impl App {
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             workspaces,
+            remote_sources: crate::remote_source::RemoteSourceCache::default(),
             active,
             previous_pane_focus: None,
             selected,

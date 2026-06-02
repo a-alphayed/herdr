@@ -1081,8 +1081,9 @@ impl AppState {
         let Some(target) = entries.get(idx) else {
             return false;
         };
-        let ws_idx = target.ws_idx;
-        let pane_id = target.pane_id;
+        let Some((ws_idx, _tab_idx, pane_id)) = target.local_target() else {
+            return false;
+        };
 
         if self.active == Some(ws_idx) && self.workspaces[ws_idx].focused_pane_id() == Some(pane_id)
         {
@@ -1099,7 +1100,12 @@ impl AppState {
 
     fn cycle_agent_entry(&mut self, forward: bool) {
         let entries = crate::ui::agent_panel_entries(self);
-        if entries.is_empty() {
+        let local_indices: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, entry)| entry.local_target().map(|_| idx))
+            .collect();
+        if local_indices.is_empty() {
             return;
         }
 
@@ -1107,17 +1113,24 @@ impl AppState {
             .active
             .and_then(|idx| self.workspaces.get(idx))
             .and_then(crate::workspace::Workspace::focused_pane_id);
-        let current_idx =
-            focused.and_then(|pane_id| entries.iter().position(|entry| entry.pane_id == pane_id));
-        let target_idx = match (current_idx, forward) {
-            (Some(idx), true) => (idx + 1) % entries.len(),
-            (Some(0), false) => entries.len() - 1,
+        let current_entry_idx = focused.and_then(|pane_id| {
+            entries.iter().position(|entry| {
+                entry
+                    .local_target()
+                    .is_some_and(|(_, _, entry_pane_id)| entry_pane_id == pane_id)
+            })
+        });
+        let current_local_idx = current_entry_idx
+            .and_then(|entry_idx| local_indices.iter().position(|idx| *idx == entry_idx));
+        let target_local_idx = match (current_local_idx, forward) {
+            (Some(idx), true) => (idx + 1) % local_indices.len(),
+            (Some(0), false) => local_indices.len() - 1,
             (Some(idx), false) => idx - 1,
             (None, true) => 0,
-            (None, false) => entries.len() - 1,
+            (None, false) => local_indices.len() - 1,
         };
 
-        self.focus_agent_entry(target_idx);
+        self.focus_agent_entry(local_indices[target_local_idx]);
     }
 
     fn ensure_agent_panel_entry_visible(&mut self, idx: usize) {
@@ -2297,8 +2310,12 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::api::schema::{AgentInfo, AgentStatus};
     use crate::detect::{Agent, AgentState};
+    use crate::remote_source::RemoteHostKey;
     use crate::workspace::Workspace;
     use ratatui::layout::Direction;
 
@@ -2895,6 +2912,27 @@ mod tests {
         }
     }
 
+    fn remote_agent(terminal_id: &str, label: &str) -> AgentInfo {
+        AgentInfo {
+            terminal_id: terminal_id.to_string(),
+            name: None,
+            agent: Some(label.to_string()),
+            title: None,
+            display_agent: Some(label.to_string()),
+            agent_status: AgentStatus::Working,
+            custom_status: None,
+            state_labels: HashMap::new(),
+            agent_session: None,
+            workspace_id: "remote-ws".to_string(),
+            tab_id: "remote-tab".to_string(),
+            pane_id: "remote-pane".to_string(),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+            revision: 1,
+        }
+    }
+
     #[test]
     fn next_agent_cycles_agent_panel_entries_in_all_scope() {
         let mut first = Workspace::test_new("one");
@@ -2963,6 +3001,37 @@ mod tests {
         assert!(state.focus_agent_entry(0));
         assert_eq!(state.active, Some(0));
         assert_eq!(state.workspaces[0].focused_pane_id(), Some(root));
+    }
+
+    #[test]
+    fn next_and_previous_agent_skip_remote_agent_panel_entries() {
+        let mut workspace = Workspace::test_new("one");
+        let root = workspace.tabs[0].root_pane;
+        let second = workspace.test_split(Direction::Horizontal);
+        workspace.tabs[0].layout.focus_pane(root);
+
+        let mut state = AppState::test_new();
+        state.workspaces = vec![workspace];
+        state.ensure_test_terminals();
+        state.active = Some(0);
+        state.selected = 0;
+        state.mode = Mode::Terminal;
+        state.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;
+        mark_agent(&mut state, 0, 0, root);
+        mark_agent(&mut state, 0, 0, second);
+        state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![remote_agent("remote-term", "smoke-agent")],
+        );
+
+        state.next_agent();
+        assert_eq!(state.workspaces[0].focused_pane_id(), Some(second));
+
+        state.next_agent();
+        assert_eq!(state.workspaces[0].focused_pane_id(), Some(root));
+
+        state.previous_agent();
+        assert_eq!(state.workspaces[0].focused_pane_id(), Some(second));
     }
 
     #[test]

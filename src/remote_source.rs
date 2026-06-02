@@ -4,8 +4,6 @@
 //! intentionally live elsewhere. This module is rebuildable soft state for
 //! remote `AgentInfo` snapshots/events keyed by authoritative host/session.
 
-#![allow(dead_code)] // Staged pure Phase 1 cache model; production integration lands in later slices.
-
 use std::collections::BTreeMap;
 
 use crate::api::schema::AgentInfo;
@@ -25,6 +23,7 @@ impl RemoteHostKey {
     }
 }
 
+#[allow(dead_code)] // Staged for later target routing/cache lookups; tests exercise it before integration.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RemoteAgentKey {
     pub(crate) host: String,
@@ -33,6 +32,7 @@ pub(crate) struct RemoteAgentKey {
 }
 
 impl RemoteAgentKey {
+    #[allow(dead_code)] // Staged for later target routing/cache lookups; tests exercise it before integration.
     fn new(host: &RemoteHostKey, terminal_id: impl Into<String>) -> Self {
         Self {
             host: host.host.clone(),
@@ -42,6 +42,7 @@ impl RemoteAgentKey {
     }
 }
 
+#[allow(dead_code)] // Connected is set by staged cache update paths before runtime integration uses them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteConnectionStatus {
     Connected,
@@ -88,6 +89,7 @@ impl Default for RemoteHostCache {
 }
 
 impl RemoteSourceCache {
+    #[allow(dead_code)] // Staged for supervisor snapshot ingestion in later slices; tests exercise it now.
     pub(crate) fn replace_connected_snapshot(
         &mut self,
         host: RemoteHostKey,
@@ -101,10 +103,12 @@ impl RemoteSourceCache {
             .collect();
     }
 
+    #[allow(dead_code)] // Staged for supervisor disconnect handling in later slices; tests exercise it now.
     pub(crate) fn mark_disconnected(&mut self, host: &RemoteHostKey) {
         self.hosts.entry(host.clone()).or_default().status = RemoteConnectionStatus::Disconnected;
     }
 
+    #[allow(dead_code)] // Staged for subscription event updates in later slices; tests exercise it now.
     pub(crate) fn apply_agent_update(&mut self, host: RemoteHostKey, agent: AgentInfo) -> bool {
         let host_cache = self.hosts.entry(host).or_insert_with(|| RemoteHostCache {
             status: RemoteConnectionStatus::Connected,
@@ -121,6 +125,7 @@ impl RemoteSourceCache {
         }
     }
 
+    #[allow(dead_code)] // Staged for remote remove/disconnect flows in later slices.
     pub(crate) fn remove_host(&mut self, host: &RemoteHostKey) -> bool {
         self.hosts.remove(host).is_some()
     }
@@ -141,6 +146,7 @@ impl RemoteSourceCache {
             .collect()
     }
 
+    #[allow(dead_code)] // Staged for target routing/cache lookups in later slices.
     pub(crate) fn agent(&self, key: &RemoteAgentKey) -> Option<RemoteAgentEntry> {
         let host = RemoteHostKey::new(key.host.clone(), key.session.clone());
         let host_cache = self.hosts.get(&host)?;

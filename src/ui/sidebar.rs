@@ -16,10 +16,22 @@ use crate::terminal::TerminalRuntimeRegistry;
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AgentPanelEntryLocation {
+    Local {
+        ws_idx: usize,
+        tab_idx: usize,
+        pane_id: crate::layout::PaneId,
+    },
+    Remote {
+        host: String,
+        session: String,
+        terminal_id: String,
+    },
+}
+
 pub(crate) struct AgentPanelEntry {
-    pub ws_idx: usize,
-    pub tab_idx: usize,
-    pub pane_id: crate::layout::PaneId,
+    pub location: AgentPanelEntryLocation,
     pub primary_label: String,
     pub primary_tab_label: Option<String>,
     pub agent_label: Option<String>,
@@ -27,6 +39,19 @@ pub(crate) struct AgentPanelEntry {
     pub seen: bool,
     pub custom_status: Option<String>,
     pub state_labels: std::collections::HashMap<String, String>,
+}
+
+impl AgentPanelEntry {
+    pub(crate) fn local_target(&self) -> Option<(usize, usize, crate::layout::PaneId)> {
+        match self.location {
+            AgentPanelEntryLocation::Local {
+                ws_idx,
+                tab_idx,
+                pane_id,
+            } => Some((ws_idx, tab_idx, pane_id)),
+            AgentPanelEntryLocation::Remote { .. } => None,
+        }
+    }
 }
 
 fn sidebar_section_heights(total_h: u16, split_ratio: f32) -> (u16, u16) {
@@ -145,9 +170,11 @@ fn agent_panel_entries_with_runtimes(
             ws.pane_details(&app.terminals)
                 .into_iter()
                 .map(|detail| AgentPanelEntry {
-                    ws_idx,
-                    tab_idx: detail.tab_idx,
-                    pane_id: detail.pane_id,
+                    location: AgentPanelEntryLocation::Local {
+                        ws_idx,
+                        tab_idx: detail.tab_idx,
+                        pane_id: detail.pane_id,
+                    },
                     primary_label: detail.label,
                     primary_tab_label: None,
                     agent_label: None,
@@ -158,29 +185,92 @@ fn agent_panel_entries_with_runtimes(
                 })
                 .collect()
         }
-        AgentPanelScope::AllWorkspaces => app
-            .workspaces
-            .iter()
-            .enumerate()
-            .flat_map(|(ws_idx, ws)| {
-                let multi_tab = ws.tabs.len() > 1;
-                let workspace_label = ws.display_name_from(&app.terminals, terminal_runtimes);
-                ws.pane_details(&app.terminals)
-                    .into_iter()
-                    .map(move |detail| AgentPanelEntry {
-                        ws_idx,
-                        tab_idx: detail.tab_idx,
-                        pane_id: detail.pane_id,
-                        primary_label: workspace_label.clone(),
-                        primary_tab_label: multi_tab.then_some(detail.tab_label),
-                        agent_label: Some(detail.agent_label),
-                        state: detail.state,
-                        seen: detail.seen,
-                        custom_status: detail.custom_status,
-                        state_labels: detail.state_labels,
-                    })
-            })
-            .collect(),
+        AgentPanelScope::AllWorkspaces => {
+            let mut entries: Vec<_> = app
+                .workspaces
+                .iter()
+                .enumerate()
+                .flat_map(|(ws_idx, ws)| {
+                    let multi_tab = ws.tabs.len() > 1;
+                    let workspace_label = ws.display_name_from(&app.terminals, terminal_runtimes);
+                    ws.pane_details(&app.terminals)
+                        .into_iter()
+                        .map(move |detail| AgentPanelEntry {
+                            location: AgentPanelEntryLocation::Local {
+                                ws_idx,
+                                tab_idx: detail.tab_idx,
+                                pane_id: detail.pane_id,
+                            },
+                            primary_label: workspace_label.clone(),
+                            primary_tab_label: multi_tab.then_some(detail.tab_label),
+                            agent_label: Some(detail.agent_label),
+                            state: detail.state,
+                            seen: detail.seen,
+                            custom_status: detail.custom_status,
+                            state_labels: detail.state_labels,
+                        })
+                })
+                .collect();
+            entries.extend(remote_agent_panel_entries(app));
+            entries
+        }
+    }
+}
+
+fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
+    app.remote_sources
+        .list_entries()
+        .into_iter()
+        .map(|entry| {
+            let agent_label = remote_agent_label(&entry.agent);
+            let primary_label = if entry.host.session == crate::session::DEFAULT_SESSION_NAME {
+                format!("{}/{}", entry.host.host, agent_label)
+            } else {
+                format!("{}/{}/{}", entry.host.host, entry.host.session, agent_label)
+            };
+            let (state, seen) = remote_agent_state(entry.agent.agent_status);
+            let custom_status = if entry.stale() {
+                Some("disconnected".to_string())
+            } else {
+                entry.agent.custom_status.clone()
+            };
+
+            AgentPanelEntry {
+                location: AgentPanelEntryLocation::Remote {
+                    host: entry.host.host,
+                    session: entry.host.session,
+                    terminal_id: entry.agent.terminal_id.clone(),
+                },
+                primary_label,
+                primary_tab_label: None,
+                agent_label: None,
+                state,
+                seen,
+                custom_status,
+                state_labels: entry.agent.state_labels,
+            }
+        })
+        .collect()
+}
+
+fn remote_agent_label(agent: &crate::api::schema::AgentInfo) -> String {
+    agent
+        .name
+        .as_deref()
+        .or(agent.display_agent.as_deref())
+        .or(agent.agent.as_deref())
+        .or(agent.title.as_deref())
+        .unwrap_or(&agent.terminal_id)
+        .to_string()
+}
+
+fn remote_agent_state(status: crate::api::schema::AgentStatus) -> (AgentState, bool) {
+    match status {
+        crate::api::schema::AgentStatus::Working => (AgentState::Working, true),
+        crate::api::schema::AgentStatus::Blocked => (AgentState::Blocked, true),
+        crate::api::schema::AgentStatus::Idle => (AgentState::Idle, true),
+        crate::api::schema::AgentStatus::Done => (AgentState::Idle, false),
+        crate::api::schema::AgentStatus::Unknown => (AgentState::Unknown, true),
     }
 }
 
@@ -1098,8 +1188,11 @@ fn render_agent_detail(
             break;
         }
 
-        // Check if this agent entry corresponds to the active session
-        let is_active = app.is_active_pane(detail.ws_idx, detail.tab_idx, detail.pane_id);
+        // Check if this local agent entry corresponds to the active session.
+        // Remote entries are read-only for now and must not masquerade as local panes.
+        let is_active = detail
+            .local_target()
+            .is_some_and(|(ws_idx, tab_idx, pane_id)| app.is_active_pane(ws_idx, tab_idx, pane_id));
 
         let (icon, icon_style) = agent_icon(detail.state, detail.seen, app.spinner_tick, p);
         let label_color = state_label_color(detail.state, detail.seen, p);
@@ -1203,8 +1296,41 @@ fn render_sidebar_toggle(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
-    use crate::{detect::Agent, workspace::Workspace};
+    use crate::{
+        api::schema::{AgentInfo, AgentStatus},
+        detect::Agent,
+        remote_source::RemoteHostKey,
+        workspace::Workspace,
+    };
+
+    fn remote_agent(
+        terminal_id: &str,
+        label: &str,
+        status: AgentStatus,
+        revision: u64,
+    ) -> AgentInfo {
+        AgentInfo {
+            terminal_id: terminal_id.to_string(),
+            name: None,
+            agent: Some(label.to_string()),
+            title: None,
+            display_agent: Some(label.to_string()),
+            agent_status: status,
+            custom_status: None,
+            state_labels: HashMap::new(),
+            agent_session: None,
+            workspace_id: "remote-ws".to_string(),
+            tab_id: "remote-tab".to_string(),
+            pane_id: "remote-pane".to_string(),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+            revision,
+        }
+    }
 
     #[test]
     fn all_workspaces_agent_panel_entries_use_workspace_and_optional_tab_labels() {
@@ -1340,11 +1466,121 @@ mod tests {
     }
 
     #[test]
+    fn all_workspaces_agent_panel_appends_remote_entries_after_local_entries() {
+        let mut app = crate::app::state::AppState::test_new();
+        let workspace = Workspace::test_new("local");
+        let local_pane = workspace.tabs[0].root_pane;
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        let terminal_id = app.workspaces[0].tabs[0].panes[&local_pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals.get_mut(&terminal_id).unwrap().detected_agent = Some(Agent::Pi);
+        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![remote_agent(
+                "remote-term",
+                "smoke-agent",
+                AgentStatus::Working,
+                1,
+            )],
+        );
+
+        let entries = agent_panel_entries(&app);
+
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            entries[0].location,
+            AgentPanelEntryLocation::Local { .. }
+        ));
+        assert_eq!(entries[0].primary_label, "local");
+        assert_eq!(entries[1].primary_label, "jafar/smoke-agent");
+        assert_eq!(
+            entries[1].location,
+            AgentPanelEntryLocation::Remote {
+                host: "jafar".to_string(),
+                session: crate::session::DEFAULT_SESSION_NAME.to_string(),
+                terminal_id: "remote-term".to_string(),
+            }
+        );
+        assert_eq!(entries[1].state, AgentState::Working);
+        assert!(entries[1].seen);
+    }
+
+    #[test]
+    fn all_workspaces_agent_panel_remote_entries_include_non_default_session_and_stale_status() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        let host = RemoteHostKey::new("jafar", "agents");
+        app.remote_sources.replace_connected_snapshot(
+            host.clone(),
+            vec![remote_agent("remote-term", "claude", AgentStatus::Done, 1)],
+        );
+        app.remote_sources.mark_disconnected(&host);
+
+        let entries = agent_panel_entries(&app);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].primary_label, "jafar/agents/claude");
+        assert_eq!(entries[0].state, AgentState::Idle);
+        assert!(!entries[0].seen);
+        assert_eq!(entries[0].custom_status.as_deref(), Some("disconnected"));
+        assert_eq!(
+            entries[0].location,
+            AgentPanelEntryLocation::Remote {
+                host: "jafar".to_string(),
+                session: "agents".to_string(),
+                terminal_id: "remote-term".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn current_workspace_agent_panel_scope_excludes_remote_entries() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.agent_panel_scope = AgentPanelScope::CurrentWorkspace;
+        app.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![remote_agent(
+                "remote-term",
+                "smoke-agent",
+                AgentStatus::Working,
+                1,
+            )],
+        );
+
+        assert!(agent_panel_entries(&app).is_empty());
+    }
+
+    #[test]
+    fn remote_agent_panel_entry_has_no_local_target() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![remote_agent(
+                "remote-term",
+                "smoke-agent",
+                AgentStatus::Working,
+                1,
+            )],
+        );
+
+        let entries = agent_panel_entries(&app);
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].local_target().is_none());
+    }
+
+    #[test]
     fn all_workspaces_primary_label_truncates_workspace_and_tab() {
         let entry = AgentPanelEntry {
-            ws_idx: 0,
-            tab_idx: 0,
-            pane_id: crate::layout::PaneId::from_raw(1),
+            location: AgentPanelEntryLocation::Local {
+                ws_idx: 0,
+                tab_idx: 0,
+                pane_id: crate::layout::PaneId::from_raw(1),
+            },
             primary_label: "agent-browser".into(),
             primary_tab_label: Some("test-escalation".into()),
             agent_label: Some("claude".into()),
