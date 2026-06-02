@@ -24,6 +24,8 @@ const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
 const UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
+pub(crate) const REMOTE_CLIENT_BRIDGE_SUBCOMMAND: &str = "remote-client-bridge";
+pub(crate) const REMOTE_API_BRIDGE_SUBCOMMAND: &str = "remote-api-bridge";
 
 pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
 
@@ -182,17 +184,48 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
 pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
     ensure_remote_server_running()?;
 
-    let socket_path = crate::server::socket_paths::client_socket_path();
-    let stream = UnixStream::connect(&socket_path).map_err(|err| {
+    let (socket_path, description) = remote_bridge_socket_target(RemoteBridgeSocketKind::Client);
+    run_stdio_socket_bridge(&socket_path, description)
+}
+
+pub(crate) fn run_remote_api_bridge() -> io::Result<()> {
+    ensure_remote_server_running()?;
+
+    let (socket_path, description) = remote_bridge_socket_target(RemoteBridgeSocketKind::Api);
+    run_stdio_socket_bridge(&socket_path, description)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteBridgeSocketKind {
+    Client,
+    Api,
+}
+
+fn remote_bridge_socket_target(kind: RemoteBridgeSocketKind) -> (PathBuf, &'static str) {
+    match kind {
+        RemoteBridgeSocketKind::Client => (
+            crate::server::socket_paths::client_socket_path(),
+            "remote Herdr client socket",
+        ),
+        RemoteBridgeSocketKind::Api => (crate::api::socket_path(), "remote Herdr API socket"),
+    }
+}
+
+fn run_stdio_socket_bridge(socket_path: &Path, description: &str) -> io::Result<()> {
+    let stream = UnixStream::connect(socket_path).map_err(|err| {
         io::Error::new(
             err.kind(),
             format!(
-                "failed to connect to remote Herdr client socket {}: {err}",
+                "failed to connect to {description} {}: {err}",
                 socket_path.display()
             ),
         )
     })?;
 
+    bridge_stdio_to_unix_stream(stream)
+}
+
+fn bridge_stdio_to_unix_stream(stream: UnixStream) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     let mut socket_to_stdout = stream.try_clone()?;
     let mut stdin_to_socket = stream;
@@ -1213,12 +1246,21 @@ fn ssh_output(target: &str, command: &str) -> io::Result<Output> {
 }
 
 fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
+    remote_bridge_command_for(remote_herdr, session_name, REMOTE_CLIENT_BRIDGE_SUBCOMMAND)
+}
+
+fn remote_bridge_command_for(
+    remote_herdr: &RemoteHerdr,
+    session_name: &str,
+    bridge_subcommand: &str,
+) -> String {
     let mut command = format!("exec {}", remote_herdr.shell_path);
     if session_name != crate::session::DEFAULT_SESSION_NAME {
         command.push_str(" --session ");
         command.push_str(&shell_quote(session_name));
     }
-    command.push_str(" remote-client-bridge");
+    command.push(' ');
+    command.push_str(bridge_subcommand);
     command
 }
 
@@ -1531,6 +1573,21 @@ mod tests {
     }
 
     #[test]
+    fn remote_bridge_socket_target_selects_client_and_api_paths() {
+        let (client_path, client_description) =
+            remote_bridge_socket_target(RemoteBridgeSocketKind::Client);
+        assert_eq!(
+            client_path,
+            crate::server::socket_paths::client_socket_path()
+        );
+        assert_eq!(client_description, "remote Herdr client socket");
+
+        let (api_path, api_description) = remote_bridge_socket_target(RemoteBridgeSocketKind::Api);
+        assert_eq!(api_path, crate::api::socket_path());
+        assert_eq!(api_description, "remote Herdr API socket");
+    }
+
+    #[test]
     fn extract_remote_args_removes_space_form() {
         let args = vec![
             "herdr".into(),
@@ -1731,6 +1788,46 @@ mod tests {
         assert_eq!(
             remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
             "exec \"$HOME/.local/bin/herdr\" remote-client-bridge"
+        );
+    }
+
+    #[test]
+    fn remote_bridge_command_uses_named_session() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        assert_eq!(
+            remote_bridge_command(&remote_herdr, "fed-api"),
+            "exec \"$HOME/.local/bin/herdr\" --session fed-api remote-client-bridge"
+        );
+    }
+
+    #[test]
+    fn remote_bridge_command_for_api_uses_api_subcommand() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        assert_eq!(
+            remote_bridge_command_for(
+                &remote_herdr,
+                crate::session::DEFAULT_SESSION_NAME,
+                REMOTE_API_BRIDGE_SUBCOMMAND,
+            ),
+            "exec \"$HOME/.local/bin/herdr\" remote-api-bridge"
+        );
+    }
+
+    #[test]
+    fn remote_bridge_command_for_api_quotes_named_session() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        assert_eq!(
+            remote_bridge_command_for(&remote_herdr, "fed api", REMOTE_API_BRIDGE_SUBCOMMAND),
+            "exec \"$HOME/.local/bin/herdr\" --session 'fed api' remote-api-bridge"
         );
     }
 
