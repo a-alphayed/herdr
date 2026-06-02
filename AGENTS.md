@@ -35,6 +35,36 @@ Before committing, propose the commit message and get alignment.
 
 After the change is integrated, remove the task worktree and delete the task branch locally and remotely.
 
+## Federated remote agents spike workflow
+
+When working on the federated remote agents spike, use Ahmed's Herdr mod workspace agent roles this way.
+
+Big-picture anchor: `docs/next/remote-agent-control-design.md` is the current federated remote agents design proposal. Use it as the architectural reference unless Ahmed supersedes it. The spike must stay aligned with these boundaries: remote hosts remain authoritative for PTYs, panes, hooks, persistence, and child processes; the local Herdr node only aggregates remote agent metadata, caches state, and routes/proxies allowed commands; transport is an SSH-bridged JSON API path, not local ownership of remote PTYs; MVP focus uses direct terminal attach rather than embedded remote panes. Do not drift into full multi-server workspace merging, broad destructive remote operations, or release/publishing work unless Ahmed explicitly expands the scope.
+
+- **Orchestrator / supervising assistant**: own the plan, task breakdown, architecture boundaries, review synthesis, test gate, and commit gate. Do not implement large code changes directly unless Ahmed asks. Keep checking for architectural drift against the principles above and the federated-agent design after every implementation slice and before every commit. If a decision affects UX, safety, scope, protocol compatibility, release behavior, or Ahmed's live setup, stop and ask Ahmed.
+- **Sub1**: implementation agent. Sub1 makes the requested code/doc/test changes for each slice. Sub1 should not commit. Sub1 should keep changes scoped to the assigned slice and report what changed, what was tested, and any uncertainties.
+- **Codex reviewer** and **Claude reviewer**: independent review agents. Both must review the implementation before any commit. Reviews should cover correctness, tests, safety, architecture drift, scope creep, and whether the slice still matches the spike goal.
+- **Terminal pane**: stable scratch terminal if a real Herdr pane environment is needed. Prefer the tool shell for ordinary repo inspection and commands.
+
+Commit gate for this spike:
+
+1. Orchestrator assigns a narrow slice to Sub1.
+2. Sub1 implements and reports back.
+3. Orchestrator runs or requests the relevant validation.
+4. Codex reviewer and Claude reviewer both review before commit.
+5. If the reviewers disagree or raise different fixes, the orchestrator synthesizes the best path and sends that synthesis back to both reviewers for input.
+6. Sub1 implements any agreed follow-up changes.
+7. Repeat review for substantive follow-up changes.
+8. Orchestrator checks architecture drift, proposes the commit message to Ahmed, gets alignment, then commits.
+
+Testing guardrails for this spike:
+
+- Do not touch Ahmed's real Herdr default session or normal named sessions.
+- Use the source-built binary by explicit path, never plain `herdr`, for spike runtime tests.
+- Use temporary `XDG_CONFIG_HOME` and `XDG_STATE_HOME` under `/tmp/herdr-fed-*` and named sessions beginning with `fed-`.
+- Prefer Docker or localhost SSH with fake/reported agents before any real remote host.
+- Cleanup commands must be scoped to the temporary paths and `fed-` sessions only.
+
 ## Testing
 
 Use `just` recipes by default for tests and checks instead of invoking cargo or scripts directly.
