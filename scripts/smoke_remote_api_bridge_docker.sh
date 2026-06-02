@@ -164,7 +164,7 @@ if ! PATH="$WRAPPER_DIR:$PATH" HOME="$LOCAL_HOME" ssh -T "$ALIAS" true >/dev/nul
   exit 1
 fi
 
-output="$(env \
+ping_output="$(env \
   -u HERDR_SOCKET_PATH \
   -u HERDR_CLIENT_SOCKET_PATH \
   -u HERDR_SESSION \
@@ -175,7 +175,7 @@ output="$(env \
   XDG_RUNTIME_DIR="$LOCAL_RUNTIME" \
   "$HERDR_BIN" --session "$SESSION" remote-api-ping "$ALIAS")"
 
-python3 - "$output" <<'PY'
+python3 - "$ping_output" <<'PY'
 import json
 import sys
 
@@ -187,4 +187,59 @@ if result.get("type") != "pong":
     raise SystemExit(f"unexpected response result.type: {result.get('type')!r}")
 PY
 
-echo "remote API bridge Docker smoke passed: $output"
+workspace_json="$(PATH="$WRAPPER_DIR:$PATH" HOME="$LOCAL_HOME" ssh -T "$ALIAS" \
+  "/usr/local/bin/herdr --session $SESSION workspace create --cwd /tmp --focus")"
+
+pane_id="$(python3 - "$workspace_json" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+try:
+    print(payload["result"]["root_pane"]["pane_id"])
+except KeyError as exc:
+    raise SystemExit(f"workspace create response missing {exc}: {payload}")
+PY
+)"
+
+PATH="$WRAPPER_DIR:$PATH" HOME="$LOCAL_HOME" ssh -T "$ALIAS" \
+  "/usr/local/bin/herdr --session $SESSION pane report-agent $pane_id --source smoke --agent smoke-agent --state working" \
+  >/dev/null
+
+agent_list_output="$(env \
+  -u HERDR_SOCKET_PATH \
+  -u HERDR_CLIENT_SOCKET_PATH \
+  -u HERDR_SESSION \
+  PATH="$WRAPPER_DIR:$PATH" \
+  HOME="$LOCAL_HOME" \
+  XDG_CONFIG_HOME="$LOCAL_CONFIG" \
+  XDG_STATE_HOME="$LOCAL_STATE" \
+  XDG_RUNTIME_DIR="$LOCAL_RUNTIME" \
+  "$HERDR_BIN" --session "$SESSION" remote-api-agent-list "$ALIAS")"
+
+python3 - "$agent_list_output" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+if payload.get("id") != "remote-api-agent-list":
+    raise SystemExit(f"unexpected response id: {payload.get('id')!r}")
+result = payload.get("result") or {}
+if result.get("type") != "agent_list":
+    raise SystemExit(f"unexpected response result.type: {result.get('type')!r}")
+agents = result.get("agents") or []
+for agent in agents:
+    labels = {
+        agent.get("agent"),
+        agent.get("display_agent"),
+        agent.get("name"),
+        agent.get("title"),
+    }
+    status = agent.get("agent_status") or agent.get("status")
+    if "smoke-agent" in labels and status == "working":
+        break
+else:
+    raise SystemExit(f"smoke-agent working entry not found in agents: {agents}")
+PY
+
+echo "remote API bridge Docker smoke passed: ping and agent-list probes succeeded"

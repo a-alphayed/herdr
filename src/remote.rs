@@ -27,6 +27,7 @@ pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 pub(crate) const REMOTE_CLIENT_BRIDGE_SUBCOMMAND: &str = "remote-client-bridge";
 pub(crate) const REMOTE_API_BRIDGE_SUBCOMMAND: &str = "remote-api-bridge";
 pub(crate) const REMOTE_API_PING_SUBCOMMAND: &str = "remote-api-ping";
+pub(crate) const REMOTE_API_AGENT_LIST_SUBCOMMAND: &str = "remote-api-agent-list";
 
 pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
 
@@ -187,10 +188,26 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
 }
 
 pub(crate) fn run_remote_api_ping(args: &[String]) -> io::Result<()> {
-    let target = parse_remote_api_ping_target(args).map_err(|err| {
+    run_remote_api_one_shot_probe(args, REMOTE_API_PING_SUBCOMMAND, remote_api_ping_request())
+}
+
+pub(crate) fn run_remote_api_agent_list(args: &[String]) -> io::Result<()> {
+    run_remote_api_one_shot_probe(
+        args,
+        REMOTE_API_AGENT_LIST_SUBCOMMAND,
+        remote_api_agent_list_request(),
+    )
+}
+
+fn run_remote_api_one_shot_probe(
+    args: &[String],
+    subcommand: &str,
+    request: crate::api::schema::Request,
+) -> io::Result<()> {
+    let target = parse_remote_api_probe_target(args, subcommand).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{err}\nusage: herdr {REMOTE_API_PING_SUBCOMMAND} <ssh-target>"),
+            format!("{err}\nusage: herdr {subcommand} <ssh-target>"),
         )
     })?;
     let session_name = crate::session::active_name()
@@ -208,28 +225,38 @@ pub(crate) fn run_remote_api_ping(args: &[String]) -> io::Result<()> {
         &session_name,
         REMOTE_API_BRIDGE_SUBCOMMAND,
     );
-    let response = send_remote_api_ping_request(target, &bridge_command)?;
+    let response = send_remote_api_request(target, &bridge_command, &request)?;
     println!("{response}");
     Ok(())
 }
 
-fn parse_remote_api_ping_target(args: &[String]) -> Result<&str, String> {
+fn parse_remote_api_probe_target<'a>(args: &'a [String], label: &str) -> Result<&'a str, String> {
     let [target] = args else {
         return Err("expected exactly one SSH target".to_string());
     };
 
-    validate_remote_target_for(target, REMOTE_API_PING_SUBCOMMAND)
+    validate_remote_target_for(target, label)
 }
 
 fn remote_api_ping_request() -> crate::api::schema::Request {
     crate::api::schema::Request {
-        id: "remote-api-ping".into(),
+        id: REMOTE_API_PING_SUBCOMMAND.into(),
         method: crate::api::schema::Method::Ping(crate::api::schema::PingParams::default()),
     }
 }
 
-fn write_remote_api_ping_request<W: io::Write>(writer: &mut W) -> io::Result<()> {
-    let request = serde_json::to_string(&remote_api_ping_request()).map_err(io::Error::other)?;
+fn remote_api_agent_list_request() -> crate::api::schema::Request {
+    crate::api::schema::Request {
+        id: REMOTE_API_AGENT_LIST_SUBCOMMAND.into(),
+        method: crate::api::schema::Method::AgentList(crate::api::schema::EmptyParams::default()),
+    }
+}
+
+fn write_remote_api_request<W: io::Write>(
+    writer: &mut W,
+    request: &crate::api::schema::Request,
+) -> io::Result<()> {
+    let request = serde_json::to_string(request).map_err(io::Error::other)?;
     writer.write_all(request.as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()
@@ -248,7 +275,11 @@ fn read_remote_api_response_line<R: BufRead>(reader: &mut R) -> io::Result<Strin
     Ok(response.trim_end_matches(['\r', '\n']).to_string())
 }
 
-fn send_remote_api_ping_request(target: &str, bridge_command: &str) -> io::Result<String> {
+fn send_remote_api_request(
+    target: &str,
+    bridge_command: &str,
+    request: &crate::api::schema::Request,
+) -> io::Result<String> {
     let mut command = Command::new("ssh");
     command
         .arg("-T")
@@ -270,7 +301,7 @@ fn send_remote_api_ping_request(target: &str, bridge_command: &str) -> io::Resul
         .take()
         .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing"))?;
 
-    write_remote_api_ping_request(&mut child_stdin)?;
+    write_remote_api_request(&mut child_stdin, request)?;
     drop(child_stdin);
 
     let mut reader = BufReader::new(child_stdout);
@@ -1698,7 +1729,10 @@ mod tests {
     fn remote_api_ping_args_accept_one_target() {
         let args = vec!["jafar".to_string()];
 
-        assert_eq!(parse_remote_api_ping_target(&args).unwrap(), "jafar");
+        assert_eq!(
+            parse_remote_api_probe_target(&args, REMOTE_API_PING_SUBCOMMAND).unwrap(),
+            "jafar"
+        );
     }
 
     #[test]
@@ -1706,7 +1740,7 @@ mod tests {
         let args = Vec::new();
 
         assert_eq!(
-            parse_remote_api_ping_target(&args).unwrap_err(),
+            parse_remote_api_probe_target(&args, REMOTE_API_PING_SUBCOMMAND).unwrap_err(),
             "expected exactly one SSH target"
         );
     }
@@ -1716,7 +1750,7 @@ mod tests {
         let args = vec!["jafar".to_string(), "extra".to_string()];
 
         assert_eq!(
-            parse_remote_api_ping_target(&args).unwrap_err(),
+            parse_remote_api_probe_target(&args, REMOTE_API_PING_SUBCOMMAND).unwrap_err(),
             "expected exactly one SSH target"
         );
     }
@@ -1726,8 +1760,48 @@ mod tests {
         let args = vec!["-oProxyCommand=x".to_string()];
 
         assert_eq!(
-            parse_remote_api_ping_target(&args).unwrap_err(),
+            parse_remote_api_probe_target(&args, REMOTE_API_PING_SUBCOMMAND).unwrap_err(),
             "remote-api-ping target must not start with '-'"
+        );
+    }
+
+    #[test]
+    fn remote_api_agent_list_args_accept_one_target() {
+        let args = vec!["jafar".to_string()];
+
+        assert_eq!(
+            parse_remote_api_probe_target(&args, REMOTE_API_AGENT_LIST_SUBCOMMAND).unwrap(),
+            "jafar"
+        );
+    }
+
+    #[test]
+    fn remote_api_agent_list_args_reject_missing_target() {
+        let args = Vec::new();
+
+        assert_eq!(
+            parse_remote_api_probe_target(&args, REMOTE_API_AGENT_LIST_SUBCOMMAND).unwrap_err(),
+            "expected exactly one SSH target"
+        );
+    }
+
+    #[test]
+    fn remote_api_agent_list_args_reject_extra_args() {
+        let args = vec!["jafar".to_string(), "extra".to_string()];
+
+        assert_eq!(
+            parse_remote_api_probe_target(&args, REMOTE_API_AGENT_LIST_SUBCOMMAND).unwrap_err(),
+            "expected exactly one SSH target"
+        );
+    }
+
+    #[test]
+    fn remote_api_agent_list_args_reject_dash_target() {
+        let args = vec!["-oProxyCommand=x".to_string()];
+
+        assert_eq!(
+            parse_remote_api_probe_target(&args, REMOTE_API_AGENT_LIST_SUBCOMMAND).unwrap_err(),
+            "remote-api-agent-list target must not start with '-'"
         );
     }
 
@@ -1743,10 +1817,21 @@ mod tests {
     }
 
     #[test]
-    fn remote_api_ping_writer_emits_newline_terminated_ping_request() {
+    fn remote_api_agent_list_request_uses_agent_list_method() {
+        let request = remote_api_agent_list_request();
+
+        assert_eq!(request.id, "remote-api-agent-list");
+        assert!(matches!(
+            request.method,
+            crate::api::schema::Method::AgentList(_)
+        ));
+    }
+
+    #[test]
+    fn remote_api_request_writer_emits_newline_terminated_ping_request() {
         let mut buffer = Vec::new();
 
-        write_remote_api_ping_request(&mut buffer).unwrap();
+        write_remote_api_request(&mut buffer, &remote_api_ping_request()).unwrap();
 
         assert!(buffer.ends_with(b"\n"));
         let request: crate::api::schema::Request = serde_json::from_slice(&buffer).unwrap();
@@ -1754,6 +1839,21 @@ mod tests {
         assert!(matches!(
             request.method,
             crate::api::schema::Method::Ping(_)
+        ));
+    }
+
+    #[test]
+    fn remote_api_request_writer_emits_newline_terminated_agent_list_request() {
+        let mut buffer = Vec::new();
+
+        write_remote_api_request(&mut buffer, &remote_api_agent_list_request()).unwrap();
+
+        assert!(buffer.ends_with(b"\n"));
+        let request: crate::api::schema::Request = serde_json::from_slice(&buffer).unwrap();
+        assert_eq!(request.id, "remote-api-agent-list");
+        assert!(matches!(
+            request.method,
+            crate::api::schema::Method::AgentList(_)
         ));
     }
 
