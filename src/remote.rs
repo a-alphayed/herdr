@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, IsTerminal, Write as _};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -26,6 +26,7 @@ const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 pub(crate) const REMOTE_CLIENT_BRIDGE_SUBCOMMAND: &str = "remote-client-bridge";
 pub(crate) const REMOTE_API_BRIDGE_SUBCOMMAND: &str = "remote-api-bridge";
+pub(crate) const REMOTE_API_PING_SUBCOMMAND: &str = "remote-api-ping";
 
 pub(crate) const REMOTE_KEYBINDINGS_ENV_VAR: &str = "HERDR_REMOTE_KEYBINDINGS";
 
@@ -140,11 +141,15 @@ pub(crate) fn extract_remote_args(
 }
 
 fn validate_remote_target(target: &str) -> Result<&str, String> {
+    validate_remote_target_for(target, "--remote")
+}
+
+fn validate_remote_target_for<'a>(target: &'a str, label: &str) -> Result<&'a str, String> {
     if target.is_empty() {
-        return Err("missing value for --remote".to_string());
+        return Err(format!("missing value for {label}"));
     }
     if target.starts_with('-') {
-        return Err("--remote target must not start with '-'".to_string());
+        return Err(format!("{label} target must not start with '-'"));
     }
     Ok(target)
 }
@@ -179,6 +184,108 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     )?;
 
     run_client_process(&local_socket, &reattach_command, remote.keybindings)
+}
+
+pub(crate) fn run_remote_api_ping(args: &[String]) -> io::Result<()> {
+    let target = parse_remote_api_ping_target(args).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{err}\nusage: herdr {REMOTE_API_PING_SUBCOMMAND} <ssh-target>"),
+        )
+    })?;
+    let session_name = crate::session::active_name()
+        .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
+    let prepared_remote = prepare_remote_herdr(target, false)?;
+    ensure_remote_server_ready(
+        target,
+        &prepared_remote.remote_herdr,
+        prepared_remote.installed_or_replaced,
+        false,
+    )?;
+
+    let bridge_command = remote_bridge_command_for(
+        &prepared_remote.remote_herdr,
+        &session_name,
+        REMOTE_API_BRIDGE_SUBCOMMAND,
+    );
+    let response = send_remote_api_ping_request(target, &bridge_command)?;
+    println!("{response}");
+    Ok(())
+}
+
+fn parse_remote_api_ping_target(args: &[String]) -> Result<&str, String> {
+    let [target] = args else {
+        return Err("expected exactly one SSH target".to_string());
+    };
+
+    validate_remote_target_for(target, REMOTE_API_PING_SUBCOMMAND)
+}
+
+fn remote_api_ping_request() -> crate::api::schema::Request {
+    crate::api::schema::Request {
+        id: "remote-api-ping".into(),
+        method: crate::api::schema::Method::Ping(crate::api::schema::PingParams::default()),
+    }
+}
+
+fn write_remote_api_ping_request<W: io::Write>(writer: &mut W) -> io::Result<()> {
+    let request = serde_json::to_string(&remote_api_ping_request()).map_err(io::Error::other)?;
+    writer.write_all(request.as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.flush()
+}
+
+fn read_remote_api_response_line<R: BufRead>(reader: &mut R) -> io::Result<String> {
+    let mut response = String::new();
+    let bytes_read = reader.read_line(&mut response)?;
+    if bytes_read == 0 || response.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "remote API ping returned an empty response",
+        ));
+    }
+
+    Ok(response.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn send_remote_api_ping_request(target: &str, bridge_command: &str) -> io::Result<String> {
+    let mut command = Command::new("ssh");
+    command
+        .arg("-T")
+        .arg(target)
+        .arg(bridge_command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    let mut child = command
+        .spawn()
+        .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdin missing"))?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing"))?;
+
+    write_remote_api_ping_request(&mut child_stdin)?;
+    drop(child_stdin);
+
+    let mut reader = BufReader::new(child_stdout);
+    let response = read_remote_api_response_line(&mut reader);
+    drop(reader);
+
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            format!("ssh bridge exited with {status}"),
+        ));
+    }
+
+    response
 }
 
 pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
@@ -1588,6 +1695,103 @@ mod tests {
     }
 
     #[test]
+    fn remote_api_ping_args_accept_one_target() {
+        let args = vec!["jafar".to_string()];
+
+        assert_eq!(parse_remote_api_ping_target(&args).unwrap(), "jafar");
+    }
+
+    #[test]
+    fn remote_api_ping_args_reject_missing_target() {
+        let args = Vec::new();
+
+        assert_eq!(
+            parse_remote_api_ping_target(&args).unwrap_err(),
+            "expected exactly one SSH target"
+        );
+    }
+
+    #[test]
+    fn remote_api_ping_args_reject_extra_args() {
+        let args = vec!["jafar".to_string(), "extra".to_string()];
+
+        assert_eq!(
+            parse_remote_api_ping_target(&args).unwrap_err(),
+            "expected exactly one SSH target"
+        );
+    }
+
+    #[test]
+    fn remote_api_ping_args_reject_dash_target() {
+        let args = vec!["-oProxyCommand=x".to_string()];
+
+        assert_eq!(
+            parse_remote_api_ping_target(&args).unwrap_err(),
+            "remote-api-ping target must not start with '-'"
+        );
+    }
+
+    #[test]
+    fn remote_api_ping_request_uses_ping_method() {
+        let request = remote_api_ping_request();
+
+        assert_eq!(request.id, "remote-api-ping");
+        assert!(matches!(
+            request.method,
+            crate::api::schema::Method::Ping(_)
+        ));
+    }
+
+    #[test]
+    fn remote_api_ping_writer_emits_newline_terminated_ping_request() {
+        let mut buffer = Vec::new();
+
+        write_remote_api_ping_request(&mut buffer).unwrap();
+
+        assert!(buffer.ends_with(b"\n"));
+        let request: crate::api::schema::Request = serde_json::from_slice(&buffer).unwrap();
+        assert_eq!(request.id, "remote-api-ping");
+        assert!(matches!(
+            request.method,
+            crate::api::schema::Method::Ping(_)
+        ));
+    }
+
+    #[test]
+    fn remote_api_response_reader_trims_newline_and_crlf() {
+        let mut newline = std::io::Cursor::new(b"{\"ok\":true}\n");
+        assert_eq!(
+            read_remote_api_response_line(&mut newline).unwrap(),
+            "{\"ok\":true}"
+        );
+
+        let mut crlf = std::io::Cursor::new(b"{\"ok\":true}\r\n");
+        assert_eq!(
+            read_remote_api_response_line(&mut crlf).unwrap(),
+            "{\"ok\":true}"
+        );
+    }
+
+    #[test]
+    fn remote_api_response_reader_rejects_empty_or_whitespace_only_input() {
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        assert_eq!(
+            read_remote_api_response_line(&mut empty)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        let mut whitespace = std::io::Cursor::new(b"   \t\n");
+        assert_eq!(
+            read_remote_api_response_line(&mut whitespace)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
     fn extract_remote_args_removes_space_form() {
         let args = vec![
             "herdr".into(),
@@ -1804,7 +2008,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_bridge_command_for_api_uses_api_subcommand() {
+    fn remote_api_bridge_command_uses_api_subcommand() {
         let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
@@ -1820,7 +2024,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_bridge_command_for_api_quotes_named_session() {
+    fn remote_api_bridge_command_quotes_named_session() {
         let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
             os: "linux",
             arch: "x86_64",
