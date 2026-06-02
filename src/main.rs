@@ -43,6 +43,7 @@ mod pty;
 mod raw_input;
 mod release_notes;
 mod remote;
+mod remote_source;
 mod selection;
 mod server;
 mod session;
