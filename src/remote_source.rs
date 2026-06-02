@@ -23,7 +23,6 @@ impl RemoteHostKey {
     }
 }
 
-#[allow(dead_code)] // Staged for later target routing/cache lookups; tests exercise it before integration.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RemoteAgentKey {
     pub(crate) host: String,
@@ -32,8 +31,8 @@ pub(crate) struct RemoteAgentKey {
 }
 
 impl RemoteAgentKey {
-    #[allow(dead_code)] // Staged for later target routing/cache lookups; tests exercise it before integration.
-    fn new(host: &RemoteHostKey, terminal_id: impl Into<String>) -> Self {
+    #[allow(dead_code)] // Staged for supervisor/remove events before runtime sender integration exists.
+    pub(crate) fn new(host: &RemoteHostKey, terminal_id: impl Into<String>) -> Self {
         Self {
             host: host.host.clone(),
             session: host.session.clone(),
@@ -42,7 +41,6 @@ impl RemoteAgentKey {
     }
 }
 
-#[allow(dead_code)] // Connected is set by staged cache update paths before runtime integration uses them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteConnectionStatus {
     Connected,
@@ -89,7 +87,6 @@ impl Default for RemoteHostCache {
 }
 
 impl RemoteSourceCache {
-    #[allow(dead_code)] // Staged for supervisor snapshot ingestion in later slices; tests exercise it now.
     pub(crate) fn replace_connected_snapshot(
         &mut self,
         host: RemoteHostKey,
@@ -103,12 +100,10 @@ impl RemoteSourceCache {
             .collect();
     }
 
-    #[allow(dead_code)] // Staged for supervisor disconnect handling in later slices; tests exercise it now.
     pub(crate) fn mark_disconnected(&mut self, host: &RemoteHostKey) {
         self.hosts.entry(host.clone()).or_default().status = RemoteConnectionStatus::Disconnected;
     }
 
-    #[allow(dead_code)] // Staged for subscription event updates in later slices; tests exercise it now.
     pub(crate) fn apply_agent_update(&mut self, host: RemoteHostKey, agent: AgentInfo) -> bool {
         let host_cache = self.hosts.entry(host).or_insert_with(|| RemoteHostCache {
             status: RemoteConnectionStatus::Connected,
@@ -125,9 +120,16 @@ impl RemoteSourceCache {
         }
     }
 
-    #[allow(dead_code)] // Staged for remote remove/disconnect flows in later slices.
     pub(crate) fn remove_host(&mut self, host: &RemoteHostKey) -> bool {
         self.hosts.remove(host).is_some()
+    }
+
+    pub(crate) fn remove_agent(&mut self, key: &RemoteAgentKey) -> bool {
+        let host = RemoteHostKey::new(key.host.clone(), key.session.clone());
+        let Some(host_cache) = self.hosts.get_mut(&host) else {
+            return false;
+        };
+        host_cache.agents.remove(&key.terminal_id).is_some()
     }
 
     pub(crate) fn list_entries(&self) -> Vec<RemoteAgentEntry> {
@@ -363,6 +365,23 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn remote_source_remove_agent_deletes_only_that_host_session_terminal() {
+        let mut cache = RemoteSourceCache::default();
+        let keep = RemoteHostKey::new("jafar", "default");
+        let remove = RemoteHostKey::new("jafar", "agents");
+        cache.replace_connected_snapshot(keep.clone(), vec![agent("term-1", "codex", 1)]);
+        cache.replace_connected_snapshot(remove.clone(), vec![agent("term-1", "claude", 1)]);
+
+        assert!(cache.remove_agent(&RemoteAgentKey::new(&remove, "term-1")));
+        assert!(!cache.remove_agent(&RemoteAgentKey::new(&remove, "term-1")));
+
+        let entries = cache.list_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].host, keep);
+        assert_eq!(entries[0].agent.terminal_id, "term-1");
     }
 
     #[test]

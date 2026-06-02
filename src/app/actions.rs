@@ -2022,6 +2022,26 @@ impl AppState {
                 }
                 Vec::new()
             }
+            AppEvent::RemoteSourceSnapshot { host, agents } => {
+                self.remote_sources.replace_connected_snapshot(host, agents);
+                Vec::new()
+            }
+            AppEvent::RemoteSourceAgentUpdated { host, agent } => {
+                self.remote_sources.apply_agent_update(host, *agent);
+                Vec::new()
+            }
+            AppEvent::RemoteSourceAgentRemoved { key } => {
+                self.remote_sources.remove_agent(&key);
+                Vec::new()
+            }
+            AppEvent::RemoteSourceDisconnected { host } => {
+                self.remote_sources.mark_disconnected(&host);
+                Vec::new()
+            }
+            AppEvent::RemoteSourceRemoved { host } => {
+                self.remote_sources.remove_host(&host);
+                Vec::new()
+            }
             AppEvent::StateChanged {
                 pane_id,
                 agent,
@@ -2315,7 +2335,7 @@ mod tests {
     use super::*;
     use crate::api::schema::{AgentInfo, AgentStatus};
     use crate::detect::{Agent, AgentState};
-    use crate::remote_source::RemoteHostKey;
+    use crate::remote_source::{RemoteAgentKey, RemoteHostKey};
     use crate::workspace::Workspace;
     use ratatui::layout::Direction;
 
@@ -2913,13 +2933,22 @@ mod tests {
     }
 
     fn remote_agent(terminal_id: &str, label: &str) -> AgentInfo {
+        remote_agent_with_revision(terminal_id, label, AgentStatus::Working, 1)
+    }
+
+    fn remote_agent_with_revision(
+        terminal_id: &str,
+        label: &str,
+        status: AgentStatus,
+        revision: u64,
+    ) -> AgentInfo {
         AgentInfo {
             terminal_id: terminal_id.to_string(),
             name: None,
             agent: Some(label.to_string()),
             title: None,
             display_agent: Some(label.to_string()),
-            agent_status: AgentStatus::Working,
+            agent_status: status,
             custom_status: None,
             state_labels: HashMap::new(),
             agent_session: None,
@@ -2929,7 +2958,7 @@ mod tests {
             focused: false,
             cwd: None,
             foreground_cwd: None,
-            revision: 1,
+            revision,
         }
     }
 
@@ -3032,6 +3061,145 @@ mod tests {
 
         state.previous_agent();
         assert_eq!(state.workspaces[0].focused_pane_id(), Some(second));
+    }
+
+    #[test]
+    fn remote_source_events_snapshot_populates_agent_panel_without_pane_updates() {
+        let mut state = AppState::test_new();
+        state.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+
+        let updates = state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            host,
+            agents: vec![remote_agent("remote-term", "smoke-agent")],
+        });
+
+        assert!(updates.is_empty());
+        let entries = crate::ui::agent_panel_entries(&state);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].primary_label, "jafar/smoke-agent");
+    }
+
+    #[test]
+    fn remote_source_events_disconnected_marks_agent_panel_entry_stale() {
+        let mut state = AppState::test_new();
+        state.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            host: host.clone(),
+            agents: vec![remote_agent("remote-term", "smoke-agent")],
+        });
+
+        let updates = state.handle_app_event(AppEvent::RemoteSourceDisconnected { host });
+
+        assert!(updates.is_empty());
+        let entries = crate::ui::agent_panel_entries(&state);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].custom_status.as_deref(), Some("disconnected"));
+    }
+
+    #[test]
+    fn remote_source_events_agent_update_obeys_revision_ordering() {
+        let mut state = AppState::test_new();
+        state.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            host: host.clone(),
+            agents: vec![remote_agent_with_revision(
+                "remote-term",
+                "current",
+                AgentStatus::Working,
+                10,
+            )],
+        });
+
+        let old_updates = state.handle_app_event(AppEvent::RemoteSourceAgentUpdated {
+            host: host.clone(),
+            agent: Box::new(remote_agent_with_revision(
+                "remote-term",
+                "old",
+                AgentStatus::Idle,
+                9,
+            )),
+        });
+        let same_updates = state.handle_app_event(AppEvent::RemoteSourceAgentUpdated {
+            host: host.clone(),
+            agent: Box::new(remote_agent_with_revision(
+                "remote-term",
+                "same",
+                AgentStatus::Idle,
+                10,
+            )),
+        });
+        let new_updates = state.handle_app_event(AppEvent::RemoteSourceAgentUpdated {
+            host,
+            agent: Box::new(remote_agent_with_revision(
+                "remote-term",
+                "new",
+                AgentStatus::Idle,
+                11,
+            )),
+        });
+
+        assert!(old_updates.is_empty());
+        assert!(same_updates.is_empty());
+        assert!(new_updates.is_empty());
+        let entries = crate::ui::agent_panel_entries(&state);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].primary_label, "jafar/new");
+        assert_eq!(entries[0].state, AgentState::Idle);
+    }
+
+    #[test]
+    fn remote_source_events_agent_removed_is_host_session_scoped() {
+        let mut state = AppState::test_new();
+        state.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;
+        let keep = RemoteHostKey::new("jafar", "default");
+        let remove = RemoteHostKey::new("jafar", "agents");
+        state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            host: keep.clone(),
+            agents: vec![remote_agent("remote-term", "keep")],
+        });
+        state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            host: remove.clone(),
+            agents: vec![remote_agent("remote-term", "remove")],
+        });
+
+        let updates = state.handle_app_event(AppEvent::RemoteSourceAgentRemoved {
+            key: RemoteAgentKey::new(&remove, "remote-term"),
+        });
+
+        assert!(updates.is_empty());
+        let labels: Vec<_> = crate::ui::agent_panel_entries(&state)
+            .into_iter()
+            .map(|entry| entry.primary_label)
+            .collect();
+        assert_eq!(labels, vec!["jafar/keep"]);
+    }
+
+    #[test]
+    fn remote_source_events_host_removed_clears_only_that_host_session() {
+        let mut state = AppState::test_new();
+        state.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;
+        let keep = RemoteHostKey::new("jafar", "default");
+        let remove = RemoteHostKey::new("jafar", "agents");
+        state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            host: keep.clone(),
+            agents: vec![remote_agent("keep-term", "keep")],
+        });
+        state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            host: remove.clone(),
+            agents: vec![remote_agent("remove-term", "remove")],
+        });
+
+        let updates = state.handle_app_event(AppEvent::RemoteSourceRemoved { host: remove });
+
+        assert!(updates.is_empty());
+        let labels: Vec<_> = crate::ui::agent_panel_entries(&state)
+            .into_iter()
+            .map(|entry| entry.primary_label)
+            .collect();
+        assert_eq!(labels, vec!["jafar/keep"]);
     }
 
     #[test]

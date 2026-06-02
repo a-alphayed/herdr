@@ -5,8 +5,10 @@
 
 use std::time::Instant;
 
+use crate::api::schema::AgentInfo;
 use crate::detect::{Agent, AgentState};
 use crate::layout::PaneId;
+use crate::remote_source::{RemoteAgentKey, RemoteHostKey};
 use crate::workspace::{GitStatusCacheEntry, WorkspaceGitStatus};
 
 #[derive(Debug)]
@@ -85,6 +87,32 @@ pub enum AppEvent {
         version: String,
         install_command: String,
     },
+    /// A connected authoritative remote host/session reported a full agent snapshot.
+    #[allow(dead_code)]
+    // Staged ingress for future remote supervisors; reducer/tests exercise it before runtime sender exists.
+    RemoteSourceSnapshot {
+        host: RemoteHostKey,
+        agents: Vec<AgentInfo>,
+    },
+    /// A connected authoritative remote host/session reported one newer agent entry.
+    #[allow(dead_code)]
+    // Staged ingress for future remote supervisors; reducer/tests exercise it before runtime sender exists.
+    RemoteSourceAgentUpdated {
+        host: RemoteHostKey,
+        agent: Box<AgentInfo>,
+    },
+    /// A connected authoritative remote host/session reported one agent gone.
+    #[allow(dead_code)]
+    // Staged ingress for future remote supervisors; reducer/tests exercise it before runtime sender exists.
+    RemoteSourceAgentRemoved { key: RemoteAgentKey },
+    /// A remote host/session became unreachable; keep last-known agents stale.
+    #[allow(dead_code)]
+    // Staged ingress for future remote supervisors; reducer/tests exercise it before runtime sender exists.
+    RemoteSourceDisconnected { host: RemoteHostKey },
+    /// A remote host/session was removed from aggregation state.
+    #[allow(dead_code)]
+    // Staged ingress for future remote supervisors; reducer/tests exercise it before runtime sender exists.
+    RemoteSourceRemoved { host: RemoteHostKey },
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
     /// re-emits it through herdr's own clipboard writer.
     ClipboardWrite { content: Vec<u8> },
