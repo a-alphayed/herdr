@@ -23,6 +23,16 @@ const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CURRENT_PROTOCOL: u32 = crate::protocol::PROTOCOL_VERSION;
 const UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
+const NONINTERACTIVE_SSH_OPTIONS: &[&str] = &[
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=5",
+    "-o",
+    "ServerAliveCountMax=2",
+];
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 pub(crate) const REMOTE_CLIENT_BRIDGE_SUBCOMMAND: &str = "remote-client-bridge";
 pub(crate) const REMOTE_API_BRIDGE_SUBCOMMAND: &str = "remote-api-bridge";
@@ -279,15 +289,55 @@ pub(crate) fn send_remote_api_request_to_host(
     send_remote_api_request(&host.target, &bridge_command, request)
 }
 
+pub(crate) fn send_remote_api_request_to_host_noninteractive(
+    host: &crate::remote_target::RemoteHostConfig,
+    request: &crate::api::schema::Request,
+) -> io::Result<String> {
+    let remote_herdr = prepare_remote_herdr_noninteractive(&host.target)?;
+    let bridge_command = remote_api_bridge_command_for_host(&remote_herdr, host);
+    send_remote_api_request_noninteractive(&host.target, &bridge_command, request)
+}
+
 fn send_remote_api_request(
     target: &str,
     bridge_command: &str,
     request: &crate::api::schema::Request,
 ) -> io::Result<String> {
-    let mut command = Command::new("ssh");
+    send_remote_api_request_with_mode(
+        target,
+        bridge_command,
+        request,
+        SshInvocationMode::Interactive,
+    )
+}
+
+fn send_remote_api_request_noninteractive(
+    target: &str,
+    bridge_command: &str,
+    request: &crate::api::schema::Request,
+) -> io::Result<String> {
+    send_remote_api_request_with_mode(
+        target,
+        bridge_command,
+        request,
+        SshInvocationMode::Noninteractive,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SshInvocationMode {
+    Interactive,
+    Noninteractive,
+}
+
+fn send_remote_api_request_with_mode(
+    target: &str,
+    bridge_command: &str,
+    request: &crate::api::schema::Request,
+    mode: SshInvocationMode,
+) -> io::Result<String> {
+    let mut command = ssh_command(target, mode);
     command
-        .arg("-T")
-        .arg(target)
         .arg(bridge_command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -564,6 +614,30 @@ impl InstallSource {
     }
 }
 
+fn prepare_remote_herdr_noninteractive(target: &str) -> io::Result<RemoteHerdr> {
+    let platform = detect_remote_platform_noninteractive(target)?;
+    let remote_herdr = RemoteHerdr::for_platform(platform);
+
+    if let Some(path_remote_herdr) =
+        remote_binary_on_path_any_noninteractive(target, &remote_herdr)?.filter(|candidate| {
+            remote_binary_matches_noninteractive(target, candidate).unwrap_or(false)
+        })
+    {
+        return Ok(path_remote_herdr);
+    }
+
+    if remote_binary_matches_noninteractive(target, &remote_herdr)? {
+        return Ok(remote_herdr);
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "compatible herdr v{CURRENT_VERSION} protocol {CURRENT_PROTOCOL} was not found on remote host {target}; run `herdr --remote {target}` interactively to install or upgrade it"
+        ),
+    ))
+}
+
 fn prepare_remote_herdr(
     target: &str,
     live_handoff_enabled: bool,
@@ -627,7 +701,18 @@ fn prepare_remote_herdr(
 }
 
 fn detect_remote_platform(target: &str) -> io::Result<RemotePlatform> {
-    let output = ssh_output(target, "uname -s; uname -m")?;
+    detect_remote_platform_with(target, ssh_output)
+}
+
+fn detect_remote_platform_noninteractive(target: &str) -> io::Result<RemotePlatform> {
+    detect_remote_platform_with(target, ssh_output_noninteractive)
+}
+
+fn detect_remote_platform_with(
+    target: &str,
+    run_ssh: fn(&str, &str) -> io::Result<Output>,
+) -> io::Result<RemotePlatform> {
+    let output = run_ssh(target, "uname -s; uname -m")?;
     if !output.status.success() {
         return Err(command_failed("remote platform detection failed", &output));
     }
@@ -649,7 +734,22 @@ fn remote_binary_on_path_any(
     target: &str,
     remote_herdr: &RemoteHerdr,
 ) -> io::Result<Option<RemoteHerdr>> {
-    let output = ssh_output(target, remote_path_probe_any_command())?;
+    remote_binary_on_path_any_with(target, remote_herdr, ssh_output)
+}
+
+fn remote_binary_on_path_any_noninteractive(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+) -> io::Result<Option<RemoteHerdr>> {
+    remote_binary_on_path_any_with(target, remote_herdr, ssh_output_noninteractive)
+}
+
+fn remote_binary_on_path_any_with(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+    run_ssh: fn(&str, &str) -> io::Result<Output>,
+) -> io::Result<Option<RemoteHerdr>> {
+    let output = run_ssh(target, remote_path_probe_any_command())?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -695,11 +795,26 @@ fn remote_herdr_from_path_probe_any(
 }
 
 fn remote_binary_matches(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
+    remote_binary_matches_with(target, remote_herdr, ssh_output)
+}
+
+fn remote_binary_matches_noninteractive(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+) -> io::Result<bool> {
+    remote_binary_matches_with(target, remote_herdr, ssh_output_noninteractive)
+}
+
+fn remote_binary_matches_with(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+    run_ssh: fn(&str, &str) -> io::Result<Output>,
+) -> io::Result<bool> {
     let command = format!(
         "test -x {0} && {0} --version && {0} status client --json",
         remote_herdr.shell_path
     );
-    let output = ssh_output(target, &command)?;
+    let output = run_ssh(target, &command)?;
     if !output.status.success() {
         return Ok(false);
     }
@@ -1380,11 +1495,25 @@ mv "$tmp" "$dest"
 }
 
 fn ssh_output(target: &str, command: &str) -> io::Result<Output> {
-    Command::new("ssh")
-        .arg("-T")
-        .arg(target)
+    ssh_command(target, SshInvocationMode::Interactive)
         .arg(command)
         .output()
+}
+
+fn ssh_output_noninteractive(target: &str, command: &str) -> io::Result<Output> {
+    ssh_command(target, SshInvocationMode::Noninteractive)
+        .arg(command)
+        .output()
+}
+
+fn ssh_command(target: &str, mode: SshInvocationMode) -> Command {
+    let mut command = Command::new("ssh");
+    command.arg("-T");
+    if mode == SshInvocationMode::Noninteractive {
+        command.args(NONINTERACTIVE_SSH_OPTIONS);
+    }
+    command.arg(target);
+    command
 }
 
 fn remote_bridge_command(remote_herdr: &RemoteHerdr, session_name: &str) -> String {
@@ -2182,6 +2311,42 @@ mod tests {
             remote_api_bridge_command_for_host(&remote_herdr, &host),
             "exec \"$HOME/.local/bin/herdr\" remote-api-bridge"
         );
+    }
+
+    #[test]
+    fn noninteractive_ssh_command_uses_batch_mode_and_timeouts() {
+        let command = ssh_command("jafar", SshInvocationMode::Noninteractive);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            args,
+            vec![
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "ServerAliveInterval=5",
+                "-o",
+                "ServerAliveCountMax=2",
+                "jafar",
+            ]
+        );
+    }
+
+    #[test]
+    fn interactive_ssh_command_does_not_force_batch_mode() {
+        let command = ssh_command("jafar", SshInvocationMode::Interactive);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(args, vec!["-T", "jafar"]);
     }
 
     #[test]

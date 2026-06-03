@@ -175,6 +175,7 @@ impl RemoteHostConfig {
 pub(crate) enum RemoteHostConfigError {
     InvalidAlias(RemoteAliasError),
     EmptySshTarget,
+    SshTargetStartsWithDash,
     EmptySession,
     DuplicateAlias(String),
 }
@@ -184,6 +185,7 @@ impl std::fmt::Display for RemoteHostConfigError {
         match self {
             Self::InvalidAlias(err) => write!(f, "{err}"),
             Self::EmptySshTarget => write!(f, "remote SSH target cannot be empty"),
+            Self::SshTargetStartsWithDash => write!(f, "remote SSH target cannot start with '-'"),
             Self::EmptySession => write!(f, "remote session cannot be empty"),
             Self::DuplicateAlias(alias) => write!(f, "duplicate remote alias: {alias}"),
         }
@@ -219,6 +221,9 @@ impl RemoteHostRegistry {
         if config.target.is_empty() {
             return Err(RemoteHostConfigError::EmptySshTarget);
         }
+        if config.target.starts_with('-') {
+            return Err(RemoteHostConfigError::SshTargetStartsWithDash);
+        }
         if config.session.is_empty() {
             return Err(RemoteHostConfigError::EmptySession);
         }
@@ -233,7 +238,6 @@ impl RemoteHostRegistry {
         self.hosts.get(alias)
     }
 
-    #[allow(dead_code)] // Staged deterministic listing for future remote status/config UI; tests exercise it now.
     pub(crate) fn list(&self) -> Vec<&RemoteHostConfig> {
         self.hosts.values().collect()
     }
@@ -690,6 +694,19 @@ mod tests {
             .unwrap_err(),
             RemoteHostConfigError::EmptySession
         );
+    }
+
+    #[test]
+    fn remote_target_registry_rejects_option_like_ssh_target() {
+        let err = RemoteHostRegistry::from_configs(vec![RemoteHostConfig::new(
+            "jafar",
+            "-oProxyCommand=sh",
+            "default",
+            true,
+        )])
+        .unwrap_err();
+
+        assert_eq!(err, RemoteHostConfigError::SshTargetStartsWithDash);
     }
 
     #[test]

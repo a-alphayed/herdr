@@ -118,9 +118,9 @@ pub struct App {
     pub(crate) overlay_panes: HashMap<crate::layout::PaneId, OverlayPaneState>,
     pub(crate) local_terminal_notifications: bool,
     pub(crate) config_reloaded_from_disk: bool,
-    #[allow(dead_code)]
-    // Staged runtime-side registry for future remote supervisors/routing; config loads it before consumers exist.
     pub(crate) remote_hosts: crate::remote_target::RemoteHostRegistry,
+    pub(crate) remote_source_supervisors:
+        Vec<crate::remote_supervisor::RemoteSourceSupervisorHandle>,
 }
 
 pub(crate) const APP_EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -201,6 +201,30 @@ fn remote_host_registry_from_config(config: &Config) -> crate::remote_target::Re
             crate::remote_target::RemoteHostRegistry::default()
         }
     }
+}
+
+fn start_remote_source_supervisors_if_enabled(
+    no_session: bool,
+    registry: &crate::remote_target::RemoteHostRegistry,
+    event_tx: tokio::sync::mpsc::Sender<AppEvent>,
+) -> Vec<crate::remote_supervisor::RemoteSourceSupervisorHandle> {
+    if no_session || cfg!(test) {
+        return Vec::new();
+    }
+
+    crate::remote_supervisor::start_remote_source_supervisors(registry, event_tx)
+}
+
+fn remote_host_keys(
+    registry: &crate::remote_target::RemoteHostRegistry,
+) -> std::collections::BTreeSet<crate::remote_source::RemoteHostKey> {
+    registry
+        .list()
+        .into_iter()
+        .map(|host| {
+            crate::remote_source::RemoteHostKey::new(host.name.clone(), host.session.clone())
+        })
+        .collect()
 }
 
 /// Parse the configured agent name list into a deduplicated set of `Agent`
@@ -575,6 +599,9 @@ impl App {
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
 
+        let remote_source_supervisors =
+            start_remote_source_supervisors_if_enabled(no_session, &remote_hosts, event_tx.clone());
+
         Self {
             config_diagnostic_deadline: None,
             toast_deadline: None,
@@ -613,6 +640,7 @@ impl App {
             local_terminal_notifications: true,
             config_reloaded_from_disk: false,
             remote_hosts,
+            remote_source_supervisors,
         }
     }
 
@@ -673,6 +701,11 @@ impl App {
                 .get(idx)
                 .and_then(|ws| ws.focused_pane_id().map(|pane_id| (idx, pane_id)))
         });
+        app.remote_source_supervisors = start_remote_source_supervisors_if_enabled(
+            app.no_session,
+            &app.remote_hosts,
+            app.event_tx.clone(),
+        );
         Ok(app)
     }
 
@@ -1181,7 +1214,22 @@ impl App {
         }
 
         if !invalid_section("remote") {
+            let previous_remote_hosts = remote_host_keys(&self.remote_hosts);
             self.remote_hosts = remote_host_registry_from_config(config);
+            let current_remote_hosts = remote_host_keys(&self.remote_hosts);
+            for host in previous_remote_hosts.difference(&current_remote_hosts) {
+                let _ = self
+                    .state
+                    .handle_app_event(AppEvent::RemoteSourceRemoved { host: host.clone() });
+            }
+            crate::remote_supervisor::stop_remote_source_supervisors(
+                &mut self.remote_source_supervisors,
+            );
+            self.remote_source_supervisors = start_remote_source_supervisors_if_enabled(
+                self.no_session,
+                &self.remote_hosts,
+                self.event_tx.clone(),
+            );
         }
 
         if !invalid_section("theme") {
@@ -1435,6 +1483,27 @@ mod tests {
         }
     }
 
+    fn remote_agent_info(terminal_id: &str) -> crate::api::schema::AgentInfo {
+        crate::api::schema::AgentInfo {
+            terminal_id: terminal_id.to_string(),
+            name: Some("codex".to_string()),
+            agent: Some("codex".to_string()),
+            title: None,
+            display_agent: Some("codex".to_string()),
+            agent_status: crate::api::schema::AgentStatus::Working,
+            custom_status: None,
+            state_labels: std::collections::HashMap::new(),
+            agent_session: None,
+            workspace_id: "ws-1".to_string(),
+            tab_id: "tab-1".to_string(),
+            pane_id: "pane-1".to_string(),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+            revision: 1,
+        }
+    }
+
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(
@@ -1492,6 +1561,36 @@ mod tests {
         let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
 
         assert!(app.remote_hosts.list().is_empty());
+    }
+
+    #[test]
+    fn app_ignores_remote_source_snapshot_for_unconfigured_host() {
+        let mut app = test_app();
+
+        app.handle_internal_event(AppEvent::RemoteSourceSnapshot {
+            host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
+            agents: vec![remote_agent_info("term-1")],
+        });
+
+        assert!(app.state.remote_sources.list_entries().is_empty());
+    }
+
+    #[test]
+    fn app_applies_remote_source_snapshot_for_configured_host() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar", "jafar", "default", true,
+        )];
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        app.handle_internal_event(AppEvent::RemoteSourceSnapshot {
+            host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
+            agents: vec![remote_agent_info("term-1")],
+        });
+
+        assert_eq!(app.state.remote_sources.list_entries().len(), 1);
     }
 
     fn config_env_lock() -> &'static Mutex<()> {
@@ -1864,10 +1963,17 @@ session = "agents"
         assert_eq!(host.target, "user@jafar:2222");
         assert_eq!(host.session, "agents");
 
+        app.state.remote_sources.replace_connected_snapshot(
+            crate::remote_source::RemoteHostKey::new("jafar", "agents"),
+            vec![remote_agent_info("term-1")],
+        );
+        assert_eq!(app.state.remote_sources.list_entries().len(), 1);
+
         std::fs::write(&path, "[remote]\nenabled = false\n").unwrap();
         let report = app.reload_config();
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert!(app.remote_hosts.list().is_empty());
+        assert!(app.state.remote_sources.list_entries().is_empty());
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

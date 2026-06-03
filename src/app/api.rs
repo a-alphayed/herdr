@@ -20,6 +20,10 @@ enum RuntimeExitAction {
 
 impl App {
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
+        if self.remote_source_event_is_from_unconfigured_host(&ev) {
+            return;
+        }
+
         if let AppEvent::ClipboardWrite { content } = ev {
             #[cfg(not(test))]
             crate::selection::write_osc52_bytes(&content);
@@ -211,6 +215,21 @@ impl App {
 
         self.sync_toast_deadline(previous_toast);
         self.shutdown_detached_terminal_runtimes();
+    }
+
+    fn remote_source_event_is_from_unconfigured_host(&self, ev: &AppEvent) -> bool {
+        match ev {
+            AppEvent::RemoteSourceSnapshot { host, .. }
+            | AppEvent::RemoteSourceAgentUpdated { host, .. }
+            | AppEvent::RemoteSourceDisconnected { host } => !self.remote_host_is_configured(host),
+            _ => false,
+        }
+    }
+
+    fn remote_host_is_configured(&self, host: &crate::remote_source::RemoteHostKey) -> bool {
+        self.remote_hosts
+            .get(&host.host)
+            .is_some_and(|config| config.session == host.session)
     }
 
     pub(crate) fn refresh_new_herdr_toast_context_for_update(
