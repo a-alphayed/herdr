@@ -1139,6 +1139,8 @@ Tasks:
 - tests for restart/reconnect flows;
 - optional internal SSH ControlMaster optimization.
 
+Production validation should go beyond the Docker/localhost SSH smoke. Before shipping, test at least one real SSH-reachable remote host, multiple configured hosts, slow/unreachable SSH, sleep/offline/wake reconnect behavior, and a Tailscale/MagicDNS target if that is a supported deployment path. The Docker smoke proves the controlled one-hop federation path, but it does not prove real-network behavior or tailnet naming/reachability assumptions.
+
 Acceptance criteria:
 
 - SteamDeck restart re-aggregates remote agents.
