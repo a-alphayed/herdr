@@ -1,9 +1,12 @@
-//! Pure parsing for future host-qualified remote target routing.
+//! Pure parsing and read-only cache resolution for future host-qualified remote target routing.
 //!
-//! This module only classifies target strings. It does not inspect caches, open
-//! bridges, or execute command routing.
+//! This module classifies target strings and resolves them against a read-only
+//! `RemoteSourceCache` snapshot. It does not open bridges, perform IO, or execute
+//! command routing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::remote_source::{RemoteAgentEntry, RemoteAgentKey, RemoteHostKey, RemoteSourceCache};
 
 #[allow(dead_code)] // Staged validation error for future remote config/target routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,9 +287,210 @@ pub(crate) fn plan_target_route(
     }
 }
 
+#[allow(dead_code)] // Staged resolver output for future remote command routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteAgentResolution {
+    pub(crate) host: RemoteHostConfig,
+    pub(crate) key: RemoteAgentKey,
+    pub(crate) entry: RemoteAgentEntry,
+}
+
+#[allow(dead_code)] // Staged ambiguity details for future remote command routing errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteAgentCandidate {
+    pub(crate) key: RemoteAgentKey,
+    pub(crate) label: String,
+    pub(crate) pane_id: String,
+    pub(crate) terminal_id: String,
+    pub(crate) stale: bool,
+}
+
+#[allow(dead_code)] // Staged resolver error for future remote command routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteAgentResolveError {
+    NotFound {
+        target: RemoteTargetSelector,
+    },
+    Ambiguous {
+        target: RemoteTargetSelector,
+        candidates: Vec<RemoteAgentCandidate>,
+    },
+    UnsupportedSelector {
+        target: RemoteTargetSelector,
+    },
+}
+
+impl std::fmt::Display for RemoteAgentResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { target } => write!(f, "remote agent target not found: {target:?}"),
+            Self::Ambiguous { target, .. } => {
+                write!(f, "remote agent target is ambiguous: {target:?}")
+            }
+            Self::UnsupportedSelector { target } => {
+                write!(
+                    f,
+                    "remote selector is not a single-agent target: {target:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RemoteAgentResolveError {}
+
+#[allow(dead_code)] // Staged pure resolver for future remote command routing.
+pub(crate) fn resolve_remote_agent_target(
+    cache: &RemoteSourceCache,
+    host: &RemoteHostConfig,
+    selector: &RemoteTargetSelector,
+) -> Result<RemoteAgentResolution, RemoteAgentResolveError> {
+    if matches!(selector, RemoteTargetSelector::Workspace(_)) {
+        return Err(RemoteAgentResolveError::UnsupportedSelector {
+            target: selector.clone(),
+        });
+    }
+
+    let host_key = RemoteHostKey::new(host.name.clone(), host.session.clone());
+    let matches: Vec<_> = cache
+        .entries_for_host(&host_key)
+        .into_iter()
+        .filter(|entry| remote_agent_matches_selector(entry, selector))
+        .collect();
+
+    match matches.len() {
+        0 => Err(RemoteAgentResolveError::NotFound {
+            target: selector.clone(),
+        }),
+        1 => {
+            let mut matches = matches.into_iter();
+            let Some(entry) = matches.next() else {
+                return Err(RemoteAgentResolveError::NotFound {
+                    target: selector.clone(),
+                });
+            };
+            let key = RemoteAgentKey::new(&host_key, entry.agent.terminal_id.clone());
+            Ok(RemoteAgentResolution {
+                host: host.clone(),
+                key,
+                entry,
+            })
+        }
+        _ => Err(RemoteAgentResolveError::Ambiguous {
+            target: selector.clone(),
+            candidates: matches
+                .into_iter()
+                .map(|entry| remote_agent_candidate(&host_key, &entry))
+                .collect(),
+        }),
+    }
+}
+
+fn remote_agent_matches_selector(
+    entry: &RemoteAgentEntry,
+    selector: &RemoteTargetSelector,
+) -> bool {
+    match selector {
+        RemoteTargetSelector::Terminal(terminal_id) => entry.agent.terminal_id == *terminal_id,
+        RemoteTargetSelector::Pane(pane_id) => entry.agent.pane_id == *pane_id,
+        RemoteTargetSelector::Agent(label) => {
+            remote_agent_identity_labels(&entry.agent).contains(label)
+        }
+        RemoteTargetSelector::Workspace(_) => false,
+    }
+}
+
+fn remote_agent_candidate(host: &RemoteHostKey, entry: &RemoteAgentEntry) -> RemoteAgentCandidate {
+    RemoteAgentCandidate {
+        key: RemoteAgentKey::new(host, entry.agent.terminal_id.clone()),
+        label: preferred_remote_agent_label(&entry.agent),
+        pane_id: entry.agent.pane_id.clone(),
+        terminal_id: entry.agent.terminal_id.clone(),
+        stale: entry.stale(),
+    }
+}
+
+fn remote_agent_identity_labels(agent: &crate::api::schema::AgentInfo) -> BTreeSet<String> {
+    let mut labels = BTreeSet::new();
+    for label in [
+        agent.name.as_deref(),
+        agent.display_agent.as_deref(),
+        agent.agent.as_deref(),
+        agent.title.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        labels.insert(label.to_string());
+    }
+    labels.insert(agent.terminal_id.clone());
+    labels
+}
+
+fn preferred_remote_agent_label(agent: &crate::api::schema::AgentInfo) -> String {
+    agent
+        .name
+        .as_deref()
+        .or(agent.display_agent.as_deref())
+        .or(agent.agent.as_deref())
+        .or(agent.title.as_deref())
+        .unwrap_or(&agent.terminal_id)
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use crate::api::schema::{AgentInfo, AgentStatus};
+    use crate::remote_source::{
+        RemoteAgentKey, RemoteConnectionStatus, RemoteHostKey, RemoteSourceCache,
+    };
+
     use super::*;
+
+    fn agent_with_fields(
+        terminal_id: &str,
+        pane_id: &str,
+        name: Option<&str>,
+        display_agent: Option<&str>,
+        agent: Option<&str>,
+        title: Option<&str>,
+    ) -> AgentInfo {
+        AgentInfo {
+            terminal_id: terminal_id.to_string(),
+            name: name.map(str::to_string),
+            agent: agent.map(str::to_string),
+            title: title.map(str::to_string),
+            display_agent: display_agent.map(str::to_string),
+            agent_status: AgentStatus::Working,
+            custom_status: None,
+            state_labels: HashMap::new(),
+            agent_session: None,
+            workspace_id: "remote-ws".to_string(),
+            tab_id: "remote-tab".to_string(),
+            pane_id: pane_id.to_string(),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+            revision: 1,
+        }
+    }
+
+    fn labeled_agent(terminal_id: &str, pane_id: &str, label: &str) -> AgentInfo {
+        agent_with_fields(
+            terminal_id,
+            pane_id,
+            Some(label),
+            Some(label),
+            Some(label),
+            None,
+        )
+    }
+
+    fn host_config(name: &str, session: &str) -> RemoteHostConfig {
+        RemoteHostConfig::new(name, name, session, true)
+    }
 
     #[test]
     fn remote_target_accepts_valid_aliases() {
@@ -582,5 +786,227 @@ mod tests {
             plan_target_route(&registry, "jafar/").unwrap_err(),
             RemoteRoutePlanError::Parse(TargetRouteParseError::EmptyRemoteTarget)
         );
+    }
+
+    #[test]
+    fn remote_target_resolves_terminal_selector_with_host_session_scope() {
+        let host = host_config("jafar", "default");
+        let other_session = host_config("jafar", "agents");
+        let mut cache = RemoteSourceCache::default();
+        cache.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![labeled_agent("term-1", "pane-1", "codex")],
+        );
+        cache.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "agents"),
+            vec![labeled_agent("term-1", "pane-other", "other")],
+        );
+
+        let resolved = resolve_remote_agent_target(
+            &cache,
+            &host,
+            &RemoteTargetSelector::Terminal("term-1".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.host, host);
+        assert_eq!(
+            resolved.key,
+            RemoteAgentKey::new(&RemoteHostKey::new("jafar", "default"), "term-1")
+        );
+        assert_eq!(resolved.entry.agent.pane_id, "pane-1");
+        assert!(resolve_remote_agent_target(
+            &cache,
+            &other_session,
+            &RemoteTargetSelector::Terminal("term-missing".to_string())
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn remote_target_resolves_pane_selector() {
+        let host = host_config("jafar", "default");
+        let mut cache = RemoteSourceCache::default();
+        cache.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![labeled_agent("term-1", "pane-1", "codex")],
+        );
+
+        let resolved = resolve_remote_agent_target(
+            &cache,
+            &host,
+            &RemoteTargetSelector::Pane("pane-1".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.entry.agent.terminal_id, "term-1");
+    }
+
+    #[test]
+    fn remote_target_resolves_agent_selector_by_identity_fields_and_terminal_fallback() {
+        let host = host_config("jafar", "default");
+        let mut cache = RemoteSourceCache::default();
+        cache.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![
+                agent_with_fields("term-name", "pane-name", Some("named"), None, None, None),
+                agent_with_fields(
+                    "term-display",
+                    "pane-display",
+                    None,
+                    Some("displayed"),
+                    None,
+                    None,
+                ),
+                agent_with_fields(
+                    "term-agent",
+                    "pane-agent",
+                    None,
+                    None,
+                    Some("agent-label"),
+                    None,
+                ),
+                agent_with_fields("term-title", "pane-title", None, None, None, Some("titled")),
+                agent_with_fields("term-fallback", "pane-fallback", None, None, None, None),
+            ],
+        );
+
+        for (selector, terminal_id) in [
+            ("named", "term-name"),
+            ("displayed", "term-display"),
+            ("agent-label", "term-agent"),
+            ("titled", "term-title"),
+            ("term-fallback", "term-fallback"),
+            ("term-name", "term-name"),
+        ] {
+            let resolved = resolve_remote_agent_target(
+                &cache,
+                &host,
+                &RemoteTargetSelector::Agent(selector.to_string()),
+            )
+            .unwrap();
+            assert_eq!(resolved.entry.agent.terminal_id, terminal_id);
+        }
+    }
+
+    #[test]
+    fn remote_target_resolution_keeps_same_name_isolated_by_host_session() {
+        let default_host = host_config("jafar", "default");
+        let agents_host = host_config("jafar", "agents");
+        let mut cache = RemoteSourceCache::default();
+        cache.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![labeled_agent("term-default", "pane-1", "codex")],
+        );
+        cache.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "agents"),
+            vec![labeled_agent("term-agents", "pane-1", "codex")],
+        );
+
+        let default_resolved = resolve_remote_agent_target(
+            &cache,
+            &default_host,
+            &RemoteTargetSelector::Agent("codex".to_string()),
+        )
+        .unwrap();
+        let agents_resolved = resolve_remote_agent_target(
+            &cache,
+            &agents_host,
+            &RemoteTargetSelector::Agent("codex".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(default_resolved.entry.agent.terminal_id, "term-default");
+        assert_eq!(agents_resolved.entry.agent.terminal_id, "term-agents");
+    }
+
+    #[test]
+    fn remote_target_resolution_returns_not_found_for_unknown_selector() {
+        let host = host_config("jafar", "default");
+        let cache = RemoteSourceCache::default();
+
+        assert_eq!(
+            resolve_remote_agent_target(
+                &cache,
+                &host,
+                &RemoteTargetSelector::Agent("missing".to_string())
+            )
+            .unwrap_err(),
+            RemoteAgentResolveError::NotFound {
+                target: RemoteTargetSelector::Agent("missing".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn remote_target_resolution_returns_deterministic_ambiguity_candidates() {
+        let host = host_config("jafar", "default");
+        let mut cache = RemoteSourceCache::default();
+        cache.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![
+                labeled_agent("term-b", "pane-b", "codex"),
+                labeled_agent("term-a", "pane-a", "codex"),
+            ],
+        );
+
+        let err = resolve_remote_agent_target(
+            &cache,
+            &host,
+            &RemoteTargetSelector::Agent("codex".to_string()),
+        )
+        .unwrap_err();
+
+        let RemoteAgentResolveError::Ambiguous { candidates, .. } = err else {
+            panic!("expected ambiguity");
+        };
+        let terminal_ids: Vec<_> = candidates
+            .iter()
+            .map(|candidate| candidate.terminal_id.as_str())
+            .collect();
+        assert_eq!(terminal_ids, vec!["term-a", "term-b"]);
+        assert_eq!(candidates[0].label, "codex");
+        assert_eq!(candidates[0].pane_id, "pane-a");
+        assert!(!candidates[0].stale);
+    }
+
+    #[test]
+    fn remote_target_resolution_rejects_workspace_selector_for_single_agent_resolution() {
+        let host = host_config("jafar", "default");
+        let cache = RemoteSourceCache::default();
+
+        assert_eq!(
+            resolve_remote_agent_target(
+                &cache,
+                &host,
+                &RemoteTargetSelector::Workspace("w1".to_string())
+            )
+            .unwrap_err(),
+            RemoteAgentResolveError::UnsupportedSelector {
+                target: RemoteTargetSelector::Workspace("w1".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn remote_target_resolution_resolves_stale_entry_with_status_intact() {
+        let host = host_config("jafar", "default");
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let mut cache = RemoteSourceCache::default();
+        cache.replace_connected_snapshot(
+            host_key.clone(),
+            vec![labeled_agent("term-1", "pane-1", "codex")],
+        );
+        cache.mark_disconnected(&host_key);
+
+        let resolved = resolve_remote_agent_target(
+            &cache,
+            &host,
+            &RemoteTargetSelector::Agent("codex".to_string()),
+        )
+        .unwrap();
+
+        assert!(resolved.entry.stale());
+        assert_eq!(resolved.entry.status, RemoteConnectionStatus::Disconnected);
     }
 }

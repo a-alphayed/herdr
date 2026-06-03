@@ -86,6 +86,19 @@ impl Default for RemoteHostCache {
     }
 }
 
+impl RemoteHostCache {
+    fn entries(&self, host: &RemoteHostKey) -> Vec<RemoteAgentEntry> {
+        self.agents
+            .values()
+            .map(|agent| RemoteAgentEntry {
+                host: host.clone(),
+                agent: agent.clone(),
+                status: self.status,
+            })
+            .collect()
+    }
+}
+
 impl RemoteSourceCache {
     pub(crate) fn replace_connected_snapshot(
         &mut self,
@@ -135,17 +148,15 @@ impl RemoteSourceCache {
     pub(crate) fn list_entries(&self) -> Vec<RemoteAgentEntry> {
         self.hosts
             .iter()
-            .flat_map(|(host, host_cache)| {
-                host_cache
-                    .agents
-                    .values()
-                    .map(move |agent| RemoteAgentEntry {
-                        host: host.clone(),
-                        agent: agent.clone(),
-                        status: host_cache.status,
-                    })
-            })
+            .flat_map(|(host, host_cache)| host_cache.entries(host))
             .collect()
+    }
+
+    pub(crate) fn entries_for_host(&self, host: &RemoteHostKey) -> Vec<RemoteAgentEntry> {
+        self.hosts
+            .get(host)
+            .map(|host_cache| host_cache.entries(host))
+            .unwrap_or_default()
     }
 
     #[allow(dead_code)] // Staged for target routing/cache lookups in later slices.
