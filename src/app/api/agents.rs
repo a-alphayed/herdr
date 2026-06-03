@@ -1,12 +1,16 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentRenameParams, AgentSendParams, AgentStartParams, AgentTarget, PaneReadResult, ReadFormat,
-    ReadSource, ResponseResult,
+    AgentReadParams, AgentRenameParams, AgentSendParams, AgentStartParams, AgentTarget, ErrorBody,
+    Method, PaneReadResult, ReadFormat, ReadSource, Request, ResponseResult,
 };
 use crate::app::App;
 
 use super::responses::{encode_error, encode_error_body, encode_success};
+use crate::remote_target::{
+    plan_target_route, resolve_remote_agent_target, PlannedTargetRoute, RemoteAgentResolveError,
+    RemoteRoutePlanError, RemoteTargetSelector,
+};
 
 impl App {
     pub(super) fn handle_agent_list(&mut self, id: String) -> String {
@@ -19,12 +23,28 @@ impl App {
     }
 
     pub(super) fn handle_agent_get(&mut self, id: String, target: AgentTarget) -> String {
-        let agent = match self.agent_info_for_target(&target.target) {
-            Ok(agent) => agent,
-            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
-        };
+        match self.plan_agent_api_target(&target.target) {
+            Ok(PlannedTargetRoute::Local { .. }) => {
+                let agent = match self.agent_info_for_target(&target.target) {
+                    Ok(agent) => agent,
+                    Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+                };
 
-        encode_success(id, ResponseResult::AgentInfo { agent })
+                encode_success(id, ResponseResult::AgentInfo { agent })
+            }
+            Ok(PlannedTargetRoute::Remote { host, target }) => {
+                match resolve_remote_agent_target(&self.state.remote_sources, &host, &target) {
+                    Ok(resolved) => encode_success(
+                        id,
+                        ResponseResult::AgentInfo {
+                            agent: resolved.entry.agent,
+                        },
+                    ),
+                    Err(err) => encode_error_body(id, remote_agent_resolve_error_body(err)),
+                }
+            }
+            Err(err) => encode_error_body(id, remote_route_plan_error_body(err)),
+        }
     }
 
     pub(super) fn handle_agent_focus(&mut self, id: String, target: AgentTarget) -> String {
@@ -54,11 +74,15 @@ impl App {
         encode_success(id, ResponseResult::AgentStarted { agent, argv })
     }
 
-    pub(super) fn handle_agent_read(
-        &mut self,
-        id: String,
-        params: crate::api::schema::AgentReadParams,
-    ) -> String {
+    pub(super) fn handle_agent_read(&mut self, id: String, params: AgentReadParams) -> String {
+        match self.plan_agent_api_target(&params.target) {
+            Ok(PlannedTargetRoute::Local { .. }) => {}
+            Ok(PlannedTargetRoute::Remote { host, target }) => {
+                return self.handle_remote_agent_read(id, host, target, params);
+            }
+            Err(err) => return encode_error_body(id, remote_route_plan_error_body(err)),
+        }
+
         let resolved = match self.resolve_terminal_target(&params.target) {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
@@ -103,6 +127,14 @@ impl App {
     }
 
     pub(super) fn handle_agent_send(&mut self, id: String, params: AgentSendParams) -> String {
+        match self.plan_agent_api_target(&params.target) {
+            Ok(PlannedTargetRoute::Local { .. }) => {}
+            Ok(PlannedTargetRoute::Remote { host, target }) => {
+                return self.handle_remote_agent_send(id, host, target, params);
+            }
+            Err(err) => return encode_error_body(id, remote_route_plan_error_body(err)),
+        }
+
         let resolved = match self.resolve_terminal_target(&params.target) {
             Ok(resolved) => resolved,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
@@ -116,6 +148,68 @@ impl App {
 
         encode_success(id, ResponseResult::Ok {})
     }
+
+    fn plan_agent_api_target(
+        &self,
+        target: &str,
+    ) -> Result<PlannedTargetRoute, RemoteRoutePlanError> {
+        if self.remote_hosts.list().is_empty() {
+            return Ok(PlannedTargetRoute::Local {
+                target: target.to_string(),
+            });
+        }
+        plan_target_route(&self.remote_hosts, target)
+    }
+
+    fn handle_remote_agent_read(
+        &self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        selector: RemoteTargetSelector,
+        params: AgentReadParams,
+    ) -> String {
+        let resolved =
+            match resolve_remote_agent_target(&self.state.remote_sources, &host, &selector) {
+                Ok(resolved) => resolved,
+                Err(err) => return encode_error_body(id, remote_agent_resolve_error_body(err)),
+            };
+        let request = remote_agent_read_request(
+            id.clone(),
+            params,
+            resolved.entry.agent.terminal_id.as_str(),
+        );
+        match crate::remote::send_remote_api_request_to_host_noninteractive(&host, &request)
+            .and_then(|response| rewrite_response_id(&response, &id))
+        {
+            Ok(response) => response,
+            Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
+        }
+    }
+
+    fn handle_remote_agent_send(
+        &self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        selector: RemoteTargetSelector,
+        params: AgentSendParams,
+    ) -> String {
+        let resolved =
+            match resolve_remote_agent_target(&self.state.remote_sources, &host, &selector) {
+                Ok(resolved) => resolved,
+                Err(err) => return encode_error_body(id, remote_agent_resolve_error_body(err)),
+            };
+        let request = remote_agent_send_request(
+            id.clone(),
+            params,
+            resolved.entry.agent.terminal_id.as_str(),
+        );
+        match crate::remote::send_remote_api_request_to_host_noninteractive(&host, &request)
+            .and_then(|response| rewrite_response_id(&response, &id))
+        {
+            Ok(response) => response,
+            Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
+        }
+    }
 }
 
 fn agent_not_found(id: String, target: &str) -> String {
@@ -124,4 +218,277 @@ fn agent_not_found(id: String, target: &str) -> String {
         "agent_not_found",
         format!("agent target {target} not found"),
     )
+}
+
+fn remote_agent_read_request(
+    id: String,
+    mut params: AgentReadParams,
+    terminal_id: &str,
+) -> Request {
+    params.target = terminal_id.to_string();
+    Request {
+        id,
+        method: Method::AgentRead(params),
+    }
+}
+
+fn remote_agent_send_request(
+    id: String,
+    mut params: AgentSendParams,
+    terminal_id: &str,
+) -> Request {
+    params.target = terminal_id.to_string();
+    Request {
+        id,
+        method: Method::AgentSend(params),
+    }
+}
+
+fn rewrite_response_id(response: &str, id: &str) -> std::io::Result<String> {
+    let mut value: serde_json::Value = serde_json::from_str(response).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid remote API response JSON: {err}"),
+        )
+    })?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote API response must be a JSON object",
+        ));
+    };
+    if !object.contains_key("result") && !object.contains_key("error") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote API response must contain result or error",
+        ));
+    }
+    object.insert("id".to_string(), serde_json::Value::String(id.to_string()));
+    serde_json::to_string(&value).map_err(std::io::Error::other)
+}
+
+fn remote_route_plan_error_body(err: RemoteRoutePlanError) -> ErrorBody {
+    match err {
+        RemoteRoutePlanError::Parse(err) => ErrorBody {
+            code: "remote_target_error".to_string(),
+            message: err.to_string(),
+        },
+        RemoteRoutePlanError::UnknownHost(host) => ErrorBody {
+            code: "remote_target_error".to_string(),
+            message: format!("unknown remote host: {host}"),
+        },
+    }
+}
+
+fn remote_agent_resolve_error_body(err: RemoteAgentResolveError) -> ErrorBody {
+    match err {
+        RemoteAgentResolveError::NotFound { target } => ErrorBody {
+            code: "remote_agent_not_found".to_string(),
+            message: format!("remote agent target not found: {target:?}"),
+        },
+        RemoteAgentResolveError::Ambiguous { candidates, .. } => ErrorBody {
+            code: "remote_agent_ambiguous".to_string(),
+            message: format!(
+                "remote agent target matched {} agents: {}",
+                candidates.len(),
+                candidates
+                    .into_iter()
+                    .map(|candidate| candidate.terminal_id)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
+        RemoteAgentResolveError::UnsupportedSelector { target } => ErrorBody {
+            code: "remote_target_error".to_string(),
+            message: format!("remote selector is not a single-agent target: {target:?}"),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::api::schema::{
+        AgentInfo, AgentReadParams, AgentStatus, ErrorBody, ErrorResponse, SuccessResponse,
+    };
+    use crate::remote_source::RemoteHostKey;
+
+    use super::*;
+
+    fn test_app(config: &crate::config::Config) -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(config, true, None, api_rx, crate::api::EventHub::default())
+    }
+
+    fn remote_agent(terminal_id: &str, pane_id: &str, name: &str) -> AgentInfo {
+        AgentInfo {
+            terminal_id: terminal_id.to_string(),
+            name: Some(name.to_string()),
+            agent: Some(name.to_string()),
+            title: None,
+            display_agent: Some(name.to_string()),
+            agent_status: AgentStatus::Working,
+            custom_status: None,
+            state_labels: HashMap::new(),
+            agent_session: None,
+            workspace_id: "remote-ws".to_string(),
+            tab_id: "remote-tab".to_string(),
+            pane_id: pane_id.to_string(),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn remote_agent_get_returns_cached_remote_agent() {
+        let mut config = crate::config::Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar", "jafar", "default", true,
+        )];
+        let mut app = test_app(&config);
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![remote_agent("term-1", "pane-1", "codex")],
+        );
+
+        let response = app.handle_agent_get(
+            "local-id".to_string(),
+            AgentTarget {
+                target: "jafar/codex".to_string(),
+            },
+        );
+        let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.id, "local-id");
+        let ResponseResult::AgentInfo { agent } = parsed.result else {
+            panic!("expected agent info");
+        };
+        assert_eq!(agent.terminal_id, "term-1");
+        assert_eq!(agent.pane_id, "pane-1");
+    }
+
+    #[test]
+    fn bare_agent_get_keeps_local_target_errors() {
+        let mut app = test_app(&crate::config::Config::default());
+
+        let response = app.handle_agent_get(
+            "local-id".to_string(),
+            AgentTarget {
+                target: "missing".to_string(),
+            },
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.id, "local-id");
+        assert_eq!(parsed.error.code, "agent_not_found");
+    }
+
+    #[test]
+    fn slash_target_without_remote_hosts_keeps_local_target_errors() {
+        let mut app = test_app(&crate::config::Config::default());
+
+        let response = app.handle_agent_get(
+            "local-id".to_string(),
+            AgentTarget {
+                target: "local/name".to_string(),
+            },
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.id, "local-id");
+        assert_eq!(parsed.error.code, "agent_not_found");
+    }
+
+    #[test]
+    fn remote_agent_read_request_uses_resolved_terminal_id() {
+        let request = remote_agent_read_request(
+            "req-1".to_string(),
+            AgentReadParams {
+                target: "jafar/codex".to_string(),
+                source: ReadSource::Recent,
+                lines: Some(20),
+                format: ReadFormat::Text,
+                strip_ansi: true,
+            },
+            "term-1",
+        );
+
+        let Method::AgentRead(params) = request.method else {
+            panic!("expected agent.read");
+        };
+        assert_eq!(request.id, "req-1");
+        assert_eq!(params.target, "term-1");
+        assert_eq!(params.lines, Some(20));
+    }
+
+    #[test]
+    fn remote_agent_send_request_uses_resolved_terminal_id() {
+        let request = remote_agent_send_request(
+            "req-1".to_string(),
+            AgentSendParams {
+                target: "jafar/codex".to_string(),
+                text: "hello".to_string(),
+            },
+            "term-1",
+        );
+
+        let Method::AgentSend(params) = request.method else {
+            panic!("expected agent.send");
+        };
+        assert_eq!(request.id, "req-1");
+        assert_eq!(params.target, "term-1");
+        assert_eq!(params.text, "hello");
+    }
+
+    #[test]
+    fn rewrite_response_id_preserves_success_body() {
+        let response = serde_json::to_string(&SuccessResponse {
+            id: "remote-id".to_string(),
+            result: ResponseResult::Ok {},
+        })
+        .unwrap();
+
+        let rewritten = rewrite_response_id(&response, "local-id").unwrap();
+        let parsed: SuccessResponse = serde_json::from_str(&rewritten).unwrap();
+
+        assert_eq!(parsed.id, "local-id");
+        assert_eq!(parsed.result, ResponseResult::Ok {});
+    }
+
+    #[test]
+    fn rewrite_response_id_preserves_error_body() {
+        let response = serde_json::to_string(&ErrorResponse {
+            id: "remote-id".to_string(),
+            error: ErrorBody {
+                code: "remote_error".to_string(),
+                message: "failed remotely".to_string(),
+            },
+        })
+        .unwrap();
+
+        let rewritten = rewrite_response_id(&response, "local-id").unwrap();
+        let parsed: ErrorResponse = serde_json::from_str(&rewritten).unwrap();
+
+        assert_eq!(parsed.id, "local-id");
+        assert_eq!(parsed.error.code, "remote_error");
+        assert_eq!(parsed.error.message, "failed remotely");
+    }
+
+    #[test]
+    fn rewrite_response_id_rejects_malformed_json() {
+        let err = rewrite_response_id("not json", "local-id").unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rewrite_response_id_rejects_non_api_json() {
+        let err = rewrite_response_id(r#"{"id":"remote-id"}"#, "local-id").unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 }

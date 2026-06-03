@@ -10,7 +10,6 @@ use serde::Deserialize;
 
 use crate::remote_source::{RemoteAgentEntry, RemoteAgentKey, RemoteHostKey, RemoteSourceCache};
 
-#[allow(dead_code)] // Staged validation error for future remote config/target routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteAliasError {
     Empty,
@@ -32,7 +31,6 @@ impl std::fmt::Display for RemoteAliasError {
 
 impl std::error::Error for RemoteAliasError {}
 
-#[allow(dead_code)] // Staged for future remote config and host-qualified target parsing.
 pub(crate) fn validate_remote_alias(alias: &str) -> Result<&str, RemoteAliasError> {
     if alias.is_empty() {
         return Err(RemoteAliasError::Empty);
@@ -49,7 +47,6 @@ pub(crate) fn validate_remote_alias(alias: &str) -> Result<&str, RemoteAliasErro
     Ok(alias)
 }
 
-#[allow(dead_code)] // Staged parse error for future cross-host command routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TargetRouteParseError {
     InvalidAlias(RemoteAliasError),
@@ -73,7 +70,6 @@ impl From<RemoteAliasError> for TargetRouteParseError {
     }
 }
 
-#[allow(dead_code)] // Staged parser output for future cross-host command routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TargetRoute {
     Local {
@@ -85,7 +81,6 @@ pub(crate) enum TargetRoute {
     },
 }
 
-#[allow(dead_code)] // Staged selector for future cross-host command routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteTargetSelector {
     Agent(String),
@@ -94,7 +89,6 @@ pub(crate) enum RemoteTargetSelector {
     Workspace(String),
 }
 
-#[allow(dead_code)] // Staged parser entrypoint for future cross-host command routing.
 pub(crate) fn parse_target_route(target: &str) -> Result<TargetRoute, TargetRouteParseError> {
     let Some((host, remote_target)) = target.split_once('/') else {
         return Ok(TargetRoute::Local {
@@ -113,7 +107,6 @@ pub(crate) fn parse_target_route(target: &str) -> Result<TargetRoute, TargetRout
     })
 }
 
-#[allow(dead_code)] // Staged selector parser for future cross-host command routing.
 pub(crate) fn parse_remote_target_selector(
     target: &str,
 ) -> Result<RemoteTargetSelector, TargetRouteParseError> {
@@ -170,7 +163,6 @@ impl RemoteHostConfig {
     }
 }
 
-#[allow(dead_code)] // Staged validation error for future remote host registry/config loading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteHostConfigError {
     InvalidAlias(RemoteAliasError),
@@ -243,7 +235,6 @@ impl RemoteHostRegistry {
     }
 }
 
-#[allow(dead_code)] // Staged route plan for future cross-host command routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PlannedTargetRoute {
     Local {
@@ -255,7 +246,6 @@ pub(crate) enum PlannedTargetRoute {
     },
 }
 
-#[allow(dead_code)] // Staged route planning error for future cross-host command routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteRoutePlanError {
     Parse(TargetRouteParseError),
@@ -279,7 +269,6 @@ impl From<TargetRouteParseError> for RemoteRoutePlanError {
     }
 }
 
-#[allow(dead_code)] // Staged pure planner for future cross-host command routing.
 pub(crate) fn plan_target_route(
     registry: &RemoteHostRegistry,
     target: &str,
@@ -298,7 +287,6 @@ pub(crate) fn plan_target_route(
     }
 }
 
-#[allow(dead_code)] // Staged resolver output for future remote command routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteAgentResolution {
     pub(crate) host: RemoteHostConfig,
@@ -306,7 +294,6 @@ pub(crate) struct RemoteAgentResolution {
     pub(crate) entry: RemoteAgentEntry,
 }
 
-#[allow(dead_code)] // Staged ambiguity details for future remote command routing errors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteAgentCandidate {
     pub(crate) key: RemoteAgentKey,
@@ -316,7 +303,6 @@ pub(crate) struct RemoteAgentCandidate {
     pub(crate) stale: bool,
 }
 
-#[allow(dead_code)] // Staged resolver error for future remote command routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteAgentResolveError {
     NotFound {
@@ -350,7 +336,6 @@ impl std::fmt::Display for RemoteAgentResolveError {
 
 impl std::error::Error for RemoteAgentResolveError {}
 
-#[allow(dead_code)] // Staged pure resolver for future remote command routing.
 pub(crate) fn resolve_remote_agent_target(
     cache: &RemoteSourceCache,
     host: &RemoteHostConfig,
