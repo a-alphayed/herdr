@@ -212,20 +212,8 @@ fn run_remote_api_one_shot_probe(
     })?;
     let session_name = crate::session::active_name()
         .unwrap_or_else(|| crate::session::DEFAULT_SESSION_NAME.to_string());
-    let prepared_remote = prepare_remote_herdr(target, false)?;
-    ensure_remote_server_ready(
-        target,
-        &prepared_remote.remote_herdr,
-        prepared_remote.installed_or_replaced,
-        false,
-    )?;
-
-    let bridge_command = remote_bridge_command_for(
-        &prepared_remote.remote_herdr,
-        &session_name,
-        REMOTE_API_BRIDGE_SUBCOMMAND,
-    );
-    let response = send_remote_api_request(target, &bridge_command, &request)?;
+    let host = crate::remote_target::RemoteHostConfig::new(target, target, session_name, true);
+    let response = send_remote_api_request_to_host(&host, &request)?;
     println!("{response}");
     Ok(())
 }
@@ -273,6 +261,22 @@ fn read_remote_api_response_line<R: BufRead>(reader: &mut R) -> io::Result<Strin
     }
 
     Ok(response.trim_end_matches(['\r', '\n']).to_string())
+}
+
+pub(crate) fn send_remote_api_request_to_host(
+    host: &crate::remote_target::RemoteHostConfig,
+    request: &crate::api::schema::Request,
+) -> io::Result<String> {
+    let prepared_remote = prepare_remote_herdr(&host.target, false)?;
+    ensure_remote_server_ready(
+        &host.target,
+        &prepared_remote.remote_herdr,
+        prepared_remote.installed_or_replaced,
+        false,
+    )?;
+
+    let bridge_command = remote_api_bridge_command_for_host(&prepared_remote.remote_herdr, host);
+    send_remote_api_request(&host.target, &bridge_command, request)
 }
 
 fn send_remote_api_request(
@@ -1402,6 +1406,13 @@ fn remote_bridge_command_for(
     command
 }
 
+fn remote_api_bridge_command_for_host(
+    remote_herdr: &RemoteHerdr,
+    host: &crate::remote_target::RemoteHostConfig,
+) -> String {
+    remote_bridge_command_for(remote_herdr, &host.session, REMOTE_API_BRIDGE_SUBCOMMAND)
+}
+
 fn reattach_command(
     program: &str,
     target: &str,
@@ -2132,6 +2143,44 @@ mod tests {
         assert_eq!(
             remote_bridge_command_for(&remote_herdr, "fed api", REMOTE_API_BRIDGE_SUBCOMMAND),
             "exec \"$HOME/.local/bin/herdr\" --session 'fed api' remote-api-bridge"
+        );
+    }
+
+    #[test]
+    fn remote_api_bridge_command_for_host_uses_host_session() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let host = crate::remote_target::RemoteHostConfig::new(
+            "jafar",
+            "user@jafar:2222",
+            "fed api",
+            true,
+        );
+
+        assert_eq!(
+            remote_api_bridge_command_for_host(&remote_herdr, &host),
+            "exec \"$HOME/.local/bin/herdr\" --session 'fed api' remote-api-bridge"
+        );
+    }
+
+    #[test]
+    fn remote_api_bridge_command_for_host_omits_default_session() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let host = crate::remote_target::RemoteHostConfig::new(
+            "jafar",
+            "user@jafar:2222",
+            crate::session::DEFAULT_SESSION_NAME,
+            true,
+        );
+
+        assert_eq!(
+            remote_api_bridge_command_for_host(&remote_herdr, &host),
+            "exec \"$HOME/.local/bin/herdr\" remote-api-bridge"
         );
     }
 

@@ -47,7 +47,7 @@ use crossterm::{
 use ratatui::layout::Rect;
 use ratatui::DefaultTerminal;
 use tokio::sync::{mpsc, Notify};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::events::AppEvent;
@@ -118,6 +118,9 @@ pub struct App {
     pub(crate) overlay_panes: HashMap<crate::layout::PaneId, OverlayPaneState>,
     pub(crate) local_terminal_notifications: bool,
     pub(crate) config_reloaded_from_disk: bool,
+    #[allow(dead_code)]
+    // Staged runtime-side registry for future remote supervisors/routing; config loads it before consumers exist.
+    pub(crate) remote_hosts: crate::remote_target::RemoteHostRegistry,
 }
 
 pub(crate) const APP_EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -183,6 +186,20 @@ fn agent_panel_scope_from_config(
     match scope {
         crate::config::AgentPanelScopeConfig::Current => state::AgentPanelScope::CurrentWorkspace,
         crate::config::AgentPanelScopeConfig::All => state::AgentPanelScope::AllWorkspaces,
+    }
+}
+
+fn remote_host_registry_from_config(config: &Config) -> crate::remote_target::RemoteHostRegistry {
+    if !config.remote.enabled {
+        return crate::remote_target::RemoteHostRegistry::default();
+    }
+
+    match crate::remote_target::RemoteHostRegistry::from_configs(config.remote.hosts.clone()) {
+        Ok(registry) => registry,
+        Err(err) => {
+            warn!(err = %err, "invalid remote host config; remote hosts disabled");
+            crate::remote_target::RemoteHostRegistry::default()
+        }
     }
 }
 
@@ -372,6 +389,8 @@ impl App {
             pane_scrollback_limit_bytes = config.advanced.scrollback_limit_bytes,
             "using pane scrollback configuration"
         );
+
+        let remote_hosts = remote_host_registry_from_config(config);
 
         let latest_release_notes = crate::release_notes::load_latest();
         let update_available = latest_release_notes
@@ -593,6 +612,7 @@ impl App {
             overlay_panes: HashMap::new(),
             local_terminal_notifications: true,
             config_reloaded_from_disk: false,
+            remote_hosts,
         }
     }
 
@@ -1160,6 +1180,10 @@ impl App {
                 crate::worktree::expand_tilde_absolute_path(&config.worktrees.directory);
         }
 
+        if !invalid_section("remote") {
+            self.remote_hosts = remote_host_registry_from_config(config);
+        }
+
         if !invalid_section("theme") {
             self.state.palette = resolve_palette_with_legacy_accent(config, !invalid_section("ui"));
             self.state.theme_name = config
@@ -1420,6 +1444,54 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[test]
+    fn app_loads_remote_host_registry_when_remote_config_enabled() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar",
+            "user@jafar:2222",
+            "agents",
+            true,
+        )];
+
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert_eq!(app.remote_hosts.list().len(), 1);
+        let host = app.remote_hosts.get("jafar").unwrap();
+        assert_eq!(host.target, "user@jafar:2222");
+        assert_eq!(host.session, "agents");
+    }
+
+    #[test]
+    fn app_ignores_remote_hosts_when_remote_config_disabled() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = Config::default();
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar", "jafar", "default", true,
+        )];
+
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert!(app.remote_hosts.list().is_empty());
+    }
+
+    #[test]
+    fn app_uses_empty_remote_registry_for_invalid_remote_config() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![
+            crate::remote_target::RemoteHostConfig::new("jafar", "host-a", "default", true),
+            crate::remote_target::RemoteHostConfig::new("jafar", "host-b", "default", true),
+        ];
+
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        assert!(app.remote_hosts.list().is_empty());
     }
 
     fn config_env_lock() -> &'static Mutex<()> {
@@ -1758,6 +1830,74 @@ mod tests {
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);
         assert_eq!(toast.title, "reloaded config");
         assert_eq!(toast.context, "using config.toml");
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_updates_remote_host_registry() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-remote-hosts");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert!(app.remote_hosts.list().is_empty());
+
+        std::fs::write(
+            &path,
+            r#"
+[remote]
+enabled = true
+
+[[remote.hosts]]
+name = "jafar"
+target = "user@jafar:2222"
+session = "agents"
+"#,
+        )
+        .unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        let host = app.remote_hosts.get("jafar").unwrap();
+        assert_eq!(host.target, "user@jafar:2222");
+        assert_eq!(host.session, "agents");
+
+        std::fs::write(&path, "[remote]\nenabled = false\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(app.remote_hosts.list().is_empty());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_keeps_remote_registry_when_remote_section_is_invalid() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-invalid-remote-section");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut config = Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar",
+            "user@jafar:2222",
+            "agents",
+            true,
+        )];
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        std::fs::write(&path, "[remote]\nenabled = \"yes\"\n").unwrap();
+        let report = app.reload_config();
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Partial);
+        let host = app.remote_hosts.get("jafar").unwrap();
+        assert_eq!(host.target, "user@jafar:2222");
+        assert_eq!(host.session, "agents");
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

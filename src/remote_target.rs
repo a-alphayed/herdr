@@ -6,6 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::Deserialize;
+
 use crate::remote_source::{RemoteAgentEntry, RemoteAgentKey, RemoteHostKey, RemoteSourceCache};
 
 #[allow(dead_code)] // Staged validation error for future remote config/target routing.
@@ -134,17 +136,25 @@ pub(crate) fn parse_remote_target_selector(
     Ok(RemoteTargetSelector::Agent(target.to_string()))
 }
 
-#[allow(dead_code)] // Staged in-memory model for future persisted remote config.
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn default_remote_session_name() -> String {
+    crate::session::DEFAULT_SESSION_NAME.to_string()
+}
+
+fn default_auto_connect() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub(crate) struct RemoteHostConfig {
     pub(crate) name: String,
     pub(crate) target: String,
+    #[serde(default = "default_remote_session_name")]
     pub(crate) session: String,
+    #[serde(default = "default_auto_connect")]
     pub(crate) auto_connect: bool,
 }
 
 impl RemoteHostConfig {
-    #[allow(dead_code)] // Staged constructor for future remote config loading; tests exercise it now.
     pub(crate) fn new(
         name: impl Into<String>,
         target: impl Into<String>,
@@ -188,14 +198,12 @@ impl From<RemoteAliasError> for RemoteHostConfigError {
     }
 }
 
-#[allow(dead_code)] // Staged deterministic host table for future route planning/config loading.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RemoteHostRegistry {
     hosts: BTreeMap<String, RemoteHostConfig>,
 }
 
 impl RemoteHostRegistry {
-    #[allow(dead_code)] // Staged bulk loader for future remote config; tests exercise it now.
     pub(crate) fn from_configs(
         configs: Vec<RemoteHostConfig>,
     ) -> Result<Self, RemoteHostConfigError> {
@@ -206,7 +214,6 @@ impl RemoteHostRegistry {
         Ok(registry)
     }
 
-    #[allow(dead_code)] // Staged registry mutation for future remote config reloads; tests exercise it now.
     pub(crate) fn insert(&mut self, config: RemoteHostConfig) -> Result<(), RemoteHostConfigError> {
         validate_remote_alias(&config.name)?;
         if config.target.is_empty() {

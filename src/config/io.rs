@@ -183,6 +183,14 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
     );
     load_live_section(
         table,
+        "remote",
+        "remote config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.remote = section,
+    );
+    load_live_section(
+        table,
         "ui",
         "ui config",
         &mut diagnostics,
@@ -482,6 +490,32 @@ resume_agents_on_restore = true
         .unwrap();
 
         assert!(loaded.config.session.resume_agents_on_restore);
+        assert!(loaded.diagnostics.is_empty());
+        assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn load_live_config_parses_remote_section() {
+        let loaded = load_live_config_from_str(
+            r#"
+[remote]
+enabled = true
+
+[[remote.hosts]]
+name = "jafar"
+target = "jafar"
+"#,
+        )
+        .unwrap();
+
+        assert!(loaded.config.remote.enabled);
+        assert_eq!(loaded.config.remote.hosts.len(), 1);
+        assert_eq!(loaded.config.remote.hosts[0].name, "jafar");
+        assert_eq!(
+            loaded.config.remote.hosts[0].session,
+            crate::session::DEFAULT_SESSION_NAME
+        );
+        assert!(loaded.config.remote.hosts[0].auto_connect);
         assert!(loaded.diagnostics.is_empty());
         assert!(loaded.invalid_sections.is_empty());
     }

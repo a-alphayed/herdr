@@ -6,6 +6,7 @@ use super::{
     BindingConfig, CommandKeybindConfig, SoundConfig, ThemeConfig, DEFAULT_MOBILE_WIDTH_THRESHOLD,
     DEFAULT_MOUSE_SCROLL_LINES, DEFAULT_SCROLLBACK_LIMIT_BYTES,
 };
+use crate::remote_target::RemoteHostConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -125,11 +126,19 @@ pub struct Config {
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
     pub session: SessionConfig,
+    pub remote: RemoteConfig,
     pub keys: KeysConfig,
     pub ui: UiConfig,
     pub worktrees: WorktreesConfig,
     pub advanced: AdvancedConfig,
     pub experimental: ExperimentalConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct RemoteConfig {
+    pub enabled: bool,
+    pub hosts: Vec<RemoteHostConfig>,
 }
 
 #[derive(Debug)]
@@ -558,6 +567,58 @@ resume_agents_on_restore = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.session.resume_agents_on_restore);
+    }
+
+    #[test]
+    fn remote_config_defaults_disabled_with_no_hosts() {
+        let default_config = Config::default();
+        assert!(!default_config.remote.enabled);
+        assert!(default_config.remote.hosts.is_empty());
+    }
+
+    #[test]
+    fn remote_config_parses_enabled_hosts() {
+        let config: Config = toml::from_str(
+            r#"
+[remote]
+enabled = true
+
+[[remote.hosts]]
+name = "jafar"
+target = "jafar"
+session = "default"
+auto_connect = false
+"#,
+        )
+        .unwrap();
+
+        assert!(config.remote.enabled);
+        assert_eq!(config.remote.hosts.len(), 1);
+        assert_eq!(config.remote.hosts[0].name, "jafar");
+        assert_eq!(config.remote.hosts[0].target, "jafar");
+        assert_eq!(config.remote.hosts[0].session, "default");
+        assert!(!config.remote.hosts[0].auto_connect);
+    }
+
+    #[test]
+    fn remote_host_defaults_auto_connect_and_session() {
+        let config: Config = toml::from_str(
+            r#"
+[remote]
+enabled = true
+
+[[remote.hosts]]
+name = "jafar"
+target = "jafar"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.remote.hosts[0].session,
+            crate::session::DEFAULT_SESSION_NAME
+        );
+        assert!(config.remote.hosts[0].auto_connect);
     }
 
     #[test]
