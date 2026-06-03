@@ -377,7 +377,7 @@ MVP resync algorithm:
 
 1. Open remote `events.subscribe` for the subscription set below.
 2. Buffer incoming events for that host/session.
-3. Pull a full snapshot using `agent.list` and any required pane/workspace metadata calls.
+3. Pull a full **local-only** snapshot using the internal `agent.list_local` API on the remote node, plus any required pane/workspace metadata calls.
 4. Replace or reconcile that host/session's cache from the snapshot.
 5. Replay buffered events idempotently, applying an event only if its `revision` is newer than the cached entry for that identity.
 6. Continue applying subscription events live.
@@ -389,12 +389,13 @@ Periodic refresh constraints:
 
 - It must not be a tight loop. Default interval should be conservative (for example 60 seconds or slower) with jitter.
 - It should run only while the host/session is connected.
-- It should fetch only the metadata needed for aggregation (`agent.list` and any required pane/workspace metadata), never pane output.
+- It should fetch only the metadata needed for aggregation (`agent.list_local` and any required pane/workspace metadata), never pane output. Public `agent.list` may aggregate cached remotes for users, so supervisors must not poll it or they can ingest remote-of-remote entries.
 - The interval should be configurable or at least centralized as a named constant so it is not accidentally shipped as a 1s loop.
 
 Subscription scope:
 
 - Subscribe to `pane.agent_status_changed` and `pane.agent_detected`, plus the workspace/tab/pane lifecycle subscriptions (`workspace.*`, `tab.*`, `pane.created` / `closed` / `focused` / `exited`) needed to maintain the remote cache.
+- Subscription streams must preserve the same local-only boundary as snapshots. A local aggregator should subscribe only to events for the remote node's own panes/agents, not to that remote node's aggregated remote-of-remote view.
 - There is no raw-output subscription to avoid: the API exposes no `PaneOutputChanged` subscription. The only output-oriented subscription is `pane.output_matched`, which is pattern-filtered. Do **not** use `pane.output_matched` for aggregation — aggregation needs status and lifecycle, not output text.
 
 Cache deletion rules:
@@ -471,6 +472,7 @@ Rules:
 - The target remainder is parsed verbatim; remote agent labels may contain `/` because only the first slash is structural.
 - Typed handles use prefixes such as `pane:` and `terminal:`.
 - Bare targets are local-only in MVP. Remote targets must be host-qualified.
+- If no remote hosts are configured, host-qualified parsing is not activated; slash-containing local labels keep the pre-federation local behavior.
 - Later versions may add global unique shorthand, but MVP should not search remotes for bare names.
 
 ### 8. Unified sidebar entries
@@ -525,7 +527,8 @@ Allowed command categories for MVP:
 
 ```text
 ping/status/capability checks
-agent.list
+agent.list        # public aggregated local + cached configured remotes
+agent.list_local  # hidden/internal local-only snapshot primitive for supervisors
 agent.get
 agent.read
 agent.send
@@ -556,6 +559,8 @@ broad workspace/tab destructive mutation
 Workspace/tab creation or pane placement may be allowed only through explicit remote `agent.start` placement features.
 
 `agent.wait` is not a routable API method — the API exposes no such op. The CLI's `agent wait` is composed from the long-held wait primitives (`events.wait` / `pane.wait_for_output`). Over federation it is realized by proxying those primitives to the owning node on a dedicated bridge and running the wait/match logic locally, not by forwarding an `agent.wait` call.
+
+Current spike API shape: aggregated `agent.list` host-qualifies label fields so they can be passed back to `agent.get/read/send`, but it keeps raw remote `terminal_id`, `pane_id`, `workspace_id`, and `tab_id` values. Those raw IDs are authoritative on the owning host but not globally unique. A future schema should add machine-readable host/session fields instead of encoding location into labels.
 
 Non-idempotent retry rule:
 
@@ -716,6 +721,7 @@ Federation uses the existing SSH trust boundary.
 - `agent.start` runs arbitrary commands on the remote host, intentionally, through SSH-authenticated Herdr control.
 - Compromise of the aggregating local node can control configured remote nodes within the allowed method set and SSH account permissions.
 - The remote API bridge grants no privilege beyond what the SSH user could already do by logging in and using that user's `~/.config/herdr/.../herdr.sock`.
+- Configured SSH targets must be validated before invoking `ssh`; leading-dash targets are rejected so a host value cannot be interpreted as an SSH option.
 - The local API socket is not exposed to remote hosts.
 - Remote hooks report to their own local node only.
 - Do not persist proxied remote pane contents in local snapshots in MVP.
@@ -979,8 +985,9 @@ Acceptance criteria:
 
 - Start an agent in the remote Herdr session.
 - Local sidebar shows `host/agent` with current state.
-- Disconnect remote host; sidebar marks entries stale/disconnected.
-- Reconnect remote host; sidebar resyncs without duplicate entries.
+- Public local `agent.list` shows cached configured remote agents as host-qualified entries; the supervisor snapshot path remains local-only via `agent.list_local`.
+- Disconnect remote host; sidebar/API list marks entries stale/disconnected.
+- Reconnect remote host; sidebar/API list resyncs without duplicate entries.
 
 Tests:
 
@@ -1027,6 +1034,8 @@ herdr agent read jafar/codex
   -> return remote response
 ```
 
+Spike limitation: the first implementation performs the one-request SSH bridge synchronously in the App API handler. That proves the routing path, but it can block the local UI/server loop while SSH probes and request execution run. A shipping implementation should move remote request execution off the main loop and reuse supervisor compatibility/preparation state instead of probing the remote binary on every read/send.
+
 Acceptance criteria:
 
 ```bash
@@ -1041,8 +1050,10 @@ Tests:
 
 - host-qualified target routes remote;
 - bare target routes local only;
+- public `agent.list` aggregates cached configured remotes while hidden `agent.list_local` stays local-only for supervisor snapshots;
 - non-idempotent send is not retried after uncertain delivery;
-- denied methods are rejected.
+- denied methods are rejected;
+- Docker/local SSH smoke proves configured remote -> supervisor cache -> API list/get -> host-qualified send/read -> disconnect stale -> reconnect without duplicates.
 
 ### Phase 3 — Cross-node focus / direct remote terminal attach
 
