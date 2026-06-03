@@ -11,17 +11,21 @@ else
 fi
 
 ALIAS="herdr-fed-docker"
-SESSION="fed-remote-api"
+REMOTE_SESSION="fed-remote-api"
+LOCAL_SESSION="fed-local-api"
 LOCAL_HOME="$BASE/local-home"
 LOCAL_CONFIG="$BASE/local-config"
+LOCAL_CONFIG_FILE="$BASE/local-config.toml"
 LOCAL_STATE="$BASE/local-state"
 LOCAL_RUNTIME="$BASE/runtime"
+LOCAL_SERVER_LOG="$BASE/local-server.log"
 SSH_DIR="$LOCAL_HOME/.ssh"
 WRAPPER_DIR="$BASE/bin"
 KEY_PATH="$BASE/id_ed25519"
 IMAGE_TAG="herdr-remote-api-smoke:$(basename "$BASE" | tr -c '[:alnum:]_.-' '-')"
 CONTAINER_NAME="herdr-remote-api-smoke-$$"
 PORT=""
+LOCAL_SERVER_PID=""
 
 require_command() {
   local name="$1"
@@ -48,9 +52,9 @@ case "$BASE" in
     ;;
 esac
 
-for path in "$LOCAL_HOME" "$LOCAL_CONFIG" "$LOCAL_STATE" "$LOCAL_RUNTIME" "$WRAPPER_DIR"; do
+for path in "$LOCAL_HOME" "$LOCAL_CONFIG" "$LOCAL_STATE" "$LOCAL_RUNTIME" "$WRAPPER_DIR" "$LOCAL_CONFIG_FILE" "$LOCAL_SERVER_LOG"; do
   case "$path" in
-    "$BASE"/*)
+    "$BASE"/* | "$BASE")
       ;;
     *)
       echo "error: refusing local path outside BASE: $path" >&2
@@ -59,11 +63,42 @@ for path in "$LOCAL_HOME" "$LOCAL_CONFIG" "$LOCAL_STATE" "$LOCAL_RUNTIME" "$WRAP
   esac
 done
 
+run_herdr() {
+  local session="$1"
+  shift
+  env \
+    -u HERDR_SOCKET_PATH \
+    -u HERDR_CLIENT_SOCKET_PATH \
+    -u HERDR_SESSION \
+    PATH="$WRAPPER_DIR:$PATH" \
+    HOME="$LOCAL_HOME" \
+    XDG_CONFIG_HOME="$LOCAL_CONFIG" \
+    XDG_STATE_HOME="$LOCAL_STATE" \
+    XDG_RUNTIME_DIR="$LOCAL_RUNTIME" \
+    HERDR_CONFIG_PATH="$LOCAL_CONFIG_FILE" \
+    "$HERDR_BIN" --session "$session" "$@"
+}
+
+run_remote_ssh() {
+  PATH="$WRAPPER_DIR:$PATH" HOME="$LOCAL_HOME" ssh -T "$ALIAS" "$@"
+}
+
 cleanup() {
   set +e
-  if [[ -n "${CONTAINER_STARTED:-}" ]]; then
-    docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  if [[ -n "$LOCAL_SERVER_PID" ]]; then
+    run_herdr "$LOCAL_SESSION" server stop >/dev/null 2>&1 || true
+    for _ in {1..40}; do
+      if ! kill -0 "$LOCAL_SERVER_PID" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 0.05
+    done
+    if kill -0 "$LOCAL_SERVER_PID" >/dev/null 2>&1; then
+      kill "$LOCAL_SERVER_PID" >/dev/null 2>&1 || true
+    fi
+    wait "$LOCAL_SERVER_PID" >/dev/null 2>&1 || true
   fi
+  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
   if [[ -n "${IMAGE_BUILT:-}" ]]; then
     docker image rm "$IMAGE_TAG" >/dev/null 2>&1 || true
   fi
@@ -124,12 +159,26 @@ s.close()
 PY
 )"
 
-docker run -d --rm \
-  --name "$CONTAINER_NAME" \
-  -p "127.0.0.1:$PORT:22" \
-  --mount "type=bind,src=$HERDR_BIN,dst=/usr/local/bin/herdr,readonly" \
-  "$IMAGE_TAG" >/dev/null
-CONTAINER_STARTED=1
+start_container() {
+  docker run -d --rm \
+    --name "$CONTAINER_NAME" \
+    -p "127.0.0.1:$PORT:22" \
+    --mount "type=bind,src=$HERDR_BIN,dst=/usr/local/bin/herdr,readonly" \
+    "$IMAGE_TAG" >/dev/null
+}
+
+wait_for_ssh() {
+  for _ in {1..120}; do
+    if run_remote_ssh true >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "error: SSH server in Docker container did not become reachable" >&2
+  return 1
+}
+
+start_container
 
 cat >"$SSH_DIR/config" <<EOF
 Host $ALIAS
@@ -153,48 +202,43 @@ exec "$REAL_SSH" -F "$SSH_DIR/config" "\$@"
 EOF
 chmod 700 "$WRAPPER_DIR/ssh"
 
-for _ in {1..120}; do
-  if PATH="$WRAPPER_DIR:$PATH" HOME="$LOCAL_HOME" ssh -T "$ALIAS" true >/dev/null 2>&1; then
-    break
-  fi
-  sleep 0.25
-done
-if ! PATH="$WRAPPER_DIR:$PATH" HOME="$LOCAL_HOME" ssh -T "$ALIAS" true >/dev/null 2>&1; then
-  echo "error: SSH server in Docker container did not become reachable" >&2
-  exit 1
-fi
+wait_for_ssh
 
-ping_output="$(env \
-  -u HERDR_SOCKET_PATH \
-  -u HERDR_CLIENT_SOCKET_PATH \
-  -u HERDR_SESSION \
-  PATH="$WRAPPER_DIR:$PATH" \
-  HOME="$LOCAL_HOME" \
-  XDG_CONFIG_HOME="$LOCAL_CONFIG" \
-  XDG_STATE_HOME="$LOCAL_STATE" \
-  XDG_RUNTIME_DIR="$LOCAL_RUNTIME" \
-  "$HERDR_BIN" --session "$SESSION" remote-api-ping "$ALIAS")"
+cat >"$LOCAL_CONFIG_FILE" <<EOF
+[remote]
+enabled = true
 
-python3 - "$ping_output" <<'PY'
+[[remote.hosts]]
+name = "$ALIAS"
+target = "$ALIAS"
+session = "$REMOTE_SESSION"
+auto_connect = true
+EOF
+
+create_remote_smoke_agent() {
+  local workspace_json pane_id
+  workspace_json="$(run_remote_ssh "/usr/local/bin/herdr --session $REMOTE_SESSION workspace create --cwd /tmp --focus")"
+  pane_id="$(python3 - "$workspace_json" <<'PY'
 import json
 import sys
 
-payload = json.loads(sys.argv[1])
-if payload.get("id") != "remote-api-ping":
-    raise SystemExit(f"unexpected response id: {payload.get('id')!r}")
-result = payload.get("result") or {}
-if result.get("type") != "pong":
-    raise SystemExit(f"unexpected response result.type: {result.get('type')!r}")
-PY
-
-workspace_json="$(PATH="$WRAPPER_DIR:$PATH" HOME="$LOCAL_HOME" ssh -T "$ALIAS" \
-  "/usr/local/bin/herdr --session $SESSION workspace create --cwd /tmp --focus")"
-
-pane_id="$(python3 - "$workspace_json" <<'PY'
-import json
-import sys
-
-payload = json.loads(sys.argv[1])
+text = sys.argv[1]
+decoder = json.JSONDecoder()
+idx = 0
+payload = None
+while idx < len(text):
+    idx = text.find("{", idx)
+    if idx == -1:
+        break
+    try:
+        value, idx = decoder.raw_decode(text, idx)
+    except json.JSONDecodeError:
+        idx += 1
+        continue
+    if value.get("id") == "cli:workspace:create" or value.get("result", {}).get("root_pane"):
+        payload = value
+if payload is None:
+    raise SystemExit(f"workspace create response not found in: {text!r}")
 try:
     print(payload["result"]["root_pane"]["pane_id"])
 except KeyError as exc:
@@ -202,28 +246,277 @@ except KeyError as exc:
 PY
 )"
 
-PATH="$WRAPPER_DIR:$PATH" HOME="$LOCAL_HOME" ssh -T "$ALIAS" \
-  "/usr/local/bin/herdr --session $SESSION pane report-agent $pane_id --source smoke --agent smoke-agent --state working" \
-  >/dev/null
+  run_remote_ssh "/usr/local/bin/herdr --session $REMOTE_SESSION pane report-agent $pane_id --source smoke --agent smoke-agent --state working" >/dev/null
+}
 
-agent_list_output="$(env \
-  -u HERDR_SOCKET_PATH \
-  -u HERDR_CLIENT_SOCKET_PATH \
-  -u HERDR_SESSION \
-  PATH="$WRAPPER_DIR:$PATH" \
-  HOME="$LOCAL_HOME" \
-  XDG_CONFIG_HOME="$LOCAL_CONFIG" \
-  XDG_STATE_HOME="$LOCAL_STATE" \
-  XDG_RUNTIME_DIR="$LOCAL_RUNTIME" \
-  "$HERDR_BIN" --session "$SESSION" remote-api-agent-list "$ALIAS")"
+json_has_agent() {
+  local payload="$1"
+  local expected_name="$2"
+  python3 - "$payload" "$expected_name" <<'PY'
+import json
+import sys
+
+text = sys.argv[1]
+expected_name = sys.argv[2]
+decoder = json.JSONDecoder()
+idx = 0
+payload = None
+while idx < len(text):
+    idx = text.find("{", idx)
+    if idx == -1:
+        break
+    try:
+        payload, idx = decoder.raw_decode(text, idx)
+    except json.JSONDecodeError:
+        idx += 1
+        continue
+if payload is None:
+    raise SystemExit(1)
+result = payload.get("result") or {}
+agents = result.get("agents") or []
+for agent in agents:
+    labels = {
+        agent.get("agent"),
+        agent.get("display_agent"),
+        agent.get("name"),
+        agent.get("title"),
+    }
+    if expected_name in labels:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+json_agent_count() {
+  local payload="$1"
+  local expected_name="$2"
+  python3 - "$payload" "$expected_name" <<'PY'
+import json
+import sys
+
+text = sys.argv[1]
+expected_name = sys.argv[2]
+decoder = json.JSONDecoder()
+idx = 0
+payload = None
+while idx < len(text):
+    idx = text.find("{", idx)
+    if idx == -1:
+        break
+    try:
+        payload, idx = decoder.raw_decode(text, idx)
+    except json.JSONDecodeError:
+        idx += 1
+        continue
+if payload is None:
+    raise SystemExit(1)
+result = payload.get("result") or {}
+agents = result.get("agents") or []
+count = 0
+for agent in agents:
+    labels = {
+        agent.get("agent"),
+        agent.get("display_agent"),
+        agent.get("name"),
+        agent.get("title"),
+    }
+    if expected_name in labels:
+        count += 1
+print(count)
+PY
+}
+
+wait_for_local_server() {
+  for _ in {1..100}; do
+    local status_json
+    status_json="$(run_herdr "$LOCAL_SESSION" status server --json 2>/dev/null || true)"
+    if python3 - "$status_json" <<'PY' >/dev/null 2>&1
+import json
+import sys
+text = sys.argv[1]
+decoder = json.JSONDecoder()
+idx = 0
+payload = None
+while idx < len(text):
+    idx = text.find("{", idx)
+    if idx == -1:
+        break
+    try:
+        payload, idx = decoder.raw_decode(text, idx)
+    except json.JSONDecodeError:
+        idx += 1
+        continue
+raise SystemExit(0 if payload and payload.get("status") == "running" else 1)
+PY
+    then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "error: local Herdr server did not become reachable; log follows" >&2
+  sed -n '1,200p' "$LOCAL_SERVER_LOG" >&2 || true
+  return 1
+}
+
+wait_for_local_agent() {
+  local expected_name="$1"
+  local timeout_seconds="$2"
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local list_json
+    list_json="$(run_herdr "$LOCAL_SESSION" agent list 2>/dev/null || true)"
+    if [[ -n "$list_json" ]] && json_has_agent "$list_json" "$expected_name"; then
+      printf '%s' "$list_json"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "error: local agent list did not contain $expected_name within ${timeout_seconds}s" >&2
+  return 1
+}
+
+wait_for_local_agent_disconnected() {
+  local expected_name="$1"
+  local timeout_seconds="$2"
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local list_json
+    list_json="$(run_herdr "$LOCAL_SESSION" agent list 2>/dev/null || true)"
+    if [[ -n "$list_json" ]] && python3 - "$list_json" "$expected_name" <<'PY'
+import json
+import sys
+
+text = sys.argv[1]
+expected_name = sys.argv[2]
+decoder = json.JSONDecoder()
+idx = 0
+payload = None
+while idx < len(text):
+    idx = text.find("{", idx)
+    if idx == -1:
+        break
+    try:
+        payload, idx = decoder.raw_decode(text, idx)
+    except json.JSONDecodeError:
+        idx += 1
+        continue
+if payload is None:
+    raise SystemExit(1)
+for agent in (payload.get("result") or {}).get("agents") or []:
+    labels = {agent.get("agent"), agent.get("display_agent"), agent.get("name"), agent.get("title")}
+    if expected_name in labels and agent.get("custom_status") == "disconnected":
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    then
+      printf '%s' "$list_json"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "error: local agent list did not mark $expected_name disconnected within ${timeout_seconds}s" >&2
+  return 1
+}
+
+wait_for_single_connected_local_agent() {
+  local expected_name="$1"
+  local timeout_seconds="$2"
+  local deadline=$((SECONDS + timeout_seconds))
+  while (( SECONDS < deadline )); do
+    local list_json count
+    list_json="$(run_herdr "$LOCAL_SESSION" agent list 2>/dev/null || true)"
+    if [[ -n "$list_json" ]]; then
+      count="$(json_agent_count "$list_json" "$expected_name")"
+      if [[ "$count" == "1" ]] && python3 - "$list_json" "$expected_name" <<'PY'
+import json
+import sys
+
+text = sys.argv[1]
+expected_name = sys.argv[2]
+decoder = json.JSONDecoder()
+idx = 0
+payload = None
+while idx < len(text):
+    idx = text.find("{", idx)
+    if idx == -1:
+        break
+    try:
+        payload, idx = decoder.raw_decode(text, idx)
+    except json.JSONDecodeError:
+        idx += 1
+        continue
+if payload is None:
+    raise SystemExit(1)
+for agent in (payload.get("result") or {}).get("agents") or []:
+    labels = {agent.get("agent"), agent.get("display_agent"), agent.get("name"), agent.get("title")}
+    if expected_name in labels:
+        raise SystemExit(0 if agent.get("custom_status") != "disconnected" else 1)
+raise SystemExit(1)
+PY
+      then
+        printf '%s' "$list_json"
+        return 0
+      fi
+    fi
+    sleep 1
+  done
+  echo "error: local agent list did not contain one connected $expected_name within ${timeout_seconds}s" >&2
+  return 1
+}
+
+ping_output="$(run_herdr "$REMOTE_SESSION" remote-api-ping "$ALIAS")"
+
+python3 - "$ping_output" <<'PY'
+import json
+import sys
+
+text = sys.argv[1]
+decoder = json.JSONDecoder()
+idx = 0
+payload = None
+while idx < len(text):
+    idx = text.find("{", idx)
+    if idx == -1:
+        break
+    try:
+        value, idx = decoder.raw_decode(text, idx)
+    except json.JSONDecodeError:
+        idx += 1
+        continue
+    if value.get("id") == "remote-api-ping":
+        payload = value
+if payload is None:
+    raise SystemExit(f"remote-api-ping response not found in: {text!r}")
+result = payload.get("result") or {}
+if result.get("type") != "pong":
+    raise SystemExit(f"unexpected response result.type: {result.get('type')!r}")
+PY
+
+create_remote_smoke_agent
+
+agent_list_output="$(run_herdr "$REMOTE_SESSION" remote-api-agent-list "$ALIAS")"
 
 python3 - "$agent_list_output" <<'PY'
 import json
 import sys
 
-payload = json.loads(sys.argv[1])
-if payload.get("id") != "remote-api-agent-list":
-    raise SystemExit(f"unexpected response id: {payload.get('id')!r}")
+text = sys.argv[1]
+decoder = json.JSONDecoder()
+idx = 0
+payload = None
+while idx < len(text):
+    idx = text.find("{", idx)
+    if idx == -1:
+        break
+    try:
+        value, idx = decoder.raw_decode(text, idx)
+    except json.JSONDecodeError:
+        idx += 1
+        continue
+    if value.get("id") == "remote-api-agent-list":
+        payload = value
+if payload is None:
+    raise SystemExit(f"remote-api-agent-list response not found in: {text!r}")
 result = payload.get("result") or {}
 if result.get("type") != "agent_list":
     raise SystemExit(f"unexpected response result.type: {result.get('type')!r}")
@@ -242,4 +535,115 @@ else:
     raise SystemExit(f"smoke-agent working entry not found in agents: {agents}")
 PY
 
-echo "remote API bridge Docker smoke passed: ping and agent-list probes succeeded"
+run_herdr "$LOCAL_SESSION" server >"$LOCAL_SERVER_LOG" 2>&1 &
+LOCAL_SERVER_PID="$!"
+wait_for_local_server
+
+HOST_AGENT="$ALIAS/smoke-agent"
+wait_for_local_agent "$HOST_AGENT" 90 >/dev/null
+
+get_output="$(run_herdr "$LOCAL_SESSION" agent get "$HOST_AGENT")"
+python3 - "$get_output" "$HOST_AGENT" <<'PY'
+import json
+import sys
+
+text = sys.argv[1]
+expected_name = sys.argv[2]
+decoder = json.JSONDecoder()
+idx = 0
+payload = None
+while idx < len(text):
+    idx = text.find("{", idx)
+    if idx == -1:
+        break
+    try:
+        payload, idx = decoder.raw_decode(text, idx)
+    except json.JSONDecodeError:
+        idx += 1
+        continue
+if payload is None:
+    raise SystemExit(f"agent.get response not found in: {text!r}")
+agent = (payload.get("result") or {}).get("agent") or {}
+labels = {agent.get("agent"), agent.get("display_agent"), agent.get("name"), agent.get("title")}
+if expected_name not in labels:
+    raise SystemExit(f"host-qualified agent label not found in get response: {agent}")
+if not agent.get("terminal_id") or not agent.get("pane_id"):
+    raise SystemExit(f"remote ids missing in get response: {agent}")
+PY
+
+SMOKE_TEXT="herdr-fed-smoke-$RANDOM"
+SEND_TEXT="$(printf "printf '%%s\\\\n' %q\n" "$SMOKE_TEXT")"
+run_herdr "$LOCAL_SESSION" agent send "$HOST_AGENT" "$SEND_TEXT" >/dev/null
+
+for _ in {1..40}; do
+  read_output="$(run_herdr "$LOCAL_SESSION" agent read "$HOST_AGENT" --source recent-unwrapped --lines 40 2>/dev/null || true)"
+  if [[ -n "$read_output" ]] && python3 - "$read_output" "$SMOKE_TEXT" <<'PY'
+import json
+import sys
+
+raw = sys.argv[1]
+needle = sys.argv[2]
+decoder = json.JSONDecoder()
+idx = 0
+payload = None
+while idx < len(raw):
+    idx = raw.find("{", idx)
+    if idx == -1:
+        break
+    try:
+        payload, idx = decoder.raw_decode(raw, idx)
+    except json.JSONDecodeError:
+        idx += 1
+        continue
+if payload is None:
+    raise SystemExit(1)
+text = ((payload.get("result") or {}).get("read") or {}).get("text") or ""
+raise SystemExit(0 if needle in text else 1)
+PY
+  then
+    break
+  fi
+  sleep 0.5
+done
+if [[ -z "${read_output:-}" ]]; then
+  echo "error: remote read did not return output" >&2
+  exit 1
+fi
+python3 - "${read_output:-{}}" "$SMOKE_TEXT" <<'PY'
+import json
+import sys
+
+raw = sys.argv[1]
+needle = sys.argv[2]
+decoder = json.JSONDecoder()
+idx = 0
+payload = None
+while idx < len(raw):
+    idx = raw.find("{", idx)
+    if idx == -1:
+        break
+    try:
+        payload, idx = decoder.raw_decode(raw, idx)
+    except json.JSONDecodeError:
+        idx += 1
+        continue
+if payload is None:
+    raise SystemExit(1)
+text = ((payload.get("result") or {}).get("read") or {}).get("text") or ""
+if needle not in text:
+    raise SystemExit(f"remote read did not contain {needle!r}: {text!r}")
+PY
+
+# This single-container smoke verifies the configured remote path. The
+# no-transitive remote-of-remote supervisor boundary is covered by unit tests
+# around the hidden agent.list_local snapshot path.
+docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+wait_for_local_agent_disconnected "$HOST_AGENT" 120 >/dev/null
+
+start_container
+wait_for_ssh
+run_herdr "$REMOTE_SESSION" remote-api-ping "$ALIAS" >/dev/null
+create_remote_smoke_agent
+wait_for_single_connected_local_agent "$HOST_AGENT" 120 >/dev/null
+
+echo "remote API bridge Docker smoke passed: probes, supervisor cache, host-qualified get/read/send, disconnect, and reconnect succeeded"
