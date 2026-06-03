@@ -5,6 +5,18 @@ use crate::api::schema::{AgentStartParams, SplitDirection};
 
 impl App {
     pub(super) fn collect_agent_infos(&self) -> Vec<crate::api::schema::AgentInfo> {
+        let mut agents = self.collect_local_agent_infos();
+        agents.extend(
+            self.state
+                .remote_sources
+                .list_entries()
+                .into_iter()
+                .map(host_qualified_remote_agent_info),
+        );
+        agents
+    }
+
+    pub(crate) fn collect_local_agent_infos(&self) -> Vec<crate::api::schema::AgentInfo> {
         self.state
             .workspaces
             .iter()
@@ -433,7 +445,7 @@ impl App {
         name: &str,
         except_terminal_id: &str,
     ) -> Vec<crate::api::schema::AgentInfo> {
-        self.collect_agent_infos()
+        self.collect_local_agent_infos()
             .into_iter()
             .filter(|agent| {
                 agent.name.as_deref() == Some(name) && agent.terminal_id != except_terminal_id
@@ -456,10 +468,170 @@ pub(super) enum AgentStartError {
     },
 }
 
+pub(crate) fn host_qualified_remote_agent_info(
+    entry: crate::remote_source::RemoteAgentEntry,
+) -> crate::api::schema::AgentInfo {
+    let stale = entry.stale();
+    let mut agent = entry.agent;
+    agent.name = prefix_remote_label(&entry.host.host, agent.name);
+    agent.display_agent = prefix_remote_label(&entry.host.host, agent.display_agent);
+    agent.agent = prefix_remote_label(&entry.host.host, agent.agent);
+    agent.title = prefix_remote_label(&entry.host.host, agent.title);
+    if stale {
+        agent.custom_status = Some("disconnected".to_string());
+    }
+    agent
+}
+
+fn prefix_remote_label(host: &str, label: Option<String>) -> Option<String> {
+    label.map(|label| format!("{host}/{label}"))
+}
+
 pub(super) enum AgentRenameError {
     Target(TerminalTargetError),
     DuplicateName {
         name: String,
         candidates: Vec<crate::api::schema::AgentInfo>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::api::schema::{AgentInfo, AgentStatus};
+    use crate::app::App;
+    use crate::remote_source::RemoteHostKey;
+
+    fn test_app() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    fn remote_agent(terminal_id: &str, pane_id: &str, label: &str) -> AgentInfo {
+        AgentInfo {
+            terminal_id: terminal_id.to_string(),
+            name: Some(label.to_string()),
+            agent: Some(label.to_string()),
+            title: Some(format!("{label} title")),
+            display_agent: Some(format!("{label} display")),
+            agent_status: AgentStatus::Working,
+            custom_status: None,
+            state_labels: HashMap::new(),
+            agent_session: None,
+            workspace_id: "remote-ws".to_string(),
+            tab_id: "remote-tab".to_string(),
+            pane_id: pane_id.to_string(),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+            revision: 1,
+        }
+    }
+
+    #[test]
+    fn collect_agent_infos_keeps_local_agents_first_and_unchanged() {
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("local");
+        let local_pane_id = workspace.tabs[0].root_pane;
+        let local_terminal_id = workspace.terminal_id(local_pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state
+            .terminals
+            .get_mut(&local_terminal_id)
+            .unwrap()
+            .set_agent_name("local-codex".to_string());
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![remote_agent("remote-term", "remote-pane", "codex")],
+        );
+
+        let agents = app.collect_agent_infos();
+
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].terminal_id, local_terminal_id.to_string());
+        assert_eq!(agents[0].name.as_deref(), Some("local-codex"));
+        assert_eq!(agents[1].terminal_id, "remote-term");
+    }
+
+    #[test]
+    fn local_agent_name_conflicts_ignore_remote_cache_entries() {
+        let mut app = test_app();
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![remote_agent("remote-term", "remote-pane", "codex")],
+        );
+
+        let conflicts = app.agent_name_conflicts("jafar/codex", "");
+
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn collect_agent_infos_appends_host_qualified_remote_labels() {
+        let mut app = test_app();
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![remote_agent("remote-term", "remote-pane", "codex")],
+        );
+
+        let agents = app.collect_agent_infos();
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name.as_deref(), Some("jafar/codex"));
+        assert_eq!(agents[0].agent.as_deref(), Some("jafar/codex"));
+        assert_eq!(
+            agents[0].display_agent.as_deref(),
+            Some("jafar/codex display")
+        );
+        assert_eq!(agents[0].title.as_deref(), Some("jafar/codex title"));
+        assert_eq!(agents[0].terminal_id, "remote-term");
+        assert_eq!(agents[0].pane_id, "remote-pane");
+    }
+
+    #[test]
+    fn collect_agent_infos_keeps_disconnected_remote_cache_entries() {
+        let mut app = test_app();
+        let host = RemoteHostKey::new("jafar", "default");
+        let mut agent = remote_agent("remote-term", "remote-pane", "codex");
+        agent.custom_status = Some("busy".to_string());
+        app.state
+            .remote_sources
+            .replace_connected_snapshot(host.clone(), vec![agent]);
+        app.state.remote_sources.mark_disconnected(&host);
+
+        let agents = app.collect_agent_infos();
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name.as_deref(), Some("jafar/codex"));
+        assert_eq!(agents[0].custom_status.as_deref(), Some("disconnected"));
+        assert_eq!(agents[0].terminal_id, "remote-term");
+    }
+
+    #[test]
+    fn collect_agent_infos_does_not_synthesize_remote_label_or_local_ids() {
+        let mut app = test_app();
+        let mut agent = remote_agent("remote-term", "remote-pane", "codex");
+        agent.name = None;
+        agent.display_agent = None;
+        app.state
+            .remote_sources
+            .replace_connected_snapshot(RemoteHostKey::new("jafar", "default"), vec![agent]);
+
+        let agents = app.collect_agent_infos();
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, None);
+        assert_eq!(agents[0].display_agent, None);
+        assert_eq!(agents[0].agent.as_deref(), Some("jafar/codex"));
+        assert_eq!(agents[0].pane_id, "remote-pane");
+        assert_eq!(agents[0].terminal_id, "remote-term");
+    }
 }

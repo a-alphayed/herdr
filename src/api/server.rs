@@ -288,6 +288,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::TabRename(_) => "tab.rename",
         Method::TabClose(_) => "tab.close",
         Method::AgentList(_) => "agent.list",
+        Method::AgentListLocal(_) => "agent.list_local",
         Method::AgentGet(_) => "agent.get",
         Method::AgentRead(_) => "agent.read",
         Method::AgentSend(_) => "agent.send",

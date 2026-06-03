@@ -192,7 +192,7 @@ pub(crate) fn ping_request() -> Request {
 pub(crate) fn agent_list_request() -> Request {
     Request {
         id: "remote-source.agent-list".to_string(),
-        method: Method::AgentList(EmptyParams::default()),
+        method: Method::AgentListLocal(EmptyParams::default()),
     }
 }
 
@@ -305,7 +305,10 @@ mod tests {
     #[test]
     fn remote_supervisor_builds_ping_and_agent_list_requests_without_subscriptions() {
         assert!(matches!(ping_request().method, Method::Ping(_)));
-        assert!(matches!(agent_list_request().method, Method::AgentList(_)));
+        assert!(matches!(
+            agent_list_request().method,
+            Method::AgentListLocal(_)
+        ));
     }
 
     #[test]
@@ -322,7 +325,7 @@ mod tests {
                 thread_calls.fetch_add(1, Ordering::Relaxed);
                 match &request.method {
                     Method::Ping(_) => Ok(pong_response()),
-                    Method::AgentList(_) => Ok(agent_list_response(vec![agent("term-1")])),
+                    Method::AgentListLocal(_) => Ok(agent_list_response(vec![agent("term-1")])),
                     _ => unreachable!("unexpected request"),
                 }
             });

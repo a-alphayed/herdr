@@ -22,6 +22,15 @@ impl App {
         )
     }
 
+    pub(super) fn handle_agent_list_local(&mut self, id: String) -> String {
+        encode_success(
+            id,
+            ResponseResult::AgentList {
+                agents: self.collect_local_agent_infos(),
+            },
+        )
+    }
+
     pub(super) fn handle_agent_get(&mut self, id: String, target: AgentTarget) -> String {
         match self.plan_agent_api_target(&target.target) {
             Ok(PlannedTargetRoute::Local { .. }) => {
@@ -37,7 +46,9 @@ impl App {
                     Ok(resolved) => encode_success(
                         id,
                         ResponseResult::AgentInfo {
-                            agent: resolved.entry.agent,
+                            agent: crate::app::agents::host_qualified_remote_agent_info(
+                                resolved.entry,
+                            ),
                         },
                     ),
                     Err(err) => encode_error_body(id, remote_agent_resolve_error_body(err)),
@@ -310,7 +321,8 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::api::schema::{
-        AgentInfo, AgentReadParams, AgentStatus, ErrorBody, ErrorResponse, SuccessResponse,
+        AgentInfo, AgentReadParams, AgentStatus, EmptyParams, ErrorBody, ErrorResponse,
+        SuccessResponse,
     };
     use crate::remote_source::RemoteHostKey;
 
@@ -367,8 +379,123 @@ mod tests {
         let ResponseResult::AgentInfo { agent } = parsed.result else {
             panic!("expected agent info");
         };
+        assert_eq!(agent.name.as_deref(), Some("jafar/codex"));
+        assert_eq!(agent.display_agent.as_deref(), Some("jafar/codex"));
+        assert_eq!(agent.agent.as_deref(), Some("jafar/codex"));
         assert_eq!(agent.terminal_id, "term-1");
         assert_eq!(agent.pane_id, "pane-1");
+        assert_eq!(agent.workspace_id, "remote-ws");
+        assert_eq!(agent.tab_id, "remote-tab");
+    }
+
+    #[test]
+    fn remote_agent_get_marks_stale_cached_agent_disconnected() {
+        let mut config = crate::config::Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar", "jafar", "default", true,
+        )];
+        let mut app = test_app(&config);
+        let host = RemoteHostKey::new("jafar", "default");
+        let mut agent = remote_agent("term-1", "pane-1", "codex");
+        agent.custom_status = Some("busy".to_string());
+        app.state
+            .remote_sources
+            .replace_connected_snapshot(host.clone(), vec![agent]);
+        app.state.remote_sources.mark_disconnected(&host);
+
+        let response = app.handle_agent_get(
+            "local-id".to_string(),
+            AgentTarget {
+                target: "jafar/codex".to_string(),
+            },
+        );
+        let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentInfo { agent } = parsed.result else {
+            panic!("expected agent info");
+        };
+
+        assert_eq!(agent.name.as_deref(), Some("jafar/codex"));
+        assert_eq!(agent.custom_status.as_deref(), Some("disconnected"));
+    }
+
+    #[test]
+    fn agent_list_local_returns_only_local_agents() {
+        let mut app = test_app(&crate::config::Config::default());
+        let workspace = crate::workspace::Workspace::test_new("local");
+        let local_pane_id = workspace.tabs[0].root_pane;
+        let local_terminal_id = workspace.terminal_id(local_pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state
+            .terminals
+            .get_mut(&local_terminal_id)
+            .unwrap()
+            .set_agent_name("local-codex".to_string());
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![remote_agent("remote-term", "remote-pane", "codex")],
+        );
+
+        let response = app.handle_agent_list_local("local-id".to_string());
+        let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentList { agents } = parsed.result else {
+            panic!("expected agent list");
+        };
+
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].terminal_id, local_terminal_id.to_string());
+        assert_eq!(agents[0].name.as_deref(), Some("local-codex"));
+    }
+
+    #[test]
+    fn public_agent_list_aggregates_local_and_remote_cache() {
+        let mut app = test_app(&crate::config::Config::default());
+        let workspace = crate::workspace::Workspace::test_new("local");
+        let local_pane_id = workspace.tabs[0].root_pane;
+        let local_terminal_id = workspace.terminal_id(local_pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state
+            .terminals
+            .get_mut(&local_terminal_id)
+            .unwrap()
+            .set_agent_name("local-codex".to_string());
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![remote_agent("remote-term", "remote-pane", "codex")],
+        );
+
+        let response = app.handle_agent_list("local-id".to_string());
+        let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentList { agents } = parsed.result else {
+            panic!("expected agent list");
+        };
+
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].name.as_deref(), Some("local-codex"));
+        assert_eq!(agents[1].name.as_deref(), Some("jafar/codex"));
+    }
+
+    #[test]
+    fn agent_list_local_method_dispatch_returns_only_local_agents() {
+        let mut app = test_app(&crate::config::Config::default());
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![remote_agent("remote-term", "remote-pane", "codex")],
+        );
+        let request = Request {
+            id: "local-id".to_string(),
+            method: Method::AgentListLocal(EmptyParams::default()),
+        };
+
+        let response = app.handle_api_request(request);
+        let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentList { agents } = parsed.result else {
+            panic!("expected agent list");
+        };
+
+        assert!(agents.is_empty());
     }
 
     #[test]
