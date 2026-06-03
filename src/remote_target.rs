@@ -1,7 +1,9 @@
 //! Pure parsing for future host-qualified remote target routing.
 //!
-//! This module only classifies target strings. It does not consult remote
-//! config, inspect caches, open bridges, or route commands.
+//! This module only classifies target strings. It does not inspect caches, open
+//! bridges, or execute command routing.
+
+use std::collections::BTreeMap;
 
 #[allow(dead_code)] // Staged validation error for future remote config/target routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +129,159 @@ pub(crate) fn parse_remote_target_selector(
     }
 
     Ok(RemoteTargetSelector::Agent(target.to_string()))
+}
+
+#[allow(dead_code)] // Staged in-memory model for future persisted remote config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteHostConfig {
+    pub(crate) name: String,
+    pub(crate) target: String,
+    pub(crate) session: String,
+    pub(crate) auto_connect: bool,
+}
+
+impl RemoteHostConfig {
+    #[allow(dead_code)] // Staged constructor for future remote config loading; tests exercise it now.
+    pub(crate) fn new(
+        name: impl Into<String>,
+        target: impl Into<String>,
+        session: impl Into<String>,
+        auto_connect: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            target: target.into(),
+            session: session.into(),
+            auto_connect,
+        }
+    }
+}
+
+#[allow(dead_code)] // Staged validation error for future remote host registry/config loading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteHostConfigError {
+    InvalidAlias(RemoteAliasError),
+    EmptySshTarget,
+    EmptySession,
+    DuplicateAlias(String),
+}
+
+impl std::fmt::Display for RemoteHostConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidAlias(err) => write!(f, "{err}"),
+            Self::EmptySshTarget => write!(f, "remote SSH target cannot be empty"),
+            Self::EmptySession => write!(f, "remote session cannot be empty"),
+            Self::DuplicateAlias(alias) => write!(f, "duplicate remote alias: {alias}"),
+        }
+    }
+}
+
+impl std::error::Error for RemoteHostConfigError {}
+
+impl From<RemoteAliasError> for RemoteHostConfigError {
+    fn from(err: RemoteAliasError) -> Self {
+        Self::InvalidAlias(err)
+    }
+}
+
+#[allow(dead_code)] // Staged deterministic host table for future route planning/config loading.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RemoteHostRegistry {
+    hosts: BTreeMap<String, RemoteHostConfig>,
+}
+
+impl RemoteHostRegistry {
+    #[allow(dead_code)] // Staged bulk loader for future remote config; tests exercise it now.
+    pub(crate) fn from_configs(
+        configs: Vec<RemoteHostConfig>,
+    ) -> Result<Self, RemoteHostConfigError> {
+        let mut registry = Self::default();
+        for config in configs {
+            registry.insert(config)?;
+        }
+        Ok(registry)
+    }
+
+    #[allow(dead_code)] // Staged registry mutation for future remote config reloads; tests exercise it now.
+    pub(crate) fn insert(&mut self, config: RemoteHostConfig) -> Result<(), RemoteHostConfigError> {
+        validate_remote_alias(&config.name)?;
+        if config.target.is_empty() {
+            return Err(RemoteHostConfigError::EmptySshTarget);
+        }
+        if config.session.is_empty() {
+            return Err(RemoteHostConfigError::EmptySession);
+        }
+        if self.hosts.contains_key(&config.name) {
+            return Err(RemoteHostConfigError::DuplicateAlias(config.name));
+        }
+        self.hosts.insert(config.name.clone(), config);
+        Ok(())
+    }
+
+    pub(crate) fn get(&self, alias: &str) -> Option<&RemoteHostConfig> {
+        self.hosts.get(alias)
+    }
+
+    #[allow(dead_code)] // Staged deterministic listing for future remote status/config UI; tests exercise it now.
+    pub(crate) fn list(&self) -> Vec<&RemoteHostConfig> {
+        self.hosts.values().collect()
+    }
+}
+
+#[allow(dead_code)] // Staged route plan for future cross-host command routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PlannedTargetRoute {
+    Local {
+        target: String,
+    },
+    Remote {
+        host: RemoteHostConfig,
+        target: RemoteTargetSelector,
+    },
+}
+
+#[allow(dead_code)] // Staged route planning error for future cross-host command routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteRoutePlanError {
+    Parse(TargetRouteParseError),
+    UnknownHost(String),
+}
+
+impl std::fmt::Display for RemoteRoutePlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse(err) => write!(f, "{err}"),
+            Self::UnknownHost(host) => write!(f, "unknown remote host: {host}"),
+        }
+    }
+}
+
+impl std::error::Error for RemoteRoutePlanError {}
+
+impl From<TargetRouteParseError> for RemoteRoutePlanError {
+    fn from(err: TargetRouteParseError) -> Self {
+        Self::Parse(err)
+    }
+}
+
+#[allow(dead_code)] // Staged pure planner for future cross-host command routing.
+pub(crate) fn plan_target_route(
+    registry: &RemoteHostRegistry,
+    target: &str,
+) -> Result<PlannedTargetRoute, RemoteRoutePlanError> {
+    match parse_target_route(target)? {
+        TargetRoute::Local { target } => Ok(PlannedTargetRoute::Local { target }),
+        TargetRoute::Remote { host, target } => {
+            let config = registry
+                .get(&host)
+                .ok_or_else(|| RemoteRoutePlanError::UnknownHost(host.clone()))?;
+            Ok(PlannedTargetRoute::Remote {
+                host: config.clone(),
+                target,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -271,6 +426,161 @@ mod tests {
                 host: "jafar".to_string(),
                 target: RemoteTargetSelector::Agent("team/codex:review/1".to_string()),
             }
+        );
+    }
+
+    #[test]
+    fn remote_target_registry_accepts_valid_config_and_looks_up_deterministically() {
+        let registry = RemoteHostRegistry::from_configs(vec![
+            RemoteHostConfig::new("work", "user@work:2222", "default", false),
+            RemoteHostConfig::new("jafar", "jafar", "agents", true),
+        ])
+        .unwrap();
+
+        assert_eq!(registry.get("jafar").unwrap().target, "jafar");
+        assert_eq!(registry.get("jafar").unwrap().session, "agents");
+        let names: Vec<_> = registry
+            .list()
+            .into_iter()
+            .map(|config| config.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["jafar", "work"]);
+    }
+
+    #[test]
+    fn remote_target_registry_rejects_invalid_alias() {
+        let err = RemoteHostRegistry::from_configs(vec![RemoteHostConfig::new(
+            "bad/alias",
+            "host",
+            "default",
+            true,
+        )])
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            RemoteHostConfigError::InvalidAlias(RemoteAliasError::ContainsSlash)
+        );
+    }
+
+    #[test]
+    fn remote_target_registry_rejects_empty_target_or_session() {
+        assert_eq!(
+            RemoteHostRegistry::from_configs(vec![RemoteHostConfig::new(
+                "jafar", "", "default", true
+            )])
+            .unwrap_err(),
+            RemoteHostConfigError::EmptySshTarget
+        );
+        assert_eq!(
+            RemoteHostRegistry::from_configs(vec![RemoteHostConfig::new(
+                "jafar", "host", "", true
+            )])
+            .unwrap_err(),
+            RemoteHostConfigError::EmptySession
+        );
+    }
+
+    #[test]
+    fn remote_target_registry_rejects_duplicate_aliases() {
+        let err = RemoteHostRegistry::from_configs(vec![
+            RemoteHostConfig::new("jafar", "host-a", "default", true),
+            RemoteHostConfig::new("jafar", "host-b", "default", true),
+        ])
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            RemoteHostConfigError::DuplicateAlias("jafar".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_target_registry_duplicate_insert_keeps_original_entry_intact() {
+        let mut registry = RemoteHostRegistry::from_configs(vec![RemoteHostConfig::new(
+            "jafar", "host-a", "default", true,
+        )])
+        .unwrap();
+
+        let err = registry
+            .insert(RemoteHostConfig::new("jafar", "host-b", "agents", false))
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            RemoteHostConfigError::DuplicateAlias("jafar".to_string())
+        );
+        assert_eq!(registry.list().len(), 1);
+        let original = registry.get("jafar").unwrap();
+        assert_eq!(original.target, "host-a");
+        assert_eq!(original.session, "default");
+        assert!(original.auto_connect);
+    }
+
+    #[test]
+    fn remote_target_registry_allows_colons_in_ssh_target() {
+        let registry = RemoteHostRegistry::from_configs(vec![
+            RemoteHostConfig::new("work", "user@host", "default", true),
+            RemoteHostConfig::new("ports", "host:2222", "default", true),
+        ])
+        .unwrap();
+
+        assert_eq!(registry.get("work").unwrap().target, "user@host");
+        assert_eq!(registry.get("ports").unwrap().target, "host:2222");
+    }
+
+    #[test]
+    fn remote_target_plan_keeps_bare_typed_lookalike_local() {
+        let registry = RemoteHostRegistry::from_configs(vec![RemoteHostConfig::new(
+            "jafar", "jafar", "default", true,
+        )])
+        .unwrap();
+
+        assert_eq!(
+            plan_target_route(&registry, "pane:1-1").unwrap(),
+            PlannedTargetRoute::Local {
+                target: "pane:1-1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn remote_target_plan_resolves_configured_host_to_remote_plan() {
+        let config = RemoteHostConfig::new("jafar", "user@jafar:2222", "agents", true);
+        let registry = RemoteHostRegistry::from_configs(vec![config.clone()]).unwrap();
+
+        assert_eq!(
+            plan_target_route(&registry, "jafar/terminal:term_abc").unwrap(),
+            PlannedTargetRoute::Remote {
+                host: config,
+                target: RemoteTargetSelector::Terminal("term_abc".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn remote_target_plan_returns_unknown_host_for_unconfigured_remote_alias() {
+        let registry = RemoteHostRegistry::default();
+
+        assert_eq!(
+            plan_target_route(&registry, "jafar/codex").unwrap_err(),
+            RemoteRoutePlanError::UnknownHost("jafar".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_target_plan_propagates_parser_errors_distinctly() {
+        let registry = RemoteHostRegistry::default();
+
+        assert_eq!(
+            plan_target_route(&registry, "bad:alias/codex").unwrap_err(),
+            RemoteRoutePlanError::Parse(TargetRouteParseError::InvalidAlias(
+                RemoteAliasError::ContainsColon
+            ))
+        );
+        assert_eq!(
+            plan_target_route(&registry, "jafar/").unwrap_err(),
+            RemoteRoutePlanError::Parse(TargetRouteParseError::EmptyRemoteTarget)
         );
     }
 }
