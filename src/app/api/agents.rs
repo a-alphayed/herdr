@@ -59,6 +59,17 @@ impl App {
     }
 
     pub(super) fn handle_agent_focus(&mut self, id: String, target: AgentTarget) -> String {
+        match self.plan_agent_api_target(&target.target) {
+            Ok(PlannedTargetRoute::Local { .. }) => {}
+            Ok(PlannedTargetRoute::Remote {
+                host,
+                target: selector,
+            }) => {
+                return self.handle_remote_agent_focus(id, host, selector, target);
+            }
+            Err(err) => return encode_error_body(id, remote_route_plan_error_body(err)),
+        }
+
         let agent = match self.focus_agent_target(&target.target) {
             Ok(agent) => agent,
             Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
@@ -172,6 +183,31 @@ impl App {
         plan_target_route(&self.remote_hosts, target)
     }
 
+    fn handle_remote_agent_focus(
+        &self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        selector: RemoteTargetSelector,
+        target: AgentTarget,
+    ) -> String {
+        let resolved =
+            match resolve_remote_agent_target(&self.state.remote_sources, &host, &selector) {
+                Ok(resolved) => resolved,
+                Err(err) => return encode_error_body(id, remote_agent_resolve_error_body(err)),
+            };
+        let request = remote_agent_focus_request(
+            id.clone(),
+            target,
+            resolved.entry.agent.terminal_id.as_str(),
+        );
+        match crate::remote::send_remote_api_request_to_host_noninteractive(&host, &request)
+            .and_then(|response| rewrite_response_id(&response, &id))
+        {
+            Ok(response) => response,
+            Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
+        }
+    }
+
     fn handle_remote_agent_read(
         &self,
         id: String,
@@ -229,6 +265,14 @@ fn agent_not_found(id: String, target: &str) -> String {
         "agent_not_found",
         format!("agent target {target} not found"),
     )
+}
+
+fn remote_agent_focus_request(id: String, mut target: AgentTarget, terminal_id: &str) -> Request {
+    target.target = terminal_id.to_string();
+    Request {
+        id,
+        method: Method::AgentFocus(target),
+    }
 }
 
 fn remote_agent_read_request(
@@ -528,6 +572,23 @@ mod tests {
 
         assert_eq!(parsed.id, "local-id");
         assert_eq!(parsed.error.code, "agent_not_found");
+    }
+
+    #[test]
+    fn remote_agent_focus_request_uses_resolved_terminal_id() {
+        let request = remote_agent_focus_request(
+            "req-1".to_string(),
+            AgentTarget {
+                target: "jafar/codex".to_string(),
+            },
+            "term-1",
+        );
+
+        let Method::AgentFocus(params) = request.method else {
+            panic!("expected agent.focus");
+        };
+        assert_eq!(request.id, "req-1");
+        assert_eq!(params.target, "term-1");
     }
 
     #[test]
