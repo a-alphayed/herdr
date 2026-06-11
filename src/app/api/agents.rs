@@ -88,6 +88,18 @@ impl App {
     }
 
     pub(super) fn handle_agent_start(&mut self, id: String, params: AgentStartParams) -> String {
+        if let Some(host_alias) = params.host.as_deref() {
+            let Some(host) = self.remote_hosts.get(host_alias).cloned() else {
+                return encode_error_body(
+                    id,
+                    remote_route_plan_error_body(RemoteRoutePlanError::UnknownHost(
+                        host_alias.to_string(),
+                    )),
+                );
+            };
+            return self.handle_remote_agent_start(id, host, params);
+        }
+
         let (agent, argv) = match self.start_agent(params) {
             Ok(started) => started,
             Err(err) => return encode_error_body(id, self.agent_start_error_body(err)),
@@ -257,6 +269,21 @@ impl App {
             Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
         }
     }
+
+    fn handle_remote_agent_start(
+        &self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        params: AgentStartParams,
+    ) -> String {
+        let request = remote_agent_start_request(id.clone(), params);
+        match crate::remote::send_remote_api_request_to_host_noninteractive(&host, &request)
+            .and_then(|response| rewrite_remote_agent_start_response(&response, &id, &host.name))
+        {
+            Ok(response) => response,
+            Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
+        }
+    }
 }
 
 fn agent_not_found(id: String, target: &str) -> String {
@@ -299,6 +326,15 @@ fn remote_agent_send_request(
     }
 }
 
+pub(crate) fn remote_agent_start_request(id: String, mut params: AgentStartParams) -> Request {
+    params.host = None;
+    params.new_workspace = params.workspace_id.is_none() && params.tab_id.is_none();
+    Request {
+        id,
+        method: Method::AgentStart(params),
+    }
+}
+
 fn rewrite_response_id(response: &str, id: &str) -> std::io::Result<String> {
     let mut value: serde_json::Value = serde_json::from_str(response).map_err(|err| {
         std::io::Error::new(
@@ -320,6 +356,66 @@ fn rewrite_response_id(response: &str, id: &str) -> std::io::Result<String> {
     }
     object.insert("id".to_string(), serde_json::Value::String(id.to_string()));
     serde_json::to_string(&value).map_err(std::io::Error::other)
+}
+
+pub(crate) fn rewrite_remote_agent_start_response(
+    response: &str,
+    id: &str,
+    host: &str,
+) -> std::io::Result<String> {
+    let mut value: serde_json::Value = serde_json::from_str(response).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid remote API response JSON: {err}"),
+        )
+    })?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote API response must be a JSON object",
+        ));
+    };
+    if !object.contains_key("result") && !object.contains_key("error") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote API response must contain result or error",
+        ));
+    }
+    object.insert("id".to_string(), serde_json::Value::String(id.to_string()));
+
+    if let Some(agent) = object
+        .get_mut("result")
+        .and_then(serde_json::Value::as_object_mut)
+        .filter(|result| {
+            result
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind == "agent_started")
+        })
+        .and_then(|result| result.get_mut("agent"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        prefix_remote_agent_label_field(agent, "name", host);
+        prefix_remote_agent_label_field(agent, "display_agent", host);
+        prefix_remote_agent_label_field(agent, "agent", host);
+        prefix_remote_agent_label_field(agent, "title", host);
+    }
+
+    serde_json::to_string(&value).map_err(std::io::Error::other)
+}
+
+fn prefix_remote_agent_label_field(
+    agent: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    host: &str,
+) {
+    let Some(value) = agent.get_mut(field) else {
+        return;
+    };
+    let Some(label) = value.as_str() else {
+        return;
+    };
+    *value = serde_json::Value::String(format!("{host}/{label}"));
 }
 
 fn remote_route_plan_error_body(err: RemoteRoutePlanError) -> ErrorBody {
@@ -365,8 +461,8 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::api::schema::{
-        AgentInfo, AgentReadParams, AgentStatus, EmptyParams, ErrorBody, ErrorResponse,
-        SuccessResponse,
+        AgentInfo, AgentReadParams, AgentStartParams, AgentStatus, EmptyParams, ErrorBody,
+        ErrorResponse, SuccessResponse,
     };
     use crate::remote_source::RemoteHostKey;
 
@@ -630,6 +726,108 @@ mod tests {
         assert_eq!(request.id, "req-1");
         assert_eq!(params.target, "term-1");
         assert_eq!(params.text, "hello");
+    }
+
+    #[test]
+    fn remote_agent_start_request_strips_host_and_defaults_to_new_workspace() {
+        let request = remote_agent_start_request(
+            "req-1".to_string(),
+            AgentStartParams {
+                host: Some("jafar".to_string()),
+                name: "codex".to_string(),
+                cwd: Some("/remote/project".to_string()),
+                workspace_id: None,
+                tab_id: None,
+                split: None,
+                focus: false,
+                new_workspace: false,
+                argv: vec!["codex".to_string()],
+            },
+        );
+
+        let Method::AgentStart(params) = request.method else {
+            panic!("expected agent.start");
+        };
+        assert_eq!(request.id, "req-1");
+        assert_eq!(params.host, None);
+        assert_eq!(params.cwd.as_deref(), Some("/remote/project"));
+        assert!(params.new_workspace);
+    }
+
+    #[test]
+    fn remote_agent_start_request_keeps_explicit_remote_placement() {
+        let request = remote_agent_start_request(
+            "req-1".to_string(),
+            AgentStartParams {
+                host: Some("jafar".to_string()),
+                name: "codex".to_string(),
+                cwd: None,
+                workspace_id: Some("remote-ws".to_string()),
+                tab_id: None,
+                split: None,
+                focus: false,
+                new_workspace: false,
+                argv: vec!["codex".to_string()],
+            },
+        );
+
+        let Method::AgentStart(params) = request.method else {
+            panic!("expected agent.start");
+        };
+        assert_eq!(params.host, None);
+        assert_eq!(params.workspace_id.as_deref(), Some("remote-ws"));
+        assert!(!params.new_workspace);
+    }
+
+    #[test]
+    fn remote_agent_start_request_clears_incoming_new_workspace_with_placement() {
+        let request = remote_agent_start_request(
+            "req-1".to_string(),
+            AgentStartParams {
+                host: Some("jafar".to_string()),
+                name: "codex".to_string(),
+                cwd: None,
+                workspace_id: Some("remote-ws".to_string()),
+                tab_id: None,
+                split: None,
+                focus: false,
+                new_workspace: true,
+                argv: vec!["codex".to_string()],
+            },
+        );
+
+        let Method::AgentStart(params) = request.method else {
+            panic!("expected agent.start");
+        };
+        assert_eq!(params.host, None);
+        assert_eq!(params.workspace_id.as_deref(), Some("remote-ws"));
+        assert!(!params.new_workspace);
+    }
+
+    #[test]
+    fn remote_agent_start_response_rewrites_id_and_host_qualifies_agent() {
+        let response = serde_json::to_string(&SuccessResponse {
+            id: "remote-id".to_string(),
+            result: ResponseResult::AgentStarted {
+                agent: remote_agent("term-1", "pane-1", "codex"),
+                argv: vec!["codex".to_string()],
+            },
+        })
+        .unwrap();
+
+        let rewritten =
+            rewrite_remote_agent_start_response(&response, "local-id", "jafar").unwrap();
+        let parsed: SuccessResponse = serde_json::from_str(&rewritten).unwrap();
+
+        assert_eq!(parsed.id, "local-id");
+        let ResponseResult::AgentStarted { agent, argv } = parsed.result else {
+            panic!("expected agent_started");
+        };
+        assert_eq!(agent.name.as_deref(), Some("jafar/codex"));
+        assert_eq!(agent.display_agent.as_deref(), Some("jafar/codex"));
+        assert_eq!(agent.agent.as_deref(), Some("jafar/codex"));
+        assert_eq!(agent.title, None);
+        assert_eq!(argv, vec!["codex"]);
     }
 
     #[test]

@@ -3,6 +3,8 @@ use crate::api::schema::{
     AgentTarget, EmptyParams, Method, ReadFormat, ReadSource, Request, Subscription,
 };
 
+const AGENT_START_USAGE: &str = "usage: herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>\n       herdr agent start --host HOST --name NAME [--cwd REMOTE_PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>";
+
 pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
     let Some(subcommand) = args.first().map(|arg| arg.as_str()) else {
         print_agent_help();
@@ -31,59 +33,87 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn agent_start(args: &[String]) -> std::io::Result<i32> {
-    let Some(name) = args.first() else {
-        eprintln!("usage: herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
-        return Ok(2);
+    let params = match parse_agent_start_args(args) {
+        Ok(params) => params,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(2);
+        }
     };
 
-    let Some(separator) = args.iter().position(|arg| arg == "--") else {
-        eprintln!("usage: herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
-        return Ok(2);
-    };
-    if separator == args.len() - 1 {
-        eprintln!("agent start requires argv after --");
-        return Ok(2);
+    if let Some(host_alias) = params.host.as_deref() {
+        let host = match configured_remote_start_host(host_alias) {
+            Ok(host) => host,
+            Err(message) => {
+                eprintln!("{message}");
+                return Ok(1);
+            }
+        };
+        let request = crate::app::remote_agent_start_request("cli:agent:start".into(), params);
+        let response = crate::remote::send_remote_api_request_to_host(&host, &request)?;
+        let response = crate::app::rewrite_remote_agent_start_response(
+            &response,
+            "cli:agent:start",
+            &host.name,
+        )?;
+        let response: serde_json::Value =
+            serde_json::from_str(&response).map_err(std::io::Error::other)?;
+        return super::print_response(&response);
     }
 
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:start".into(),
+        method: Method::AgentStart(params),
+    })?)
+}
+
+fn parse_agent_start_args(args: &[String]) -> Result<AgentStartParams, String> {
+    let Some(separator) = args.iter().position(|arg| arg == "--") else {
+        return Err(AGENT_START_USAGE.to_string());
+    };
+    if separator == args.len() - 1 {
+        return Err("agent start requires argv after --".to_string());
+    }
+
+    let mut host = None;
+    let mut name = None;
     let mut cwd = None;
     let mut workspace_id = None;
     let mut tab_id = None;
     let mut split = None;
     let mut focus = false;
 
-    let mut index = 1;
+    let mut index = 0;
     while index < separator {
         match args[index].as_str() {
+            "--host" => {
+                let value = flag_value(args, index, separator, "--host")?;
+                host = Some(value.clone());
+                index += 2;
+            }
+            "--name" => {
+                let value = flag_value(args, index, separator, "--name")?;
+                set_agent_start_name(&mut name, value)?;
+                index += 2;
+            }
             "--cwd" => {
-                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --cwd");
-                    return Ok(2);
-                };
+                let value = flag_value(args, index, separator, "--cwd")?;
                 cwd = Some(value.clone());
                 index += 2;
             }
             "--workspace" => {
-                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --workspace");
-                    return Ok(2);
-                };
+                let value = flag_value(args, index, separator, "--workspace")?;
                 workspace_id = Some(super::normalize_workspace_id(value));
                 index += 2;
             }
             "--tab" => {
-                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --tab");
-                    return Ok(2);
-                };
+                let value = flag_value(args, index, separator, "--tab")?;
                 tab_id = Some(super::normalize_tab_id(value));
                 index += 2;
             }
             "--split" => {
-                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
-                    eprintln!("missing value for --split");
-                    return Ok(2);
-                };
-                split = Some(super::parse_split_direction(value)?);
+                let value = flag_value(args, index, separator, "--split")?;
+                split = Some(super::parse_split_direction(value).map_err(|err| err.to_string())?);
                 index += 2;
             }
             "--focus" => {
@@ -94,25 +124,74 @@ fn agent_start(args: &[String]) -> std::io::Result<i32> {
                 focus = false;
                 index += 1;
             }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option: {other}"));
+            }
             other => {
-                eprintln!("unknown option: {other}");
-                return Ok(2);
+                set_agent_start_name(&mut name, other)?;
+                index += 1;
             }
         }
     }
 
-    super::print_response(&super::send_request(&Request {
-        id: "cli:agent:start".into(),
-        method: Method::AgentStart(AgentStartParams {
-            name: name.clone(),
-            cwd,
-            workspace_id,
-            tab_id,
-            split,
-            focus,
-            argv: args[separator + 1..].to_vec(),
-        }),
-    })?)
+    let Some(name) = name else {
+        return Err(AGENT_START_USAGE.to_string());
+    };
+    let new_workspace = host.is_some() && workspace_id.is_none() && tab_id.is_none();
+
+    Ok(AgentStartParams {
+        host,
+        name,
+        cwd,
+        workspace_id,
+        tab_id,
+        split,
+        focus,
+        new_workspace,
+        argv: args[separator + 1..].to_vec(),
+    })
+}
+
+fn flag_value<'a>(
+    args: &'a [String],
+    index: usize,
+    separator: usize,
+    flag: &str,
+) -> Result<&'a String, String> {
+    args.get(index + 1)
+        .filter(|_| index + 1 < separator)
+        .ok_or_else(|| format!("missing value for {flag}"))
+}
+
+fn set_agent_start_name(name: &mut Option<String>, value: &str) -> Result<(), String> {
+    if name.is_some() {
+        return Err("agent start name specified more than once".to_string());
+    }
+    *name = Some(value.to_string());
+    Ok(())
+}
+
+fn configured_remote_start_host(
+    alias: &str,
+) -> Result<crate::remote_target::RemoteHostConfig, String> {
+    let loaded = crate::config::Config::load();
+    configured_remote_start_host_from_config(&loaded.config, alias)
+}
+
+fn configured_remote_start_host_from_config(
+    config: &crate::config::Config,
+    alias: &str,
+) -> Result<crate::remote_target::RemoteHostConfig, String> {
+    if !config.remote.enabled {
+        return Err("remote agent start requires remote.enabled = true".to_string());
+    }
+    let registry =
+        crate::remote_target::RemoteHostRegistry::from_configs(config.remote.hosts.clone())
+            .map_err(|err| format!("invalid remote host config: {err}"))?;
+    registry
+        .get(alias)
+        .cloned()
+        .ok_or_else(|| format!("unknown remote host: {alias}"))
 }
 
 fn agent_list(args: &[String]) -> std::io::Result<i32> {
@@ -494,6 +573,104 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn agent_start_parse_legacy_local_form() {
+        let args = vec![
+            "codex".to_string(),
+            "--cwd".to_string(),
+            "/tmp/project".to_string(),
+            "--focus".to_string(),
+            "--".to_string(),
+            "codex".to_string(),
+            "--ask".to_string(),
+        ];
+
+        let params = parse_agent_start_args(&args).unwrap();
+
+        assert_eq!(params.host, None);
+        assert_eq!(params.name, "codex");
+        assert_eq!(params.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(params.workspace_id, None);
+        assert_eq!(params.tab_id, None);
+        assert_eq!(params.focus, true);
+        assert_eq!(params.new_workspace, false);
+        assert_eq!(params.argv, vec!["codex", "--ask"]);
+    }
+
+    #[test]
+    fn agent_start_parse_remote_host_name_defaults_to_new_workspace() {
+        let args = vec![
+            "--host".to_string(),
+            "jafar".to_string(),
+            "--name".to_string(),
+            "codex".to_string(),
+            "--cwd".to_string(),
+            "/remote/project".to_string(),
+            "--".to_string(),
+            "codex".to_string(),
+        ];
+
+        let params = parse_agent_start_args(&args).unwrap();
+
+        assert_eq!(params.host.as_deref(), Some("jafar"));
+        assert_eq!(params.name, "codex");
+        assert_eq!(params.cwd.as_deref(), Some("/remote/project"));
+        assert_eq!(params.workspace_id, None);
+        assert_eq!(params.tab_id, None);
+        assert_eq!(params.new_workspace, true);
+        assert_eq!(params.argv, vec!["codex"]);
+    }
+
+    #[test]
+    fn agent_start_parse_remote_host_positional_name_with_placement_does_not_force_workspace() {
+        let args = vec![
+            "--host".to_string(),
+            "jafar".to_string(),
+            "codex".to_string(),
+            "--workspace".to_string(),
+            "remote-ws".to_string(),
+            "--".to_string(),
+            "codex".to_string(),
+        ];
+
+        let params = parse_agent_start_args(&args).unwrap();
+
+        assert_eq!(params.host.as_deref(), Some("jafar"));
+        assert_eq!(params.name, "codex");
+        assert_eq!(params.workspace_id.as_deref(), Some("remote-ws"));
+        assert_eq!(params.new_workspace, false);
+    }
+
+    #[test]
+    fn agent_start_remote_host_config_resolves_configured_alias() {
+        let config = remote_config(true);
+
+        let host = configured_remote_start_host_from_config(&config, "jafar")
+            .expect("configured start host");
+
+        assert_eq!(host.name, "jafar");
+        assert_eq!(host.target, "user@jafar:2222");
+        assert_eq!(host.session, "fed-agents");
+    }
+
+    #[test]
+    fn agent_start_remote_host_config_errors_for_unknown_alias() {
+        let config = remote_config(true);
+
+        let err = configured_remote_start_host_from_config(&config, "other").unwrap_err();
+
+        assert_eq!(err, "unknown remote host: other");
+    }
+
+    #[test]
+    fn agent_start_remote_host_config_errors_when_remote_disabled() {
+        let config = remote_config(false);
+
+        let err = configured_remote_start_host_from_config(&config, "jafar").unwrap_err();
+
+        assert_eq!(err, "remote agent start requires remote.enabled = true");
+    }
 }
 
 fn print_agent_help() {
@@ -507,6 +684,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
     eprintln!("  herdr agent attach <target> [--takeover]");
     eprintln!("  herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
+    eprintln!("  herdr agent start --host HOST --name NAME [--cwd REMOTE_PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
     eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");
     eprintln!(
         "  agent send writes literal text; use pane run when you want command text plus Enter"

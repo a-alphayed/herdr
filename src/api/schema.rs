@@ -248,6 +248,8 @@ pub struct AgentRenameParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStartParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
@@ -259,6 +261,8 @@ pub struct AgentStartParams {
     pub split: Option<SplitDirection>,
     #[serde(default)]
     pub focus: bool,
+    #[serde(default)]
+    pub new_workspace: bool,
     pub argv: Vec<String>,
 }
 

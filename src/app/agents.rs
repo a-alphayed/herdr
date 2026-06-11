@@ -134,7 +134,9 @@ impl App {
         let focus = params.focus;
         let (rows, cols) = self.state.estimate_pane_size();
 
-        let (ws_idx, tab_idx, pane_id) = if let Some(tab_id) = params.tab_id {
+        let (ws_idx, tab_idx, pane_id) = if params.new_workspace {
+            self.spawn_agent_workspace(cwd, rows, cols, &argv, focus)?
+        } else if let Some(tab_id) = params.tab_id {
             let (ws_idx, tab_idx) =
                 self.parse_tab_id(&tab_id)
                     .ok_or_else(|| AgentStartError::TargetNotFound {
@@ -532,6 +534,41 @@ mod tests {
             cwd: None,
             foreground_cwd: None,
             revision: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_start_new_workspace_flag_ignores_active_workspace_default() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("existing")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+
+        let started = app.start_agent(crate::api::schema::AgentStartParams {
+            host: None,
+            name: "worker".to_string(),
+            cwd: None,
+            workspace_id: None,
+            tab_id: None,
+            split: None,
+            focus: false,
+            new_workspace: true,
+            argv: vec!["/usr/bin/true".to_string()],
+        });
+        let (agent, argv) = match started {
+            Ok(started) => started,
+            Err(_) => panic!("expected agent start to succeed"),
+        };
+
+        assert_eq!(app.state.workspaces.len(), 2);
+        assert_eq!(agent.name.as_deref(), Some("worker"));
+        assert_eq!(agent.workspace_id, app.public_workspace_id(1));
+        assert_eq!(argv, vec!["/usr/bin/true"]);
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
         }
     }
 

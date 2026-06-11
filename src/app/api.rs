@@ -9,6 +9,8 @@ mod tabs;
 mod workspaces;
 mod worktrees;
 
+pub(crate) use agents::{remote_agent_start_request, rewrite_remote_agent_start_response};
+
 use super::{api_helpers::pane_agent_status, App, Mode, OverlayPaneState, ToastKind};
 use crate::events::AppEvent;
 

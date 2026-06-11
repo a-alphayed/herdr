@@ -19,6 +19,8 @@ mod terminal_targets;
 mod theme_sync;
 mod worktrees;
 
+pub(crate) use api::{remote_agent_start_request, rewrite_remote_agent_start_response};
+
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
 use std::io::{self, Write};
@@ -3058,12 +3060,14 @@ session = "agents"
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_agent_start_focus".into(),
             method: crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                host: None,
                 name: "worker".into(),
                 cwd: None,
                 workspace_id: None,
                 tab_id: None,
                 split: Some(crate::api::schema::SplitDirection::Right),
                 focus: true,
+                new_workspace: false,
                 argv: vec!["/usr/bin/true".into()],
             }),
         });
