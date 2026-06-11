@@ -464,6 +464,52 @@ PY
   return 1
 }
 
+json_read_contains() {
+  local payload="$1"
+  local needle="$2"
+  python3 - "$payload" "$needle" <<'PY'
+import json
+import sys
+
+raw = sys.argv[1]
+needle = sys.argv[2]
+decoder = json.JSONDecoder()
+idx = 0
+payload = None
+while idx < len(raw):
+    idx = raw.find("{", idx)
+    if idx == -1:
+        break
+    try:
+        payload, idx = decoder.raw_decode(raw, idx)
+    except json.JSONDecodeError:
+        idx += 1
+        continue
+if payload is None:
+    raise SystemExit(1)
+text = ((payload.get("result") or {}).get("read") or {}).get("text") or ""
+raise SystemExit(0 if needle in text else 1)
+PY
+}
+
+read_agent_until_contains() {
+  local target="$1"
+  local needle="$2"
+  local timeout_seconds="$3"
+  local deadline=$((SECONDS + timeout_seconds))
+  local read_output=""
+  while (( SECONDS < deadline )); do
+    read_output="$(run_herdr "$LOCAL_SESSION" agent read "$target" --source recent-unwrapped --lines 40 2>/dev/null || true)"
+    if [[ -n "$read_output" ]] && json_read_contains "$read_output" "$needle"; then
+      printf '%s' "$read_output"
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "error: remote read for $target did not contain $needle within ${timeout_seconds}s" >&2
+  return 1
+}
+
 ping_output="$(run_herdr "$REMOTE_SESSION" remote-api-ping "$ALIAS")"
 
 python3 - "$ping_output" <<'PY'
@@ -574,65 +620,72 @@ PY
 SMOKE_TEXT="herdr-fed-smoke-$RANDOM"
 SEND_TEXT="$(printf "printf '%%s\\\\n' %q\n" "$SMOKE_TEXT")"
 run_herdr "$LOCAL_SESSION" agent send "$HOST_AGENT" "$SEND_TEXT" >/dev/null
+read_agent_until_contains "$HOST_AGENT" "$SMOKE_TEXT" 20 >/dev/null
 
-for _ in {1..40}; do
-  read_output="$(run_herdr "$LOCAL_SESSION" agent read "$HOST_AGENT" --source recent-unwrapped --lines 40 2>/dev/null || true)"
-  if [[ -n "$read_output" ]] && python3 - "$read_output" "$SMOKE_TEXT" <<'PY'
+STARTED_NAME="started-smoke"
+STARTED_HOST_AGENT="$ALIAS/$STARTED_NAME"
+STARTED_TEXT="herdr-fed-start-smoke-$RANDOM"
+start_output="$(run_herdr "$LOCAL_SESSION" agent start --host "$ALIAS" --name "$STARTED_NAME" --cwd /tmp -- sh -lc "printf '%s\n' '$STARTED_TEXT'; sleep 300")"
+python3 - "$start_output" "$STARTED_HOST_AGENT" <<'PY'
 import json
 import sys
 
-raw = sys.argv[1]
-needle = sys.argv[2]
+text = sys.argv[1]
+expected_name = sys.argv[2]
 decoder = json.JSONDecoder()
 idx = 0
 payload = None
-while idx < len(raw):
-    idx = raw.find("{", idx)
+while idx < len(text):
+    idx = text.find("{", idx)
     if idx == -1:
         break
     try:
-        payload, idx = decoder.raw_decode(raw, idx)
+        payload, idx = decoder.raw_decode(text, idx)
     except json.JSONDecodeError:
         idx += 1
         continue
 if payload is None:
-    raise SystemExit(1)
-text = ((payload.get("result") or {}).get("read") or {}).get("text") or ""
-raise SystemExit(0 if needle in text else 1)
+    raise SystemExit(f"agent.start response not found in: {text!r}")
+result = payload.get("result") or {}
+if result.get("type") != "agent_started":
+    raise SystemExit(f"unexpected agent.start result.type: {result.get('type')!r}")
+agent = result.get("agent") or {}
+labels = {agent.get("agent"), agent.get("display_agent"), agent.get("name"), agent.get("title")}
+if expected_name not in labels:
+    raise SystemExit(f"host-qualified started agent label not found in response: {agent}")
+if not agent.get("terminal_id") or not agent.get("pane_id"):
+    raise SystemExit(f"started agent response missing remote ids: {agent}")
 PY
-  then
-    break
-  fi
-  sleep 0.5
-done
-if [[ -z "${read_output:-}" ]]; then
-  echo "error: remote read did not return output" >&2
-  exit 1
-fi
-python3 - "${read_output:-{}}" "$SMOKE_TEXT" <<'PY'
+wait_for_local_agent "$STARTED_HOST_AGENT" 90 >/dev/null
+
+focus_output="$(run_herdr "$LOCAL_SESSION" agent focus "$STARTED_HOST_AGENT")"
+python3 - "$focus_output" <<'PY'
 import json
 import sys
 
-raw = sys.argv[1]
-needle = sys.argv[2]
+text = sys.argv[1]
 decoder = json.JSONDecoder()
 idx = 0
 payload = None
-while idx < len(raw):
-    idx = raw.find("{", idx)
+while idx < len(text):
+    idx = text.find("{", idx)
     if idx == -1:
         break
     try:
-        payload, idx = decoder.raw_decode(raw, idx)
+        payload, idx = decoder.raw_decode(text, idx)
     except json.JSONDecodeError:
         idx += 1
         continue
 if payload is None:
-    raise SystemExit(1)
-text = ((payload.get("result") or {}).get("read") or {}).get("text") or ""
-if needle not in text:
-    raise SystemExit(f"remote read did not contain {needle!r}: {text!r}")
+    raise SystemExit(f"agent.focus response not found in: {text!r}")
+result = payload.get("result") or {}
+if result.get("type") != "agent_info":
+    raise SystemExit(f"unexpected agent.focus result.type: {result.get('type')!r}")
+agent = result.get("agent") or {}
+if not agent.get("terminal_id") or not agent.get("pane_id"):
+    raise SystemExit(f"focused agent response missing remote ids: {agent}")
 PY
+read_agent_until_contains "$STARTED_HOST_AGENT" "$STARTED_TEXT" 30 >/dev/null
 
 # This single-container smoke verifies the configured remote path. The
 # no-transitive remote-of-remote supervisor boundary is covered by unit tests
@@ -646,4 +699,4 @@ run_herdr "$REMOTE_SESSION" remote-api-ping "$ALIAS" >/dev/null
 create_remote_smoke_agent
 wait_for_single_connected_local_agent "$HOST_AGENT" 120 >/dev/null
 
-echo "remote API bridge Docker smoke passed: probes, supervisor cache, host-qualified get/read/send, disconnect, and reconnect succeeded"
+echo "remote API bridge Docker smoke passed: probes, supervisor cache, host-qualified get/read/send/focus/start, disconnect, and reconnect succeeded"
