@@ -169,6 +169,7 @@ fn agent_attach(args: &[String]) -> std::io::Result<i32> {
             Ok(parsed) => parsed,
             Err(code) => return Ok(code),
         };
+    let remote_host = configured_remote_attach_host(&target);
 
     let response = resolve_agent_target(&target, "cli:agent:attach:resolve")?;
     if response.get("error").is_some() {
@@ -179,8 +180,33 @@ fn agent_attach(args: &[String]) -> std::io::Result<i32> {
         eprintln!("agent attach failed: response did not include terminal_id");
         return Ok(1);
     };
-    crate::client::run_terminal_attach(terminal_id.to_owned(), takeover)?;
+    if let Some(host) = remote_host {
+        crate::remote::run_remote_terminal_attach(&host, terminal_id.to_owned(), takeover)?;
+    } else {
+        crate::client::run_terminal_attach(terminal_id.to_owned(), takeover)?;
+    }
     Ok(0)
+}
+
+fn configured_remote_attach_host(target: &str) -> Option<crate::remote_target::RemoteHostConfig> {
+    let loaded = crate::config::Config::load();
+    configured_remote_attach_host_from_config(&loaded.config, target)
+}
+
+fn configured_remote_attach_host_from_config(
+    config: &crate::config::Config,
+    target: &str,
+) -> Option<crate::remote_target::RemoteHostConfig> {
+    if !config.remote.enabled {
+        return None;
+    }
+
+    let registry =
+        crate::remote_target::RemoteHostRegistry::from_configs(config.remote.hosts.clone()).ok()?;
+    match crate::remote_target::plan_target_route(&registry, target).ok()? {
+        crate::remote_target::PlannedTargetRoute::Remote { host, .. } => Some(host),
+        crate::remote_target::PlannedTargetRoute::Local { .. } => None,
+    }
 }
 
 fn agent_wait(args: &[String]) -> std::io::Result<i32> {
@@ -408,6 +434,65 @@ fn parse_agent_wait_status(value: &str) -> std::io::Result<AgentStatus> {
         _ => Err(std::io::Error::other(format!(
             "invalid agent status: {value} (expected idle, working, blocked, or unknown)"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn remote_config(enabled: bool) -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.remote.enabled = enabled;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar",
+            "user@jafar:2222",
+            "fed-agents",
+            true,
+        )];
+        config
+    }
+
+    #[test]
+    fn attach_route_keeps_bare_targets_local() {
+        let config = remote_config(true);
+
+        assert_eq!(
+            configured_remote_attach_host_from_config(&config, "codex"),
+            None
+        );
+    }
+
+    #[test]
+    fn attach_route_resolves_configured_host() {
+        let config = remote_config(true);
+
+        let host = configured_remote_attach_host_from_config(&config, "jafar/codex")
+            .expect("configured remote host");
+
+        assert_eq!(host.name, "jafar");
+        assert_eq!(host.target, "user@jafar:2222");
+        assert_eq!(host.session, "fed-agents");
+    }
+
+    #[test]
+    fn attach_route_respects_remote_enabled_flag() {
+        let config = remote_config(false);
+
+        assert_eq!(
+            configured_remote_attach_host_from_config(&config, "jafar/codex"),
+            None
+        );
+    }
+
+    #[test]
+    fn attach_route_ignores_unconfigured_hosts() {
+        let config = remote_config(true);
+
+        assert_eq!(
+            configured_remote_attach_host_from_config(&config, "other/codex"),
+            None
+        );
     }
 }
 

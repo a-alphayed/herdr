@@ -197,6 +197,30 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
     run_client_process(&local_socket, &reattach_command, remote.keybindings)
 }
 
+pub(crate) fn run_remote_terminal_attach(
+    host: &crate::remote_target::RemoteHostConfig,
+    terminal_id: String,
+    takeover: bool,
+) -> io::Result<()> {
+    let prepared_remote = prepare_remote_herdr(&host.target, false)?;
+    ensure_remote_server_ready(
+        &host.target,
+        &prepared_remote.remote_herdr,
+        prepared_remote.installed_or_replaced,
+        false,
+    )?;
+
+    let local_socket = remote_client_attach_socket_path(host);
+    let _bridge = SshStdioBridge::start(
+        host.target.clone(),
+        prepared_remote.remote_herdr,
+        local_socket.clone(),
+        host.session.clone(),
+    )?;
+
+    crate::client::run_terminal_attach_at_socket(&local_socket, terminal_id, takeover)
+}
+
 pub(crate) fn run_remote_api_ping(args: &[String]) -> io::Result<()> {
     run_remote_api_one_shot_probe(args, REMOTE_API_PING_SUBCOMMAND, remote_api_ping_request())
 }
@@ -1786,6 +1810,10 @@ fn local_forward_socket_path(target: &str, session_name: &str) -> PathBuf {
     PathBuf::from("/tmp").join(short_name)
 }
 
+fn remote_client_attach_socket_path(host: &crate::remote_target::RemoteHostConfig) -> PathBuf {
+    local_forward_socket_path(&host.target, &host.session)
+}
+
 fn fits_unix_socket_path(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     // sun_path is byte-limited: 104 bytes on macOS, 108 on Linux. Reserve
@@ -2732,6 +2760,35 @@ mod tests {
             "expected readable name, got {filename}"
         );
         assert!(filename.contains("-dev-default."), "got {filename}");
+        assert!(
+            fits_unix_socket_path(&path),
+            "socket path too long: {} ({} bytes)",
+            path.display(),
+            socket_path_byte_len(&path)
+        );
+    }
+
+    #[test]
+    fn remote_client_attach_socket_path_uses_host_target_and_session() {
+        let _guard = remote_env_lock().lock().unwrap();
+        let host = crate::remote_target::RemoteHostConfig::new(
+            "jafar",
+            "user@jafar:2222",
+            "fed-agents",
+            true,
+        );
+
+        let path = remote_client_attach_socket_path(&host);
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        assert!(
+            filename.contains("-user-jafar-2222-fed-agents."),
+            "got {filename}"
+        );
         assert!(
             fits_unix_socket_path(&path),
             "socket path too long: {} ({} bytes)",

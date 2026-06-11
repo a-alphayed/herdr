@@ -17,6 +17,7 @@ mod input;
 use std::collections::HashSet;
 use std::io::{self, Write as _};
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -504,7 +505,18 @@ pub fn run_client() -> io::Result<()> {
 
 /// Runs a direct terminal attach client.
 pub fn run_terminal_attach(terminal_id: String, takeover: bool) -> io::Result<()> {
-    run_client_with_mode(
+    let socket_path = client_socket_path();
+    run_terminal_attach_at_socket(&socket_path, terminal_id, takeover)
+}
+
+/// Runs a direct terminal attach client against an explicit client socket.
+pub(crate) fn run_terminal_attach_at_socket(
+    socket_path: &Path,
+    terminal_id: String,
+    takeover: bool,
+) -> io::Result<()> {
+    run_client_with_mode_at_socket(
+        socket_path,
         RenderEncoding::TerminalAnsi,
         Some((terminal_id, takeover)),
         Some(AttachEscapeState::default()),
@@ -513,6 +525,23 @@ pub fn run_terminal_attach(terminal_id: String, takeover: bool) -> io::Result<()
 }
 
 fn run_client_with_mode(
+    requested_encoding: RenderEncoding,
+    attach_request: Option<(String, bool)>,
+    attach_escape: Option<AttachEscapeState>,
+    log_message: &'static str,
+) -> io::Result<()> {
+    let socket_path = client_socket_path();
+    run_client_with_mode_at_socket(
+        &socket_path,
+        requested_encoding,
+        attach_request,
+        attach_escape,
+        log_message,
+    )
+}
+
+fn run_client_with_mode_at_socket(
+    socket_path: &Path,
     requested_encoding: RenderEncoding,
     attach_request: Option<(String, bool)>,
     attach_escape: Option<AttachEscapeState>,
@@ -528,7 +557,6 @@ fn run_client_with_mode(
     let kitty_graphics_enabled =
         loaded_config.config.experimental.kitty_graphics && !direct_attach_requested;
 
-    let socket_path = client_socket_path();
     crate::logging::startup("client");
     info!(path = %socket_path.display(), "{log_message}");
 
