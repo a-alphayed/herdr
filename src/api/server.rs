@@ -54,11 +54,7 @@ pub fn start_server(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
 ) -> std::io::Result<ServerHandle> {
-    start_server_with_capabilities(
-        api_tx,
-        event_hub,
-        Some(ServerCapabilities { live_handoff: true }),
-    )
+    start_server_with_capabilities(api_tx, event_hub, Some(ServerCapabilities::current()))
 }
 
 pub fn start_server_with_capabilities(
@@ -691,7 +687,7 @@ mod tests {
                 method: Method::Ping(crate::api::schema::PingParams::default()),
             },
             &tx,
-            Some(ServerCapabilities { live_handoff: true }),
+            Some(ServerCapabilities::current()),
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();

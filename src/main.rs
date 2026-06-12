@@ -351,6 +351,10 @@ fn main() -> io::Result<()> {
         return remote::run_remote_api_bridge();
     }
 
+    if args.get(1).map(|s| s.as_str()) == Some(remote::REMOTE_FEDERATION_CAPABILITIES_SUBCOMMAND) {
+        return remote::run_remote_federation_capabilities();
+    }
+
     if args.get(1).map(|s| s.as_str()) == Some(remote::REMOTE_API_PING_SUBCOMMAND) {
         return remote::run_remote_api_ping(&args[2..]);
     }
@@ -525,6 +529,7 @@ fn main() -> io::Result<()> {
                 "client",
                 remote::REMOTE_CLIENT_BRIDGE_SUBCOMMAND,
                 remote::REMOTE_API_BRIDGE_SUBCOMMAND,
+                remote::REMOTE_FEDERATION_CAPABILITIES_SUBCOMMAND,
                 remote::REMOTE_API_PING_SUBCOMMAND,
                 remote::REMOTE_API_AGENT_LIST_SUBCOMMAND,
                 "update",

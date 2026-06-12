@@ -23,6 +23,7 @@ use crate::remote_target::{RemoteHostConfig, RemoteHostRegistry};
 const REMOTE_SOURCE_PING_INTERVAL: Duration = Duration::from_secs(30);
 const REMOTE_SOURCE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 const REMOTE_SOURCE_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+const REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const REMOTE_SOURCE_STOP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(crate) struct RemoteSourceSupervisorHandle {
@@ -120,8 +121,9 @@ fn remote_source_supervisor_loop_with<F>(
                     let _ = event_tx.blocking_send(AppEvent::RemoteSourceDisconnected {
                         host: host_key.clone(),
                     });
-                    next_ping = now + REMOTE_SOURCE_RETRY_INTERVAL;
-                    next_snapshot = next_snapshot.max(now + REMOTE_SOURCE_RETRY_INTERVAL);
+                    let retry_interval = ping_failure_retry_interval(&err);
+                    next_ping = now + retry_interval;
+                    next_snapshot = next_snapshot.max(now + retry_interval);
                 }
             }
         }
@@ -166,6 +168,15 @@ fn sleep_until_next_due(next_due: Instant, stop: &AtomicBool) {
     }
 }
 
+fn ping_failure_retry_interval(err: &io::Error) -> Duration {
+    match err.kind() {
+        io::ErrorKind::InvalidData | io::ErrorKind::NotFound => {
+            REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL
+        }
+        _ => REMOTE_SOURCE_RETRY_INTERVAL,
+    }
+}
+
 fn send_ping<F>(host: &RemoteHostConfig, send: &F) -> io::Result<()>
 where
     F: Fn(&RemoteHostConfig, &Request) -> io::Result<String>,
@@ -198,7 +209,27 @@ pub(crate) fn agent_list_request() -> Request {
 
 pub(crate) fn parse_ping_response(response: &str) -> io::Result<()> {
     match parse_success_response(response)? {
-        ResponseResult::Pong { .. } => Ok(()),
+        ResponseResult::Pong { capabilities, .. } => {
+            let Some(federation) = capabilities.and_then(|capabilities| capabilities.federation)
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "remote API ping did not advertise federation support",
+                ));
+            };
+            for method in [
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::AGENT_LIST_LOCAL,
+            ] {
+                if !federation.supports_method(method) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("remote API ping did not advertise federation method {method}"),
+                    ));
+                }
+            }
+            Ok(())
+        }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("expected pong response, got {other:?}"),
@@ -274,7 +305,22 @@ mod tests {
             result: ResponseResult::Pong {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
-                capabilities: None,
+                capabilities: Some(crate::api::schema::ServerCapabilities::current()),
+            },
+        })
+        .unwrap()
+    }
+
+    fn old_pong_response_without_federation() -> String {
+        serde_json::to_string(&SuccessResponse {
+            id: "remote-source.ping".to_string(),
+            result: ResponseResult::Pong {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                protocol: crate::protocol::PROTOCOL_VERSION,
+                capabilities: Some(crate::api::schema::ServerCapabilities {
+                    live_handoff: true,
+                    federation: None,
+                }),
             },
         })
         .unwrap()
@@ -309,6 +355,43 @@ mod tests {
             agent_list_request().method,
             Method::AgentListLocal(_)
         ));
+    }
+
+    #[test]
+    fn remote_supervisor_ping_backoff_keeps_transient_failures_short() {
+        let err = io::Error::new(io::ErrorKind::TimedOut, "ssh timed out");
+
+        assert_eq!(
+            ping_failure_retry_interval(&err),
+            REMOTE_SOURCE_RETRY_INTERVAL
+        );
+    }
+
+    #[test]
+    fn remote_supervisor_ping_backoff_uses_long_interval_for_invalid_data() {
+        let err = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote API ping did not advertise federation support",
+        );
+
+        assert_eq!(
+            ping_failure_retry_interval(&err),
+            REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL
+        );
+        assert!(REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL > REMOTE_SOURCE_RETRY_INTERVAL);
+    }
+
+    #[test]
+    fn remote_supervisor_ping_backoff_uses_long_interval_for_missing_binary() {
+        let err = io::Error::new(
+            io::ErrorKind::NotFound,
+            "compatible herdr binary was not found",
+        );
+
+        assert_eq!(
+            ping_failure_retry_interval(&err),
+            REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL
+        );
     }
 
     #[test]
@@ -364,6 +447,37 @@ mod tests {
             panic!("expected disconnected event");
         };
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
+    }
+
+    #[test]
+    fn remote_supervisor_rejects_missing_federation_before_snapshot() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let thread_calls = Arc::clone(&calls);
+        let host = RemoteHostConfig::new("jafar", "jafar", "default", true);
+
+        let handle = thread::spawn(move || {
+            remote_source_supervisor_loop_with(host, tx, thread_stop, move |_host, request| {
+                thread_calls.fetch_add(1, Ordering::Relaxed);
+                match &request.method {
+                    Method::Ping(_) => Ok(old_pong_response_without_federation()),
+                    Method::AgentListLocal(_) => panic!("snapshot should not be requested"),
+                    _ => unreachable!("unexpected request"),
+                }
+            });
+        });
+
+        let event = rx.blocking_recv().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        let AppEvent::RemoteSourceDisconnected { host } = event else {
+            panic!("expected disconnected event");
+        };
+        assert_eq!(host, RemoteHostKey::new("jafar", "default"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -637,6 +637,58 @@ pub struct ErrorBody {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerCapabilities {
     pub live_handoff: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federation: Option<FederationCapabilities>,
+}
+
+impl ServerCapabilities {
+    pub fn current() -> Self {
+        Self {
+            live_handoff: true,
+            federation: Some(FederationCapabilities::current()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FederationCapabilities {
+    #[serde(default)]
+    pub methods: Vec<String>,
+}
+
+impl FederationCapabilities {
+    pub const REMOTE_API_BRIDGE: &'static str = "remote_api_bridge";
+    pub const AGENT_LIST: &'static str = "agent_list";
+    pub const AGENT_LIST_LOCAL: &'static str = "agent_list_local";
+    pub const AGENT_GET: &'static str = "agent_get";
+    pub const AGENT_READ: &'static str = "agent_read";
+    pub const AGENT_SEND: &'static str = "agent_send";
+    pub const AGENT_FOCUS: &'static str = "agent_focus";
+    pub const AGENT_START: &'static str = "agent_start";
+    pub const TERMINAL_ATTACH: &'static str = "terminal_attach";
+
+    pub fn current() -> Self {
+        Self {
+            methods: [
+                Self::REMOTE_API_BRIDGE,
+                Self::AGENT_LIST,
+                Self::AGENT_LIST_LOCAL,
+                Self::AGENT_GET,
+                Self::AGENT_READ,
+                Self::AGENT_SEND,
+                Self::AGENT_FOCUS,
+                Self::AGENT_START,
+                Self::TERMINAL_ATTACH,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        }
+    }
+
+    pub fn supports_method(&self, method: &str) -> bool {
+        self.methods.iter().any(|candidate| candidate == method)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1356,13 +1408,42 @@ mod tests {
             result: ResponseResult::Pong {
                 version: "0.1.2".into(),
                 protocol: 6,
-                capabilities: Some(ServerCapabilities { live_handoff: true }),
+                capabilities: Some(ServerCapabilities::current()),
             },
         };
 
         let json = serde_json::to_string(&response).unwrap();
         let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(restored, response);
+    }
+
+    #[test]
+    fn old_server_capabilities_deserialize_without_federation() {
+        let response: SuccessResponse = serde_json::from_str(
+            r#"{"id":"req_1","result":{"type":"pong","version":"0.1.2","protocol":6,"capabilities":{"live_handoff":true}}}"#,
+        )
+        .unwrap();
+
+        let ResponseResult::Pong { capabilities, .. } = response.result else {
+            panic!("expected pong");
+        };
+        let capabilities = capabilities.expect("capabilities");
+        assert!(capabilities.live_handoff);
+        assert!(capabilities.federation.is_none());
+    }
+
+    #[test]
+    fn current_server_capabilities_include_federation_methods() {
+        let capabilities = ServerCapabilities::current();
+        let federation = capabilities.federation.expect("federation");
+
+        assert!(federation.supports_method(FederationCapabilities::REMOTE_API_BRIDGE));
+        assert!(federation.supports_method(FederationCapabilities::AGENT_GET));
+        assert!(federation.supports_method(FederationCapabilities::AGENT_READ));
+        assert!(federation.supports_method(FederationCapabilities::AGENT_SEND));
+        assert!(federation.supports_method(FederationCapabilities::AGENT_FOCUS));
+        assert!(federation.supports_method(FederationCapabilities::AGENT_START));
+        assert!(federation.supports_method(FederationCapabilities::TERMINAL_ATTACH));
     }
 
     #[test]

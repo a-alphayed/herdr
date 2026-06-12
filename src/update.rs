@@ -2412,7 +2412,7 @@ mod tests {
             server: crate::api::RuntimeStatus {
                 version: Some("0.6.2".to_string()),
                 protocol: Some(76),
-                capabilities: Some(crate::api::schema::ServerCapabilities { live_handoff: true }),
+                capabilities: Some(crate::api::schema::ServerCapabilities::current()),
             },
         };
 

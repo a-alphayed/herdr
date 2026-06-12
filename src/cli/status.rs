@@ -232,6 +232,13 @@ struct ServerStatusJson {
 #[derive(Serialize)]
 struct ServerCapabilitiesJson {
     live_handoff: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    federation: Option<FederationCapabilitiesJson>,
+}
+
+#[derive(Serialize)]
+struct FederationCapabilitiesJson {
+    methods: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -263,6 +270,11 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                 .as_ref()
                 .map(|capabilities| ServerCapabilitiesJson {
                     live_handoff: capabilities.live_handoff,
+                    federation: capabilities.federation.as_ref().map(|federation| {
+                        FederationCapabilitiesJson {
+                            methods: federation.methods.clone(),
+                        }
+                    }),
                 }),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),
             socket: api::socket_path().display().to_string(),

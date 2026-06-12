@@ -36,6 +36,7 @@ const NONINTERACTIVE_SSH_OPTIONS: &[&str] = &[
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 pub(crate) const REMOTE_CLIENT_BRIDGE_SUBCOMMAND: &str = "remote-client-bridge";
 pub(crate) const REMOTE_API_BRIDGE_SUBCOMMAND: &str = "remote-api-bridge";
+pub(crate) const REMOTE_FEDERATION_CAPABILITIES_SUBCOMMAND: &str = "remote-federation-capabilities";
 pub(crate) const REMOTE_API_PING_SUBCOMMAND: &str = "remote-api-ping";
 pub(crate) const REMOTE_API_AGENT_LIST_SUBCOMMAND: &str = "remote-api-agent-list";
 
@@ -209,6 +210,12 @@ pub(crate) fn run_remote_terminal_attach(
         prepared_remote.installed_or_replaced,
         false,
     )?;
+    ensure_remote_federation_methods(
+        host,
+        &prepared_remote.remote_herdr,
+        SshInvocationMode::Interactive,
+        &[crate::api::schema::FederationCapabilities::TERMINAL_ATTACH],
+    )?;
 
     let local_socket = remote_client_attach_socket_path(host);
     let _bridge = SshStdioBridge::start(
@@ -231,6 +238,13 @@ pub(crate) fn run_remote_api_agent_list(args: &[String]) -> io::Result<()> {
         REMOTE_API_AGENT_LIST_SUBCOMMAND,
         remote_api_agent_list_request(),
     )
+}
+
+pub(crate) fn run_remote_federation_capabilities() -> io::Result<()> {
+    let capabilities = crate::api::schema::FederationCapabilities::current();
+    let json = serde_json::to_string(&capabilities).map_err(io::Error::other)?;
+    println!("{json}");
+    Ok(())
 }
 
 fn run_remote_api_one_shot_probe(
@@ -309,8 +323,12 @@ pub(crate) fn send_remote_api_request_to_host(
         false,
     )?;
 
-    let bridge_command = remote_api_bridge_command_for_host(&prepared_remote.remote_herdr, host);
-    send_remote_api_request(&host.target, &bridge_command, request)
+    send_remote_api_request_to_host_with_mode(
+        host,
+        &prepared_remote.remote_herdr,
+        request,
+        SshInvocationMode::Interactive,
+    )
 }
 
 pub(crate) fn send_remote_api_request_to_host_noninteractive(
@@ -318,40 +336,231 @@ pub(crate) fn send_remote_api_request_to_host_noninteractive(
     request: &crate::api::schema::Request,
 ) -> io::Result<String> {
     let remote_herdr = prepare_remote_herdr_noninteractive(&host.target)?;
-    let bridge_command = remote_api_bridge_command_for_host(&remote_herdr, host);
-    send_remote_api_request_noninteractive(&host.target, &bridge_command, request)
-}
-
-fn send_remote_api_request(
-    target: &str,
-    bridge_command: &str,
-    request: &crate::api::schema::Request,
-) -> io::Result<String> {
-    send_remote_api_request_with_mode(
-        target,
-        bridge_command,
-        request,
-        SshInvocationMode::Interactive,
-    )
-}
-
-fn send_remote_api_request_noninteractive(
-    target: &str,
-    bridge_command: &str,
-    request: &crate::api::schema::Request,
-) -> io::Result<String> {
-    send_remote_api_request_with_mode(
-        target,
-        bridge_command,
+    send_remote_api_request_to_host_with_mode(
+        host,
+        &remote_herdr,
         request,
         SshInvocationMode::Noninteractive,
     )
+}
+
+fn send_remote_api_request_to_host_with_mode(
+    host: &crate::remote_target::RemoteHostConfig,
+    remote_herdr: &RemoteHerdr,
+    request: &crate::api::schema::Request,
+    mode: SshInvocationMode,
+) -> io::Result<String> {
+    let required_methods = required_federation_methods_for_request(request);
+    ensure_remote_federation_methods(host, remote_herdr, mode, &required_methods)?;
+
+    let bridge_command = remote_api_bridge_command_for_host(remote_herdr, host);
+    if matches!(request.method, crate::api::schema::Method::Ping(_)) {
+        let response =
+            send_remote_api_request_with_mode(&host.target, &bridge_command, request, mode)?;
+        validate_remote_api_ping_capabilities(host, &response, &required_methods)?;
+        return Ok(response);
+    }
+
+    validate_remote_api_capabilities_with_mode(host, &bridge_command, mode, &required_methods)?;
+    send_remote_api_request_with_mode(&host.target, &bridge_command, request, mode)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SshInvocationMode {
     Interactive,
     Noninteractive,
+}
+
+fn ensure_remote_federation_methods(
+    host: &crate::remote_target::RemoteHostConfig,
+    remote_herdr: &RemoteHerdr,
+    mode: SshInvocationMode,
+    required_methods: &[&'static str],
+) -> io::Result<()> {
+    let capabilities = fetch_remote_federation_capabilities(host, remote_herdr, mode)?;
+    validate_federation_capabilities(host, &capabilities, required_methods)
+}
+
+fn fetch_remote_federation_capabilities(
+    host: &crate::remote_target::RemoteHostConfig,
+    remote_herdr: &RemoteHerdr,
+    mode: SshInvocationMode,
+) -> io::Result<crate::api::schema::FederationCapabilities> {
+    let command = remote_bridge_command_for(
+        remote_herdr,
+        &host.session,
+        REMOTE_FEDERATION_CAPABILITIES_SUBCOMMAND,
+    );
+    let output = match mode {
+        SshInvocationMode::Interactive => ssh_output(&host.target, &command)?,
+        SshInvocationMode::Noninteractive => ssh_output_noninteractive(&host.target, &command)?,
+    };
+    parse_remote_federation_capabilities_probe_output(host, &output)
+}
+
+fn parse_remote_federation_capabilities_probe_output(
+    host: &crate::remote_target::RemoteHostConfig,
+    output: &Output,
+) -> io::Result<crate::api::schema::FederationCapabilities> {
+    if !output.status.success() {
+        return Err(federation_not_advertised_error(
+            host,
+            command_output_detail(output),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_remote_federation_capabilities_json(&stdout).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "remote host {} returned invalid federation capabilities: {err}",
+                host.name
+            ),
+        )
+    })
+}
+
+fn parse_remote_federation_capabilities_json(
+    json: &str,
+) -> io::Result<crate::api::schema::FederationCapabilities> {
+    let trimmed = json.trim();
+    if trimmed.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "empty federation capabilities response",
+        ));
+    }
+    serde_json::from_str(trimmed).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn validate_remote_api_capabilities_with_mode(
+    host: &crate::remote_target::RemoteHostConfig,
+    bridge_command: &str,
+    mode: SshInvocationMode,
+    required_methods: &[&'static str],
+) -> io::Result<()> {
+    let response = send_remote_api_request_with_mode(
+        &host.target,
+        bridge_command,
+        &remote_api_ping_request(),
+        mode,
+    )?;
+    validate_remote_api_ping_capabilities(host, &response, required_methods)
+}
+
+fn validate_remote_api_ping_capabilities(
+    host: &crate::remote_target::RemoteHostConfig,
+    response: &str,
+    required_methods: &[&'static str],
+) -> io::Result<()> {
+    let value: serde_json::Value = serde_json::from_str(response).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid remote API ping response JSON: {err}"),
+        )
+    })?;
+    let response = crate::api::client::parse_response_value(value)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    let crate::api::schema::ResponseResult::Pong { capabilities, .. } = response.result else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote API ping did not return pong",
+        ));
+    };
+    let Some(federation) = capabilities.and_then(|capabilities| capabilities.federation) else {
+        return Err(federation_not_advertised_error(host, None));
+    };
+
+    validate_federation_capabilities(host, &federation, required_methods)
+}
+
+fn validate_federation_capabilities(
+    host: &crate::remote_target::RemoteHostConfig,
+    capabilities: &crate::api::schema::FederationCapabilities,
+    required_methods: &[&'static str],
+) -> io::Result<()> {
+    for method in required_methods {
+        if !capabilities.supports_method(method) {
+            return Err(federation_method_not_advertised_error(host, method));
+        }
+    }
+    Ok(())
+}
+
+fn required_federation_methods_for_request(
+    request: &crate::api::schema::Request,
+) -> Vec<&'static str> {
+    let mut methods = vec![crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE];
+    if let Some(method) = federation_method_for_api_method(&request.method) {
+        methods.push(method);
+    }
+    methods
+}
+
+fn federation_method_for_api_method(method: &crate::api::schema::Method) -> Option<&'static str> {
+    match method {
+        crate::api::schema::Method::AgentList(_) => {
+            Some(crate::api::schema::FederationCapabilities::AGENT_LIST)
+        }
+        crate::api::schema::Method::AgentListLocal(_) => {
+            Some(crate::api::schema::FederationCapabilities::AGENT_LIST_LOCAL)
+        }
+        crate::api::schema::Method::AgentGet(_) => {
+            Some(crate::api::schema::FederationCapabilities::AGENT_GET)
+        }
+        crate::api::schema::Method::AgentRead(_) => {
+            Some(crate::api::schema::FederationCapabilities::AGENT_READ)
+        }
+        crate::api::schema::Method::AgentSend(_) => {
+            Some(crate::api::schema::FederationCapabilities::AGENT_SEND)
+        }
+        crate::api::schema::Method::AgentFocus(_) => {
+            Some(crate::api::schema::FederationCapabilities::AGENT_FOCUS)
+        }
+        crate::api::schema::Method::AgentStart(_) => {
+            Some(crate::api::schema::FederationCapabilities::AGENT_START)
+        }
+        _ => None,
+    }
+}
+
+fn federation_not_advertised_error(
+    host: &crate::remote_target::RemoteHostConfig,
+    detail: Option<String>,
+) -> io::Error {
+    let mut message = format!(
+        "remote host {} has a Herdr binary that does not advertise federation support; install/update Herdr on the remote host",
+        host.name
+    );
+    if let Some(detail) = detail.filter(|detail| !detail.is_empty()) {
+        message.push_str(": ");
+        message.push_str(&detail);
+    }
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn federation_method_not_advertised_error(
+    host: &crate::remote_target::RemoteHostConfig,
+    method: &str,
+) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!(
+        "remote host {} has a Herdr binary that does not advertise federation method {method}; install/update Herdr on the remote host",
+        host.name
+    ))
+}
+
+fn command_output_detail(output: &Output) -> Option<String> {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return Some(stderr);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        None
+    } else {
+        Some(stdout)
+    }
 }
 
 fn send_remote_api_request_with_mode(
@@ -1851,6 +2060,16 @@ fn sanitize_path_component(input: &str) -> String {
 mod tests {
     use super::*;
 
+    fn process_output(status: i32, stdout: &str, stderr: &str) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+
+        Output {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
     #[test]
     fn bridge_socket_is_user_only() {
         use std::os::unix::fs::PermissionsExt;
@@ -2056,6 +2275,116 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn remote_federation_capabilities_probe_parses_success() {
+        let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true);
+        let output = process_output(
+            0,
+            r#"{"methods":["remote_api_bridge","agent_send","terminal_attach"]}"#,
+            "",
+        );
+
+        let capabilities =
+            parse_remote_federation_capabilities_probe_output(&host, &output).unwrap();
+
+        assert!(capabilities
+            .supports_method(crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE));
+        assert!(
+            capabilities.supports_method(crate::api::schema::FederationCapabilities::AGENT_SEND)
+        );
+        assert!(capabilities
+            .supports_method(crate::api::schema::FederationCapabilities::TERMINAL_ATTACH));
+    }
+
+    #[test]
+    fn remote_federation_capabilities_probe_reports_old_command() {
+        let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true);
+        let output = process_output(256, "", "unknown command: remote-federation-capabilities");
+
+        let err = parse_remote_federation_capabilities_probe_output(&host, &output).unwrap_err();
+        let message = err.to_string();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(message.contains(
+            "remote host jafar has a Herdr binary that does not advertise federation support"
+        ));
+        assert!(message.contains("install/update Herdr on the remote host"));
+        assert!(message.contains("unknown command"));
+    }
+
+    #[test]
+    fn remote_api_ping_validation_rejects_missing_federation() {
+        let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true);
+        let response = serde_json::to_string(&crate::api::schema::SuccessResponse {
+            id: "remote-api-ping".to_string(),
+            result: crate::api::schema::ResponseResult::Pong {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                protocol: crate::protocol::PROTOCOL_VERSION,
+                capabilities: Some(crate::api::schema::ServerCapabilities {
+                    live_handoff: true,
+                    federation: None,
+                }),
+            },
+        })
+        .unwrap();
+
+        let err = validate_remote_api_ping_capabilities(
+            &host,
+            &response,
+            &[crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE],
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("does not advertise federation support"));
+    }
+
+    #[test]
+    fn route_method_validation_rejects_missing_method() {
+        let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true);
+        let capabilities = crate::api::schema::FederationCapabilities {
+            methods: vec![crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE.into()],
+        };
+
+        let err = validate_federation_capabilities(
+            &host,
+            &capabilities,
+            &[
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::AGENT_SEND,
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("does not advertise federation method agent_send"));
+    }
+
+    #[test]
+    fn required_federation_methods_include_remote_agent_method() {
+        let request = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::AgentSend(crate::api::schema::AgentSendParams {
+                target: "jafar/codex".to_string(),
+                text: "continue".to_string(),
+            }),
+        };
+
+        let methods = required_federation_methods_for_request(&request);
+
+        assert_eq!(
+            methods,
+            vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::AGENT_SEND
+            ]
         );
     }
 
@@ -2300,6 +2629,22 @@ mod tests {
         assert_eq!(
             remote_bridge_command_for(&remote_herdr, "fed api", REMOTE_API_BRIDGE_SUBCOMMAND),
             "exec \"$HOME/.local/bin/herdr\" --session 'fed api' remote-api-bridge"
+        );
+    }
+
+    #[test]
+    fn remote_federation_capabilities_command_quotes_named_session() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        assert_eq!(
+            remote_bridge_command_for(
+                &remote_herdr,
+                "fed api",
+                REMOTE_FEDERATION_CAPABILITIES_SUBCOMMAND
+            ),
+            "exec \"$HOME/.local/bin/herdr\" --session 'fed api' remote-federation-capabilities"
         );
     }
 
