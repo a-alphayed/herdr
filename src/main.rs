@@ -355,6 +355,10 @@ fn main() -> io::Result<()> {
         return remote::run_remote_federation_capabilities();
     }
 
+    if args.get(1).map(|s| s.as_str()) == Some(remote::REMOTE_API_STATUS_SUBCOMMAND) {
+        return remote::run_remote_api_status();
+    }
+
     if args.get(1).map(|s| s.as_str()) == Some(remote::REMOTE_API_PING_SUBCOMMAND) {
         return remote::run_remote_api_ping(&args[2..]);
     }
@@ -417,6 +421,7 @@ fn main() -> io::Result<()> {
         println!("       herdr agent <subcommand> ...");
         println!("       herdr pane <subcommand> ...");
         println!("       herdr wait <subcommand> ...");
+        println!("       herdr remote <subcommand> ...");
         println!("       herdr session <subcommand> ...");
         println!("       herdr integration <subcommand> ...");
         println!();
@@ -460,6 +465,10 @@ fn main() -> io::Result<()> {
             (
                 "herdr wait <subcommand>",
                 "Blocking wait helpers over the socket API",
+            ),
+            (
+                "herdr remote <subcommand>",
+                "Inspect configured remote federation hosts",
             ),
             (
                 "herdr session <subcommand>",
@@ -530,6 +539,7 @@ fn main() -> io::Result<()> {
                 remote::REMOTE_CLIENT_BRIDGE_SUBCOMMAND,
                 remote::REMOTE_API_BRIDGE_SUBCOMMAND,
                 remote::REMOTE_FEDERATION_CAPABILITIES_SUBCOMMAND,
+                remote::REMOTE_API_STATUS_SUBCOMMAND,
                 remote::REMOTE_API_PING_SUBCOMMAND,
                 remote::REMOTE_API_AGENT_LIST_SUBCOMMAND,
                 "update",
@@ -539,6 +549,7 @@ fn main() -> io::Result<()> {
                 "worktree",
                 "pane",
                 "wait",
+                "remote",
                 "session",
                 "integration",
             ]

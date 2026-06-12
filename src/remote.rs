@@ -7,7 +7,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -37,6 +37,7 @@ pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 pub(crate) const REMOTE_CLIENT_BRIDGE_SUBCOMMAND: &str = "remote-client-bridge";
 pub(crate) const REMOTE_API_BRIDGE_SUBCOMMAND: &str = "remote-api-bridge";
 pub(crate) const REMOTE_FEDERATION_CAPABILITIES_SUBCOMMAND: &str = "remote-federation-capabilities";
+pub(crate) const REMOTE_API_STATUS_SUBCOMMAND: &str = "remote-api-status";
 pub(crate) const REMOTE_API_PING_SUBCOMMAND: &str = "remote-api-ping";
 pub(crate) const REMOTE_API_AGENT_LIST_SUBCOMMAND: &str = "remote-api-agent-list";
 
@@ -247,6 +248,49 @@ pub(crate) fn run_remote_federation_capabilities() -> io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn run_remote_api_status() -> io::Result<()> {
+    let response = match crate::api::read_runtime_status_at(
+        &crate::api::socket_path(),
+        Duration::from_millis(500),
+    )? {
+        Some(status) => RemoteApiStatusResponse {
+            state: RemoteApiStatusState::Running,
+            version: status.version,
+            protocol: status.protocol,
+            capabilities: status.capabilities,
+        },
+        None => RemoteApiStatusResponse {
+            state: RemoteApiStatusState::NotRunning,
+            version: None,
+            protocol: None,
+            capabilities: None,
+        },
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&response).map_err(io::Error::other)?
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RemoteApiStatusResponse {
+    pub(crate) state: RemoteApiStatusState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) protocol: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) capabilities: Option<crate::api::schema::ServerCapabilities>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteApiStatusState {
+    Running,
+    NotRunning,
+}
+
 fn run_remote_api_one_shot_probe(
     args: &[String],
     subcommand: &str,
@@ -342,6 +386,50 @@ pub(crate) fn send_remote_api_request_to_host_noninteractive(
         request,
         SshInvocationMode::Noninteractive,
     )
+}
+
+pub(crate) fn remote_api_status_to_host_noninteractive(
+    host: &crate::remote_target::RemoteHostConfig,
+) -> io::Result<RemoteApiStatusResponse> {
+    let remote_herdr = prepare_remote_herdr_noninteractive(&host.target)?;
+    let command =
+        remote_bridge_command_for(&remote_herdr, &host.session, REMOTE_API_STATUS_SUBCOMMAND);
+    let output = ssh_output_noninteractive(&host.target, &command)?;
+    parse_remote_api_status_output(host, &output)
+}
+
+fn parse_remote_api_status_output(
+    host: &crate::remote_target::RemoteHostConfig,
+    output: &Output,
+) -> io::Result<RemoteApiStatusResponse> {
+    if !output.status.success() {
+        let detail = command_output_detail(output)
+            .unwrap_or_else(|| format!("ssh remote API status exited with {}", output.status));
+        let lower = detail.to_ascii_lowercase();
+        let kind = if lower.contains("unknown command") || lower.contains("usage:") {
+            io::ErrorKind::InvalidData
+        } else {
+            io::ErrorKind::ConnectionAborted
+        };
+        return Err(io::Error::new(
+            kind,
+            format!(
+                "remote host {} API status probe failed: {detail}",
+                host.name
+            ),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(stdout.trim()).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "remote host {} returned invalid API status JSON: {err}",
+                host.name
+            ),
+        )
+    })
 }
 
 fn send_remote_api_request_to_host_with_mode(
@@ -2276,6 +2364,17 @@ mod tests {
                 .kind(),
             io::ErrorKind::UnexpectedEof
         );
+    }
+
+    #[test]
+    fn remote_status_probe_reports_old_command_as_invalid_data() {
+        let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true);
+        let output = process_output(256, "", "unknown command: remote-api-status");
+
+        let err = parse_remote_api_status_output(&host, &output).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unknown command"));
     }
 
     #[test]

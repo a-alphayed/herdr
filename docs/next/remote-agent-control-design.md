@@ -1134,6 +1134,7 @@ Implemented in this spike:
 - host-qualified `agent get/read/send/focus`;
 - CLI direct remote terminal attach via the existing remote client/render bridge;
 - CLI/API remote `agent.start`, defaulting to a new remote workspace when no remote workspace/tab placement is supplied;
+- federation capability/method negotiation for the hidden remote API bridge and routed agent methods;
 - Docker smoke coverage for the configured one-hop path: get/read/send/focus/start, disconnect, and reconnect.
 
 Still not production-complete:
@@ -1141,7 +1142,6 @@ Still not production-complete:
 - no embedded remote panes or local-owned remote PTYs;
 - no broad destructive remote operations;
 - no transitive remote-of-remote routing;
-- no capability or method-set negotiation beyond coarse binary/protocol preparation;
 - no real-network, Tailscale, or multi-host production validation yet.
 
 Direct remote terminal attach is terminal-interactive and is covered by unit tests and review, not by the Docker smoke.
