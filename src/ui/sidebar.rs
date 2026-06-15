@@ -230,7 +230,7 @@ fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
             };
             let (state, seen) = remote_agent_state(entry.agent.agent_status);
             let custom_status = if entry.stale() {
-                Some("disconnected".to_string())
+                entry.status.stale_label().map(str::to_string)
             } else {
                 entry.agent.custom_status.clone()
             };
@@ -1517,7 +1517,10 @@ mod tests {
             host.clone(),
             vec![remote_agent("remote-term", "claude", AgentStatus::Done, 1)],
         );
-        app.remote_sources.mark_disconnected(&host);
+        app.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::NeedsUpdate,
+        );
 
         let entries = agent_panel_entries(&app);
 
@@ -1525,7 +1528,7 @@ mod tests {
         assert_eq!(entries[0].primary_label, "jafar/agents/claude");
         assert_eq!(entries[0].state, AgentState::Idle);
         assert!(!entries[0].seen);
-        assert_eq!(entries[0].custom_status.as_deref(), Some("disconnected"));
+        assert_eq!(entries[0].custom_status.as_deref(), Some("needs update"));
         assert_eq!(
             entries[0].location,
             AgentPanelEntryLocation::Remote {

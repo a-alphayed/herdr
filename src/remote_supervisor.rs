@@ -17,7 +17,7 @@ use tracing::debug;
 use crate::api::client::{parse_response_value, ApiClientError};
 use crate::api::schema::{AgentInfo, EmptyParams, Method, PingParams, Request, ResponseResult};
 use crate::events::AppEvent;
-use crate::remote_source::RemoteHostKey;
+use crate::remote_source::{RemoteConnectionStatus, RemoteHostKey};
 use crate::remote_target::{RemoteHostConfig, RemoteHostRegistry};
 
 const REMOTE_SOURCE_PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -118,8 +118,10 @@ fn remote_source_supervisor_loop_with<F>(
                         break;
                     }
                     debug!(host = %host.name, session = %host.session, err = %err, "remote source ping failed");
+                    let status = remote_source_failure_status(&err);
                     let _ = event_tx.blocking_send(AppEvent::RemoteSourceDisconnected {
                         host: host_key.clone(),
+                        status,
                     });
                     let retry_interval = ping_failure_retry_interval(&err);
                     next_ping = now + retry_interval;
@@ -146,8 +148,10 @@ fn remote_source_supervisor_loop_with<F>(
                         break;
                     }
                     debug!(host = %host.name, session = %host.session, err = %err, "remote source snapshot failed");
+                    let status = remote_source_failure_status(&err);
                     let _ = event_tx.blocking_send(AppEvent::RemoteSourceDisconnected {
                         host: host_key.clone(),
+                        status,
                     });
                     next_snapshot = now + REMOTE_SOURCE_RETRY_INTERVAL;
                 }
@@ -175,6 +179,45 @@ fn ping_failure_retry_interval(err: &io::Error) -> Duration {
         }
         _ => REMOTE_SOURCE_RETRY_INTERVAL,
     }
+}
+
+fn remote_source_failure_status(err: &io::Error) -> RemoteConnectionStatus {
+    match err.kind() {
+        io::ErrorKind::InvalidData | io::ErrorKind::NotFound => RemoteConnectionStatus::NeedsUpdate,
+        io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::TimedOut
+        | io::ErrorKind::WouldBlock
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::PermissionDenied => RemoteConnectionStatus::Unreachable,
+        _ if looks_like_ssh_transport_error(&err.to_string()) => {
+            RemoteConnectionStatus::Unreachable
+        }
+        _ => RemoteConnectionStatus::Disconnected,
+    }
+}
+
+fn looks_like_ssh_transport_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "ssh",
+        "permission denied",
+        "could not resolve hostname",
+        "name or service not known",
+        "connection timed out",
+        "connection refused",
+        "connection reset",
+        "no route to host",
+        "remote platform detection failed: exit status: 255",
+        "exit status: 255",
+        "host key verification failed",
+        "known_hosts",
+        "publickey",
+        "batchmode",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn send_ping<F>(host: &RemoteHostConfig, send: &F) -> io::Result<()>
@@ -395,6 +438,52 @@ mod tests {
     }
 
     #[test]
+    fn remote_supervisor_failure_status_marks_invalid_data_as_needs_update() {
+        let err = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote API ping did not advertise federation support",
+        );
+
+        assert_eq!(
+            remote_source_failure_status(&err),
+            RemoteConnectionStatus::NeedsUpdate
+        );
+    }
+
+    #[test]
+    fn remote_supervisor_failure_status_marks_not_found_as_needs_update() {
+        let err = io::Error::new(
+            io::ErrorKind::NotFound,
+            "compatible herdr binary was not found",
+        );
+
+        assert_eq!(
+            remote_source_failure_status(&err),
+            RemoteConnectionStatus::NeedsUpdate
+        );
+    }
+
+    #[test]
+    fn remote_supervisor_failure_status_marks_transport_as_unreachable() {
+        let err = io::Error::new(io::ErrorKind::TimedOut, "ssh timed out");
+
+        assert_eq!(
+            remote_source_failure_status(&err),
+            RemoteConnectionStatus::Unreachable
+        );
+    }
+
+    #[test]
+    fn remote_supervisor_failure_status_keeps_unknown_as_disconnected() {
+        let err = io::Error::other("unexpected remote source failure");
+
+        assert_eq!(
+            remote_source_failure_status(&err),
+            RemoteConnectionStatus::Disconnected
+        );
+    }
+
+    #[test]
     fn remote_supervisor_loop_sends_snapshot_on_success() {
         let (tx, mut rx) = mpsc::channel(4);
         let stop = Arc::new(AtomicBool::new(false));
@@ -443,10 +532,11 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
-        let AppEvent::RemoteSourceDisconnected { host } = event else {
+        let AppEvent::RemoteSourceDisconnected { host, status } = event else {
             panic!("expected disconnected event");
         };
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
+        assert_eq!(status, RemoteConnectionStatus::Unreachable);
     }
 
     #[test]
@@ -473,11 +563,47 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
-        let AppEvent::RemoteSourceDisconnected { host } = event else {
+        let AppEvent::RemoteSourceDisconnected { host, status } = event else {
             panic!("expected disconnected event");
         };
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
+        assert_eq!(status, RemoteConnectionStatus::NeedsUpdate);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn remote_supervisor_loop_marks_snapshot_invalid_data_as_needs_update() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let thread_calls = Arc::clone(&calls);
+        let host = RemoteHostConfig::new("jafar", "jafar", "default", true);
+
+        let handle = thread::spawn(move || {
+            remote_source_supervisor_loop_with(host, tx, thread_stop, move |_host, request| {
+                thread_calls.fetch_add(1, Ordering::Relaxed);
+                match &request.method {
+                    Method::Ping(_) => Ok(pong_response()),
+                    Method::AgentListLocal(_) => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "remote API ping did not advertise federation method agent.list",
+                    )),
+                    _ => unreachable!("unexpected request"),
+                }
+            });
+        });
+
+        let event = rx.blocking_recv().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        let AppEvent::RemoteSourceDisconnected { host, status } = event else {
+            panic!("expected disconnected event");
+        };
+        assert_eq!(host, RemoteHostKey::new("jafar", "default"));
+        assert_eq!(status, RemoteConnectionStatus::NeedsUpdate);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     #[test]

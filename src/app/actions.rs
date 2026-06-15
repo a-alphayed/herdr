@@ -2034,8 +2034,8 @@ impl AppState {
                 self.remote_sources.remove_agent(&key);
                 Vec::new()
             }
-            AppEvent::RemoteSourceDisconnected { host } => {
-                self.remote_sources.mark_disconnected(&host);
+            AppEvent::RemoteSourceDisconnected { host, status } => {
+                self.remote_sources.mark_status(&host, status);
                 Vec::new()
             }
             AppEvent::RemoteSourceRemoved { host } => {
@@ -3090,12 +3090,15 @@ mod tests {
             agents: vec![remote_agent("remote-term", "smoke-agent")],
         });
 
-        let updates = state.handle_app_event(AppEvent::RemoteSourceDisconnected { host });
+        let updates = state.handle_app_event(AppEvent::RemoteSourceDisconnected {
+            host,
+            status: crate::remote_source::RemoteConnectionStatus::Unreachable,
+        });
 
         assert!(updates.is_empty());
         let entries = crate::ui::agent_panel_entries(&state);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].custom_status.as_deref(), Some("disconnected"));
+        assert_eq!(entries[0].custom_status.as_deref(), Some("unreachable"));
     }
 
     #[test]

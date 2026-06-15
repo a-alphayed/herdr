@@ -480,7 +480,7 @@ pub(crate) fn host_qualified_remote_agent_info(
     agent.agent = prefix_remote_label(&entry.host.host, agent.agent);
     agent.title = prefix_remote_label(&entry.host.host, agent.title);
     if stale {
-        agent.custom_status = Some("disconnected".to_string());
+        agent.custom_status = entry.status.stale_label().map(str::to_string);
     }
     agent
 }
@@ -642,13 +642,16 @@ mod tests {
         app.state
             .remote_sources
             .replace_connected_snapshot(host.clone(), vec![agent]);
-        app.state.remote_sources.mark_disconnected(&host);
+        app.state.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::NeedsUpdate,
+        );
 
         let agents = app.collect_agent_infos();
 
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name.as_deref(), Some("jafar/codex"));
-        assert_eq!(agents[0].custom_status.as_deref(), Some("disconnected"));
+        assert_eq!(agents[0].custom_status.as_deref(), Some("needs update"));
         assert_eq!(agents[0].terminal_id, "remote-term");
     }
 

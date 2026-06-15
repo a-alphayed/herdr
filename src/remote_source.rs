@@ -45,11 +45,22 @@ impl RemoteAgentKey {
 pub(crate) enum RemoteConnectionStatus {
     Connected,
     Disconnected,
+    NeedsUpdate,
+    Unreachable,
 }
 
 impl RemoteConnectionStatus {
     pub(crate) fn is_connected(self) -> bool {
         matches!(self, Self::Connected)
+    }
+
+    pub(crate) fn stale_label(self) -> Option<&'static str> {
+        match self {
+            Self::Connected => None,
+            Self::Disconnected => Some("disconnected"),
+            Self::NeedsUpdate => Some("needs update"),
+            Self::Unreachable => Some("unreachable"),
+        }
     }
 }
 
@@ -114,7 +125,11 @@ impl RemoteSourceCache {
     }
 
     pub(crate) fn mark_disconnected(&mut self, host: &RemoteHostKey) {
-        self.hosts.entry(host.clone()).or_default().status = RemoteConnectionStatus::Disconnected;
+        self.mark_status(host, RemoteConnectionStatus::Disconnected);
+    }
+
+    pub(crate) fn mark_status(&mut self, host: &RemoteHostKey, status: RemoteConnectionStatus) {
+        self.hosts.entry(host.clone()).or_default().status = status;
     }
 
     pub(crate) fn apply_agent_update(&mut self, host: RemoteHostKey, agent: AgentInfo) -> bool {
@@ -247,6 +262,28 @@ mod tests {
         let entries = cache.list_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, RemoteConnectionStatus::Disconnected);
+        assert_eq!(entries[0].status.stale_label(), Some("disconnected"));
+        assert!(entries[0].stale());
+    }
+
+    #[test]
+    fn remote_source_specific_failure_status_marks_entries_stale_but_keeps_them() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+        cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
+
+        cache.mark_status(&host, RemoteConnectionStatus::NeedsUpdate);
+        let entries = cache.list_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, RemoteConnectionStatus::NeedsUpdate);
+        assert_eq!(entries[0].status.stale_label(), Some("needs update"));
+        assert!(entries[0].stale());
+
+        cache.mark_status(&host, RemoteConnectionStatus::Unreachable);
+        let entries = cache.list_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, RemoteConnectionStatus::Unreachable);
+        assert_eq!(entries[0].status.stale_label(), Some("unreachable"));
         assert!(entries[0].stale());
     }
 

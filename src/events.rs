@@ -8,7 +8,7 @@ use std::time::Instant;
 use crate::api::schema::AgentInfo;
 use crate::detect::{Agent, AgentState};
 use crate::layout::PaneId;
-use crate::remote_source::{RemoteAgentKey, RemoteHostKey};
+use crate::remote_source::{RemoteAgentKey, RemoteConnectionStatus, RemoteHostKey};
 use crate::workspace::{GitStatusCacheEntry, WorkspaceGitStatus};
 
 #[derive(Debug)]
@@ -103,8 +103,11 @@ pub enum AppEvent {
     #[allow(dead_code)]
     // Staged ingress for future remote supervisors; reducer/tests exercise it before runtime sender exists.
     RemoteSourceAgentRemoved { key: RemoteAgentKey },
-    /// A remote host/session became unreachable; keep last-known agents stale.
-    RemoteSourceDisconnected { host: RemoteHostKey },
+    /// A remote host/session became unreachable or incompatible; keep last-known agents stale.
+    RemoteSourceDisconnected {
+        host: RemoteHostKey,
+        status: RemoteConnectionStatus,
+    },
     /// A remote host/session was removed from aggregation state.
     RemoteSourceRemoved { host: RemoteHostKey },
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop

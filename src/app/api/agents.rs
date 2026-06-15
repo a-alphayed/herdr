@@ -529,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_agent_get_marks_stale_cached_agent_disconnected() {
+    fn remote_agent_get_marks_stale_cached_agent_needs_update() {
         let mut config = crate::config::Config::default();
         config.remote.enabled = true;
         config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
@@ -542,7 +542,10 @@ mod tests {
         app.state
             .remote_sources
             .replace_connected_snapshot(host.clone(), vec![agent]);
-        app.state.remote_sources.mark_disconnected(&host);
+        app.state.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::NeedsUpdate,
+        );
 
         let response = app.handle_agent_get(
             "local-id".to_string(),
@@ -556,7 +559,7 @@ mod tests {
         };
 
         assert_eq!(agent.name.as_deref(), Some("jafar/codex"));
-        assert_eq!(agent.custom_status.as_deref(), Some("disconnected"));
+        assert_eq!(agent.custom_status.as_deref(), Some("needs update"));
     }
 
     #[test]
