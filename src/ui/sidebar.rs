@@ -28,6 +28,10 @@ pub(crate) enum AgentPanelEntryLocation {
         session: String,
         terminal_id: String,
     },
+    RemoteHost {
+        host: String,
+        session: String,
+    },
 }
 
 pub(crate) struct AgentPanelEntry {
@@ -49,7 +53,9 @@ impl AgentPanelEntry {
                 tab_idx,
                 pane_id,
             } => Some((ws_idx, tab_idx, pane_id)),
-            AgentPanelEntryLocation::Remote { .. } => None,
+            AgentPanelEntryLocation::Remote { .. } | AgentPanelEntryLocation::RemoteHost { .. } => {
+                None
+            }
         }
     }
 }
@@ -218,39 +224,72 @@ fn agent_panel_entries_with_runtimes(
 }
 
 fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
-    app.remote_sources
-        .list_entries()
+    let mut entries: Vec<_> = app
+        .remote_sources
+        .list_host_statuses()
         .into_iter()
-        .map(|entry| {
-            let agent_label = remote_agent_label(&entry.agent);
-            let primary_label = if entry.host.session == crate::session::DEFAULT_SESSION_NAME {
-                format!("{}/{}", entry.host.host, agent_label)
-            } else {
-                format!("{}/{}/{}", entry.host.host, entry.host.session, agent_label)
-            };
-            let (state, seen) = remote_agent_state(entry.agent.agent_status);
-            let custom_status = if entry.stale() {
-                entry.status.stale_label().map(str::to_string)
-            } else {
-                entry.agent.custom_status.clone()
-            };
+        .filter(|entry| entry.agent_count == 0 && !entry.status.is_connected())
+        .map(remote_host_panel_entry)
+        .collect();
 
-            AgentPanelEntry {
-                location: AgentPanelEntryLocation::Remote {
-                    host: entry.host.host,
-                    session: entry.host.session,
-                    terminal_id: entry.agent.terminal_id.clone(),
-                },
-                primary_label,
-                primary_tab_label: None,
-                agent_label: None,
-                state,
-                seen,
-                custom_status,
-                state_labels: entry.agent.state_labels,
-            }
-        })
-        .collect()
+    entries.extend(app.remote_sources.list_entries().into_iter().map(|entry| {
+        let agent_label = remote_agent_label(&entry.agent);
+        let primary_label = if entry.host.session == crate::session::DEFAULT_SESSION_NAME {
+            format!("{}/{}", entry.host.host, agent_label)
+        } else {
+            format!("{}/{}/{}", entry.host.host, entry.host.session, agent_label)
+        };
+        let (state, seen) = remote_agent_state(entry.agent.agent_status);
+        let custom_status = if entry.stale() {
+            entry.status.stale_label().map(str::to_string)
+        } else {
+            entry.agent.custom_status.clone()
+        };
+
+        AgentPanelEntry {
+            location: AgentPanelEntryLocation::Remote {
+                host: entry.host.host,
+                session: entry.host.session,
+                terminal_id: entry.agent.terminal_id.clone(),
+            },
+            primary_label,
+            primary_tab_label: None,
+            agent_label: None,
+            state,
+            seen,
+            custom_status,
+            state_labels: entry.agent.state_labels,
+        }
+    }));
+    entries
+}
+
+fn remote_host_panel_entry(entry: crate::remote_source::RemoteHostStatusEntry) -> AgentPanelEntry {
+    let primary_label = remote_host_label(&entry.host);
+    let mut state_labels = std::collections::HashMap::new();
+    state_labels.insert("unknown".to_string(), "remote".to_string());
+
+    AgentPanelEntry {
+        location: AgentPanelEntryLocation::RemoteHost {
+            host: entry.host.host,
+            session: entry.host.session,
+        },
+        primary_label,
+        primary_tab_label: None,
+        agent_label: None,
+        state: AgentState::Unknown,
+        seen: true,
+        custom_status: entry.status.stale_label().map(str::to_string),
+        state_labels,
+    }
+}
+
+fn remote_host_label(host: &crate::remote_source::RemoteHostKey) -> String {
+    if host.session == crate::session::DEFAULT_SESSION_NAME {
+        host.host.clone()
+    } else {
+        format!("{}/{}", host.host, host.session)
+    }
 }
 
 fn remote_agent_label(agent: &crate::api::schema::AgentInfo) -> String {
@@ -1537,6 +1576,78 @@ mod tests {
                 terminal_id: "remote-term".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn all_workspaces_agent_panel_shows_remote_host_statuses_without_agents() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.remote_sources.mark_status(
+            &RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            crate::remote_source::RemoteConnectionStatus::Unreachable,
+        );
+        app.remote_sources.mark_status(
+            &RemoteHostKey::new("lab", crate::session::DEFAULT_SESSION_NAME),
+            crate::remote_source::RemoteConnectionStatus::Disconnected,
+        );
+        app.remote_sources.mark_status(
+            &RemoteHostKey::new("work", "agents"),
+            crate::remote_source::RemoteConnectionStatus::NeedsUpdate,
+        );
+
+        let entries = agent_panel_entries(&app);
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].primary_label, "jafar");
+        assert_eq!(entries[0].custom_status.as_deref(), Some("unreachable"));
+        assert_eq!(
+            entries[0].location,
+            AgentPanelEntryLocation::RemoteHost {
+                host: "jafar".to_string(),
+                session: crate::session::DEFAULT_SESSION_NAME.to_string(),
+            }
+        );
+        assert_eq!(entries[1].primary_label, "lab");
+        assert_eq!(entries[1].custom_status.as_deref(), Some("disconnected"));
+        assert_eq!(entries[2].primary_label, "work/agents");
+        assert_eq!(entries[2].custom_status.as_deref(), Some("needs update"));
+    }
+
+    #[test]
+    fn all_workspaces_agent_panel_uses_stale_agent_row_instead_of_duplicate_host_row() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        let host = RemoteHostKey::new("jafar", "agents");
+        app.remote_sources.replace_connected_snapshot(
+            host.clone(),
+            vec![remote_agent("remote-term", "claude", AgentStatus::Done, 1)],
+        );
+        app.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Unreachable,
+        );
+
+        let entries = agent_panel_entries(&app);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].primary_label, "jafar/agents/claude");
+        assert_eq!(entries[0].custom_status.as_deref(), Some("unreachable"));
+        assert!(matches!(
+            entries[0].location,
+            AgentPanelEntryLocation::Remote { .. }
+        ));
+    }
+
+    #[test]
+    fn all_workspaces_agent_panel_hides_connected_remote_host_without_agents() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            Vec::new(),
+        );
+
+        assert!(agent_panel_entries(&app).is_empty());
     }
 
     #[test]

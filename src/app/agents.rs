@@ -656,6 +656,19 @@ mod tests {
     }
 
     #[test]
+    fn collect_agent_infos_ignores_remote_host_status_without_agents() {
+        let mut app = test_app();
+        app.state.remote_sources.mark_status(
+            &RemoteHostKey::new("jafar", "default"),
+            crate::remote_source::RemoteConnectionStatus::Unreachable,
+        );
+
+        let agents = app.collect_agent_infos();
+
+        assert!(agents.is_empty());
+    }
+
+    #[test]
     fn collect_agent_infos_does_not_synthesize_remote_label_or_local_ids() {
         let mut app = test_app();
         let mut agent = remote_agent("remote-term", "remote-pane", "codex");

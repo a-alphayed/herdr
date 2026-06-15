@@ -233,7 +233,7 @@ impl App {
     fn remote_host_is_configured(&self, host: &crate::remote_source::RemoteHostKey) -> bool {
         self.remote_hosts
             .get(&host.host)
-            .is_some_and(|config| config.session == host.session)
+            .is_some_and(|config| config.session == host.session && config.auto_connect)
     }
 
     pub(crate) fn refresh_new_herdr_toast_context_for_update(

@@ -71,6 +71,13 @@ pub(crate) struct RemoteAgentEntry {
     pub(crate) status: RemoteConnectionStatus,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteHostStatusEntry {
+    pub(crate) host: RemoteHostKey,
+    pub(crate) status: RemoteConnectionStatus,
+    pub(crate) agent_count: usize,
+}
+
 impl RemoteAgentEntry {
     pub(crate) fn stale(&self) -> bool {
         !self.status.is_connected()
@@ -128,6 +135,13 @@ impl RemoteSourceCache {
         self.hosts.entry(host.clone()).or_default().status = status;
     }
 
+    pub(crate) fn ensure_host(&mut self, host: RemoteHostKey, status: RemoteConnectionStatus) {
+        self.hosts.entry(host).or_insert_with(|| RemoteHostCache {
+            status,
+            agents: BTreeMap::new(),
+        });
+    }
+
     pub(crate) fn apply_agent_update(&mut self, host: RemoteHostKey, agent: AgentInfo) -> bool {
         let host_cache = self.hosts.entry(host).or_insert_with(|| RemoteHostCache {
             status: RemoteConnectionStatus::Connected,
@@ -160,6 +174,17 @@ impl RemoteSourceCache {
         self.hosts
             .iter()
             .flat_map(|(host, host_cache)| host_cache.entries(host))
+            .collect()
+    }
+
+    pub(crate) fn list_host_statuses(&self) -> Vec<RemoteHostStatusEntry> {
+        self.hosts
+            .iter()
+            .map(|(host, host_cache)| RemoteHostStatusEntry {
+                host: host.clone(),
+                status: host_cache.status,
+                agent_count: host_cache.agents.len(),
+            })
             .collect()
     }
 
@@ -248,6 +273,26 @@ mod tests {
     }
 
     #[test]
+    fn remote_source_ensure_host_adds_empty_status_without_clobbering_existing() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+
+        cache.ensure_host(host.clone(), RemoteConnectionStatus::Disconnected);
+        assert_eq!(cache.list_entries().len(), 0);
+        let statuses = cache.list_host_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].host, host);
+        assert_eq!(statuses[0].status, RemoteConnectionStatus::Disconnected);
+        assert_eq!(statuses[0].agent_count, 0);
+
+        cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
+        cache.ensure_host(host, RemoteConnectionStatus::Disconnected);
+        let statuses = cache.list_host_statuses();
+        assert_eq!(statuses[0].status, RemoteConnectionStatus::Connected);
+        assert_eq!(statuses[0].agent_count, 1);
+    }
+
+    #[test]
     fn remote_source_disconnect_marks_entries_stale_but_keeps_them() {
         let mut cache = RemoteSourceCache::default();
         let host = RemoteHostKey::new("jafar", "default");
@@ -281,6 +326,26 @@ mod tests {
         assert_eq!(entries[0].status, RemoteConnectionStatus::Unreachable);
         assert_eq!(entries[0].status.stale_label(), Some("unreachable"));
         assert!(entries[0].stale());
+    }
+
+    #[test]
+    fn remote_source_status_without_agents_keeps_host_visible() {
+        let mut cache = RemoteSourceCache::default();
+        let jafar = RemoteHostKey::new("jafar", "default");
+        let work = RemoteHostKey::new("work", "agents");
+
+        cache.mark_status(&jafar, RemoteConnectionStatus::Unreachable);
+        cache.mark_status(&work, RemoteConnectionStatus::NeedsUpdate);
+
+        assert!(cache.list_entries().is_empty());
+        let hosts = cache.list_host_statuses();
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0].host, jafar);
+        assert_eq!(hosts[0].status, RemoteConnectionStatus::Unreachable);
+        assert_eq!(hosts[0].agent_count, 0);
+        assert_eq!(hosts[1].host, work);
+        assert_eq!(hosts[1].status, RemoteConnectionStatus::NeedsUpdate);
+        assert_eq!(hosts[1].agent_count, 0);
     }
 
     #[test]

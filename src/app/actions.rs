@@ -3102,6 +3102,24 @@ mod tests {
     }
 
     #[test]
+    fn remote_source_events_disconnected_without_agents_marks_remote_host_visible() {
+        let mut state = AppState::test_new();
+        state.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+
+        let updates = state.handle_app_event(AppEvent::RemoteSourceDisconnected {
+            host,
+            status: crate::remote_source::RemoteConnectionStatus::NeedsUpdate,
+        });
+
+        assert!(updates.is_empty());
+        let entries = crate::ui::agent_panel_entries(&state);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].primary_label, "jafar");
+        assert_eq!(entries[0].custom_status.as_deref(), Some("needs update"));
+    }
+
+    #[test]
     fn remote_source_events_agent_update_obeys_revision_ordering() {
         let mut state = AppState::test_new();
         state.agent_panel_scope = crate::app::state::AgentPanelScope::AllWorkspaces;

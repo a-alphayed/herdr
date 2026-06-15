@@ -217,16 +217,29 @@ fn start_remote_source_supervisors_if_enabled(
     crate::remote_supervisor::start_remote_source_supervisors(registry, event_tx)
 }
 
-fn remote_host_keys(
+fn remote_source_host_keys(
     registry: &crate::remote_target::RemoteHostRegistry,
 ) -> std::collections::BTreeSet<crate::remote_source::RemoteHostKey> {
     registry
         .list()
         .into_iter()
+        .filter(|host| host.auto_connect)
         .map(|host| {
             crate::remote_source::RemoteHostKey::new(host.name.clone(), host.session.clone())
         })
         .collect()
+}
+
+fn seed_remote_source_hosts(
+    remote_sources: &mut crate::remote_source::RemoteSourceCache,
+    registry: &crate::remote_target::RemoteHostRegistry,
+) {
+    for host in crate::remote_supervisor::auto_connect_hosts(registry) {
+        remote_sources.ensure_host(
+            crate::remote_source::RemoteHostKey::new(host.name, host.session),
+            crate::remote_source::RemoteConnectionStatus::Disconnected,
+        );
+    }
 }
 
 /// Parse the configured agent name list into a deduplicated set of `Agent`
@@ -438,12 +451,15 @@ impl App {
             state::Mode::Navigate
         };
 
+        let mut remote_sources = crate::remote_source::RemoteSourceCache::default();
+        seed_remote_source_hosts(&mut remote_sources, &remote_hosts);
+
         let mut state = AppState {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             workspaces,
-            remote_sources: crate::remote_source::RemoteSourceCache::default(),
+            remote_sources,
             active,
             previous_pane_focus: None,
             selected,
@@ -1216,9 +1232,9 @@ impl App {
         }
 
         if !invalid_section("remote") {
-            let previous_remote_hosts = remote_host_keys(&self.remote_hosts);
+            let previous_remote_hosts = remote_source_host_keys(&self.remote_hosts);
             self.remote_hosts = remote_host_registry_from_config(config);
-            let current_remote_hosts = remote_host_keys(&self.remote_hosts);
+            let current_remote_hosts = remote_source_host_keys(&self.remote_hosts);
             for host in previous_remote_hosts.difference(&current_remote_hosts) {
                 let _ = self
                     .state
@@ -1227,6 +1243,7 @@ impl App {
             crate::remote_supervisor::stop_remote_source_supervisors(
                 &mut self.remote_source_supervisors,
             );
+            seed_remote_source_hosts(&mut self.state.remote_sources, &self.remote_hosts);
             self.remote_source_supervisors = start_remote_source_supervisors_if_enabled(
                 self.no_session,
                 &self.remote_hosts,
@@ -1538,6 +1555,31 @@ mod tests {
     }
 
     #[test]
+    fn app_seeds_auto_connect_remote_hosts_as_disconnected_sources() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![
+            crate::remote_target::RemoteHostConfig::new("manual", "manual", "default", false),
+            crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "agents", true),
+        ];
+
+        let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        let hosts = app.state.remote_sources.list_host_statuses();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(
+            hosts[0].host,
+            crate::remote_source::RemoteHostKey::new("jafar", "agents")
+        );
+        assert_eq!(
+            hosts[0].status,
+            crate::remote_source::RemoteConnectionStatus::Disconnected
+        );
+        assert_eq!(hosts[0].agent_count, 0);
+    }
+
+    #[test]
     fn app_ignores_remote_hosts_when_remote_config_disabled() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut config = Config::default();
@@ -1575,6 +1617,25 @@ mod tests {
         });
 
         assert!(app.state.remote_sources.list_entries().is_empty());
+    }
+
+    #[test]
+    fn app_ignores_remote_source_snapshot_for_manual_host() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar", "jafar", "default", false,
+        )];
+        let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+
+        app.handle_internal_event(AppEvent::RemoteSourceSnapshot {
+            host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
+            agents: vec![remote_agent_info("term-1")],
+        });
+
+        assert!(app.state.remote_sources.list_entries().is_empty());
+        assert!(app.state.remote_sources.list_host_statuses().is_empty());
     }
 
     #[test]
@@ -1975,6 +2036,68 @@ session = "agents"
         let report = app.reload_config();
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert!(app.remote_hosts.list().is_empty());
+        assert!(app.state.remote_sources.list_entries().is_empty());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_removes_remote_source_when_auto_connect_is_disabled() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-remote-auto-connect");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        std::fs::write(
+            &path,
+            r#"
+[remote]
+enabled = true
+
+[[remote.hosts]]
+name = "jafar"
+target = "jafar"
+session = "default"
+"#,
+        )
+        .unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(app.state.remote_sources.list_host_statuses().len(), 1);
+
+        std::fs::write(
+            &path,
+            r#"
+[remote]
+enabled = true
+
+[[remote.hosts]]
+name = "jafar"
+target = "jafar"
+session = "default"
+auto_connect = false
+"#,
+        )
+        .unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+
+        let host = app.remote_hosts.get("jafar").unwrap();
+        assert!(!host.auto_connect);
+        assert!(app.state.remote_sources.list_host_statuses().is_empty());
+        assert!(app.state.remote_sources.list_entries().is_empty());
+
+        app.handle_internal_event(AppEvent::RemoteSourceDisconnected {
+            host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
+            status: crate::remote_source::RemoteConnectionStatus::Unreachable,
+        });
+        app.handle_internal_event(AppEvent::RemoteSourceSnapshot {
+            host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
+            agents: vec![remote_agent_info("term-1")],
+        });
+        assert!(app.state.remote_sources.list_host_statuses().is_empty());
         assert!(app.state.remote_sources.list_entries().is_empty());
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
