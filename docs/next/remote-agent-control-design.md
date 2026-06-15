@@ -679,20 +679,33 @@ If SteamDeck loses network/Tailscale/SSH access to Jafar:
 
 ## Commands
 
-Remote host management:
+Remote host management and diagnostics:
 
 ```bash
+# Implemented read-only diagnostics for configured hosts:
+herdr remote status
+herdr remote status jafar
+herdr remote check
+herdr remote check jafar
+
+# Planned host management commands, not part of the current MVP implementation:
 herdr remote add jafar --target jafar --session default
 herdr remote list
-herdr remote status jafar
 herdr remote connect jafar
 herdr remote reconnect jafar
 herdr remote disconnect jafar
 herdr remote remove jafar
 ```
 
-Semantics:
+Implemented diagnostic semantics:
 
+- `remote status [HOST]` is a compact read-only status table for all configured hosts or one host alias. It validates remote config before SSH and classifies hosts as connected, not running, needs update, unreachable, or error.
+- `remote check [HOST]` is a deeper read-only diagnostic. It separates SSH/binary compatibility, federation capability support, and no-spawn API server status. It does not install/update/restart/spawn remote Herdr.
+- Unknown host filters fail before probing. Invalid remote config, including leading-dash SSH targets, fails before SSH.
+
+Planned host management semantics:
+
+- `remote list` lists configured hosts without mutating them.
 - `remote add` saves config and may validate/provision interactively.
 - `remote connect` ensures a bridge now, interactive if setup is required.
 - `remote reconnect` tears down and reopens bridges.
@@ -1135,14 +1148,19 @@ Implemented in this spike:
 - CLI direct remote terminal attach via the existing remote client/render bridge;
 - CLI/API remote `agent.start`, defaulting to a new remote workspace when no remote workspace/tab placement is supplied;
 - federation capability/method negotiation for the hidden remote API bridge and routed agent methods;
-- Docker smoke coverage for the configured one-hop path: get/read/send/focus/start, disconnect, and reconnect.
+- read-only `herdr remote status [HOST]` and `herdr remote check [HOST]` diagnostics;
+- live remote source failure reasons (`disconnected`, `needs update`, `unreachable`) shared between the supervisor, CLI status, and sidebar labels;
+- sidebar host-state rows for configured auto-connect remotes when no cached agents exist;
+- Docker smoke coverage for the configured one-hop path: get/read/send/focus/start, disconnect, and reconnect;
+- real-host Jafar smoke for capability/status commands and isolated `fed-*` host-qualified control after updating the remote binary.
 
-Still not production-complete:
+Still intentionally out of MVP scope:
 
-- no embedded remote panes or local-owned remote PTYs;
-- no broad destructive remote operations;
-- no transitive remote-of-remote routing;
-- no real-network, Tailscale, or multi-host production validation yet.
+- embedded remote panes or local-owned remote PTYs;
+- broad destructive remote operations;
+- transitive remote-of-remote routing;
+- automatic remote update/setup orchestration for configured hosts;
+- multi-host production soak/chaos validation beyond the Docker and Jafar smoke coverage.
 
 Direct remote terminal attach is terminal-interactive and is covered by unit tests and review, not by the Docker smoke.
 
@@ -1150,24 +1168,32 @@ Direct remote terminal attach is terminal-interactive and is covered by unit tes
 
 Goal: make federation reliable and documented.
 
-Tasks:
+Implemented Phase 5 hardening:
 
-- remote list/status/remove/connect/disconnect polish;
-- protocol mismatch messaging;
-- auth/host-key failure messaging;
-- stale/disconnected UI styling;
-- docs for sessions vs workspaces;
-- tests for restart/reconnect flows;
-- optional internal SSH ControlMaster optimization.
+- Federation capability/method negotiation gates hidden bridge use and routed agent methods. Version/protocol-compatible binaries that do not advertise federation support now fail clearly as `needs update` instead of later with `unknown command: remote-api-bridge`.
+- `herdr remote status [HOST]` gives a compact read-only status view and distinguishes connected, not running, needs update, unreachable, and error cases.
+- `herdr remote check [HOST]` gives layered read-only diagnostics for SSH/binary compatibility, federation capabilities, and no-spawn API server status.
+- Remote failure classification is shared between CLI status/check and the live `RemoteSource` supervisor, including longer retry backoff for missing/incompatible binaries.
+- The sidebar preserves stale remote agents and labels them with the specific failure reason. Configured auto-connect hosts with no cached agents now appear as host-only rows when disconnected, unreachable, or needing update.
+- Remote status/check validate configuration before SSH, including rejecting leading-dash SSH targets.
+- Jafar real-host smoke covered updated remote capability/status commands, isolated `fed-*` status, and host-qualified list/get/read/send/focus/start paths.
 
-Production validation should go beyond the Docker/localhost SSH smoke. Before shipping, test at least one real SSH-reachable remote host, multiple configured hosts, slow/unreachable SSH, sleep/offline/wake reconnect behavior, and a Tailscale/MagicDNS target if that is a supported deployment path. The Docker smoke proves the controlled one-hop federation path, but it does not prove real-network behavior or tailnet naming/reachability assumptions.
+Remaining non-MVP or later polish:
 
-Acceptance criteria:
+- planned `remote list` and mutating `remote add/connect/reconnect/disconnect/remove` management commands;
+- automatic remote update/setup orchestration;
+- optional internal SSH ControlMaster optimization;
+- broader multi-host and sleep/offline/wake soak testing.
 
-- SteamDeck restart re-aggregates remote agents.
+Production validation should go beyond the Docker/localhost SSH smoke. Before wider release, test multiple configured hosts, slow/unreachable SSH, sleep/offline/wake reconnect behavior, and a Tailscale/MagicDNS target if that is a supported deployment path. The Docker smoke proves the controlled one-hop federation path, and the Jafar smoke proves one real SSH-reachable host, but neither is a multi-host soak.
+
+Acceptance criteria for the MVP hardening slice:
+
+- SteamDeck restart re-aggregates configured auto-connect remote agents.
 - Jafar restart is handled by Jafar Herdr and then resynced.
 - Network drop does not kill remote agents.
 - `herdr remote status` clearly explains disconnected/auth/incompatible states.
+- The sidebar clearly shows stale remote agents and host-level failure state even when no cached agents exist.
 
 ### Phase 6 — Optional embedded remote panes
 
