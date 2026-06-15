@@ -8,6 +8,7 @@ pub(super) fn run_remote_command(args: &[String]) -> io::Result<i32> {
 
     match subcommand {
         "status" => remote_status(&args[1..]),
+        "check" => remote_check(&args[1..]),
         "help" | "--help" | "-h" => {
             print_remote_help();
             Ok(0)
@@ -20,43 +21,14 @@ pub(super) fn run_remote_command(args: &[String]) -> io::Result<i32> {
 }
 
 fn remote_status(args: &[String]) -> io::Result<i32> {
-    let host_filter = match parse_remote_status_filter(args) {
-        Ok(host_filter) => host_filter,
-        Err(()) => {
-            eprintln!("usage: herdr remote status [HOST]");
-            return Ok(2);
-        }
+    let hosts = match configured_remote_hosts(args, "herdr remote status [HOST]")? {
+        RemoteHostSelection::Hosts(hosts) => hosts,
+        RemoteHostSelection::Exit(code) => return Ok(code),
     };
-
-    let loaded = crate::config::Config::load();
-    let remote = &loaded.config.remote;
-    if !remote.enabled {
-        println!("remote federation is disabled (set remote.enabled = true to configure remotes).");
-        return Ok(0);
-    }
-
-    let registry = match remote_status_registry(&remote.hosts) {
-        Ok(registry) => registry,
-        Err(err) => {
-            eprintln!("invalid remote host config: {err}");
-            return Ok(1);
-        }
-    };
-    let hosts = match remote_status_hosts(&registry, host_filter) {
-        Ok(hosts) => hosts,
-        Err(RemoteStatusHostError::UnknownHost(host)) => {
-            eprintln!("unknown remote host: {host}");
-            return Ok(1);
-        }
-    };
-    if hosts.is_empty() {
-        println!("remote federation is enabled, but no remote hosts are configured.");
-        return Ok(0);
-    }
 
     println!("{:<20} {:<18} {:<14} details", "host", "status", "session");
     for host in hosts {
-        let status = probe_remote_status(host);
+        let status = probe_remote_status(&host);
         println!(
             "{:<20} {:<18} {:<14} {}",
             host.name,
@@ -68,13 +40,171 @@ fn remote_status(args: &[String]) -> io::Result<i32> {
     Ok(0)
 }
 
+fn remote_check(args: &[String]) -> io::Result<i32> {
+    let hosts = match configured_remote_hosts(args, "herdr remote check [HOST]")? {
+        RemoteHostSelection::Hosts(hosts) => hosts,
+        RemoteHostSelection::Exit(code) => return Ok(code),
+    };
+
+    println!("{:<20} {:<12} {:<14} details", "host", "check", "status");
+    for host in hosts {
+        print_remote_check(&host);
+    }
+    Ok(0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteHostSelection {
+    Hosts(Vec<crate::remote_target::RemoteHostConfig>),
+    Exit(i32),
+}
+
+fn configured_remote_hosts(args: &[String], usage: &str) -> io::Result<RemoteHostSelection> {
+    let host_filter = match parse_remote_host_filter(args) {
+        Ok(host_filter) => host_filter,
+        Err(()) => {
+            eprintln!("usage: {usage}");
+            return Ok(RemoteHostSelection::Exit(2));
+        }
+    };
+
+    let loaded = crate::config::Config::load();
+    let remote = &loaded.config.remote;
+    if !remote.enabled {
+        println!("remote federation is disabled (set remote.enabled = true to configure remotes).");
+        return Ok(RemoteHostSelection::Exit(0));
+    }
+
+    let registry = match remote_status_registry(&remote.hosts) {
+        Ok(registry) => registry,
+        Err(err) => {
+            eprintln!("invalid remote host config: {err}");
+            return Ok(RemoteHostSelection::Exit(1));
+        }
+    };
+    let hosts = match remote_status_hosts(&registry, host_filter) {
+        Ok(hosts) => hosts.into_iter().cloned().collect::<Vec<_>>(),
+        Err(RemoteStatusHostError::UnknownHost(host)) => {
+            eprintln!("unknown remote host: {host}");
+            return Ok(RemoteHostSelection::Exit(1));
+        }
+    };
+    if hosts.is_empty() {
+        println!("remote federation is enabled, but no remote hosts are configured.");
+        return Ok(RemoteHostSelection::Exit(0));
+    }
+    Ok(RemoteHostSelection::Hosts(hosts))
+}
+
+fn print_remote_check(host: &crate::remote_target::RemoteHostConfig) {
+    let prepared = match crate::remote::prepare_remote_binary_to_host_noninteractive(host) {
+        Ok(remote_herdr) => {
+            print_check_row(
+                host,
+                &remote_check_binary_row(Ok(remote_herdr.shell_path().to_string())),
+            );
+            remote_herdr
+        }
+        Err(err) => {
+            print_check_row(host, &remote_check_binary_row(Err(err)));
+            return;
+        }
+    };
+
+    let federation = remote_check_federation_row(
+        crate::remote::remote_federation_capabilities_for_prepared_host_noninteractive(
+            host, &prepared,
+        ),
+    );
+    print_check_row(host, &federation);
+    if !federation.should_continue() {
+        return;
+    }
+
+    let api = remote_check_api_row(
+        host,
+        crate::remote::remote_api_status_for_prepared_host_noninteractive(host, &prepared),
+    );
+    print_check_row(host, &api);
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteCheckRow {
+    check: &'static str,
+    status: &'static str,
+    detail: String,
+}
+
+impl RemoteCheckRow {
+    fn should_continue(&self) -> bool {
+        self.status == "ok"
+    }
+}
+
+fn remote_check_binary_row(result: io::Result<String>) -> RemoteCheckRow {
+    match result {
+        Ok(path) => RemoteCheckRow {
+            check: "ssh/binary",
+            status: "ok",
+            detail: format!("compatible Herdr binary at {path}"),
+        },
+        Err(err) => remote_check_error_row("ssh/binary", &err),
+    }
+}
+
+fn remote_check_federation_row(
+    result: io::Result<crate::api::schema::FederationCapabilities>,
+) -> RemoteCheckRow {
+    match result {
+        Ok(capabilities) => RemoteCheckRow {
+            check: "federation",
+            status: "ok",
+            detail: format!("methods: {}", capabilities.methods.join(",")),
+        },
+        Err(err) => remote_check_error_row("federation", &err),
+    }
+}
+
+fn remote_check_api_row(
+    host: &crate::remote_target::RemoteHostConfig,
+    result: io::Result<crate::remote::RemoteApiStatusResponse>,
+) -> RemoteCheckRow {
+    match result {
+        Ok(status) => {
+            let classified = classify_remote_api_status(host, &status);
+            RemoteCheckRow {
+                check: "api",
+                status: classified.kind.label(),
+                detail: classified.detail,
+            }
+        }
+        Err(err) => remote_check_error_row("api", &err),
+    }
+}
+
+fn remote_check_error_row(check: &'static str, err: &io::Error) -> RemoteCheckRow {
+    let status = classify_remote_status_error(err);
+    RemoteCheckRow {
+        check,
+        status: status.kind.label(),
+        detail: status.detail,
+    }
+}
+
+fn print_check_row(host: &crate::remote_target::RemoteHostConfig, row: &RemoteCheckRow) {
+    println!(
+        "{:<20} {:<12} {:<14} {}",
+        host.name, row.check, row.status, row.detail
+    );
+}
+
 fn remote_status_registry(
     hosts: &[crate::remote_target::RemoteHostConfig],
 ) -> Result<crate::remote_target::RemoteHostRegistry, crate::remote_target::RemoteHostConfigError> {
     crate::remote_target::RemoteHostRegistry::from_configs(hosts.to_vec())
 }
 
-fn parse_remote_status_filter(args: &[String]) -> Result<Option<&str>, ()> {
+fn parse_remote_host_filter(args: &[String]) -> Result<Option<&str>, ()> {
     match args {
         [] => Ok(None),
         [host] => Ok(Some(host.as_str())),
@@ -211,26 +341,16 @@ impl RemoteStatusKind {
 
 fn classify_remote_status_error(err: &io::Error) -> RemoteStatus {
     let message = normalize_status_detail(&err.to_string());
-    match err.kind() {
-        io::ErrorKind::NotFound | io::ErrorKind::InvalidData => RemoteStatus {
+    match crate::remote::classify_remote_failure(err) {
+        crate::remote::RemoteFailureClass::NeedsUpdate => RemoteStatus {
             kind: RemoteStatusKind::Incompatible,
             detail: with_update_guidance(message.clone()),
         },
-        io::ErrorKind::ConnectionRefused
-        | io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::ConnectionReset
-        | io::ErrorKind::TimedOut
-        | io::ErrorKind::WouldBlock
-        | io::ErrorKind::BrokenPipe
-        | io::ErrorKind::PermissionDenied => RemoteStatus {
+        crate::remote::RemoteFailureClass::Unreachable => RemoteStatus {
             kind: RemoteStatusKind::Unreachable,
             detail: with_ssh_guidance(&message),
         },
-        _ if looks_like_ssh_transport_error(&message) => RemoteStatus {
-            kind: RemoteStatusKind::Unreachable,
-            detail: with_ssh_guidance(&message),
-        },
-        _ => RemoteStatus {
+        crate::remote::RemoteFailureClass::Unknown => RemoteStatus {
             kind: RemoteStatusKind::Unknown,
             detail: message,
         },
@@ -258,31 +378,10 @@ fn with_ssh_guidance(detail: &str) -> String {
     }
 }
 
-fn looks_like_ssh_transport_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    [
-        "ssh",
-        "permission denied",
-        "could not resolve hostname",
-        "name or service not known",
-        "connection timed out",
-        "connection refused",
-        "connection reset",
-        "no route to host",
-        "remote platform detection failed: exit status: 255",
-        "exit status: 255",
-        "host key verification failed",
-        "known_hosts",
-        "publickey",
-        "batchmode",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
 fn print_remote_help() {
     eprintln!("herdr remote commands:");
-    eprintln!("  herdr remote status");
+    eprintln!("  herdr remote status [HOST]");
+    eprintln!("  herdr remote check [HOST]");
 }
 
 #[cfg(test)]
@@ -324,9 +423,9 @@ mod tests {
 
     #[test]
     fn remote_status_filter_accepts_no_host_or_one_host() {
-        assert_eq!(parse_remote_status_filter(&[]).unwrap(), None);
+        assert_eq!(parse_remote_host_filter(&[]).unwrap(), None);
         assert_eq!(
-            parse_remote_status_filter(&["jafar".to_string()]).unwrap(),
+            parse_remote_host_filter(&["jafar".to_string()]).unwrap(),
             Some("jafar")
         );
     }
@@ -334,7 +433,7 @@ mod tests {
     #[test]
     fn remote_status_filter_rejects_too_many_args() {
         assert_eq!(
-            parse_remote_status_filter(&["jafar".to_string(), "extra".to_string()]),
+            parse_remote_host_filter(&["jafar".to_string(), "extra".to_string()]),
             Err(())
         );
     }
@@ -383,6 +482,100 @@ mod tests {
             err,
             crate::remote_target::RemoteHostConfigError::SshTargetStartsWithDash
         );
+    }
+
+    #[test]
+    fn remote_check_binary_row_reports_compatible_binary() {
+        let row = remote_check_binary_row(Ok("$HOME/.local/bin/herdr".to_string()));
+
+        assert_eq!(
+            row,
+            RemoteCheckRow {
+                check: "ssh/binary",
+                status: "ok",
+                detail: "compatible Herdr binary at $HOME/.local/bin/herdr".to_string(),
+            }
+        );
+        assert!(row.should_continue());
+    }
+
+    #[test]
+    fn remote_check_binary_row_classifies_missing_binary_as_needs_update() {
+        let row = remote_check_binary_row(Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "compatible herdr was not found on remote host jafar",
+        )));
+
+        assert_eq!(row.check, "ssh/binary");
+        assert_eq!(row.status, "needs update");
+        assert!(row.detail.contains("compatible herdr"));
+        assert!(row
+            .detail
+            .contains("install/update Herdr on the remote host"));
+        assert!(!row.should_continue());
+    }
+
+    #[test]
+    fn remote_check_federation_row_lists_advertised_methods() {
+        let row = remote_check_federation_row(Ok(crate::api::schema::FederationCapabilities {
+            methods: vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE.to_string(),
+                crate::api::schema::FederationCapabilities::AGENT_SEND.to_string(),
+            ],
+        }));
+
+        assert_eq!(row.check, "federation");
+        assert_eq!(row.status, "ok");
+        assert_eq!(row.detail, "methods: remote_api_bridge,agent_send");
+        assert!(row.should_continue());
+    }
+
+    #[test]
+    fn remote_check_federation_row_classifies_old_command_as_needs_update() {
+        let row = remote_check_federation_row(Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote host jafar has a Herdr binary that does not advertise federation support",
+        )));
+
+        assert_eq!(row.check, "federation");
+        assert_eq!(row.status, "needs update");
+        assert!(row.detail.contains("does not advertise federation support"));
+        assert!(!row.should_continue());
+    }
+
+    #[test]
+    fn remote_check_api_row_reports_not_running_without_starting_it() {
+        let row = remote_check_api_row(
+            &host("jafar", "jafar", "fed-agents"),
+            Ok(crate::remote::RemoteApiStatusResponse {
+                state: crate::remote::RemoteApiStatusState::NotRunning,
+                version: None,
+                protocol: None,
+                capabilities: None,
+            }),
+        );
+
+        assert_eq!(row.check, "api");
+        assert_eq!(row.status, "not running");
+        assert!(row.detail.contains("not running"));
+        assert!(row
+            .detail
+            .contains("run herdr --remote jafar --session fed-agents interactively"));
+        assert!(!row.should_continue());
+    }
+
+    #[test]
+    fn remote_check_api_row_reports_running_connected() {
+        let row = remote_check_api_row(
+            &host("jafar", "jafar", "default"),
+            Ok(running_response(Some(
+                crate::api::schema::ServerCapabilities::current(),
+            ))),
+        );
+
+        assert_eq!(row.check, "api");
+        assert_eq!(row.status, "connected");
+        assert!(row.detail.contains("federation advertised"));
     }
 
     #[test]

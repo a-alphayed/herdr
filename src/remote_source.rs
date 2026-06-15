@@ -124,10 +124,6 @@ impl RemoteSourceCache {
             .collect();
     }
 
-    pub(crate) fn mark_disconnected(&mut self, host: &RemoteHostKey) {
-        self.mark_status(host, RemoteConnectionStatus::Disconnected);
-    }
-
     pub(crate) fn mark_status(&mut self, host: &RemoteHostKey, status: RemoteConnectionStatus) {
         self.hosts.entry(host.clone()).or_default().status = status;
     }
@@ -257,7 +253,7 @@ mod tests {
         let host = RemoteHostKey::new("jafar", "default");
         cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
 
-        cache.mark_disconnected(&host);
+        cache.mark_status(&host, RemoteConnectionStatus::Disconnected);
 
         let entries = cache.list_entries();
         assert_eq!(entries.len(), 1);
@@ -292,7 +288,7 @@ mod tests {
         let mut cache = RemoteSourceCache::default();
         let host = RemoteHostKey::new("jafar", "default");
         cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
-        cache.mark_disconnected(&host);
+        cache.mark_status(&host, RemoteConnectionStatus::Disconnected);
 
         cache.replace_connected_snapshot(host, vec![agent("term-1", "codex-new", 3)]);
 

@@ -173,51 +173,19 @@ fn sleep_until_next_due(next_due: Instant, stop: &AtomicBool) {
 }
 
 fn ping_failure_retry_interval(err: &io::Error) -> Duration {
-    match err.kind() {
-        io::ErrorKind::InvalidData | io::ErrorKind::NotFound => {
-            REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL
-        }
-        _ => REMOTE_SOURCE_RETRY_INTERVAL,
+    match crate::remote::classify_remote_failure(err) {
+        crate::remote::RemoteFailureClass::NeedsUpdate => REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL,
+        crate::remote::RemoteFailureClass::Unreachable
+        | crate::remote::RemoteFailureClass::Unknown => REMOTE_SOURCE_RETRY_INTERVAL,
     }
 }
 
 fn remote_source_failure_status(err: &io::Error) -> RemoteConnectionStatus {
-    match err.kind() {
-        io::ErrorKind::InvalidData | io::ErrorKind::NotFound => RemoteConnectionStatus::NeedsUpdate,
-        io::ErrorKind::ConnectionRefused
-        | io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::ConnectionReset
-        | io::ErrorKind::TimedOut
-        | io::ErrorKind::WouldBlock
-        | io::ErrorKind::BrokenPipe
-        | io::ErrorKind::PermissionDenied => RemoteConnectionStatus::Unreachable,
-        _ if looks_like_ssh_transport_error(&err.to_string()) => {
-            RemoteConnectionStatus::Unreachable
-        }
-        _ => RemoteConnectionStatus::Disconnected,
+    match crate::remote::classify_remote_failure(err) {
+        crate::remote::RemoteFailureClass::NeedsUpdate => RemoteConnectionStatus::NeedsUpdate,
+        crate::remote::RemoteFailureClass::Unreachable => RemoteConnectionStatus::Unreachable,
+        crate::remote::RemoteFailureClass::Unknown => RemoteConnectionStatus::Disconnected,
     }
-}
-
-fn looks_like_ssh_transport_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    [
-        "ssh",
-        "permission denied",
-        "could not resolve hostname",
-        "name or service not known",
-        "connection timed out",
-        "connection refused",
-        "connection reset",
-        "no route to host",
-        "remote platform detection failed: exit status: 255",
-        "exit status: 255",
-        "host key verification failed",
-        "known_hosts",
-        "publickey",
-        "batchmode",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
 }
 
 fn send_ping<F>(host: &RemoteHostConfig, send: &F) -> io::Result<()>

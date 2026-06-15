@@ -1006,7 +1006,10 @@ mod tests {
             host_key.clone(),
             vec![labeled_agent("term-1", "pane-1", "codex")],
         );
-        cache.mark_disconnected(&host_key);
+        cache.mark_status(
+            &host_key,
+            crate::remote_source::RemoteConnectionStatus::Disconnected,
+        );
 
         let resolved = resolve_remote_agent_target(
             &cache,

@@ -388,14 +388,78 @@ pub(crate) fn send_remote_api_request_to_host_noninteractive(
     )
 }
 
+pub(crate) fn prepare_remote_binary_to_host_noninteractive(
+    host: &crate::remote_target::RemoteHostConfig,
+) -> io::Result<RemoteHerdr> {
+    prepare_remote_herdr_noninteractive(&host.target)
+}
+
+pub(crate) fn remote_federation_capabilities_for_prepared_host_noninteractive(
+    host: &crate::remote_target::RemoteHostConfig,
+    remote_herdr: &RemoteHerdr,
+) -> io::Result<crate::api::schema::FederationCapabilities> {
+    fetch_remote_federation_capabilities(host, remote_herdr, SshInvocationMode::Noninteractive)
+}
+
 pub(crate) fn remote_api_status_to_host_noninteractive(
     host: &crate::remote_target::RemoteHostConfig,
 ) -> io::Result<RemoteApiStatusResponse> {
-    let remote_herdr = prepare_remote_herdr_noninteractive(&host.target)?;
+    let remote_herdr = prepare_remote_binary_to_host_noninteractive(host)?;
+    remote_api_status_for_prepared_host_noninteractive(host, &remote_herdr)
+}
+
+pub(crate) fn remote_api_status_for_prepared_host_noninteractive(
+    host: &crate::remote_target::RemoteHostConfig,
+    remote_herdr: &RemoteHerdr,
+) -> io::Result<RemoteApiStatusResponse> {
     let command =
-        remote_bridge_command_for(&remote_herdr, &host.session, REMOTE_API_STATUS_SUBCOMMAND);
+        remote_bridge_command_for(remote_herdr, &host.session, REMOTE_API_STATUS_SUBCOMMAND);
     let output = ssh_output_noninteractive(&host.target, &command)?;
     parse_remote_api_status_output(host, &output)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteFailureClass {
+    NeedsUpdate,
+    Unreachable,
+    Unknown,
+}
+
+pub(crate) fn classify_remote_failure(err: &io::Error) -> RemoteFailureClass {
+    match err.kind() {
+        io::ErrorKind::InvalidData | io::ErrorKind::NotFound => RemoteFailureClass::NeedsUpdate,
+        io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::TimedOut
+        | io::ErrorKind::WouldBlock
+        | io::ErrorKind::BrokenPipe
+        | io::ErrorKind::PermissionDenied => RemoteFailureClass::Unreachable,
+        _ if looks_like_ssh_transport_error(&err.to_string()) => RemoteFailureClass::Unreachable,
+        _ => RemoteFailureClass::Unknown,
+    }
+}
+
+pub(crate) fn looks_like_ssh_transport_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "ssh",
+        "permission denied",
+        "could not resolve hostname",
+        "name or service not known",
+        "connection timed out",
+        "connection refused",
+        "connection reset",
+        "no route to host",
+        "remote platform detection failed: exit status: 255",
+        "exit status: 255",
+        "host key verification failed",
+        "known_hosts",
+        "publickey",
+        "batchmode",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn parse_remote_api_status_output(
@@ -820,13 +884,17 @@ impl RemotePlatform {
 }
 
 #[derive(Debug, Clone)]
-struct RemoteHerdr {
+pub(crate) struct RemoteHerdr {
     install_suffix: String,
     shell_path: String,
     platform: RemotePlatform,
 }
 
 impl RemoteHerdr {
+    pub(crate) fn shell_path(&self) -> &str {
+        &self.shell_path
+    }
+
     fn for_platform(platform: RemotePlatform) -> Self {
         let install_suffix = ".local/bin/herdr".to_string();
         let shell_path = format!("\"$HOME/{install_suffix}\"");
@@ -2375,6 +2443,42 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("unknown command"));
+    }
+
+    #[test]
+    fn remote_failure_classification_distinguishes_update_transport_and_unknown() {
+        let invalid_data = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remote API ping did not advertise federation support",
+        );
+        let not_found = io::Error::new(
+            io::ErrorKind::NotFound,
+            "compatible herdr binary was not found",
+        );
+        let timed_out = io::Error::new(io::ErrorKind::TimedOut, "connection timed out");
+        let ssh_255 = io::Error::other("remote platform detection failed: exit status: 255");
+        let unknown = io::Error::other("unexpected local parse failure");
+
+        assert_eq!(
+            classify_remote_failure(&invalid_data),
+            RemoteFailureClass::NeedsUpdate
+        );
+        assert_eq!(
+            classify_remote_failure(&not_found),
+            RemoteFailureClass::NeedsUpdate
+        );
+        assert_eq!(
+            classify_remote_failure(&timed_out),
+            RemoteFailureClass::Unreachable
+        );
+        assert_eq!(
+            classify_remote_failure(&ssh_255),
+            RemoteFailureClass::Unreachable
+        );
+        assert_eq!(
+            classify_remote_failure(&unknown),
+            RemoteFailureClass::Unknown
+        );
     }
 
     #[test]
