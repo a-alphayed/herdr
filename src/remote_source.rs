@@ -41,6 +41,30 @@ impl RemoteAgentKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteAttachTarget {
+    pub(crate) host: String,
+    pub(crate) session: String,
+    pub(crate) terminal_id: String,
+    pub(crate) label: String,
+}
+
+impl RemoteAttachTarget {
+    pub(crate) fn key(&self) -> RemoteAgentKey {
+        RemoteAgentKey {
+            host: self.host.clone(),
+            session: self.session.clone(),
+            terminal_id: self.terminal_id.clone(),
+        }
+    }
+
+    pub(crate) fn same_remote_terminal(&self, other: &Self) -> bool {
+        self.host == other.host
+            && self.session == other.session
+            && self.terminal_id == other.terminal_id
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteConnectionStatus {
     Connected,

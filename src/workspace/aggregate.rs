@@ -37,6 +37,9 @@ impl Tab {
             .filter_map(|id| {
                 let pane = self.panes.get(id)?;
                 let terminal = terminals.get(&pane.attached_terminal_id)?;
+                if terminal.remote_attach.is_some() {
+                    return None;
+                }
                 let fallback_agent_label = terminal
                     .agent_name
                     .as_deref()
@@ -202,6 +205,23 @@ mod tests {
             labels,
             vec![("planner".into(), "planner".into(), Some(Agent::Pi))]
         );
+    }
+
+    #[test]
+    fn pane_details_ignore_remote_attach_terminals() {
+        let ws = Workspace::test_new("test");
+        let root_pane = ws.tabs[0].root_pane;
+        let mut terminal = terminal_for_pane(&ws, root_pane);
+        terminal.set_detected_state(Some(Agent::Codex), AgentState::Working);
+        terminal.remote_attach = Some(crate::remote_source::RemoteAttachTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: "remote-term".into(),
+            label: "jafar/codex".into(),
+        });
+        let terminals = HashMap::from([(terminal.id.clone(), terminal)]);
+
+        assert!(ws.pane_details(&terminals).is_empty());
     }
 
     #[test]

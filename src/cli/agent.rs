@@ -516,6 +516,24 @@ fn parse_agent_wait_status(value: &str) -> std::io::Result<AgentStatus> {
     }
 }
 
+fn print_agent_help() {
+    eprintln!("herdr agent commands:");
+    eprintln!("  herdr agent list");
+    eprintln!("  herdr agent get <target>");
+    eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
+    eprintln!("  herdr agent send <target> <text>");
+    eprintln!("  herdr agent rename <target> <name>|--clear");
+    eprintln!("  herdr agent focus <target>");
+    eprintln!("  herdr agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
+    eprintln!("  herdr agent attach <target> [--takeover]");
+    eprintln!("  herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
+    eprintln!("  herdr agent start --host HOST --name NAME [--cwd REMOTE_PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
+    eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");
+    eprintln!(
+        "  agent send writes literal text; use pane run when you want command text plus Enter"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,8 +611,8 @@ mod tests {
         assert_eq!(params.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(params.workspace_id, None);
         assert_eq!(params.tab_id, None);
-        assert_eq!(params.focus, true);
-        assert_eq!(params.new_workspace, false);
+        assert!(params.focus);
+        assert!(!params.new_workspace);
         assert_eq!(params.argv, vec!["codex", "--ask"]);
     }
 
@@ -618,7 +636,7 @@ mod tests {
         assert_eq!(params.cwd.as_deref(), Some("/remote/project"));
         assert_eq!(params.workspace_id, None);
         assert_eq!(params.tab_id, None);
-        assert_eq!(params.new_workspace, true);
+        assert!(params.new_workspace);
         assert_eq!(params.argv, vec!["codex"]);
     }
 
@@ -639,7 +657,7 @@ mod tests {
         assert_eq!(params.host.as_deref(), Some("jafar"));
         assert_eq!(params.name, "codex");
         assert_eq!(params.workspace_id.as_deref(), Some("remote-ws"));
-        assert_eq!(params.new_workspace, false);
+        assert!(!params.new_workspace);
     }
 
     #[test]
@@ -671,22 +689,4 @@ mod tests {
 
         assert_eq!(err, "remote agent start requires remote.enabled = true");
     }
-}
-
-fn print_agent_help() {
-    eprintln!("herdr agent commands:");
-    eprintln!("  herdr agent list");
-    eprintln!("  herdr agent get <target>");
-    eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
-    eprintln!("  herdr agent send <target> <text>");
-    eprintln!("  herdr agent rename <target> <name>|--clear");
-    eprintln!("  herdr agent focus <target>");
-    eprintln!("  herdr agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
-    eprintln!("  herdr agent attach <target> [--takeover]");
-    eprintln!("  herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
-    eprintln!("  herdr agent start --host HOST --name NAME [--cwd REMOTE_PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>");
-    eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");
-    eprintln!(
-        "  agent send writes literal text; use pane run when you want command text plus Enter"
-    );
 }

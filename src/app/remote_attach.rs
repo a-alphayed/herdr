@@ -1,0 +1,593 @@
+use std::path::Path;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
+
+use super::{
+    state::{Mode, PendingRemoteAttach, RemoteAttachPaneTarget, ToastKind, ToastNotification},
+    App,
+};
+use crate::remote_source::RemoteAttachTarget;
+use crate::remote_target::{plan_target_route, PlannedTargetRoute, RemoteTargetSelector};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteAttachPrecheckError {
+    RemoteNotConfigured,
+    RouteMismatch(String),
+    TargetNotCached,
+    TargetNotConnected(&'static str),
+}
+
+impl std::fmt::Display for RemoteAttachPrecheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RemoteNotConfigured => {
+                write!(
+                    f,
+                    "remote federation is disabled or has no configured hosts"
+                )
+            }
+            Self::RouteMismatch(detail) => write!(f, "remote attach target is invalid: {detail}"),
+            Self::TargetNotCached => write!(f, "remote agent is not in the live cache"),
+            Self::TargetNotConnected(status) => {
+                write!(
+                    f,
+                    "remote host is {status}; wait for it to reconnect before attaching"
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteAttachApplyError {
+    PaneMissing,
+    TerminalMissing,
+    Precheck(RemoteAttachPrecheckError),
+    CurrentExe(String),
+    Spawn(String),
+}
+
+impl std::fmt::Display for RemoteAttachApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PaneMissing => write!(f, "focused pane no longer exists"),
+            Self::TerminalMissing => write!(f, "focused pane terminal no longer exists"),
+            Self::Precheck(err) => write!(f, "{err}"),
+            Self::CurrentExe(err) => write!(f, "failed to locate current Herdr binary: {err}"),
+            Self::Spawn(err) => write!(f, "failed to start remote attach: {err}"),
+        }
+    }
+}
+
+pub(crate) fn remote_attach_argv_from_exe(exe: &Path, target: &RemoteAttachTarget) -> Vec<String> {
+    vec![
+        exe.display().to_string(),
+        "agent".to_string(),
+        "attach".to_string(),
+        format!("{}/terminal:{}", target.host, target.terminal_id),
+    ]
+}
+
+fn remote_attach_target_string(target: &RemoteAttachTarget) -> String {
+    format!("{}/terminal:{}", target.host, target.terminal_id)
+}
+
+fn toast_error(app: &mut App, title: &str, detail: impl Into<String>) {
+    app.state.toast = Some(ToastNotification {
+        kind: ToastKind::NeedsAttention,
+        title: title.to_string(),
+        context: detail.into(),
+        target: None,
+    });
+    app.sync_toast_deadline(None);
+}
+
+fn set_terminal_mode(app: &mut App) {
+    app.state.mode = if app.state.active.is_some() {
+        Mode::Terminal
+    } else {
+        Mode::Navigate
+    };
+}
+
+fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+impl App {
+    pub(crate) fn drain_remote_attach_request(&mut self) {
+        let Some(request) = self.state.request_remote_attach.take() else {
+            return;
+        };
+        self.begin_remote_attach_request(request);
+    }
+
+    pub(crate) fn begin_remote_attach_request(&mut self, request: PendingRemoteAttach) {
+        if self.focus_existing_remote_attach(&request.target) {
+            return;
+        }
+
+        if let Err(err) = self.precheck_remote_attach_target(&request.target) {
+            toast_error(self, "attach unavailable", err.to_string());
+            set_terminal_mode(self);
+            return;
+        }
+
+        if self
+            .state
+            .remote_attach_pane_indices(&request.pane)
+            .is_none()
+        {
+            toast_error(
+                self,
+                "attach unavailable",
+                RemoteAttachApplyError::PaneMissing.to_string(),
+            );
+            set_terminal_mode(self);
+            return;
+        }
+
+        if self.remote_attach_pane_is_safe(&request.pane) {
+            self.apply_remote_attach_or_toast(request);
+        } else {
+            self.state.pending_remote_attach = Some(request);
+            self.state.mode = Mode::ConfirmRemoteAttach;
+        }
+    }
+
+    pub(crate) fn handle_confirm_remote_attach_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter => self.confirm_remote_attach_accept(),
+            KeyCode::Esc => self.confirm_remote_attach_cancel(),
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                self.confirm_remote_attach_cancel()
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn handle_confirm_remote_attach_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.state.mode != Mode::ConfirmRemoteAttach {
+            return false;
+        }
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return true;
+        }
+        let Some(inner) =
+            crate::ui::confirm_remote_attach_inner_rect(self.state.view.terminal_area)
+        else {
+            self.confirm_remote_attach_cancel();
+            return true;
+        };
+        let (confirm, _cancel) = crate::ui::confirm_remote_attach_button_rects(inner);
+        if rect_contains(confirm, mouse.column, mouse.row) {
+            self.confirm_remote_attach_accept();
+        } else {
+            self.confirm_remote_attach_cancel();
+        }
+        true
+    }
+
+    pub(crate) fn confirm_remote_attach_accept(&mut self) {
+        let Some(request) = self.state.pending_remote_attach.take() else {
+            set_terminal_mode(self);
+            return;
+        };
+        self.apply_remote_attach_or_toast(request);
+    }
+
+    pub(crate) fn confirm_remote_attach_cancel(&mut self) {
+        self.state.pending_remote_attach = None;
+        set_terminal_mode(self);
+    }
+
+    fn apply_remote_attach_or_toast(&mut self, request: PendingRemoteAttach) {
+        match self.apply_remote_attach(request) {
+            Ok(()) => {}
+            Err(err) => {
+                toast_error(self, "attach unavailable", err.to_string());
+                set_terminal_mode(self);
+            }
+        }
+    }
+
+    fn focus_existing_remote_attach(&mut self, target: &RemoteAttachTarget) -> bool {
+        let Some((ws_idx, pane_id)) = self.state.find_remote_attach_pane(target) else {
+            return false;
+        };
+        self.state.focus_pane_in_workspace(ws_idx, pane_id);
+        set_terminal_mode(self);
+        true
+    }
+
+    pub(crate) fn precheck_remote_attach_target(
+        &self,
+        target: &RemoteAttachTarget,
+    ) -> Result<(), RemoteAttachPrecheckError> {
+        if self.remote_hosts.list().is_empty() {
+            return Err(RemoteAttachPrecheckError::RemoteNotConfigured);
+        }
+
+        match plan_target_route(&self.remote_hosts, &remote_attach_target_string(target)) {
+            Ok(PlannedTargetRoute::Remote {
+                host,
+                target: RemoteTargetSelector::Terminal(terminal_id),
+            }) if host.name == target.host
+                && host.session == target.session
+                && terminal_id == target.terminal_id => {}
+            Ok(route) => {
+                return Err(RemoteAttachPrecheckError::RouteMismatch(format!(
+                    "unexpected route {route:?}"
+                )));
+            }
+            Err(err) => return Err(RemoteAttachPrecheckError::RouteMismatch(err.to_string())),
+        }
+
+        let key = target.key();
+        let entry = self
+            .state
+            .remote_sources
+            .agent(&key)
+            .ok_or(RemoteAttachPrecheckError::TargetNotCached)?;
+        if !entry.status.is_connected() {
+            return Err(RemoteAttachPrecheckError::TargetNotConnected(
+                entry.status.stale_label().unwrap_or("disconnected"),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remote_attach_pane_is_safe(&self, pane: &RemoteAttachPaneTarget) -> bool {
+        let Some((ws_idx, _tab_idx)) = self.state.remote_attach_pane_indices(pane) else {
+            return false;
+        };
+        let Some(terminal) = self.state.terminals.get(&pane.terminal_id) else {
+            return false;
+        };
+        if terminal.remote_attach.is_some()
+            || terminal.launch_argv.is_some()
+            || terminal.is_agent_terminal()
+        {
+            return false;
+        }
+        self.state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane.pane_id)
+            .and_then(crate::terminal::TerminalRuntime::foreground_is_pane_shell)
+            == Some(true)
+    }
+
+    fn apply_remote_attach(
+        &mut self,
+        request: PendingRemoteAttach,
+    ) -> Result<(), RemoteAttachApplyError> {
+        let exe = std::env::current_exe()
+            .map_err(|err| RemoteAttachApplyError::CurrentExe(err.to_string()))?;
+        self.apply_remote_attach_with_exe(request, &exe)
+    }
+
+    fn apply_remote_attach_with_exe(
+        &mut self,
+        request: PendingRemoteAttach,
+        exe: &Path,
+    ) -> Result<(), RemoteAttachApplyError> {
+        if self.focus_existing_remote_attach(&request.target) {
+            return Ok(());
+        }
+        self.precheck_remote_attach_target(&request.target)
+            .map_err(RemoteAttachApplyError::Precheck)?;
+
+        let (ws_idx, _tab_idx) = self
+            .state
+            .remote_attach_pane_indices(&request.pane)
+            .ok_or(RemoteAttachApplyError::PaneMissing)?;
+        let terminal_id = request.pane.terminal_id.clone();
+        let terminal = self
+            .state
+            .terminals
+            .get(&terminal_id)
+            .ok_or(RemoteAttachApplyError::TerminalMissing)?;
+        let cwd = terminal.cwd.clone();
+        let (rows, cols) = self
+            .terminal_runtimes
+            .get(&terminal_id)
+            .map(crate::terminal::TerminalRuntime::current_size)
+            .unwrap_or_else(|| self.state.estimate_pane_size());
+        let argv = remote_attach_argv_from_exe(exe, &request.target);
+        let runtime = crate::terminal::TerminalRuntime::spawn_argv_command(
+            request.pane.pane_id,
+            rows,
+            cols,
+            cwd,
+            &argv,
+            self.state.pane_scrollback_limit_bytes,
+            self.state.host_terminal_theme,
+            self.event_tx.clone(),
+            self.render_notify.clone(),
+            self.render_dirty.clone(),
+        )
+        .map_err(|err| RemoteAttachApplyError::Spawn(err.to_string()))?;
+
+        let old_runtime = self.terminal_runtimes.insert(terminal_id.clone(), runtime);
+        if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+            terminal.clear_agent_runtime_identity_for_replacement();
+            terminal.remote_attach = Some(request.target.clone());
+            terminal.respawn_shell_on_exit = true;
+            terminal.launch_argv = None;
+        }
+        self.state
+            .focus_pane_in_workspace(ws_idx, request.pane.pane_id);
+        set_terminal_mode(self);
+        self.render_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.render_notify.notify_one();
+        if let Some(old_runtime) = old_runtime {
+            old_runtime.shutdown();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::api::schema::{AgentInfo, AgentStatus};
+    use crate::config::Config;
+    use crate::remote_source::{RemoteConnectionStatus, RemoteHostKey};
+    use crate::remote_target::RemoteHostConfig;
+    use crate::workspace::Workspace;
+
+    fn target() -> RemoteAttachTarget {
+        RemoteAttachTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: "term-1".into(),
+            label: "jafar/codex".into(),
+        }
+    }
+
+    fn remote_agent(terminal_id: &str) -> AgentInfo {
+        AgentInfo {
+            terminal_id: terminal_id.to_string(),
+            name: Some("codex".into()),
+            agent: Some("codex".into()),
+            title: None,
+            display_agent: Some("codex".into()),
+            agent_status: AgentStatus::Working,
+            custom_status: None,
+            state_labels: HashMap::new(),
+            agent_session: None,
+            workspace_id: "remote-ws".into(),
+            tab_id: "remote-tab".into(),
+            pane_id: "remote-pane".into(),
+            focused: false,
+            cwd: None,
+            foreground_cwd: None,
+            revision: 1,
+        }
+    }
+
+    fn app_with_remote(session: &str) -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut config = Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![RemoteHostConfig::new("jafar", "jafar", session, true)];
+        App::new(&config, true, None, api_rx, crate::api::EventHub::default())
+    }
+
+    fn pane_request(app: &mut App) -> PendingRemoteAttach {
+        let workspace = Workspace::test_new("local");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        PendingRemoteAttach {
+            target: target(),
+            pane: RemoteAttachPaneTarget {
+                workspace_id: app.state.workspaces[0].id.clone(),
+                pane_id,
+                terminal_id,
+            },
+        }
+    }
+
+    fn cache_connected_target(app: &mut App) {
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![remote_agent("term-1")],
+        );
+    }
+
+    #[test]
+    fn remote_attach_argv_uses_direct_agent_attach_target() {
+        let argv = remote_attach_argv_from_exe(Path::new("/bin/herdr"), &target());
+
+        assert_eq!(
+            argv,
+            vec![
+                "/bin/herdr".to_string(),
+                "agent".to_string(),
+                "attach".to_string(),
+                "jafar/terminal:term-1".to_string()
+            ]
+        );
+        assert!(!argv.iter().any(|arg| arg == "--takeover"));
+    }
+
+    #[test]
+    fn remote_attach_precheck_accepts_connected_cached_target() {
+        let mut app = app_with_remote("default");
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![remote_agent("term-1")],
+        );
+
+        assert_eq!(app.precheck_remote_attach_target(&target()), Ok(()));
+    }
+
+    #[test]
+    fn remote_attach_precheck_rejects_missing_remote_config() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+
+        assert_eq!(
+            app.precheck_remote_attach_target(&target()),
+            Err(RemoteAttachPrecheckError::RemoteNotConfigured)
+        );
+    }
+
+    #[test]
+    fn remote_attach_precheck_rejects_route_session_mismatch() {
+        let mut app = app_with_remote("agents");
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![remote_agent("term-1")],
+        );
+
+        assert!(matches!(
+            app.precheck_remote_attach_target(&target()),
+            Err(RemoteAttachPrecheckError::RouteMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn remote_attach_precheck_rejects_stale_or_missing_target() {
+        let mut app = app_with_remote("default");
+
+        assert_eq!(
+            app.precheck_remote_attach_target(&target()),
+            Err(RemoteAttachPrecheckError::TargetNotCached)
+        );
+
+        let host = RemoteHostKey::new("jafar", "default");
+        app.state
+            .remote_sources
+            .replace_connected_snapshot(host.clone(), vec![remote_agent("term-1")]);
+        app.state
+            .remote_sources
+            .mark_status(&host, RemoteConnectionStatus::Unreachable);
+
+        assert_eq!(
+            app.precheck_remote_attach_target(&target()),
+            Err(RemoteAttachPrecheckError::TargetNotConnected("unreachable"))
+        );
+    }
+
+    #[test]
+    fn remote_attach_request_for_unknown_safe_pane_opens_confirmation() {
+        let mut app = app_with_remote("default");
+        cache_connected_target(&mut app);
+        let request = pane_request(&mut app);
+
+        app.begin_remote_attach_request(request.clone());
+
+        assert_eq!(app.state.mode, Mode::ConfirmRemoteAttach);
+        assert_eq!(app.state.pending_remote_attach, Some(request));
+    }
+
+    #[test]
+    fn remote_attach_confirm_accept_revalidates_missing_pane() {
+        let mut app = app_with_remote("default");
+        cache_connected_target(&mut app);
+        let request = pane_request(&mut app);
+        let terminal_id = request.pane.terminal_id.clone();
+
+        app.begin_remote_attach_request(request);
+        app.state.workspaces.clear();
+        app.state.active = None;
+        app.confirm_remote_attach_accept();
+
+        assert_eq!(app.state.mode, Mode::Navigate);
+        assert!(app.state.pending_remote_attach.is_none());
+        assert!(app.terminal_runtimes.get(&terminal_id).is_none());
+        assert!(app
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.remote_attach.as_ref())
+            .is_none());
+        let toast = app.state.toast.as_ref().expect("missing pane toast");
+        assert_eq!(toast.title, "attach unavailable");
+        assert!(toast.context.contains("focused pane no longer exists"));
+    }
+
+    #[test]
+    fn remote_attach_confirm_accept_revalidates_remote_status() {
+        let mut app = app_with_remote("default");
+        cache_connected_target(&mut app);
+        let request = pane_request(&mut app);
+        let terminal_id = request.pane.terminal_id.clone();
+
+        app.begin_remote_attach_request(request);
+        app.state.remote_sources.mark_status(
+            &RemoteHostKey::new("jafar", "default"),
+            RemoteConnectionStatus::Unreachable,
+        );
+        app.confirm_remote_attach_accept();
+
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.pending_remote_attach.is_none());
+        assert!(app.terminal_runtimes.get(&terminal_id).is_none());
+        assert!(app
+            .state
+            .terminals
+            .get(&terminal_id)
+            .and_then(|terminal| terminal.remote_attach.as_ref())
+            .is_none());
+        let toast = app.state.toast.as_ref().expect("remote status toast");
+        assert_eq!(toast.title, "attach unavailable");
+        assert!(toast.context.contains("remote host is unreachable"));
+    }
+
+    #[test]
+    fn remote_attach_spawn_failure_keeps_metadata_clear() {
+        let mut app = app_with_remote("default");
+        cache_connected_target(&mut app);
+        let request = pane_request(&mut app);
+        let terminal_id = request.pane.terminal_id.clone();
+
+        let result = app.apply_remote_attach_with_exe(
+            request,
+            Path::new("/__herdr_missing_remote_attach_executable__"),
+        );
+
+        assert!(matches!(result, Err(RemoteAttachApplyError::Spawn(_))));
+        assert!(app.terminal_runtimes.get(&terminal_id).is_none());
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        assert!(terminal.remote_attach.is_none());
+        assert!(terminal.launch_argv.is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_attach_apply_records_runtime_only_metadata() {
+        let mut app = app_with_remote("default");
+        cache_connected_target(&mut app);
+        let request = pane_request(&mut app);
+        let terminal_id = request.pane.terminal_id.clone();
+
+        app.apply_remote_attach_with_exe(request, Path::new("/bin/true"))
+            .expect("remote attach should spawn argv child");
+
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        assert_eq!(terminal.remote_attach, Some(target()));
+        assert!(terminal.launch_argv.is_none());
+        assert!(terminal.respawn_shell_on_exit);
+        assert!(!terminal.is_agent_terminal());
+        let runtime = app
+            .terminal_runtimes
+            .remove(&terminal_id)
+            .expect("attach runtime");
+        runtime.shutdown();
+    }
+}

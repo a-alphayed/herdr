@@ -29,6 +29,8 @@ pub struct WorktreeRemoveResult {
 pub enum AppEvent {
     /// A pane's child process exited.
     PaneDied { pane_id: PaneId },
+    /// A pane runtime's child process exited, with the runtime token that sent it.
+    PaneRuntimeDied { pane_id: PaneId, runtime_token: u64 },
     /// Fallback detector state changed in a pane.
     StateChanged {
         pane_id: PaneId,

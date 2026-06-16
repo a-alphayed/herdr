@@ -4,6 +4,7 @@ use ratatui::layout::{Direction, Rect};
 use crate::{
     app::state::{
         AppState, ContextMenuKind, ContextMenuState, MenuListState, Mode, NavigatorStateFilter,
+        PendingRemoteAttach, ToastKind, ToastNotification,
     },
     input::TerminalKey,
     layout::NavDirection,
@@ -739,6 +740,30 @@ pub(super) fn apply_context_menu_action(
                 } else {
                     Mode::Navigate
                 };
+            }
+        }
+        (
+            ContextMenuKind::RemoteAgent {
+                target,
+                focused_pane,
+            },
+            Some("Attach to focused pane"),
+        ) => {
+            if let Some(pane) = focused_pane {
+                state.request_remote_attach = Some(PendingRemoteAttach { target, pane });
+                state.mode = if state.active.is_some() {
+                    Mode::Terminal
+                } else {
+                    Mode::Navigate
+                };
+            } else {
+                state.toast = Some(ToastNotification {
+                    kind: ToastKind::NeedsAttention,
+                    title: "attach unavailable".into(),
+                    context: "focus a local pane before attaching a remote agent".into(),
+                    target: None,
+                });
+                leave_modal(state);
             }
         }
         _ => leave_modal(state),

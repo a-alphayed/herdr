@@ -34,6 +34,7 @@ pub(crate) enum AgentPanelEntryLocation {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentPanelEntry {
     pub location: AgentPanelEntryLocation,
     pub primary_label: String,
@@ -54,6 +55,24 @@ impl AgentPanelEntry {
                 pane_id,
             } => Some((ws_idx, tab_idx, pane_id)),
             AgentPanelEntryLocation::Remote { .. } | AgentPanelEntryLocation::RemoteHost { .. } => {
+                None
+            }
+        }
+    }
+
+    pub(crate) fn remote_attach_target(&self) -> Option<crate::remote_source::RemoteAttachTarget> {
+        match &self.location {
+            AgentPanelEntryLocation::Remote {
+                host,
+                session,
+                terminal_id,
+            } => Some(crate::remote_source::RemoteAttachTarget {
+                host: host.clone(),
+                session: session.clone(),
+                terminal_id: terminal_id.clone(),
+                label: self.primary_label.clone(),
+            }),
+            AgentPanelEntryLocation::Local { .. } | AgentPanelEntryLocation::RemoteHost { .. } => {
                 None
             }
         }
@@ -107,6 +126,7 @@ fn agent_panel_current_workspace_idx(app: &AppState) -> Option<usize> {
             | Mode::RenamePane
             | Mode::Resize
             | Mode::ConfirmClose
+            | Mode::ConfirmRemoteAttach
             | Mode::ContextMenu
             | Mode::Settings
             | Mode::GlobalMenu

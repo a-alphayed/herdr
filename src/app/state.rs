@@ -746,6 +746,7 @@ pub enum Mode {
     ConfirmRemoveWorktree,
     Resize,
     ConfirmClose,
+    ConfirmRemoteAttach,
     ContextMenu,
     Settings,
     GlobalMenu,
@@ -1014,6 +1015,10 @@ pub enum ContextMenuKind {
         pane_id: PaneId,
         has_manual_label: bool,
     },
+    RemoteAgent {
+        target: crate::remote_source::RemoteAttachTarget,
+        focused_pane: Option<RemoteAttachPaneTarget>,
+    },
 }
 
 /// Right-click context menu state.
@@ -1083,6 +1088,7 @@ impl ContextMenuState {
                 "Zoom",
                 "Close pane",
             ],
+            ContextMenuKind::RemoteAgent { .. } => &["Attach to focused pane"],
         }
     }
 }
@@ -1146,6 +1152,19 @@ pub(crate) struct PaneFocusTarget {
     pub pane_id: PaneId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteAttachPaneTarget {
+    pub workspace_id: String,
+    pub pane_id: PaneId,
+    pub terminal_id: crate::terminal::TerminalId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingRemoteAttach {
+    pub target: crate::remote_source::RemoteAttachTarget,
+    pub pane: RemoteAttachPaneTarget,
+}
+
 /// All application state — pure data, no channels or async runtime.
 /// Testable without PTYs or a tokio runtime.
 pub struct AppState {
@@ -1182,6 +1201,8 @@ pub struct AppState {
     /// Set when UI interaction requested a clipboard write that must be
     /// handled by the outer App/event loop instead of directly from AppState.
     pub request_clipboard_write: Option<Vec<u8>>,
+    pub(crate) request_remote_attach: Option<PendingRemoteAttach>,
+    pub(crate) pending_remote_attach: Option<PendingRemoteAttach>,
     pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
     pub rename_pane_target: Option<PaneId>,
@@ -1486,6 +1507,8 @@ impl AppState {
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
+            request_remote_attach: None,
+            pending_remote_attach: None,
             creating_new_tab: false,
             requested_new_tab_name: None,
             rename_pane_target: None,

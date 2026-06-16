@@ -12,6 +12,7 @@ mod config_io;
 mod creation;
 mod ids;
 mod input;
+mod remote_attach;
 mod runtime;
 mod session;
 pub mod state;
@@ -479,6 +480,8 @@ impl App {
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
+            request_remote_attach: None,
+            pending_remote_attach: None,
             creating_new_tab: false,
             requested_new_tab_name: None,
             rename_pane_target: None,
@@ -1429,6 +1432,9 @@ impl App {
             Mode::ConfirmClose => {
                 input::handle_confirm_close_key(&mut self.state, key_event);
             }
+            Mode::ConfirmRemoteAttach => {
+                self.handle_confirm_remote_attach_key(key_event);
+            }
             Mode::ContextMenu => {
                 input::handle_context_menu_key(
                     &mut self.state,
@@ -1461,6 +1467,7 @@ impl App {
                 // Should not be called in terminal mode.
             }
         }
+        self.drain_remote_attach_request();
     }
 
     /// Handles a mouse event for the headless server.

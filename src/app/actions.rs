@@ -13,7 +13,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::state::{
     text_matches_query, AppState, Mode, NavigatorRow, NavigatorStateFilter, NavigatorTarget,
-    PaneFocusTarget, ToastKind, ToastNotification, ToastTarget, ViewLayout,
+    PaneFocusTarget, RemoteAttachPaneTarget, ToastKind, ToastNotification, ToastTarget, ViewLayout,
 };
 
 fn is_background_completion_transition(prev_state: AgentState, new_state: AgentState) -> bool {
@@ -115,6 +115,76 @@ impl AppState {
         Some(PaneFocusTarget {
             workspace_id: ws.id.clone(),
             pane_id,
+        })
+    }
+
+    pub(crate) fn current_remote_attach_pane_target(&self) -> Option<RemoteAttachPaneTarget> {
+        let ws_idx = self.active?;
+        let ws = self.workspaces.get(ws_idx)?;
+        let pane_id = ws.focused_pane_id()?;
+        let terminal_id = ws.terminal_id(pane_id)?.clone();
+        Some(RemoteAttachPaneTarget {
+            workspace_id: ws.id.clone(),
+            pane_id,
+            terminal_id,
+        })
+    }
+
+    pub(crate) fn remote_attach_pane_indices(
+        &self,
+        pane: &RemoteAttachPaneTarget,
+    ) -> Option<(usize, usize)> {
+        let ws_idx = self
+            .workspaces
+            .iter()
+            .position(|ws| ws.id == pane.workspace_id)?;
+        let tab_idx = self.workspaces[ws_idx].find_tab_index_for_pane(pane.pane_id)?;
+        let terminal_id = self.workspaces[ws_idx].terminal_id(pane.pane_id)?;
+        (terminal_id == &pane.terminal_id).then_some((ws_idx, tab_idx))
+    }
+
+    pub(crate) fn find_remote_attach_pane(
+        &self,
+        target: &crate::remote_source::RemoteAttachTarget,
+    ) -> Option<(usize, PaneId)> {
+        let matches_target = |ws_idx: usize, pane_id: PaneId| -> Option<(usize, PaneId)> {
+            let ws = self.workspaces.get(ws_idx)?;
+            let pane = ws.pane_state(pane_id)?;
+            let terminal = self.terminals.get(&pane.attached_terminal_id)?;
+            terminal
+                .remote_attach
+                .as_ref()
+                .filter(|attached| attached.same_remote_terminal(target))
+                .map(|_| (ws_idx, pane_id))
+        };
+
+        if let Some((ws_idx, pane_id)) = self
+            .active
+            .and_then(|ws_idx| self.workspaces.get(ws_idx).map(|ws| (ws_idx, ws)))
+            .and_then(|(ws_idx, ws)| ws.focused_pane_id().map(|pane_id| (ws_idx, pane_id)))
+            .and_then(|(ws_idx, pane_id)| matches_target(ws_idx, pane_id))
+        {
+            return Some((ws_idx, pane_id));
+        }
+
+        if let Some((ws_idx, pane_id)) = self
+            .previous_pane_focus
+            .as_ref()
+            .and_then(|previous| {
+                self.pane_focus_target_indices(previous)
+                    .map(|(ws_idx, _tab_idx)| (ws_idx, previous.pane_id))
+            })
+            .and_then(|(ws_idx, pane_id)| matches_target(ws_idx, pane_id))
+        {
+            return Some((ws_idx, pane_id));
+        }
+
+        self.workspaces.iter().enumerate().find_map(|(ws_idx, ws)| {
+            ws.tabs.iter().find_map(|tab| {
+                tab.panes
+                    .keys()
+                    .find_map(|pane_id| matches_target(ws_idx, *pane_id))
+            })
         })
     }
 
@@ -1997,7 +2067,7 @@ impl AppState {
 
     pub fn handle_app_event(&mut self, event: AppEvent) -> Vec<PaneStateUpdate> {
         match event {
-            AppEvent::PaneDied { pane_id } => {
+            AppEvent::PaneDied { pane_id } | AppEvent::PaneRuntimeDied { pane_id, .. } => {
                 self.handle_pane_died(pane_id);
                 Vec::new()
             }
@@ -3284,6 +3354,32 @@ mod tests {
         state.switch_workspace(2);
         assert_eq!(state.active, Some(2));
         assert_eq!(state.selected, 2);
+    }
+
+    #[test]
+    fn find_remote_attach_pane_prefers_current_focus_when_duplicates_exist() {
+        let mut state = app_with_workspaces(&["first", "second"]);
+        let target = crate::remote_source::RemoteAttachTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: "remote-term".into(),
+            label: "jafar/codex".into(),
+        };
+        let first_pane = state.workspaces[0].tabs[0].root_pane;
+        let second_pane = state.workspaces[1].tabs[0].root_pane;
+        for (ws_idx, pane_id) in [(0, first_pane), (1, second_pane)] {
+            let terminal_id = state.workspaces[ws_idx]
+                .terminal_id(pane_id)
+                .cloned()
+                .unwrap();
+            state.terminals.get_mut(&terminal_id).unwrap().remote_attach = Some(target.clone());
+        }
+        state.focus_pane_in_workspace(1, second_pane);
+
+        assert_eq!(
+            state.find_remote_attach_pane(&target),
+            Some((1, second_pane))
+        );
     }
 
     #[test]

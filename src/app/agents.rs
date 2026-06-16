@@ -418,6 +418,9 @@ impl App {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane_state = ws.pane_state(pane_id)?;
         let terminal = self.state.terminals.get(&pane_state.attached_terminal_id)?;
+        if terminal.remote_attach.is_some() {
+            return None;
+        }
         if !terminal.is_agent_terminal() {
             return None;
         }
@@ -609,6 +612,27 @@ mod tests {
         let conflicts = app.agent_name_conflicts("jafar/codex", "");
 
         assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn local_agent_infos_ignore_remote_attach_terminals() {
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("attach");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_agent_name("codex".to_string());
+        terminal.remote_attach = Some(crate::remote_source::RemoteAttachTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: "remote-term".into(),
+            label: "jafar/codex".into(),
+        });
+
+        assert!(app.collect_local_agent_infos().is_empty());
+        assert!(app.agent_name_conflicts("codex", "").is_empty());
     }
 
     #[test]

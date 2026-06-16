@@ -329,6 +329,7 @@ impl AppState {
                 | Mode::RenameWorkspace
                 | Mode::Resize
                 | Mode::ConfirmClose
+                | Mode::ConfirmRemoteAttach
                 | Mode::ContextMenu
                 | Mode::Settings
                 | Mode::GlobalMenu
@@ -441,10 +442,7 @@ impl AppState {
             && row < rect.y + rect.height
     }
 
-    pub(super) fn agent_detail_target_at(
-        &self,
-        row: u16,
-    ) -> Option<(usize, usize, crate::layout::PaneId)> {
+    pub(super) fn agent_detail_entry_at(&self, row: u16) -> Option<crate::ui::AgentPanelEntry> {
         if self.sidebar_collapsed {
             return None;
         }
@@ -468,7 +466,7 @@ impl AppState {
                 break;
             }
             if row == row_y || row == row_y + 1 {
-                return detail.local_target();
+                return Some(detail);
             }
             row_y = row_y.saturating_add(2);
             if row_y < body.y + body.height {
@@ -489,7 +487,7 @@ mod tests {
     use super::super::{app_for_mouse_test, capture_snapshot, mouse, unique_temp_path};
     use crate::{
         api::schema::{AgentInfo, AgentStatus},
-        app::state::{AgentPanelScope, DragTarget, Mode},
+        app::state::{AgentPanelScope, ContextMenuKind, DragTarget, Mode},
         detect::Agent,
         remote_source::RemoteHostKey,
         workspace::Workspace,
@@ -745,7 +743,200 @@ mod tests {
             crate::ui::should_show_scrollbar(metrics),
         );
 
-        assert_eq!(app.state.agent_detail_target_at(body.y), None);
+        let entry = app.state.agent_detail_entry_at(body.y).unwrap();
+        let target = entry.remote_attach_target().unwrap();
+        assert_eq!(target.host, "jafar");
+        assert_eq!(target.session, crate::session::DEFAULT_SESSION_NAME);
+        assert_eq!(target.terminal_id, "remote-term");
+    }
+
+    #[test]
+    fn right_click_remote_agent_row_opens_attach_menu() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("local")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![remote_agent("remote-term", "smoke-agent")],
+        );
+        let expected_focus = app.state.current_remote_attach_pane_target();
+
+        let detail_area = app.state.agent_panel_rect();
+        let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, detail_area);
+        let body = crate::ui::agent_panel_body_rect(
+            detail_area,
+            crate::ui::should_show_scrollbar(metrics),
+        );
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            body.x + 1,
+            body.y,
+        ));
+
+        let menu = app.state.context_menu.as_ref().expect("remote agent menu");
+        assert_eq!(menu.items(), &["Attach to focused pane"]);
+        match &menu.kind {
+            ContextMenuKind::RemoteAgent {
+                target,
+                focused_pane,
+            } => {
+                assert_eq!(target.host, "jafar");
+                assert_eq!(target.terminal_id, "remote-term");
+                assert_eq!(focused_pane, &expected_focus);
+            }
+            other => panic!("unexpected menu: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn right_click_remote_host_row_does_not_offer_attach() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = Vec::new();
+        app.state.active = None;
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.state.remote_sources.mark_status(
+            &RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            crate::remote_source::RemoteConnectionStatus::Unreachable,
+        );
+
+        let detail_area = app.state.agent_panel_rect();
+        let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, detail_area);
+        let body = crate::ui::agent_panel_body_rect(
+            detail_area,
+            crate::ui::should_show_scrollbar(metrics),
+        );
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            body.x + 1,
+            body.y,
+        ));
+
+        assert!(app.state.context_menu.is_none());
+    }
+
+    #[test]
+    fn left_click_remote_agent_without_existing_attach_is_noop() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("local")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        let focused_pane = app.state.workspaces[0].focused_pane_id();
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![remote_agent("remote-term", "smoke-agent")],
+        );
+
+        let detail_area = app.state.agent_panel_rect();
+        let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, detail_area);
+        let body = crate::ui::agent_panel_body_rect(
+            detail_area,
+            crate::ui::should_show_scrollbar(metrics),
+        );
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x + 1,
+            body.y,
+        ));
+
+        assert_eq!(app.state.active, Some(0));
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), focused_pane);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.request_remote_attach.is_none());
+        assert!(app.state.context_menu.is_none());
+    }
+
+    #[test]
+    fn left_click_remote_host_row_is_noop() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("local")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        let focused_pane = app.state.workspaces[0].focused_pane_id();
+        app.state.remote_sources.mark_status(
+            &RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            crate::remote_source::RemoteConnectionStatus::Unreachable,
+        );
+
+        let detail_area = app.state.agent_panel_rect();
+        let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, detail_area);
+        let body = crate::ui::agent_panel_body_rect(
+            detail_area,
+            crate::ui::should_show_scrollbar(metrics),
+        );
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x + 1,
+            body.y,
+        ));
+
+        assert_eq!(app.state.active, Some(0));
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), focused_pane);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.request_remote_attach.is_none());
+        assert!(app.state.context_menu.is_none());
+    }
+
+    #[test]
+    fn left_click_remote_agent_focuses_existing_attach_pane() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![
+            Workspace::test_new("local"),
+            Workspace::test_new("attached"),
+        ];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        let attached_pane = app.state.workspaces[1].tabs[0].root_pane;
+        let attached_terminal_id = app.state.workspaces[1]
+            .terminal_id(attached_pane)
+            .cloned()
+            .unwrap();
+        app.state
+            .terminals
+            .get_mut(&attached_terminal_id)
+            .unwrap()
+            .remote_attach = Some(crate::remote_source::RemoteAttachTarget {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            terminal_id: "remote-term".into(),
+            label: "jafar/smoke-agent".into(),
+        });
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![remote_agent("remote-term", "smoke-agent")],
+        );
+
+        let detail_area = app.state.agent_panel_rect();
+        let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, detail_area);
+        let body = crate::ui::agent_panel_body_rect(
+            detail_area,
+            crate::ui::should_show_scrollbar(metrics),
+        );
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x + 1,
+            body.y,
+        ));
+
+        assert_eq!(app.state.active, Some(1));
+        assert_eq!(
+            app.state.workspaces[1].focused_pane_id(),
+            Some(attached_pane)
+        );
     }
 
     #[test]

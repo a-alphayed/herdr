@@ -561,7 +561,7 @@ fn run_client_with_mode_at_socket(
     info!(path = %socket_path.display(), "{log_message}");
 
     // Try to connect to the server.
-    let mut stream = match UnixStream::connect(&socket_path) {
+    let mut stream = match UnixStream::connect(socket_path) {
         Ok(s) => s,
         Err(err) => {
             // Server unreachable — show clear error and exit.

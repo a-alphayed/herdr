@@ -56,6 +56,7 @@ use super::App;
 
 impl App {
     pub(super) async fn handle_key(&mut self, key: TerminalKey) {
+        let previous_toast = self.state.toast.clone();
         match self.state.mode {
             Mode::Terminal => self.handle_terminal_key(key).await,
             Mode::Prefix => self.handle_prefix_key(key),
@@ -76,6 +77,7 @@ impl App {
                     Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
                     Mode::Resize => handle_resize_key(&mut self.state, key),
                     Mode::ConfirmClose => handle_confirm_close_key(&mut self.state, key_event),
+                    Mode::ConfirmRemoteAttach => self.handle_confirm_remote_attach_key(key_event),
                     Mode::ContextMenu => {
                         handle_context_menu_key(
                             &mut self.state,
@@ -91,6 +93,8 @@ impl App {
                 }
             }
         }
+        self.drain_remote_attach_request();
+        self.sync_toast_deadline(previous_toast);
     }
 
     pub(super) async fn handle_paste(&mut self, text: String) {
@@ -173,6 +177,10 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.handle_confirm_remote_attach_mouse(mouse) {
+            return;
+        }
+
         if self.handle_overlay_mouse(mouse) {
             return;
         }
@@ -203,6 +211,7 @@ impl App {
 
         let handled_pane_double_click = self.handle_pane_double_click(mouse);
 
+        let previous_toast = self.state.toast.clone();
         let previous_agent_panel_scope = self.state.agent_panel_scope;
         let previous_settings_section = self.state.settings.section;
         if !handled_pane_double_click {
@@ -225,6 +234,8 @@ impl App {
                 }
             }
         }
+        self.drain_remote_attach_request();
+        self.sync_toast_deadline(previous_toast);
         if previous_settings_section != crate::app::state::SettingsSection::Integrations
             && self.state.settings.section == crate::app::state::SettingsSection::Integrations
         {

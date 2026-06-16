@@ -15,6 +15,14 @@ use crate::layout::PaneId;
 pub struct TerminalRuntime(crate::pane::PaneRuntime);
 
 impl TerminalRuntime {
+    pub(crate) fn runtime_token(&self) -> u64 {
+        self.0.runtime_token()
+    }
+
+    pub(crate) fn foreground_is_pane_shell(&self) -> Option<bool> {
+        self.0.foreground_is_pane_shell()
+    }
+
     pub fn shutdown(self) {
         self.0.shutdown();
     }

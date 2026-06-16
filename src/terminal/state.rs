@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 // Process-exit updates clear matching hook authority before recomputing state.
 
 use crate::detect::{Agent, AgentState};
+use crate::remote_source::RemoteAttachTarget;
 use crate::terminal::TerminalId;
 
 #[path = "metadata.rs"]
@@ -73,6 +74,7 @@ pub struct TerminalState {
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
+    pub remote_attach: Option<RemoteAttachTarget>,
 }
 
 impl TerminalState {
@@ -98,6 +100,7 @@ impl TerminalState {
             revision: 0,
             launch_argv: None,
             respawn_shell_on_exit: false,
+            remote_attach: None,
         }
     }
 
@@ -657,6 +660,12 @@ impl TerminalState {
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
+        self.clear_agent_runtime_identity_for_replacement();
+        self.respawn_shell_on_exit = false;
+        self.remote_attach = None;
+    }
+
+    pub fn clear_agent_runtime_identity_for_replacement(&mut self) {
         self.detected_agent = None;
         self.fallback_state = AgentState::Unknown;
         self.fallback_visible_blocker = false;
@@ -668,11 +677,13 @@ impl TerminalState {
         self.persisted_agent_session = None;
         self.agent_metadata.clear();
         self.launch_argv = None;
-        self.respawn_shell_on_exit = false;
         self.clear_agent_name();
     }
 
     pub fn is_agent_terminal(&self) -> bool {
+        if self.remote_attach.is_some() {
+            return false;
+        }
         self.agent_name.is_some()
             || self.effective_agent_label().is_some()
             || self.launch_argv.is_some()

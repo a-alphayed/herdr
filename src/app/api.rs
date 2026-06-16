@@ -22,6 +22,24 @@ enum RuntimeExitAction {
 
 impl App {
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
+        let ev = match ev {
+            AppEvent::PaneRuntimeDied {
+                pane_id,
+                runtime_token,
+            } => {
+                if !self.pane_runtime_token_matches(pane_id, runtime_token) {
+                    tracing::debug!(
+                        pane = pane_id.raw(),
+                        runtime_token,
+                        "ignoring stale pane runtime exit"
+                    );
+                    return;
+                }
+                AppEvent::PaneDied { pane_id }
+            }
+            ev => ev,
+        };
+
         if self.remote_source_event_is_from_unconfigured_host(&ev) {
             return;
         }
@@ -323,6 +341,19 @@ impl App {
         } else {
             RuntimeExitAction::ClosePane
         }
+    }
+
+    fn pane_runtime_token_matches(
+        &self,
+        pane_id: crate::layout::PaneId,
+        runtime_token: u64,
+    ) -> bool {
+        let Some((_, pane_state)) = self.find_pane(pane_id) else {
+            return false;
+        };
+        self.terminal_runtimes
+            .get(&pane_state.attached_terminal_id)
+            .is_some_and(|runtime| runtime.runtime_token() == runtime_token)
     }
 
     fn respawn_shell_for_launch_pane(&mut self, pane_id: crate::layout::PaneId) -> bool {
@@ -768,6 +799,104 @@ mod tests {
         assert!(!terminal.respawn_shell_on_exit);
         assert!(terminal.persisted_agent_session.is_none());
         assert!(terminal.agent_name.is_none());
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_exit_does_not_clear_new_remote_attach_runtime() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("attached");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let (old_runtime, _old_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let old_token = old_runtime.runtime_token();
+        let (new_runtime, _new_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        let new_token = new_runtime.runtime_token();
+        app.terminal_runtimes
+            .insert(terminal_id.clone(), old_runtime);
+        let old_runtime = app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), new_runtime)
+            .expect("old runtime");
+        let terminal = app.state.terminals.get_mut(&terminal_id).expect("terminal");
+        terminal.remote_attach = Some(crate::remote_source::RemoteAttachTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: "remote-term".into(),
+            label: "jafar/codex".into(),
+        });
+        terminal.respawn_shell_on_exit = true;
+
+        app.handle_internal_event(AppEvent::PaneRuntimeDied {
+            pane_id,
+            runtime_token: old_token,
+        });
+
+        assert!(app.find_pane(pane_id).is_some());
+        assert_eq!(
+            app.terminal_runtimes
+                .get(&terminal_id)
+                .map(crate::terminal::TerminalRuntime::runtime_token),
+            Some(new_token)
+        );
+        assert!(
+            app.state
+                .terminals
+                .get(&terminal_id)
+                .and_then(|terminal| terminal.remote_attach.as_ref())
+                .is_some(),
+            "stale old runtime exit must not clear the new attach metadata"
+        );
+
+        old_runtime.shutdown();
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_died_respawns_shell_and_clears_remote_attach_metadata() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("attached");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.respawn_shell_on_exit = true;
+        terminal.remote_attach = Some(crate::remote_source::RemoteAttachTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: "remote-term".into(),
+            label: "jafar/codex".into(),
+        });
+
+        app.handle_internal_event(AppEvent::PaneDied { pane_id });
+
+        assert!(app.find_pane(pane_id).is_some());
+        let terminal = app.state.terminals.get(&terminal_id).unwrap();
+        assert!(!terminal.respawn_shell_on_exit);
+        assert!(terminal.remote_attach.is_none());
+        assert!(terminal.launch_argv.is_none());
 
         for (_, runtime) in app.terminal_runtimes.drain() {
             runtime.shutdown();

@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::io;
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -540,9 +540,12 @@ impl AgentDetectionPresence {
 // PaneRuntime — PTY, parser, channels, background tasks
 // ---------------------------------------------------------------------------
 
+static NEXT_RUNTIME_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 /// PTY runtime for a pane. Owns the terminal, I/O channels, and background tasks.
 /// Dropping this shuts down all background tasks and closes the PTY.
 pub struct PaneRuntime {
+    runtime_token: u64,
     pane_id: PaneId,
     terminal: Arc<PaneTerminal>,
     io: PaneRuntimeIo,
@@ -914,6 +917,33 @@ fn pane_shell_command_builder(shell_config: PaneShellConfig<'_>) -> io::Result<C
 }
 
 impl PaneRuntime {
+    fn next_runtime_token() -> u64 {
+        NEXT_RUNTIME_TOKEN.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn runtime_token(&self) -> u64 {
+        self.runtime_token
+    }
+
+    pub(crate) fn foreground_is_pane_shell(&self) -> Option<bool> {
+        let pid = self.child_pid.load(Ordering::Acquire);
+        if pid == 0 {
+            return None;
+        }
+        let foreground_pgid = self
+            .io
+            .foreground_process_group_id()
+            .or_else(|| crate::platform::foreground_process_group_id(pid));
+        let probe = probe_foreground_process(pid, foreground_pgid);
+        if foreground_pgid.is_none()
+            && probe.process_group_id.is_none()
+            && !probe.foreground_is_pane_shell
+        {
+            return None;
+        }
+        Some(probe.foreground_is_pane_shell)
+    }
+
     pub fn shutdown(mut self) {
         self.detect_handle.abort();
         self.io.shutdown();
@@ -1245,6 +1275,7 @@ impl PaneRuntime {
         let terminal = Arc::new(PaneTerminal::new(pane_terminal));
         let child_pid = Arc::new(AtomicU32::new(child_pid));
         let kitty_keyboard_flags = Arc::new(AtomicU16::new(keyboard_protocol_flags));
+        let runtime_token = Self::next_runtime_token();
 
         let io = {
             let terminal = terminal.clone();
@@ -1287,7 +1318,10 @@ impl PaneRuntime {
             });
             let exit_events = events.clone();
             let on_reader_exit = Box::new(move || {
-                let _ = rt.block_on(exit_events.send(AppEvent::PaneDied { pane_id }));
+                let _ = rt.block_on(exit_events.send(AppEvent::PaneRuntimeDied {
+                    pane_id,
+                    runtime_token,
+                }));
                 debug!(pane = pane_id.raw(), "handoff PTY actor exiting");
             });
             PaneRuntimeIo::Actor(PtyIoActor::spawn(PtyIoActorConfig {
@@ -1303,6 +1337,7 @@ impl PaneRuntime {
             spawn_basic_detection_task(pane_id, child_pid.clone(), terminal.clone(), events);
 
         Ok(Self {
+            runtime_token,
             pane_id,
             terminal,
             io,
@@ -1331,6 +1366,7 @@ impl PaneRuntime {
         initial_state: SpawnInitialState<'_>,
     ) -> std::io::Result<Self> {
         crate::logging::pane_spawn_started(pane_id.raw(), rows, cols, scrollback_limit_bytes);
+        let runtime_token = Self::next_runtime_token();
 
         let (response_tx, _response_rx) = mpsc::channel::<Bytes>(1);
         let mut terminal = crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes)
@@ -1373,8 +1409,11 @@ impl PaneRuntime {
                     Err(e) => crate::logging::pane_exit_failed(pane_id.raw(), &e.to_string()),
                 }
                 child_wait_completed.store(true, Ordering::Release);
-                // Use blocking send — PaneDied is critical, must not be dropped
-                if let Err(e) = rt.block_on(events.send(AppEvent::PaneDied { pane_id })) {
+                // Use blocking send — pane death is critical, must not be dropped.
+                if let Err(e) = rt.block_on(events.send(AppEvent::PaneRuntimeDied {
+                    pane_id,
+                    runtime_token,
+                })) {
                     error!(pane = pane_id.raw(), err = %e, "failed to send PaneDied event");
                 }
             });
@@ -1714,6 +1753,7 @@ impl PaneRuntime {
         };
 
         Ok(Self {
+            runtime_token,
             pane_id,
             terminal,
             io,
@@ -2043,6 +2083,7 @@ impl PaneRuntime {
 
         (
             Self {
+                runtime_token: Self::next_runtime_token(),
                 pane_id: PaneId::from_raw(0),
                 terminal: Arc::new(PaneTerminal::new(
                     GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
@@ -2459,7 +2500,8 @@ mod tests {
             .expect("pane death event should arrive") else {
                 break;
             };
-            if matches!(event, AppEvent::PaneDied { pane_id } if pane_id == PaneId::from_raw(7)) {
+            if matches!(event, AppEvent::PaneRuntimeDied { pane_id, .. } if pane_id == PaneId::from_raw(7))
+            {
                 died = true;
                 break;
             }
@@ -2478,6 +2520,7 @@ mod tests {
             .mode_set(crate::ghostty::MODE_FOCUS_EVENT, true)
             .unwrap();
         let runtime = PaneRuntime {
+            runtime_token: PaneRuntime::next_runtime_token(),
             pane_id: PaneId::from_raw(0),
             terminal: Arc::new(PaneTerminal::new(
                 GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
@@ -2506,6 +2549,7 @@ mod tests {
         let (resize_tx, _resize_rx) = watch::channel((80, 24, 0, 0));
         let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
         let runtime = PaneRuntime {
+            runtime_token: PaneRuntime::next_runtime_token(),
             pane_id: PaneId::from_raw(0),
             terminal: Arc::new(PaneTerminal::new(
                 GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),

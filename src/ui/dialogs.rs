@@ -730,6 +730,101 @@ pub(super) fn render_confirm_close_overlay(app: &AppState, frame: &mut Frame, ar
     }
 }
 
+pub(crate) fn confirm_remote_attach_inner_rect(area: Rect) -> Option<Rect> {
+    centered_popup_rect(area, 72, 8).map(|popup| {
+        Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        )
+    })
+}
+
+pub(crate) fn confirm_remote_attach_button_rects(inner: Rect) -> (Rect, Rect) {
+    let rects = action_button_row_rects(
+        inner,
+        &[
+            ActionButtonSpec {
+                hint: Some("↵"),
+                label: "attach",
+            },
+            ActionButtonSpec {
+                hint: Some("esc"),
+                label: "cancel",
+            },
+        ],
+        2,
+        inner.height.saturating_sub(1),
+    );
+    (rects[0], rects[1])
+}
+
+pub(super) fn render_confirm_remote_attach_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    let Some(pending) = app.pending_remote_attach.as_ref() else {
+        return;
+    };
+
+    super::dim_background(frame, area);
+    let Some(inner) = render_modal_shell(frame, area, 72, 8, &app.palette) else {
+        return;
+    };
+    if inner.height < 5 {
+        return;
+    }
+
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas::<5>(inner);
+
+    render_modal_header(frame, rows[0], "attach remote agent", &app.palette);
+
+    let target = truncate_text(
+        &pending.target.label,
+        rows[1].width.saturating_sub(12) as usize,
+    );
+    frame.render_widget(
+        Paragraph::new(format!(" Attach {target} to this pane?"))
+            .style(Style::default().fg(app.palette.text)),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            " This will replace the current process in pane {}.",
+            pending.pane.pane_id.raw()
+        ))
+        .style(Style::default().fg(app.palette.subtext0)),
+        rows[2],
+    );
+
+    let (attach_rect, cancel_rect) = confirm_remote_attach_button_rects(inner);
+    render_action_button(
+        frame,
+        attach_rect,
+        Some("↵"),
+        "attach",
+        Style::default()
+            .fg(panel_contrast_fg(&app.palette))
+            .bg(app.palette.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_action_button(
+        frame,
+        cancel_rect,
+        Some("esc"),
+        "cancel",
+        Style::default()
+            .fg(app.palette.text)
+            .bg(app.palette.surface0)
+            .add_modifier(Modifier::BOLD),
+    );
+}
+
 pub(crate) fn confirm_close_popup_rect(area: Rect) -> Option<Rect> {
     centered_popup_rect(area, 64, 6)
 }
