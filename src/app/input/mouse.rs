@@ -556,13 +556,17 @@ impl AppState {
 
                     if let Some(entry) = self.agent_detail_entry_at(mouse.row) {
                         if let Some((ws_idx, _tab_idx, pane_id)) = entry.local_target() {
+                            self.selected_remote_agent = None;
                             self.focus_pane_in_workspace(ws_idx, pane_id);
                             self.mode = Mode::Terminal;
                         } else if let Some(target) = entry.remote_attach_target() {
+                            self.selected_remote_agent = Some(target.key());
                             if let Some((ws_idx, pane_id)) = self.find_remote_attach_pane(&target) {
                                 self.focus_pane_in_workspace(ws_idx, pane_id);
                                 self.mode = Mode::Terminal;
                             }
+                        } else {
+                            self.selected_remote_agent = None;
                         }
                         return None;
                     }
@@ -894,6 +898,7 @@ impl AppState {
                 }
                 if let Some(entry) = self.agent_detail_entry_at(mouse.row) {
                     if let Some(target) = entry.remote_attach_target() {
+                        self.selected_remote_agent = Some(target.key());
                         self.context_menu = Some(ContextMenuState {
                             kind: ContextMenuKind::RemoteAgent {
                                 target,
@@ -904,6 +909,8 @@ impl AppState {
                             list: MenuListState::new(0),
                         });
                         self.mode = Mode::ContextMenu;
+                    } else {
+                        self.selected_remote_agent = None;
                     }
                     return None;
                 }

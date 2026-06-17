@@ -1247,11 +1247,18 @@ fn render_agent_detail(
             break;
         }
 
-        // Check if this local agent entry corresponds to the active session.
-        // Remote entries are read-only for now and must not masquerade as local panes.
+        // Check if this entry corresponds to the active local pane or the
+        // currently selected remote agent. Remote rows do not have local panes,
+        // so they need a separate selection highlight.
         let is_active = detail
             .local_target()
             .is_some_and(|(ws_idx, tab_idx, pane_id)| app.is_active_pane(ws_idx, tab_idx, pane_id));
+        let is_selected_remote = detail.remote_attach_target().is_some_and(|target| {
+            app.selected_remote_agent
+                .as_ref()
+                .is_some_and(|selected| selected == &target.key())
+        });
+        let is_highlighted = is_active || is_selected_remote;
 
         let (icon, icon_style) = agent_icon(detail.state, detail.seen, app.spinner_tick, p);
         let label_color = state_label_color(detail.state, detail.seen, p);
@@ -1261,18 +1268,18 @@ fn render_agent_detail(
             .map(String::as_str)
             .unwrap_or_else(|| state_label(detail.state, detail.seen));
 
-        let row_style = if is_active {
+        let row_style = if is_highlighted {
             Style::default().bg(p.surface_dim)
         } else {
             Style::default()
         };
 
-        let name_style = if is_active {
+        let name_style = if is_highlighted {
             Style::default().fg(p.text).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD)
         };
-        let status_style = if is_active {
+        let status_style = if is_highlighted {
             Style::default().fg(label_color)
         } else {
             Style::default().fg(label_color).add_modifier(Modifier::DIM)
