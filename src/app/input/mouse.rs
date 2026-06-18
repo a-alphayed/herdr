@@ -39,6 +39,14 @@ impl AppState {
         };
 
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::Drag(MouseButton::Left)
+            | MouseEventKind::Up(MouseButton::Left)
+                if self.handle_remote_attach_local_selection_mouse(
+                    terminal_runtimes,
+                    &info,
+                    mouse,
+                ) => {}
             MouseEventKind::ScrollUp
             | MouseEventKind::ScrollDown
             | MouseEventKind::ScrollLeft
@@ -576,6 +584,14 @@ impl AppState {
                         self.mode = Mode::Terminal;
                     }
 
+                    if self.handle_remote_attach_local_selection_mouse(
+                        terminal_runtimes,
+                        &info,
+                        mouse,
+                    ) {
+                        return None;
+                    }
+
                     if self.forward_pane_mouse_button(terminal_runtimes, &info, mouse) {
                         self.selection = None;
                         self.selection_autoscroll = None;
@@ -614,6 +630,14 @@ impl AppState {
 
                 if self.drag.is_none() {
                     if let Some(info) = self.pane_mouse_target(mouse.column, mouse.row).cloned() {
+                        if self.handle_remote_attach_local_selection_mouse(
+                            terminal_runtimes,
+                            &info,
+                            mouse,
+                        ) {
+                            return None;
+                        }
+
                         if self.forward_pane_mouse_button(terminal_runtimes, &info, mouse) {
                             self.selection = None;
                             self.selection_autoscroll = None;
@@ -760,6 +784,19 @@ impl AppState {
 
                 if self.drag.is_none() {
                     if let Some(info) = self.pane_mouse_target(mouse.column, mouse.row).cloned() {
+                        if self.handle_remote_attach_local_selection_mouse(
+                            terminal_runtimes,
+                            &info,
+                            mouse,
+                        ) {
+                            self.selection = None;
+                            self.selection_autoscroll = None;
+                            self.workspace_press = None;
+                            self.tab_press = None;
+                            self.drag = None;
+                            return None;
+                        }
+
                         if self.forward_pane_mouse_button(terminal_runtimes, &info, mouse) {
                             self.selection = None;
                             self.selection_autoscroll = None;
@@ -1008,6 +1045,52 @@ impl AppState {
         }
 
         None
+    }
+
+    fn handle_remote_attach_local_selection_mouse(
+        &mut self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        info: &PaneInfo,
+        mouse: MouseEvent,
+    ) -> bool {
+        if !self.pane_has_remote_attach(info.id) {
+            return false;
+        }
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.focus_pane(info.id);
+                if self.mode != Mode::Terminal {
+                    self.mode = Mode::Terminal;
+                }
+                self.selection = None;
+                self.selection_autoscroll = None;
+                let (row, col) = (
+                    mouse.row.saturating_sub(info.inner_rect.y),
+                    mouse.column.saturating_sub(info.inner_rect.x),
+                );
+                self.selection = Some(Selection::anchor(
+                    info.id,
+                    row,
+                    col,
+                    self.pane_scroll_metrics(terminal_runtimes, info.id),
+                ));
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.selection.is_some() {
+                    self.update_selection_drag(terminal_runtimes, mouse.column, mouse.row);
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.selection.is_some() {
+                    self.copy_selection(terminal_runtimes);
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     fn handle_mobile_mouse(&mut self, mouse: MouseEvent) -> bool {
@@ -1630,8 +1713,12 @@ mod tests {
     };
     use super::*;
     use crate::{
-        app::state::{ContextMenuKind, ContextMenuState, MenuListState, Mode, ViewLayout},
+        app::{
+            state::{ContextMenuKind, ContextMenuState, MenuListState, Mode, ViewLayout},
+            App,
+        },
         detect::{Agent, AgentState},
+        layout::PaneInfo,
         workspace::Workspace,
     };
 
@@ -1642,6 +1729,165 @@ mod tests {
             terminal_id: "remote-term".into(),
             label: "jafar/smoke-agent".into(),
         }
+    }
+
+    fn app_with_mouse_reporting_pane(
+        remote_attach: bool,
+    ) -> (
+        App,
+        crate::layout::PaneId,
+        PaneInfo,
+        tokio::sync::mpsc::Receiver<Bytes>,
+    ) {
+        let mut app = app_for_mouse_test();
+        let ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        app.state.workspaces = vec![ws];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let info = app.state.view.pane_infos[0].clone();
+        let (runtime, rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                info.inner_rect.width.max(1),
+                info.inner_rect.height.max(1),
+                0,
+                b"\x1b[?1002halpha beta\r\n",
+                8,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+        if remote_attach {
+            let terminal_id = app.state.workspaces[0]
+                .terminal_id(pane_id)
+                .cloned()
+                .expect("pane terminal id");
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("terminal state")
+                .remote_attach = Some(remote_attach_target());
+        }
+        (app, pane_id, info, rx)
+    }
+
+    #[tokio::test]
+    async fn remote_attach_mouse_reporting_uses_local_selection_in_main_mouse_path() {
+        let (mut app, pane_id, info, mut rx) = app_with_mouse_reporting_pane(true);
+        let col = info.inner_rect.x;
+        let row = info.inner_rect.y;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+        assert_eq!(
+            app.state
+                .selection
+                .as_ref()
+                .map(|selection| selection.pane_id),
+            Some(pane_id)
+        );
+        assert!(rx.try_recv().is_err());
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            col.saturating_add(4),
+            row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            col.saturating_add(4),
+            row,
+        ));
+
+        match app.event_rx.try_recv().expect("clipboard event") {
+            crate::events::AppEvent::ClipboardWrite { content } => {
+                let text = String::from_utf8(content).expect("utf8 clipboard");
+                assert!(
+                    text.contains("alpha"),
+                    "remote attach local selection copied visible text: {text:?}"
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn remote_attach_mouse_reporting_uses_local_selection_in_pane_only_path() {
+        let (mut app, pane_id, info, mut rx) = app_with_mouse_reporting_pane(true);
+        let col = info.inner_rect.x;
+        let row = info.inner_rect.y;
+
+        app.state.handle_pane_mouse_only(
+            &app.terminal_runtimes,
+            mouse(MouseEventKind::Down(MouseButton::Left), col, row),
+        );
+        assert_eq!(
+            app.state
+                .selection
+                .as_ref()
+                .map(|selection| selection.pane_id),
+            Some(pane_id)
+        );
+        assert!(rx.try_recv().is_err());
+
+        app.state.handle_pane_mouse_only(
+            &app.terminal_runtimes,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                col.saturating_add(4),
+                row,
+            ),
+        );
+        app.state.handle_pane_mouse_only(
+            &app.terminal_runtimes,
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                col.saturating_add(4),
+                row,
+            ),
+        );
+
+        let text = String::from_utf8(
+            app.state
+                .request_clipboard_write
+                .take()
+                .expect("clipboard request"),
+        )
+        .expect("utf8 clipboard");
+        assert!(
+            text.contains("alpha"),
+            "pane-only remote attach selection copied visible text: {text:?}"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn ordinary_mouse_reporting_pane_still_forwards_main_mouse_path() {
+        let (mut app, _pane_id, info, mut rx) = app_with_mouse_reporting_pane(false);
+        let col = info.inner_rect.x;
+        let row = info.inner_rect.y;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+
+        assert!(app.state.selection.is_none());
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn ordinary_mouse_reporting_pane_still_forwards_pane_only_path() {
+        let (mut app, _pane_id, info, mut rx) = app_with_mouse_reporting_pane(false);
+        let col = info.inner_rect.x;
+        let row = info.inner_rect.y;
+
+        app.state.handle_pane_mouse_only(
+            &app.terminal_runtimes,
+            mouse(MouseEventKind::Down(MouseButton::Left), col, row),
+        );
+
+        assert!(app.state.selection.is_none());
+        assert!(app.state.request_clipboard_write.is_none());
+        assert!(rx.try_recv().is_ok());
     }
 
     #[tokio::test]

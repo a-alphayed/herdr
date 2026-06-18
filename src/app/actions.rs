@@ -137,6 +137,14 @@ impl AppState {
         self.terminals.get(&pane.terminal_id)?.remote_attach.clone()
     }
 
+    pub(crate) fn pane_has_remote_attach(&self, pane_id: PaneId) -> bool {
+        self.active
+            .and_then(|ws_idx| self.workspaces.get(ws_idx))
+            .and_then(|ws| ws.pane_state(pane_id))
+            .and_then(|pane| self.terminals.get(&pane.attached_terminal_id))
+            .is_some_and(|terminal| terminal.remote_attach.is_some())
+    }
+
     pub(crate) fn remote_attach_pane_indices(
         &self,
         pane: &RemoteAttachPaneTarget,

@@ -130,6 +130,7 @@ impl App {
                 } else {
                     self.state
                         .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
+                    self.queue_pending_clipboard_write();
                 }
                 true
             }

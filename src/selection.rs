@@ -279,8 +279,12 @@ fn should_prefer_osc52_for_env(
     ssh_connection: Option<&OsStr>,
     ssh_tty: Option<&OsStr>,
     wsl: bool,
+    herdr_env: Option<&OsStr>,
 ) -> bool {
-    ssh_connection.is_some() || ssh_tty.is_some() || wsl
+    ssh_connection.is_some()
+        || ssh_tty.is_some()
+        || wsl
+        || herdr_env == Some(OsStr::new(crate::HERDR_ENV_VALUE))
 }
 
 fn should_prefer_osc52() -> bool {
@@ -288,6 +292,7 @@ fn should_prefer_osc52() -> bool {
         std::env::var_os("SSH_CONNECTION").as_deref(),
         std::env::var_os("SSH_TTY").as_deref(),
         is_wsl(),
+        std::env::var_os(crate::HERDR_ENV_VAR).as_deref(),
     )
 }
 
@@ -329,19 +334,37 @@ mod tests {
         assert!(should_prefer_osc52_for_env(
             Some(OsStr::new("1 2 3 4")),
             None,
-            false
+            false,
+            None
         ));
         assert!(should_prefer_osc52_for_env(
             None,
             Some(OsStr::new("/dev/ttys001")),
-            false
+            false,
+            None
         ));
-        assert!(!should_prefer_osc52_for_env(None, None, false));
+        assert!(!should_prefer_osc52_for_env(None, None, false, None));
     }
 
     #[test]
     fn wsl_sessions_prefer_osc52() {
-        assert!(should_prefer_osc52_for_env(None, None, true));
+        assert!(should_prefer_osc52_for_env(None, None, true, None));
+    }
+
+    #[test]
+    fn nested_herdr_sessions_prefer_osc52() {
+        assert!(should_prefer_osc52_for_env(
+            None,
+            None,
+            false,
+            Some(OsStr::new(crate::HERDR_ENV_VALUE))
+        ));
+        assert!(!should_prefer_osc52_for_env(
+            None,
+            None,
+            false,
+            Some(OsStr::new("0"))
+        ));
     }
 
     #[test]

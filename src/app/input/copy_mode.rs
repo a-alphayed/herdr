@@ -16,15 +16,7 @@ impl App {
         self.state.update_dismissed = true;
         self.state
             .handle_copy_mode_key(&self.terminal_runtimes, key);
-        if let Some(content) = self.state.request_clipboard_write.take() {
-            if self
-                .event_tx
-                .try_send(crate::events::AppEvent::ClipboardWrite { content })
-                .is_err()
-            {
-                tracing::warn!("failed to queue clipboard write event");
-            }
-        }
+        self.queue_pending_clipboard_write();
     }
 }
 
@@ -622,6 +614,15 @@ mod tests {
         (app, pane_id)
     }
 
+    fn remote_attach_target() -> crate::remote_source::RemoteAttachTarget {
+        crate::remote_source::RemoteAttachTarget {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            terminal_id: "remote-term".into(),
+            label: "jafar/smoke-agent".into(),
+        }
+    }
+
     #[tokio::test]
     async fn enter_copy_mode_tracks_focused_pane() {
         let (mut app, pane_id) = app_with_copy_screen(b"alpha\nbeta\n");
@@ -685,6 +686,37 @@ mod tests {
                     "copied line should include beta: {text:?}"
                 );
             }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[tokio::test]
+    async fn remote_attach_copy_mode_y_emits_local_clipboard_write() {
+        let (mut app, pane_id) = app_with_copy_screen(b"alpha\nbeta\n");
+        app.state.ensure_test_terminals();
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .cloned()
+            .expect("pane terminal id");
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .expect("terminal state")
+            .remote_attach = Some(remote_attach_target());
+
+        app.state.enter_copy_mode(&app.terminal_runtimes);
+        if let Some(copy_mode) = app.state.copy_mode.as_mut() {
+            copy_mode.cursor_row = 0;
+            copy_mode.cursor_col = 0;
+        }
+        app.handle_copy_mode_key(TerminalKey::new(KeyCode::Char('v'), KeyModifiers::empty()));
+        app.handle_copy_mode_key(TerminalKey::new(KeyCode::Char('l'), KeyModifiers::empty()));
+        app.handle_copy_mode_key(TerminalKey::new(KeyCode::Char('l'), KeyModifiers::empty()));
+        app.handle_copy_mode_key(TerminalKey::new(KeyCode::Char('y'), KeyModifiers::empty()));
+
+        match app.event_rx.try_recv().expect("clipboard event") {
+            AppEvent::ClipboardWrite { content } => assert_eq!(content, b"alp"),
             other => panic!("unexpected event: {other:?}"),
         }
         assert_eq!(app.state.mode, Mode::Terminal);
