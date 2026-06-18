@@ -130,6 +130,13 @@ impl AppState {
         })
     }
 
+    pub(crate) fn current_remote_attach_target(
+        &self,
+    ) -> Option<crate::remote_source::RemoteAttachTarget> {
+        let pane = self.current_remote_attach_pane_target()?;
+        self.terminals.get(&pane.terminal_id)?.remote_attach.clone()
+    }
+
     pub(crate) fn remote_attach_pane_indices(
         &self,
         pane: &RemoteAttachPaneTarget,
@@ -186,6 +193,37 @@ impl AppState {
                     .find_map(|pane_id| matches_target(ws_idx, *pane_id))
             })
         })
+    }
+
+    pub(crate) fn remote_attach_pane_target_for(
+        &self,
+        target: &crate::remote_source::RemoteAttachTarget,
+    ) -> Option<RemoteAttachPaneTarget> {
+        let (ws_idx, pane_id) = self.find_remote_attach_pane(target)?;
+        let ws = self.workspaces.get(ws_idx)?;
+        let terminal_id = ws.terminal_id(pane_id)?.clone();
+        Some(RemoteAttachPaneTarget {
+            workspace_id: ws.id.clone(),
+            pane_id,
+            terminal_id,
+        })
+    }
+
+    pub(crate) fn has_remote_attach_pane(
+        &self,
+        target: &crate::remote_source::RemoteAttachTarget,
+    ) -> bool {
+        self.remote_attach_pane_target_for(target).is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_panel_entry_has_remote_attach_pane(
+        &self,
+        entry: &crate::ui::AgentPanelEntry,
+    ) -> bool {
+        entry
+            .remote_attach_target()
+            .is_some_and(|target| self.has_remote_attach_pane(&target))
     }
 
     fn pane_focus_target_indices(&self, target: &PaneFocusTarget) -> Option<(usize, usize)> {
@@ -2405,7 +2443,7 @@ mod tests {
     use super::*;
     use crate::api::schema::{AgentInfo, AgentStatus};
     use crate::detect::{Agent, AgentState};
-    use crate::remote_source::{RemoteAgentKey, RemoteHostKey};
+    use crate::remote_source::{RemoteAgentKey, RemoteAttachTarget, RemoteHostKey};
     use crate::workspace::Workspace;
     use ratatui::layout::Direction;
 
@@ -2421,6 +2459,29 @@ mod tests {
             state.mode = Mode::Terminal;
         }
         state
+    }
+
+    fn remote_attach_target(terminal_id: &str) -> RemoteAttachTarget {
+        RemoteAttachTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: terminal_id.into(),
+            label: "jafar/codex".into(),
+        }
+    }
+
+    fn set_pane_remote_attach(
+        state: &mut AppState,
+        ws_idx: usize,
+        pane_id: PaneId,
+        target: RemoteAttachTarget,
+    ) -> crate::terminal::TerminalId {
+        let terminal_id = state.workspaces[ws_idx]
+            .terminal_id(pane_id)
+            .cloned()
+            .unwrap();
+        state.terminals.get_mut(&terminal_id).unwrap().remote_attach = Some(target);
+        terminal_id
     }
 
     fn mark_linked_worktree(state: &mut AppState, ws_idx: usize) {
@@ -3354,6 +3415,61 @@ mod tests {
         state.switch_workspace(2);
         assert_eq!(state.active, Some(2));
         assert_eq!(state.selected, 2);
+    }
+
+    #[test]
+    fn current_remote_attach_target_returns_focused_attach_target() {
+        let mut state = app_with_workspaces(&["local"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let target = remote_attach_target("remote-term");
+        set_pane_remote_attach(&mut state, 0, pane_id, target.clone());
+
+        assert_eq!(state.current_remote_attach_target(), Some(target));
+    }
+
+    #[test]
+    fn current_remote_attach_target_returns_none_for_non_attach_pane() {
+        let state = app_with_workspaces(&["local"]);
+
+        assert_eq!(state.current_remote_attach_target(), None);
+    }
+
+    #[test]
+    fn remote_attach_pane_target_for_returns_attached_pane_identity() {
+        let mut state = app_with_workspaces(&["local"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let target = remote_attach_target("remote-term");
+        let terminal_id = set_pane_remote_attach(&mut state, 0, pane_id, target.clone());
+
+        assert_eq!(
+            state.remote_attach_pane_target_for(&target),
+            Some(RemoteAttachPaneTarget {
+                workspace_id: state.workspaces[0].id.clone(),
+                pane_id,
+                terminal_id: terminal_id.clone(),
+            })
+        );
+        assert!(state.has_remote_attach_pane(&target));
+    }
+
+    #[test]
+    fn remote_attach_pane_target_for_prefers_current_focus_when_duplicates_exist() {
+        let mut state = app_with_workspaces(&["first", "second"]);
+        let target = remote_attach_target("remote-term");
+        let first_pane = state.workspaces[0].tabs[0].root_pane;
+        let second_pane = state.workspaces[1].tabs[0].root_pane;
+        set_pane_remote_attach(&mut state, 0, first_pane, target.clone());
+        let second_terminal_id = set_pane_remote_attach(&mut state, 1, second_pane, target.clone());
+        state.focus_pane_in_workspace(1, second_pane);
+
+        assert_eq!(
+            state.remote_attach_pane_target_for(&target),
+            Some(RemoteAttachPaneTarget {
+                workspace_id: state.workspaces[1].id.clone(),
+                pane_id: second_pane,
+                terminal_id: second_terminal_id,
+            })
+        );
     }
 
     #[test]

@@ -1014,10 +1014,12 @@ pub enum ContextMenuKind {
     Pane {
         pane_id: PaneId,
         has_manual_label: bool,
+        remote_attach_pane: Option<RemoteAttachPaneTarget>,
     },
     RemoteAgent {
         target: crate::remote_source::RemoteAttachTarget,
         focused_pane: Option<RemoteAttachPaneTarget>,
+        attached_pane: Option<RemoteAttachPaneTarget>,
     },
 }
 
@@ -1069,6 +1071,32 @@ impl ContextMenuState {
             ContextMenuKind::Tab { .. } => &["New tab", "Rename", "Close"],
             ContextMenuKind::Pane {
                 has_manual_label: true,
+                remote_attach_pane: Some(_),
+                ..
+            } => &[
+                "Detach view",
+                "Rename pane",
+                "Clear pane name",
+                "Split vertical",
+                "Split horizontal",
+                "Zoom",
+                "Close pane",
+            ],
+            ContextMenuKind::Pane {
+                has_manual_label: false,
+                remote_attach_pane: Some(_),
+                ..
+            } => &[
+                "Detach view",
+                "Rename pane",
+                "Split vertical",
+                "Split horizontal",
+                "Zoom",
+                "Close pane",
+            ],
+            ContextMenuKind::Pane {
+                has_manual_label: true,
+                remote_attach_pane: None,
                 ..
             } => &[
                 "Rename pane",
@@ -1080,6 +1108,7 @@ impl ContextMenuState {
             ],
             ContextMenuKind::Pane {
                 has_manual_label: false,
+                remote_attach_pane: None,
                 ..
             } => &[
                 "Rename pane",
@@ -1088,7 +1117,14 @@ impl ContextMenuState {
                 "Zoom",
                 "Close pane",
             ],
-            ContextMenuKind::RemoteAgent { .. } => &["Attach to focused pane"],
+            ContextMenuKind::RemoteAgent {
+                attached_pane: Some(_),
+                ..
+            } => &["Focus attached pane", "Detach view"],
+            ContextMenuKind::RemoteAgent {
+                attached_pane: None,
+                ..
+            } => &["Attach to focused pane"],
         }
     }
 }
@@ -1203,6 +1239,7 @@ pub struct AppState {
     /// handled by the outer App/event loop instead of directly from AppState.
     pub request_clipboard_write: Option<Vec<u8>>,
     pub(crate) request_remote_attach: Option<PendingRemoteAttach>,
+    pub(crate) request_remote_detach_view: Option<RemoteAttachPaneTarget>,
     pub(crate) pending_remote_attach: Option<PendingRemoteAttach>,
     pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
@@ -1510,6 +1547,7 @@ impl AppState {
             request_client_config_reload: false,
             request_clipboard_write: None,
             request_remote_attach: None,
+            request_remote_detach_view: None,
             pending_remote_attach: None,
             creating_new_tab: false,
             requested_new_tab_name: None,

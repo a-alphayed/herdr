@@ -94,6 +94,7 @@ impl App {
             }
         }
         self.drain_remote_attach_request();
+        self.drain_remote_detach_view_request();
         self.sync_toast_deadline(previous_toast);
     }
 
@@ -235,6 +236,7 @@ impl App {
             }
         }
         self.drain_remote_attach_request();
+        self.drain_remote_detach_view_request();
         self.sync_toast_deadline(previous_toast);
         if previous_settings_section != crate::app::state::SettingsSection::Integrations
             && self.state.settings.section == crate::app::state::SettingsSection::Integrations

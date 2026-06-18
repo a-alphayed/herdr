@@ -690,6 +690,17 @@ impl TerminalState {
     }
 
     pub fn border_label(&self, show_agent_labels: bool) -> Option<String> {
+        if let Some(remote_attach) = &self.remote_attach {
+            let label = remote_attach.label.trim();
+            if !label.is_empty() {
+                return Some(label.to_string());
+            }
+            return Some(format!(
+                "{}/terminal:{}",
+                remote_attach.host, remote_attach.terminal_id
+            ));
+        }
+
         self.effective_title().or_else(|| {
             self.manual_label.clone().or_else(|| {
                 show_agent_labels
@@ -1450,6 +1461,28 @@ mod tests {
         terminal.set_manual_label("reviewer".into());
         terminal.clear_manual_label();
         assert_eq!(terminal.border_label(true).as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn border_label_prefers_remote_attach_label_for_attached_view() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal.set_manual_label("local label".into());
+        terminal.remote_attach = Some(crate::remote_source::RemoteAttachTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: "remote-term".into(),
+            label: "jafar/codex-fleet-api".into(),
+        });
+
+        assert_eq!(
+            terminal.border_label(false).as_deref(),
+            Some("jafar/codex-fleet-api")
+        );
+        assert_eq!(
+            terminal.border_label(true).as_deref(),
+            Some("jafar/codex-fleet-api")
+        );
     }
 
     #[test]

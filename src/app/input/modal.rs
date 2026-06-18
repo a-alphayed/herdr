@@ -704,6 +704,20 @@ pub(super) fn apply_context_menu_action(
                 };
             }
         }
+        (
+            ContextMenuKind::Pane {
+                remote_attach_pane: Some(pane),
+                ..
+            },
+            Some("Detach view"),
+        ) => {
+            state.request_remote_detach_view = Some(pane);
+            state.mode = if state.active.is_some() {
+                Mode::Terminal
+            } else {
+                Mode::Navigate
+            };
+        }
         (ContextMenuKind::Pane { pane_id, .. }, Some("Rename pane")) => {
             open_rename_pane(state, pane_id);
         }
@@ -746,6 +760,7 @@ pub(super) fn apply_context_menu_action(
             ContextMenuKind::RemoteAgent {
                 target,
                 focused_pane,
+                attached_pane: None,
             },
             Some("Attach to focused pane"),
         ) => {
@@ -765,6 +780,40 @@ pub(super) fn apply_context_menu_action(
                 });
                 leave_modal(state);
             }
+        }
+        (
+            ContextMenuKind::RemoteAgent {
+                attached_pane: Some(pane),
+                ..
+            },
+            Some("Focus attached pane"),
+        ) => {
+            if let Some((ws_idx, _tab_idx)) = state.remote_attach_pane_indices(&pane) {
+                state.focus_pane_in_workspace(ws_idx, pane.pane_id);
+                state.mode = Mode::Terminal;
+            } else {
+                state.toast = Some(ToastNotification {
+                    kind: ToastKind::NeedsAttention,
+                    title: "attach unavailable".into(),
+                    context: "attached pane no longer exists".into(),
+                    target: None,
+                });
+                leave_modal(state);
+            }
+        }
+        (
+            ContextMenuKind::RemoteAgent {
+                attached_pane: Some(pane),
+                ..
+            },
+            Some("Detach view"),
+        ) => {
+            state.request_remote_detach_view = Some(pane);
+            state.mode = if state.active.is_some() {
+                Mode::Terminal
+            } else {
+                Mode::Navigate
+            };
         }
         _ => leave_modal(state),
     }
@@ -1312,6 +1361,7 @@ mod tests {
             kind: ContextMenuKind::Pane {
                 pane_id,
                 has_manual_label: false,
+                remote_attach_pane: None,
             },
             x: 0,
             y: 0,

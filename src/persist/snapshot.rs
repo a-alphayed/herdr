@@ -826,6 +826,32 @@ mod tests {
     }
 
     #[test]
+    fn capture_contract_does_not_persist_remote_attach_marker() {
+        let mut state = state_with_workspaces(&["one"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].terminal_id(pane_id).cloned().unwrap();
+        state.terminals.get_mut(&terminal_id).unwrap().remote_attach =
+            Some(crate::remote_source::RemoteAttachTarget {
+                host: "jafar".into(),
+                session: "default".into(),
+                terminal_id: "remote-term".into(),
+                label: "jafar/codex-fleet-api".into(),
+            });
+
+        let snapshot = capture_from_state(&state);
+        let pane = snapshot.workspaces[0].tabs[0]
+            .panes
+            .get(&pane_id.raw())
+            .expect("root pane snapshot");
+        assert_eq!(pane.label, None);
+        assert_eq!(pane.launch_argv, None);
+
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("remote_attach"));
+        assert!(!json.contains("jafar/codex-fleet-api"));
+    }
+
+    #[test]
     fn capture_contract_tracks_worktree_space_membership() {
         let mut state = state_with_workspaces(&["main"]);
         state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {

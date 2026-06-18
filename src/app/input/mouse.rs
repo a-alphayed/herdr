@@ -898,11 +898,13 @@ impl AppState {
                 }
                 if let Some(entry) = self.agent_detail_entry_at(mouse.row) {
                     if let Some(target) = entry.remote_attach_target() {
+                        let attached_pane = self.remote_attach_pane_target_for(&target);
                         self.selected_remote_agent = Some(target.key());
                         self.context_menu = Some(ContextMenuState {
                             kind: ContextMenuKind::RemoteAgent {
                                 target,
                                 focused_pane: self.current_remote_attach_pane_target(),
+                                attached_pane,
                             },
                             x: mouse.column,
                             y: mouse.row,
@@ -978,6 +980,9 @@ impl AppState {
             MouseEventKind::Down(MouseButton::Right) if !in_sidebar => {
                 if let Some(info) = self.pane_mouse_target(mouse.column, mouse.row).cloned() {
                     self.focus_pane(info.id);
+                    let remote_attach_pane = self
+                        .current_remote_attach_target()
+                        .and_then(|_| self.current_remote_attach_pane_target());
                     let has_manual_label = self
                         .active
                         .and_then(|ws_idx| self.workspaces.get(ws_idx))
@@ -989,6 +994,7 @@ impl AppState {
                         kind: ContextMenuKind::Pane {
                             pane_id: info.id,
                             has_manual_label,
+                            remote_attach_pane,
                         },
                         x: mouse.column,
                         y: mouse.row,
@@ -1629,6 +1635,15 @@ mod tests {
         workspace::Workspace,
     };
 
+    fn remote_attach_target() -> crate::remote_source::RemoteAttachTarget {
+        crate::remote_source::RemoteAttachTarget {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            terminal_id: "remote-term".into(),
+            label: "jafar/smoke-agent".into(),
+        }
+    }
+
     #[tokio::test]
     async fn terminal_wheel_uses_configured_mouse_scroll_lines() {
         let mut app = app_for_mouse_test();
@@ -2027,6 +2042,7 @@ mod tests {
             kind: ContextMenuKind::Pane {
                 pane_id,
                 has_manual_label: false,
+                remote_attach_pane: None,
             },
             x: 2,
             y: 2,
@@ -2119,6 +2135,98 @@ mod tests {
             .state
             .find_border_at(col, border.pos.saturating_add(1))
             .is_none());
+    }
+
+    #[test]
+    fn right_click_attached_local_pane_offers_detach_view() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("attached")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0]
+            .terminal_id(pane_id)
+            .cloned()
+            .unwrap();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .remote_attach = Some(remote_attach_target());
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let info = app.state.view.pane_infos[0].clone();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            info.inner_rect.x,
+            info.inner_rect.y,
+        ));
+
+        let menu = app.state.context_menu.as_ref().expect("pane menu");
+        assert_eq!(
+            menu.items(),
+            &[
+                "Detach view",
+                "Rename pane",
+                "Split vertical",
+                "Split horizontal",
+                "Zoom",
+                "Close pane",
+            ]
+        );
+        match &menu.kind {
+            ContextMenuKind::Pane {
+                remote_attach_pane: Some(pane),
+                ..
+            } => {
+                assert_eq!(pane.pane_id, pane_id);
+                assert_eq!(pane.terminal_id, terminal_id);
+            }
+            other => panic!("unexpected menu: {other:?}"),
+        }
+
+        handle_context_menu_key(
+            &mut app.state,
+            &mut app.terminal_runtimes,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        let requested = app
+            .state
+            .request_remote_detach_view
+            .as_ref()
+            .expect("detach request");
+        assert_eq!(requested.pane_id, pane_id);
+        assert_eq!(requested.terminal_id, terminal_id);
+    }
+
+    #[test]
+    fn right_click_normal_local_pane_does_not_offer_detach_view() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("local")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let info = app.state.view.pane_infos[0].clone();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            info.inner_rect.x,
+            info.inner_rect.y,
+        ));
+
+        let menu = app.state.context_menu.as_ref().expect("pane menu");
+        assert!(!menu.items().contains(&"Detach view"));
+        assert!(matches!(
+            menu.kind,
+            ContextMenuKind::Pane {
+                remote_attach_pane: None,
+                ..
+            }
+        ));
     }
 
     #[test]

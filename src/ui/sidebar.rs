@@ -260,10 +260,17 @@ fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
             format!("{}/{}/{}", entry.host.host, entry.host.session, agent_label)
         };
         let (state, seen) = remote_agent_state(entry.agent.agent_status);
+        let target = crate::remote_source::RemoteAttachTarget {
+            host: entry.host.host.clone(),
+            session: entry.host.session.clone(),
+            terminal_id: entry.agent.terminal_id.clone(),
+            label: primary_label.clone(),
+        };
+        let attached = !entry.stale() && app.has_remote_attach_pane(&target);
         let custom_status = if entry.stale() {
             entry.status.stale_label().map(str::to_string)
         } else {
-            entry.agent.custom_status.clone()
+            remote_agent_custom_status(entry.agent.custom_status.clone(), attached)
         };
 
         AgentPanelEntry {
@@ -282,6 +289,17 @@ fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
         }
     }));
     entries
+}
+
+fn remote_agent_custom_status(custom_status: Option<String>, attached: bool) -> Option<String> {
+    if !attached {
+        return custom_status;
+    }
+
+    match custom_status {
+        Some(status) if !status.trim().is_empty() => Some(format!("{status} · attached")),
+        _ => Some("attached".to_string()),
+    }
 }
 
 fn remote_host_panel_entry(entry: crate::remote_source::RemoteHostStatusEntry) -> AgentPanelEntry {
@@ -1606,6 +1624,67 @@ mod tests {
     }
 
     #[test]
+    fn remote_agent_panel_entry_shows_attached_status_for_matching_local_attach_pane() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        let workspace = Workspace::test_new("local");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.terminals.get_mut(&terminal_id).unwrap().remote_attach =
+            Some(crate::remote_source::RemoteAttachTarget {
+                host: "jafar".into(),
+                session: crate::session::DEFAULT_SESSION_NAME.into(),
+                terminal_id: "remote-term".into(),
+                label: "jafar/smoke-agent".into(),
+            });
+        app.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![remote_agent(
+                "remote-term",
+                "smoke-agent",
+                AgentStatus::Working,
+                1,
+            )],
+        );
+
+        let entries = agent_panel_entries(&app);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].primary_label, "jafar/smoke-agent");
+        assert_eq!(entries[0].custom_status.as_deref(), Some("attached"));
+    }
+
+    #[test]
+    fn remote_agent_panel_entry_keeps_custom_status_with_attached_marker() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        let workspace = Workspace::test_new("local");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.terminals.get_mut(&terminal_id).unwrap().remote_attach =
+            Some(crate::remote_source::RemoteAttachTarget {
+                host: "jafar".into(),
+                session: crate::session::DEFAULT_SESSION_NAME.into(),
+                terminal_id: "remote-term".into(),
+                label: "jafar/smoke-agent".into(),
+            });
+        let mut agent = remote_agent("remote-term", "smoke-agent", AgentStatus::Working, 1);
+        agent.custom_status = Some("busy".into());
+        app.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![agent],
+        );
+
+        let entries = agent_panel_entries(&app);
+
+        assert_eq!(entries[0].custom_status.as_deref(), Some("busy · attached"));
+    }
+
+    #[test]
     fn all_workspaces_agent_panel_shows_remote_host_statuses_without_agents() {
         let mut app = crate::app::state::AppState::test_new();
         app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
@@ -1644,6 +1723,18 @@ mod tests {
     fn all_workspaces_agent_panel_uses_stale_agent_row_instead_of_duplicate_host_row() {
         let mut app = crate::app::state::AppState::test_new();
         app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        let workspace = Workspace::test_new("local");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.terminals.get_mut(&terminal_id).unwrap().remote_attach =
+            Some(crate::remote_source::RemoteAttachTarget {
+                host: "jafar".into(),
+                session: "agents".into(),
+                terminal_id: "remote-term".into(),
+                label: "jafar/agents/claude".into(),
+            });
         let host = RemoteHostKey::new("jafar", "agents");
         app.remote_sources.replace_connected_snapshot(
             host.clone(),
@@ -1712,6 +1803,40 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert!(entries[0].local_target().is_none());
+        assert_eq!(entries[0].custom_status, None);
+        assert!(!app.agent_panel_entry_has_remote_attach_pane(&entries[0]));
+    }
+
+    #[test]
+    fn remote_agent_panel_entry_detects_matching_local_attach_pane() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        let workspace = Workspace::test_new("local");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        app.terminals.get_mut(&terminal_id).unwrap().remote_attach =
+            Some(crate::remote_source::RemoteAttachTarget {
+                host: "jafar".into(),
+                session: crate::session::DEFAULT_SESSION_NAME.into(),
+                terminal_id: "remote-term".into(),
+                label: "jafar/smoke-agent".into(),
+            });
+        app.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![remote_agent(
+                "remote-term",
+                "smoke-agent",
+                AgentStatus::Working,
+                1,
+            )],
+        );
+
+        let entries = agent_panel_entries(&app);
+
+        assert_eq!(entries.len(), 1);
+        assert!(app.agent_panel_entry_has_remote_attach_pane(&entries[0]));
     }
 
     #[test]
