@@ -311,6 +311,49 @@ impl App {
         }
     }
 
+    pub(crate) fn should_route_mouse_pane_only(&self, mouse: crossterm::event::MouseEvent) -> bool {
+        if self.state.mouse_capture || self.state.mode != Mode::Terminal {
+            return false;
+        }
+        if self
+            .state
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.target.is_some())
+        {
+            let rect = self.state.view.toast_hit_area;
+            if mouse.column >= rect.x
+                && mouse.column < rect.x.saturating_add(rect.width)
+                && mouse.row >= rect.y
+                && mouse.row < rect.y.saturating_add(rect.height)
+            {
+                return false;
+            }
+        }
+        if !self
+            .state
+            .focused_pane_requests_mouse_capture_from(&self.terminal_runtimes)
+        {
+            return false;
+        }
+        let Some(focused_pane) = self
+            .state
+            .active
+            .and_then(|ws_idx| self.state.workspaces.get(ws_idx))
+            .and_then(|ws| ws.focused_pane_id())
+        else {
+            return false;
+        };
+        let Some(info) = self.state.pane_info_by_id(focused_pane) else {
+            return false;
+        };
+        let rect = info.inner_rect;
+        mouse.column >= rect.x
+            && mouse.column < rect.x.saturating_add(rect.width)
+            && mouse.row >= rect.y
+            && mouse.row < rect.y.saturating_add(rect.height)
+    }
+
     pub fn new(
         config: &Config,
         no_session: bool,
@@ -1366,12 +1409,12 @@ impl App {
                     }
                 }
                 crate::raw_input::RawInputEvent::Mouse(mouse) => {
-                    if self.state.mouse_capture {
-                        self.handle_mouse_event_headless(mouse);
-                    } else {
+                    if self.should_route_mouse_pane_only(mouse) {
                         self.state
                             .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
                         self.queue_pending_clipboard_write();
+                    } else {
+                        self.handle_mouse_event_headless(mouse);
                     }
                 }
                 crate::raw_input::RawInputEvent::Paste(text) => {
@@ -1503,7 +1546,10 @@ mod tests {
     use crate::detect::{Agent, AgentState};
     use crate::terminal::TerminalRuntime;
     use crate::workspace::Workspace;
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    use ratatui::layout::{Direction, Rect};
     use std::sync::Mutex;
 
     fn raw_key(
@@ -1555,6 +1601,364 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    fn test_mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    fn raw_mouse_event(
+        kind: MouseEventKind,
+        column: u16,
+        row: u16,
+    ) -> crate::raw_input::RawInputEvent {
+        crate::raw_input::RawInputEvent::Mouse(test_mouse_event(kind, column, row))
+    }
+
+    fn remote_attach_target() -> crate::remote_source::RemoteAttachTarget {
+        crate::remote_source::RemoteAttachTarget {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            terminal_id: "remote-term".into(),
+            label: "jafar/smoke-agent".into(),
+        }
+    }
+
+    struct MouseRoutingFixture {
+        app: App,
+        focused_pane: crate::layout::PaneId,
+        local_pane: crate::layout::PaneId,
+        focused_info: crate::layout::PaneInfo,
+        local_info: crate::layout::PaneInfo,
+        focused_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        local_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    }
+
+    fn app_with_focused_mouse_reporting_split(focused_remote_attach: bool) -> MouseRoutingFixture {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("test");
+        let focused_pane = workspace.tabs[0].root_pane;
+        let local_pane = workspace.test_split(Direction::Horizontal);
+        workspace.tabs[0].layout.focus_pane(focused_pane);
+
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.mouse_capture = false;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+
+        let focused_info = app
+            .state
+            .pane_info_by_id(focused_pane)
+            .expect("focused pane info")
+            .clone();
+        let local_info = app
+            .state
+            .pane_info_by_id(local_pane)
+            .expect("local pane info")
+            .clone();
+        let (focused_runtime, focused_rx) = TerminalRuntime::test_with_channel_and_scrollback_bytes(
+            focused_info.inner_rect.width.max(1),
+            focused_info.inner_rect.height.max(1),
+            0,
+            b"\x1b[?1002hremote text\r\n",
+            16,
+        );
+        let (local_runtime, local_rx) = TerminalRuntime::test_with_channel_and_scrollback_bytes(
+            local_info.inner_rect.width.max(1),
+            local_info.inner_rect.height.max(1),
+            0,
+            b"local text\r\n",
+            16,
+        );
+        app.state.insert_test_runtime(focused_pane, focused_runtime);
+        app.state.insert_test_runtime(local_pane, local_runtime);
+
+        if focused_remote_attach {
+            let terminal_id = app.state.workspaces[0]
+                .terminal_id(focused_pane)
+                .cloned()
+                .expect("focused terminal id");
+            app.state
+                .terminals
+                .get_mut(&terminal_id)
+                .expect("focused terminal")
+                .remote_attach = Some(remote_attach_target());
+        }
+
+        MouseRoutingFixture {
+            app,
+            focused_pane,
+            local_pane,
+            focused_info,
+            local_info,
+            focused_rx,
+            local_rx,
+        }
+    }
+
+    fn assert_next_clipboard_contains(app: &mut App, needle: &str) {
+        match app.event_rx.try_recv().expect("clipboard event") {
+            AppEvent::ClipboardWrite { content } => {
+                let text = String::from_utf8(content).expect("utf8 clipboard");
+                assert!(
+                    text.contains(needle),
+                    "clipboard should contain {needle:?}: {text:?}"
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_only_mouse_routing_requires_focused_reporting_pane() {
+        let mut fixture = app_with_focused_mouse_reporting_split(false);
+        let focused_col = fixture.focused_info.inner_rect.x;
+        let focused_row = fixture.focused_info.inner_rect.y;
+        let local_col = fixture.local_info.inner_rect.x;
+        let local_row = fixture.local_info.inner_rect.y;
+
+        assert!(fixture.app.should_route_mouse_pane_only(test_mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            focused_col,
+            focused_row,
+        )));
+        assert!(!fixture.app.should_route_mouse_pane_only(test_mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            local_col,
+            local_row,
+        )));
+        assert!(!fixture.app.should_route_mouse_pane_only(test_mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            0,
+            0,
+        )));
+
+        fixture.app.state.mouse_capture = true;
+        assert!(!fixture.app.should_route_mouse_pane_only(test_mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            focused_col,
+            focused_row,
+        )));
+
+        fixture.app.state.mouse_capture = false;
+        fixture.app.state.mode = Mode::Navigate;
+        assert!(!fixture.app.should_route_mouse_pane_only(test_mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            focused_col,
+            focused_row,
+        )));
+    }
+
+    #[tokio::test]
+    async fn clickable_toast_over_focused_reporting_pane_uses_full_mouse_path() {
+        let mut fixture = app_with_focused_mouse_reporting_split(false);
+        let col = fixture.focused_info.inner_rect.x;
+        let row = fixture.focused_info.inner_rect.y;
+        let workspace_id = fixture.app.state.workspaces[0].id.clone();
+        fixture.app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "local finished".into(),
+            context: "active".into(),
+            target: Some(crate::app::state::ToastTarget {
+                workspace_id,
+                pane_id: fixture.local_pane,
+            }),
+        });
+        fixture.app.state.view.toast_hit_area = Rect::new(col, row, 1, 1);
+
+        assert!(!fixture.app.should_route_mouse_pane_only(test_mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            col,
+            row,
+        )));
+
+        fixture.app.route_client_events(
+            vec![raw_mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                col,
+                row,
+            )],
+            false,
+        );
+
+        assert_eq!(
+            fixture.app.state.workspaces[0].focused_pane_id(),
+            Some(fixture.local_pane)
+        );
+        assert!(fixture.app.state.toast.is_none());
+        assert!(fixture.focused_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn headless_remote_attach_local_pane_drag_focuses_and_copies_local_text() {
+        let mut fixture = app_with_focused_mouse_reporting_split(true);
+        let col = fixture.local_info.inner_rect.x;
+        let row = fixture.local_info.inner_rect.y;
+
+        fixture.app.route_client_events(
+            vec![
+                raw_mouse_event(MouseEventKind::Down(MouseButton::Left), col, row),
+                raw_mouse_event(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    col.saturating_add(4),
+                    row,
+                ),
+                raw_mouse_event(
+                    MouseEventKind::Up(MouseButton::Left),
+                    col.saturating_add(4),
+                    row,
+                ),
+            ],
+            false,
+        );
+
+        assert_eq!(
+            fixture.app.state.workspaces[0].focused_pane_id(),
+            Some(fixture.local_pane)
+        );
+        assert_next_clipboard_contains(&mut fixture.app, "local");
+        assert!(fixture.focused_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn headless_paste_after_local_focus_goes_local_not_remote_attach() {
+        let mut fixture = app_with_focused_mouse_reporting_split(true);
+        let col = fixture.local_info.inner_rect.x;
+        let row = fixture.local_info.inner_rect.y;
+
+        fixture.app.route_client_events(
+            vec![raw_mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                col,
+                row,
+            )],
+            false,
+        );
+        assert_eq!(
+            fixture.app.state.workspaces[0].focused_pane_id(),
+            Some(fixture.local_pane)
+        );
+
+        fixture.app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Paste("sentinel".into())],
+            false,
+        );
+
+        assert_eq!(
+            fixture.local_rx.try_recv().expect("local paste bytes"),
+            bytes::Bytes::from_static(b"sentinel")
+        );
+        assert!(fixture.focused_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn monolithic_remote_attach_local_drag_then_paste_targets_local_pane() {
+        let mut fixture = app_with_focused_mouse_reporting_split(true);
+        let col = fixture.local_info.inner_rect.x;
+        let row = fixture.local_info.inner_rect.y;
+
+        fixture
+            .app
+            .handle_raw_input_event(raw_mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                col,
+                row,
+            ))
+            .await;
+        fixture
+            .app
+            .handle_raw_input_event(raw_mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                col.saturating_add(4),
+                row,
+            ))
+            .await;
+        fixture
+            .app
+            .handle_raw_input_event(raw_mouse_event(
+                MouseEventKind::Up(MouseButton::Left),
+                col.saturating_add(4),
+                row,
+            ))
+            .await;
+
+        assert_eq!(
+            fixture.app.state.workspaces[0].focused_pane_id(),
+            Some(fixture.local_pane)
+        );
+        assert_next_clipboard_contains(&mut fixture.app, "local");
+
+        fixture
+            .app
+            .handle_raw_input_event(crate::raw_input::RawInputEvent::Paste("sentinel".into()))
+            .await;
+        assert_eq!(
+            fixture.local_rx.recv().await.expect("local paste bytes"),
+            bytes::Bytes::from_static(b"sentinel")
+        );
+        assert!(fixture.focused_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn headless_focused_remote_attach_left_drag_still_copies_locally() {
+        let mut fixture = app_with_focused_mouse_reporting_split(true);
+        let col = fixture.focused_info.inner_rect.x;
+        let row = fixture.focused_info.inner_rect.y;
+
+        fixture.app.route_client_events(
+            vec![
+                raw_mouse_event(MouseEventKind::Down(MouseButton::Left), col, row),
+                raw_mouse_event(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    col.saturating_add(5),
+                    row,
+                ),
+                raw_mouse_event(
+                    MouseEventKind::Up(MouseButton::Left),
+                    col.saturating_add(5),
+                    row,
+                ),
+            ],
+            false,
+        );
+
+        assert_eq!(
+            fixture.app.state.workspaces[0].focused_pane_id(),
+            Some(fixture.focused_pane)
+        );
+        assert_next_clipboard_contains(&mut fixture.app, "remote");
+        assert!(fixture.focused_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn headless_focused_ordinary_mouse_reporting_pane_still_forwards() {
+        let mut fixture = app_with_focused_mouse_reporting_split(false);
+        let col = fixture.focused_info.inner_rect.x;
+        let row = fixture.focused_info.inner_rect.y;
+
+        fixture.app.route_client_events(
+            vec![raw_mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                col,
+                row,
+            )],
+            false,
+        );
+
+        assert_eq!(
+            fixture.app.state.workspaces[0].focused_pane_id(),
+            Some(fixture.focused_pane)
+        );
+        assert!(fixture.app.state.selection.is_none());
+        assert!(fixture.focused_rx.try_recv().is_ok());
     }
 
     #[test]

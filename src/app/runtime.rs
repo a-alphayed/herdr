@@ -125,12 +125,12 @@ impl App {
                 true
             }
             crate::raw_input::RawInputEvent::Mouse(mouse) => {
-                if self.state.mouse_capture {
-                    self.handle_mouse(mouse);
-                } else {
+                if self.should_route_mouse_pane_only(mouse) {
                     self.state
                         .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
                     self.queue_pending_clipboard_write();
+                } else {
+                    self.handle_mouse(mouse);
                 }
                 true
             }
