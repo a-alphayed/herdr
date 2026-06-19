@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use ratatui::layout::Direction;
 use serde::{Deserialize, Serialize};
 
-use crate::layout::Node;
+use crate::layout::{Node, PaneId};
 use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
@@ -254,12 +254,27 @@ pub fn capture(
     sidebar_section_split: f32,
     collapsed_space_keys: std::collections::HashSet<String>,
 ) -> SessionSnapshot {
+    let mut captured_workspaces = Vec::new();
+    let mut index_map = HashMap::new();
+    for (idx, workspace) in workspaces.iter().enumerate() {
+        if let Some(snapshot) = capture_workspace(workspace, terminals, terminal_runtimes) {
+            index_map.insert(idx, captured_workspaces.len());
+            captured_workspaces.push(snapshot);
+        }
+    }
+    let mapped_active = active.and_then(|idx| index_map.get(&idx).copied());
+    let selected = index_map
+        .get(&selected)
+        .copied()
+        .or(mapped_active)
+        .unwrap_or(0)
+        .min(captured_workspaces.len().saturating_sub(1));
+    let active = mapped_active
+        .or_else(|| (active.is_some() && !captured_workspaces.is_empty()).then_some(selected));
+
     SessionSnapshot {
         version: SNAPSHOT_VERSION,
-        workspaces: workspaces
-            .iter()
-            .map(|workspace| capture_workspace(workspace, terminals, terminal_runtimes))
-            .collect(),
+        workspaces: captured_workspaces,
         active,
         selected,
         agent_panel_scope,
@@ -276,20 +291,96 @@ fn capture_workspace(
         crate::terminal::TerminalState,
     >,
     terminal_runtimes: &TerminalRuntimeRegistry,
-) -> WorkspaceSnapshot {
-    WorkspaceSnapshot {
+) -> Option<WorkspaceSnapshot> {
+    let mut tabs = Vec::new();
+    let mut active_tab = None;
+    for (idx, tab) in ws.tabs.iter().enumerate() {
+        if let Some(snapshot) = capture_tab(tab, terminals, terminal_runtimes) {
+            if idx == ws.active_tab {
+                active_tab = Some(tabs.len());
+            }
+            tabs.push(snapshot);
+        }
+    }
+    if tabs.is_empty() {
+        return None;
+    }
+    Some(WorkspaceSnapshot {
         id: Some(ws.id.clone()),
         custom_name: ws.custom_name.clone(),
         identity_cwd: ws
             .resolved_identity_cwd_from(terminals, terminal_runtimes)
             .unwrap_or_else(|| ws.identity_cwd.clone()),
         worktree_space: ws.worktree_space.clone(),
-        tabs: ws
-            .tabs
-            .iter()
-            .map(|tab| capture_tab(tab, terminals, terminal_runtimes))
-            .collect(),
-        active_tab: ws.active_tab,
+        active_tab: active_tab.unwrap_or(0).min(tabs.len().saturating_sub(1)),
+        tabs,
+    })
+}
+
+fn runtime_only_remote_attach_panes(
+    tab: &crate::workspace::Tab,
+    terminals: &std::collections::HashMap<
+        crate::terminal::TerminalId,
+        crate::terminal::TerminalState,
+    >,
+) -> HashSet<PaneId> {
+    tab.panes
+        .iter()
+        .filter_map(|(id, pane)| {
+            terminals
+                .get(&pane.attached_terminal_id)
+                .is_some_and(|terminal| terminal.runtime_only_remote_attach_view)
+                .then_some(*id)
+        })
+        .collect()
+}
+
+fn layout_pane_ids(layout: &LayoutSnapshot) -> HashSet<u32> {
+    let mut ids = HashSet::new();
+    collect_layout_pane_ids(layout, &mut ids);
+    ids
+}
+
+fn collect_layout_pane_ids(layout: &LayoutSnapshot, ids: &mut HashSet<u32>) {
+    match layout {
+        LayoutSnapshot::Pane(id) => {
+            ids.insert(*id);
+        }
+        LayoutSnapshot::Split { first, second, .. } => {
+            collect_layout_pane_ids(first, ids);
+            collect_layout_pane_ids(second, ids);
+        }
+    }
+}
+
+fn capture_node_excluding(node: &Node, excluded_panes: &HashSet<PaneId>) -> Option<LayoutSnapshot> {
+    if excluded_panes.is_empty() {
+        return Some(capture_node(node));
+    }
+
+    match node {
+        Node::Pane(id) => (!excluded_panes.contains(id)).then_some(LayoutSnapshot::Pane(id.raw())),
+        Node::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => match (
+            capture_node_excluding(first, excluded_panes),
+            capture_node_excluding(second, excluded_panes),
+        ) {
+            (Some(first), Some(second)) => Some(LayoutSnapshot::Split {
+                direction: match direction {
+                    Direction::Horizontal => DirectionSnapshot::Horizontal,
+                    Direction::Vertical => DirectionSnapshot::Vertical,
+                },
+                ratio: *ratio,
+                first: Box::new(first),
+                second: Box::new(second),
+            }),
+            (Some(node), None) | (None, Some(node)) => Some(node),
+            (None, None) => None,
+        },
     }
 }
 
@@ -300,9 +391,18 @@ fn capture_tab(
         crate::terminal::TerminalState,
     >,
     terminal_runtimes: &TerminalRuntimeRegistry,
-) -> TabSnapshot {
+) -> Option<TabSnapshot> {
+    let excluded_panes = runtime_only_remote_attach_panes(tab, terminals);
+    let layout = capture_node_excluding(tab.layout.root(), &excluded_panes)?;
+    let captured_panes = layout_pane_ids(&layout);
+    let fallback_pane = first_pane_id_in_layout(&layout);
+
     let mut panes = HashMap::new();
-    for id in tab.panes.keys() {
+    for id in tab
+        .panes
+        .keys()
+        .filter(|id| captured_panes.contains(&id.raw()))
+    {
         let cwd = tab
             .cwd_for_pane(*id, terminals, terminal_runtimes)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
@@ -356,33 +456,50 @@ fn capture_tab(
             },
         );
     }
-    TabSnapshot {
+    let focused = captured_panes
+        .contains(&tab.layout.focused().raw())
+        .then_some(tab.layout.focused().raw())
+        .or(fallback_pane);
+    let root_pane = captured_panes
+        .contains(&tab.root_pane.raw())
+        .then_some(tab.root_pane.raw())
+        .or(fallback_pane);
+    Some(TabSnapshot {
         custom_name: tab.custom_name.clone(),
-        layout: capture_node(tab.layout.root()),
+        layout,
         panes,
         zoomed: tab.zoomed,
-        focused: Some(tab.layout.focused().raw()),
-        root_pane: Some(tab.root_pane.raw()),
-    }
+        focused,
+        root_pane,
+    })
 }
 
 /// Capture pane screen history separately from the structural session snapshot.
 pub fn capture_history(
     workspaces: &[Workspace],
+    terminals: &std::collections::HashMap<
+        crate::terminal::TerminalId,
+        crate::terminal::TerminalState,
+    >,
     terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> SessionHistorySnapshot {
     SessionHistorySnapshot {
         version: SNAPSHOT_VERSION,
         workspaces: workspaces
             .iter()
-            .map(|workspace| WorkspaceHistorySnapshot {
-                tabs: workspace
+            .filter_map(|workspace| {
+                let tabs: Vec<_> = workspace
                     .tabs
                     .iter()
-                    .map(|tab| TabHistorySnapshot {
-                        panes: capture_tab_history(tab, terminal_runtimes),
+                    .filter_map(|tab| {
+                        let excluded_panes = runtime_only_remote_attach_panes(tab, terminals);
+                        capture_node_excluding(tab.layout.root(), &excluded_panes)?;
+                        Some(TabHistorySnapshot {
+                            panes: capture_tab_history(tab, terminals, terminal_runtimes),
+                        })
                     })
-                    .collect(),
+                    .collect();
+                (!tabs.is_empty()).then_some(WorkspaceHistorySnapshot { tabs })
             })
             .collect(),
     }
@@ -390,10 +507,20 @@ pub fn capture_history(
 
 fn capture_tab_history(
     tab: &crate::workspace::Tab,
+    terminals: &std::collections::HashMap<
+        crate::terminal::TerminalId,
+        crate::terminal::TerminalState,
+    >,
     terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> HashMap<u32, PaneHistorySnapshot> {
     let mut panes = HashMap::new();
     for (id, pane) in &tab.panes {
+        if terminals
+            .get(&pane.attached_terminal_id)
+            .is_some_and(|terminal| terminal.remote_attach.is_some())
+        {
+            continue;
+        }
         if let Some(history) = capture_pane_history(Some(pane), terminal_runtimes) {
             panes.insert(id.raw(), history);
         }
@@ -526,7 +653,7 @@ mod tests {
         state: &AppState,
         terminal_runtimes: &TerminalRuntimeRegistry,
     ) -> SessionHistorySnapshot {
-        capture_history(&state.workspaces, terminal_runtimes)
+        capture_history(&state.workspaces, &state.terminals, terminal_runtimes)
     }
 
     fn root_split_ratio(tab: &TabSnapshot) -> Option<f32> {
@@ -852,6 +979,132 @@ mod tests {
     }
 
     #[test]
+    fn capture_contract_excludes_runtime_only_remote_attach_split_from_structure() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let attached = state.workspaces[0].test_split(Direction::Horizontal);
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].terminal_id(attached).cloned().unwrap();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.remote_attach = Some(crate::remote_source::RemoteAttachTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: "remote-term".into(),
+            label: "jafar/codex-fleet-api".into(),
+        });
+        terminal.runtime_only_remote_attach_view = true;
+
+        let snapshot = capture_from_state(&state);
+        let tab = &snapshot.workspaces[0].tabs[0];
+
+        assert!(matches!(tab.layout, LayoutSnapshot::Pane(id) if id == root.raw()));
+        assert!(tab.panes.contains_key(&root.raw()));
+        assert!(!tab.panes.contains_key(&attached.raw()));
+        assert_eq!(tab.focused, Some(root.raw()));
+        assert_eq!(tab.root_pane, Some(root.raw()));
+    }
+
+    #[tokio::test]
+    async fn sole_runtime_only_remote_attach_workspace_is_not_restored() {
+        let mut state = state_with_workspaces(&["one"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].terminal_id(root).cloned().unwrap();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.remote_attach = Some(crate::remote_source::RemoteAttachTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: "remote-term".into(),
+            label: "jafar/codex-fleet-api".into(),
+        });
+        terminal.runtime_only_remote_attach_view = true;
+        let snapshot = capture_from_state(&state);
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let (workspaces, terminals, terminal_runtimes) = crate::persist::restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            4096,
+            "/bin/sh",
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+
+        assert!(snapshot.workspaces.is_empty());
+        assert!(workspaces.is_empty());
+        assert!(terminals.is_empty());
+        assert!(terminal_runtimes.is_empty());
+    }
+
+    #[test]
+    fn capture_contract_remaps_active_when_runtime_only_workspace_is_dropped() {
+        let mut state = state_with_workspaces(&["remote-only", "local"]);
+        let root = state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = state.workspaces[0].terminal_id(root).cloned().unwrap();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.remote_attach = Some(crate::remote_source::RemoteAttachTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: "remote-term".into(),
+            label: "jafar/codex-fleet-api".into(),
+        });
+        terminal.runtime_only_remote_attach_view = true;
+        state.active = Some(0);
+        state.selected = 0;
+
+        let snapshot = capture_from_state(&state);
+
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.workspaces[0].custom_name.as_deref(), Some("local"));
+        assert_eq!(snapshot.active, Some(0));
+        assert_eq!(snapshot.selected, 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_only_remote_attach_split_is_not_restored() {
+        let mut state = state_with_workspaces(&["one"]);
+        let attached = state.workspaces[0].test_split(Direction::Horizontal);
+        state.ensure_test_terminals();
+        let terminal_id = state.workspaces[0].terminal_id(attached).cloned().unwrap();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.remote_attach = Some(crate::remote_source::RemoteAttachTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: "remote-term".into(),
+            label: "jafar/codex-fleet-api".into(),
+        });
+        terminal.runtime_only_remote_attach_view = true;
+        let snapshot = capture_from_state(&state);
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+
+        let (workspaces, terminals, mut terminal_runtimes) = crate::persist::restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            4096,
+            "/bin/sh",
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            tx,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+
+        assert_eq!(workspaces[0].tabs[0].panes.len(), 1);
+        assert!(terminals.values().all(|terminal| {
+            terminal.remote_attach.is_none() && !terminal.runtime_only_remote_attach_view
+        }));
+        for (_, runtime) in terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    #[test]
     fn capture_contract_tracks_worktree_space_membership() {
         let mut state = state_with_workspaces(&["main"]);
         state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
@@ -998,6 +1251,58 @@ mod tests {
         assert!(history.ansi.contains("alpha"));
         assert!(history.ansi.contains("gamma"));
         assert!(history.lines >= 3);
+    }
+
+    #[tokio::test]
+    async fn capture_contract_skips_remote_attach_pane_history() {
+        let mut state = state_with_workspaces(&["one"]);
+        let local = state.workspaces[0].tabs[0].root_pane;
+        let attached = state.workspaces[0].test_split(Direction::Horizontal);
+        state.ensure_test_terminals();
+        let local_terminal_id = state.workspaces[0].tabs[0].panes[&local]
+            .attached_terminal_id
+            .clone();
+        let attached_terminal_id = state.workspaces[0].tabs[0].panes[&attached]
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&attached_terminal_id)
+            .unwrap()
+            .remote_attach = Some(crate::remote_source::RemoteAttachTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: "remote-term".into(),
+            label: "jafar/codex-fleet-api".into(),
+        });
+        let mut terminal_runtimes = TerminalRuntimeRegistry::new();
+        terminal_runtimes.insert(
+            local_terminal_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                20,
+                3,
+                4096,
+                b"local-pane-history\r\n",
+            ),
+        );
+        terminal_runtimes.insert(
+            attached_terminal_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                20,
+                3,
+                4096,
+                b"remote-attach-history\r\n",
+            ),
+        );
+
+        let history_snapshot = capture_history_from_state_with_runtimes(&state, &terminal_runtimes);
+        let tab = &history_snapshot.workspaces[0].tabs[0];
+
+        assert!(tab.panes[&local.raw()].ansi.contains("local-pane-history"));
+        assert!(!tab.panes.contains_key(&attached.raw()));
+        assert!(!serde_json::to_string(&history_snapshot)
+            .unwrap()
+            .contains("remote-attach-history"));
     }
 
     #[tokio::test]

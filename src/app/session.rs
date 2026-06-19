@@ -37,7 +37,11 @@ impl App {
                 self.state.collapsed_space_keys.clone(),
             );
             let history = self.persist_pane_history.then(|| {
-                crate::persist::capture_history(&self.state.workspaces, &self.terminal_runtimes)
+                crate::persist::capture_history(
+                    &self.state.workspaces,
+                    &self.state.terminals,
+                    &self.terminal_runtimes,
+                )
             });
             crate::persist::save(&snap, history.as_ref());
         }

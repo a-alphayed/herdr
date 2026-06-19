@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::Rect;
+use ratatui::layout::{Direction, Rect};
 
 use super::{
     state::{Mode, PendingRemoteAttach, RemoteAttachPaneTarget, ToastKind, ToastNotification},
@@ -140,6 +140,13 @@ impl App {
         self.begin_remote_attach_request(request);
     }
 
+    pub(crate) fn drain_remote_attach_in_new_split_request(&mut self) {
+        let Some(target) = self.state.request_remote_attach_in_new_split.take() else {
+            return;
+        };
+        self.begin_remote_attach_in_new_split_request(target);
+    }
+
     pub(crate) fn drain_remote_detach_view_request(&mut self) {
         let Some(pane) = self.state.request_remote_detach_view.take() else {
             return;
@@ -177,6 +184,16 @@ impl App {
         } else {
             self.state.pending_remote_attach = Some(request);
             self.state.mode = Mode::ConfirmRemoteAttach;
+        }
+    }
+
+    pub(crate) fn begin_remote_attach_in_new_split_request(&mut self, target: RemoteAttachTarget) {
+        match self.apply_remote_attach_in_new_split(target) {
+            Ok(()) => {}
+            Err(err) => {
+                toast_error(self, "attach unavailable", err.to_string());
+                set_terminal_mode(self);
+            }
         }
     }
 
@@ -381,6 +398,82 @@ impl App {
         self.apply_remote_attach_with_exe(request, &exe)
     }
 
+    fn apply_remote_attach_in_new_split(
+        &mut self,
+        target: RemoteAttachTarget,
+    ) -> Result<(), RemoteAttachApplyError> {
+        let exe = std::env::current_exe()
+            .map_err(|err| RemoteAttachApplyError::CurrentExe(err.to_string()))?;
+        self.apply_remote_attach_in_new_split_with_exe(target, &exe)
+    }
+
+    fn apply_remote_attach_in_new_split_with_exe(
+        &mut self,
+        target: RemoteAttachTarget,
+        exe: &Path,
+    ) -> Result<(), RemoteAttachApplyError> {
+        if self.focus_existing_remote_attach(&target) {
+            return Ok(());
+        }
+        self.precheck_remote_attach_target(&target)
+            .map_err(RemoteAttachApplyError::Precheck)?;
+
+        let ws_idx = self
+            .state
+            .active
+            .ok_or(RemoteAttachApplyError::PaneMissing)?;
+        let focused_pane = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(crate::workspace::Workspace::focused_pane_id)
+            .ok_or(RemoteAttachApplyError::PaneMissing)?;
+        let follow_cwd = self.state.workspaces.get(ws_idx).and_then(|ws| {
+            let tab = ws.active_tab()?;
+            tab.cwd_for_pane(focused_pane, &self.state.terminals, &self.terminal_runtimes)
+        });
+        let cwd = Some(self.resolve_new_terminal_cwd(follow_cwd));
+        let (rows, cols) = self.state.estimate_pane_size();
+        let new_rows = (rows / 2).max(4);
+        let new_cols = (cols / 2).max(10);
+        let previous_focus = self.state.current_pane_focus_target();
+        let argv = remote_attach_argv_from_exe(exe, &target);
+        let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
+            return Err(RemoteAttachApplyError::PaneMissing);
+        };
+        let new_pane = ws
+            .split_focused_argv_command(
+                Direction::Horizontal,
+                new_rows,
+                new_cols,
+                cwd,
+                &argv,
+                self.state.pane_scrollback_limit_bytes,
+                self.state.host_terminal_theme,
+            )
+            .map_err(|err| RemoteAttachApplyError::Spawn(err.to_string()))?;
+        let pane_id = new_pane.pane_id;
+        let terminal_id = new_pane.terminal.id.clone();
+        let mut terminal = new_pane.terminal;
+        terminal.remote_attach = Some(target);
+        terminal.respawn_shell_on_exit = false;
+        terminal.launch_argv = None;
+        terminal.runtime_only_remote_attach_view = true;
+        self.terminal_runtimes
+            .insert(terminal_id.clone(), new_pane.runtime);
+        self.state.remove_alias_shadowed_by_new_pane(pane_id);
+        self.state.terminals.insert(terminal_id, terminal);
+        self.state
+            .record_pane_focus_change(previous_focus, ws_idx, pane_id);
+        // Remote attach placement is runtime-only. Do not schedule a session
+        // save for a split that exists solely to host the local attach client.
+        set_terminal_mode(self);
+        self.render_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.render_notify.notify_one();
+        Ok(())
+    }
+
     fn apply_remote_attach_with_exe(
         &mut self,
         request: PendingRemoteAttach,
@@ -429,6 +522,7 @@ impl App {
             terminal.remote_attach = Some(request.target.clone());
             terminal.respawn_shell_on_exit = true;
             terminal.launch_argv = None;
+            terminal.runtime_only_remote_attach_view = false;
         }
         self.state
             .focus_pane_in_workspace(ws_idx, request.pane.pane_id);
@@ -703,6 +797,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_attach_in_new_split_records_runtime_only_metadata() {
+        let mut app = app_with_remote("default");
+        cache_connected_target(&mut app);
+        let request = pane_request(&mut app);
+        let original_pane = request.pane.pane_id;
+        let original_terminal_id = request.pane.terminal_id.clone();
+
+        app.apply_remote_attach_in_new_split_with_exe(target(), Path::new("/bin/true"))
+            .expect("remote attach split should spawn argv child");
+
+        let ws = &app.state.workspaces[0];
+        let focused_pane = ws.focused_pane_id().expect("focused split pane");
+        assert_ne!(focused_pane, original_pane);
+        assert_eq!(ws.tabs[0].panes.len(), 2);
+        let focused_terminal_id = ws.terminal_id(focused_pane).cloned().unwrap();
+        assert_ne!(focused_terminal_id, original_terminal_id);
+
+        let original_terminal = app.state.terminals.get(&original_terminal_id).unwrap();
+        assert!(original_terminal.remote_attach.is_none());
+        assert!(original_terminal.launch_argv.is_none());
+
+        let split_terminal = app.state.terminals.get(&focused_terminal_id).unwrap();
+        assert_eq!(split_terminal.remote_attach, Some(target()));
+        assert!(split_terminal.launch_argv.is_none());
+        assert!(!split_terminal.respawn_shell_on_exit);
+        assert!(split_terminal.runtime_only_remote_attach_view);
+        assert!(!split_terminal.is_agent_terminal());
+        let split_runtime = app
+            .terminal_runtimes
+            .remove(&focused_terminal_id)
+            .expect("split attach runtime");
+        split_runtime.shutdown();
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_attach_in_new_split_exit_closes_runtime_only_pane() {
+        let mut app = app_with_remote("default");
+        cache_connected_target(&mut app);
+        let request = pane_request(&mut app);
+        let original_pane = request.pane.pane_id;
+
+        app.apply_remote_attach_in_new_split_with_exe(target(), Path::new("/bin/true"))
+            .expect("remote attach split should spawn argv child");
+        let attach_pane = app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("focused attach pane");
+        assert_ne!(attach_pane, original_pane);
+
+        app.handle_internal_event(crate::events::AppEvent::PaneDied {
+            pane_id: attach_pane,
+        });
+
+        assert!(app.state.workspaces[0]
+            .find_tab_index_for_pane(attach_pane)
+            .is_none());
+        assert!(app.state.workspaces[0]
+            .find_tab_index_for_pane(original_pane)
+            .is_some());
+        assert_eq!(app.state.workspaces[0].tabs[0].panes.len(), 1);
+
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
+    }
+
+    #[test]
+    fn remote_attach_in_new_split_spawn_failure_rolls_back_split() {
+        let mut app = app_with_remote("default");
+        cache_connected_target(&mut app);
+        let request = pane_request(&mut app);
+        let original_terminal_id = request.pane.terminal_id.clone();
+
+        let result = app.apply_remote_attach_in_new_split_with_exe(
+            target(),
+            Path::new("/__herdr_missing_remote_attach_executable__"),
+        );
+
+        assert!(matches!(result, Err(RemoteAttachApplyError::Spawn(_))));
+        assert_eq!(app.state.workspaces[0].tabs[0].panes.len(), 1);
+        assert_eq!(app.terminal_runtimes.len(), 0);
+        let terminal = app.state.terminals.get(&original_terminal_id).unwrap();
+        assert!(terminal.remote_attach.is_none());
+        assert!(terminal.launch_argv.is_none());
+    }
+
+    #[tokio::test]
     async fn remote_attach_apply_records_runtime_only_metadata() {
         let mut app = app_with_remote("default");
         cache_connected_target(&mut app);
@@ -716,6 +900,7 @@ mod tests {
         assert_eq!(terminal.remote_attach, Some(target()));
         assert!(terminal.launch_argv.is_none());
         assert!(terminal.respawn_shell_on_exit);
+        assert!(!terminal.runtime_only_remote_attach_view);
         assert!(!terminal.is_agent_terminal());
         let runtime = app
             .terminal_runtimes

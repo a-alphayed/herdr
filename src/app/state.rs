@@ -1124,7 +1124,7 @@ impl ContextMenuState {
             ContextMenuKind::RemoteAgent {
                 attached_pane: None,
                 ..
-            } => &["Attach to focused pane"],
+            } => &["Attach to focused pane", "Attach in new split"],
         }
     }
 }
@@ -1239,6 +1239,7 @@ pub struct AppState {
     /// handled by the outer App/event loop instead of directly from AppState.
     pub request_clipboard_write: Option<Vec<u8>>,
     pub(crate) request_remote_attach: Option<PendingRemoteAttach>,
+    pub(crate) request_remote_attach_in_new_split: Option<crate::remote_source::RemoteAttachTarget>,
     pub(crate) request_remote_detach_view: Option<RemoteAttachPaneTarget>,
     pub(crate) pending_remote_attach: Option<PendingRemoteAttach>,
     pub creating_new_tab: bool,
@@ -1547,6 +1548,7 @@ impl AppState {
             request_client_config_reload: false,
             request_clipboard_write: None,
             request_remote_attach: None,
+            request_remote_attach_in_new_split: None,
             request_remote_detach_view: None,
             pending_remote_attach: None,
             creating_new_tab: false,

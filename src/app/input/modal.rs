@@ -783,6 +783,32 @@ pub(super) fn apply_context_menu_action(
         }
         (
             ContextMenuKind::RemoteAgent {
+                target,
+                focused_pane,
+                attached_pane: None,
+            },
+            Some("Attach in new split"),
+        ) => {
+            if focused_pane.is_some() {
+                state.request_remote_attach_in_new_split = Some(target);
+                state.mode = if state.active.is_some() {
+                    Mode::Terminal
+                } else {
+                    Mode::Navigate
+                };
+            } else {
+                state.toast = Some(ToastNotification {
+                    kind: ToastKind::NeedsAttention,
+                    title: "attach unavailable".into(),
+                    context: "focus a local pane before attaching a remote agent in a new split"
+                        .into(),
+                    target: None,
+                });
+                leave_modal(state);
+            }
+        }
+        (
+            ContextMenuKind::RemoteAgent {
                 attached_pane: Some(pane),
                 ..
             },

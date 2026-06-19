@@ -537,6 +537,7 @@ impl App {
             request_client_config_reload: false,
             request_clipboard_write: None,
             request_remote_attach: None,
+            request_remote_attach_in_new_split: None,
             request_remote_detach_view: None,
             pending_remote_attach: None,
             creating_new_tab: false,
@@ -1526,6 +1527,7 @@ impl App {
             }
         }
         self.drain_remote_attach_request();
+        self.drain_remote_attach_in_new_split_request();
         self.drain_remote_detach_view_request();
     }
 

@@ -797,7 +797,10 @@ mod tests {
         ));
 
         let menu = app.state.context_menu.as_ref().expect("remote agent menu");
-        assert_eq!(menu.items(), &["Attach to focused pane"]);
+        assert_eq!(
+            menu.items(),
+            &["Attach to focused pane", "Attach in new split"]
+        );
         match &menu.kind {
             ContextMenuKind::RemoteAgent {
                 target,
@@ -812,6 +815,48 @@ mod tests {
             other => panic!("unexpected menu: {other:?}"),
         }
         assert_eq!(app.state.selected_remote_agent, Some(remote_key()));
+    }
+
+    #[test]
+    fn remote_agent_menu_attach_in_new_split_requests_target() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("local")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![remote_agent("remote-term", "smoke-agent")],
+        );
+
+        let detail_area = app.state.agent_panel_rect();
+        let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, detail_area);
+        let body = crate::ui::agent_panel_body_rect(
+            detail_area,
+            crate::ui::should_show_scrollbar(metrics),
+        );
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            body.x + 1,
+            body.y,
+        ));
+        app.state.context_menu.as_mut().unwrap().list.highlighted = 1;
+        handle_context_menu_key(
+            &mut app.state,
+            &mut app.terminal_runtimes,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        let request = app
+            .state
+            .request_remote_attach_in_new_split
+            .as_ref()
+            .expect("attach in split request");
+        assert_eq!(request.key(), remote_key());
+        assert!(app.state.request_remote_attach.is_none());
+        assert_eq!(app.state.mode, Mode::Terminal);
     }
 
     #[test]

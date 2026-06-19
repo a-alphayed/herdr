@@ -75,6 +75,10 @@ pub struct TerminalState {
     pub launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
     pub remote_attach: Option<RemoteAttachTarget>,
+    /// True for local panes created solely to host a runtime-only remote attach view.
+    /// Snapshot capture excludes these panes so active remote views are not restored
+    /// as ordinary local shells after an unrelated session save.
+    pub runtime_only_remote_attach_view: bool,
 }
 
 impl TerminalState {
@@ -101,6 +105,7 @@ impl TerminalState {
             launch_argv: None,
             respawn_shell_on_exit: false,
             remote_attach: None,
+            runtime_only_remote_attach_view: false,
         }
     }
 
@@ -663,6 +668,7 @@ impl TerminalState {
         self.clear_agent_runtime_identity_for_replacement();
         self.respawn_shell_on_exit = false;
         self.remote_attach = None;
+        self.runtime_only_remote_attach_view = false;
     }
 
     pub fn clear_agent_runtime_identity_for_replacement(&mut self) {
