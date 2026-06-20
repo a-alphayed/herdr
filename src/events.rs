@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use crate::api::schema::AgentInfo;
+use crate::api::schema::{AgentInfo, WorkspaceInfo};
 use crate::detect::{Agent, AgentState};
 use crate::layout::PaneId;
 use crate::remote_source::{RemoteAgentKey, RemoteConnectionStatus, RemoteHostKey};
@@ -93,6 +93,7 @@ pub enum AppEvent {
     RemoteSourceSnapshot {
         host: RemoteHostKey,
         agents: Vec<AgentInfo>,
+        workspaces: Option<Vec<WorkspaceInfo>>,
     },
     /// A connected authoritative remote host/session reported one newer agent entry.
     #[allow(dead_code)]

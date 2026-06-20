@@ -2044,6 +2044,7 @@ mod tests {
         app.handle_internal_event(AppEvent::RemoteSourceSnapshot {
             host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
             agents: vec![remote_agent_info("term-1")],
+            workspaces: None,
         });
 
         assert!(app.state.remote_sources.list_entries().is_empty());
@@ -2062,6 +2063,7 @@ mod tests {
         app.handle_internal_event(AppEvent::RemoteSourceSnapshot {
             host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
             agents: vec![remote_agent_info("term-1")],
+            workspaces: None,
         });
 
         assert!(app.state.remote_sources.list_entries().is_empty());
@@ -2081,6 +2083,7 @@ mod tests {
         app.handle_internal_event(AppEvent::RemoteSourceSnapshot {
             host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
             agents: vec![remote_agent_info("term-1")],
+            workspaces: None,
         });
 
         assert_eq!(app.state.remote_sources.list_entries().len(), 1);
@@ -2526,6 +2529,7 @@ auto_connect = false
         app.handle_internal_event(AppEvent::RemoteSourceSnapshot {
             host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
             agents: vec![remote_agent_info("term-1")],
+            workspaces: None,
         });
         assert!(app.state.remote_sources.list_host_statuses().is_empty());
         assert!(app.state.remote_sources.list_entries().is_empty());

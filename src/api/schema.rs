@@ -24,6 +24,8 @@ pub enum Method {
     WorkspaceCreate(WorkspaceCreateParams),
     #[serde(rename = "workspace.list")]
     WorkspaceList(EmptyParams),
+    #[serde(rename = "workspace.list_local")]
+    WorkspaceListLocal(EmptyParams),
     #[serde(rename = "workspace.get")]
     WorkspaceGet(WorkspaceTarget),
     #[serde(rename = "workspace.focus")]
@@ -658,6 +660,7 @@ pub struct FederationCapabilities {
 
 impl FederationCapabilities {
     pub const REMOTE_API_BRIDGE: &'static str = "remote_api_bridge";
+    pub const WORKSPACE_LIST_LOCAL: &'static str = "workspace_list_local";
     pub const AGENT_LIST: &'static str = "agent_list";
     pub const AGENT_LIST_LOCAL: &'static str = "agent_list_local";
     pub const AGENT_GET: &'static str = "agent_get";
@@ -671,6 +674,7 @@ impl FederationCapabilities {
         Self {
             methods: [
                 Self::REMOTE_API_BRIDGE,
+                Self::WORKSPACE_LIST_LOCAL,
                 Self::AGENT_LIST,
                 Self::AGENT_LIST_LOCAL,
                 Self::AGENT_GET,
@@ -1231,6 +1235,19 @@ mod tests {
     }
 
     #[test]
+    fn request_round_trips_for_workspace_list_local() {
+        let request = Request {
+            id: "req_workspace_list_local".into(),
+            method: Method::WorkspaceListLocal(EmptyParams::default()),
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "workspace.list_local");
+        let restored: Request = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, request);
+    }
+
+    #[test]
     fn unknown_method_is_rejected() {
         let json = r#"{"id":"req_1","method":"nope","params":{}}"#;
         let err = serde_json::from_str::<Request>(json)
@@ -1438,6 +1455,7 @@ mod tests {
         let federation = capabilities.federation.expect("federation");
 
         assert!(federation.supports_method(FederationCapabilities::REMOTE_API_BRIDGE));
+        assert!(federation.supports_method(FederationCapabilities::WORKSPACE_LIST_LOCAL));
         assert!(federation.supports_method(FederationCapabilities::AGENT_GET));
         assert!(federation.supports_method(FederationCapabilities::AGENT_READ));
         assert!(federation.supports_method(FederationCapabilities::AGENT_SEND));

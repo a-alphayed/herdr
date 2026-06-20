@@ -15,7 +15,9 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::api::client::{parse_response_value, ApiClientError};
-use crate::api::schema::{AgentInfo, EmptyParams, Method, PingParams, Request, ResponseResult};
+use crate::api::schema::{
+    AgentInfo, EmptyParams, Method, PingParams, Request, ResponseResult, WorkspaceInfo,
+};
 use crate::events::AppEvent;
 use crate::remote_source::{RemoteConnectionStatus, RemoteHostKey};
 use crate::remote_target::{RemoteHostConfig, RemoteHostRegistry};
@@ -107,12 +109,16 @@ fn remote_source_supervisor_loop_with<F>(
     let host_key = RemoteHostKey::new(host.name.clone(), host.session.clone());
     let mut next_ping = Instant::now();
     let mut next_snapshot = Instant::now();
+    let mut capabilities = RemoteSourceCapabilities::default();
 
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
         if now >= next_ping {
             match send_ping(&host, &send) {
-                Ok(()) => next_ping = now + REMOTE_SOURCE_PING_INTERVAL,
+                Ok(next_capabilities) => {
+                    capabilities = next_capabilities;
+                    next_ping = now + REMOTE_SOURCE_PING_INTERVAL;
+                }
                 Err(err) => {
                     if stop.load(Ordering::Relaxed) {
                         break;
@@ -132,14 +138,15 @@ fn remote_source_supervisor_loop_with<F>(
 
         let now = Instant::now();
         if now >= next_snapshot {
-            match send_agent_list(&host, &send) {
-                Ok(agents) => {
+            match send_remote_source_snapshot(&host, &send, capabilities) {
+                Ok((agents, workspaces)) => {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
                     let _ = event_tx.blocking_send(AppEvent::RemoteSourceSnapshot {
                         host: host_key.clone(),
                         agents,
+                        workspaces,
                     });
                     next_snapshot = now + REMOTE_SOURCE_SNAPSHOT_INTERVAL;
                 }
@@ -188,12 +195,34 @@ fn remote_source_failure_status(err: &io::Error) -> RemoteConnectionStatus {
     }
 }
 
-fn send_ping<F>(host: &RemoteHostConfig, send: &F) -> io::Result<()>
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RemoteSourceCapabilities {
+    workspace_list_local: bool,
+}
+
+fn send_ping<F>(host: &RemoteHostConfig, send: &F) -> io::Result<RemoteSourceCapabilities>
 where
     F: Fn(&RemoteHostConfig, &Request) -> io::Result<String>,
 {
     let response = send(host, &ping_request())?;
     parse_ping_response(&response)
+}
+
+fn send_remote_source_snapshot<F>(
+    host: &RemoteHostConfig,
+    send: &F,
+    capabilities: RemoteSourceCapabilities,
+) -> io::Result<(Vec<AgentInfo>, Option<Vec<WorkspaceInfo>>)>
+where
+    F: Fn(&RemoteHostConfig, &Request) -> io::Result<String>,
+{
+    let agents = send_agent_list(host, send)?;
+    let workspaces = if capabilities.workspace_list_local {
+        Some(send_workspace_list(host, send)?)
+    } else {
+        None
+    };
+    Ok((agents, workspaces))
 }
 
 fn send_agent_list<F>(host: &RemoteHostConfig, send: &F) -> io::Result<Vec<AgentInfo>>
@@ -202,6 +231,14 @@ where
 {
     let response = send(host, &agent_list_request())?;
     parse_agent_list_response(&response)
+}
+
+fn send_workspace_list<F>(host: &RemoteHostConfig, send: &F) -> io::Result<Vec<WorkspaceInfo>>
+where
+    F: Fn(&RemoteHostConfig, &Request) -> io::Result<String>,
+{
+    let response = send(host, &workspace_list_request())?;
+    parse_workspace_list_response(&response)
 }
 
 pub(crate) fn ping_request() -> Request {
@@ -218,7 +255,14 @@ pub(crate) fn agent_list_request() -> Request {
     }
 }
 
-pub(crate) fn parse_ping_response(response: &str) -> io::Result<()> {
+pub(crate) fn workspace_list_request() -> Request {
+    Request {
+        id: "remote-source.workspace-list".to_string(),
+        method: Method::WorkspaceListLocal(EmptyParams::default()),
+    }
+}
+
+pub(crate) fn parse_ping_response(response: &str) -> io::Result<RemoteSourceCapabilities> {
     match parse_success_response(response)? {
         ResponseResult::Pong { capabilities, .. } => {
             let Some(federation) = capabilities.and_then(|capabilities| capabilities.federation)
@@ -239,11 +283,25 @@ pub(crate) fn parse_ping_response(response: &str) -> io::Result<()> {
                     ));
                 }
             }
-            Ok(())
+            Ok(RemoteSourceCapabilities {
+                workspace_list_local: federation.supports_method(
+                    crate::api::schema::FederationCapabilities::WORKSPACE_LIST_LOCAL,
+                ),
+            })
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("expected pong response, got {other:?}"),
+        )),
+    }
+}
+
+pub(crate) fn parse_workspace_list_response(response: &str) -> io::Result<Vec<WorkspaceInfo>> {
+    match parse_success_response(response)? {
+        ResponseResult::WorkspaceList { workspaces } => Ok(workspaces),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected workspace.list_local response, got {other:?}"),
         )),
     }
 }
@@ -310,6 +368,20 @@ mod tests {
         }
     }
 
+    fn workspace(workspace_id: &str, label: &str) -> WorkspaceInfo {
+        WorkspaceInfo {
+            workspace_id: workspace_id.to_string(),
+            number: 1,
+            label: label.to_string(),
+            focused: false,
+            pane_count: 0,
+            tab_count: 1,
+            active_tab_id: "tab-1".to_string(),
+            agent_status: AgentStatus::Unknown,
+            worktree: None,
+        }
+    }
+
     fn pong_response() -> String {
         serde_json::to_string(&SuccessResponse {
             id: "remote-source.ping".to_string(),
@@ -337,10 +409,40 @@ mod tests {
         .unwrap()
     }
 
+    fn pong_response_without_workspace_list_local() -> String {
+        serde_json::to_string(&SuccessResponse {
+            id: "remote-source.ping".to_string(),
+            result: ResponseResult::Pong {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                protocol: crate::protocol::PROTOCOL_VERSION,
+                capabilities: Some(crate::api::schema::ServerCapabilities {
+                    live_handoff: true,
+                    federation: Some(crate::api::schema::FederationCapabilities {
+                        methods: vec![
+                            crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE
+                                .to_string(),
+                            crate::api::schema::FederationCapabilities::AGENT_LIST_LOCAL
+                                .to_string(),
+                        ],
+                    }),
+                }),
+            },
+        })
+        .unwrap()
+    }
+
     fn agent_list_response(agents: Vec<AgentInfo>) -> String {
         serde_json::to_string(&SuccessResponse {
             id: "remote-source.agent-list".to_string(),
             result: ResponseResult::AgentList { agents },
+        })
+        .unwrap()
+    }
+
+    fn workspace_list_response(workspaces: Vec<WorkspaceInfo>) -> String {
+        serde_json::to_string(&SuccessResponse {
+            id: "remote-source.workspace-list".to_string(),
+            result: ResponseResult::WorkspaceList { workspaces },
         })
         .unwrap()
     }
@@ -360,11 +462,15 @@ mod tests {
     }
 
     #[test]
-    fn remote_supervisor_builds_ping_and_agent_list_requests_without_subscriptions() {
+    fn remote_supervisor_builds_poll_requests_without_subscriptions() {
         assert!(matches!(ping_request().method, Method::Ping(_)));
         assert!(matches!(
             agent_list_request().method,
             Method::AgentListLocal(_)
+        ));
+        assert!(matches!(
+            workspace_list_request().method,
+            Method::WorkspaceListLocal(_)
         ));
     }
 
@@ -466,6 +572,9 @@ mod tests {
                 match &request.method {
                     Method::Ping(_) => Ok(pong_response()),
                     Method::AgentListLocal(_) => Ok(agent_list_response(vec![agent("term-1")])),
+                    Method::WorkspaceListLocal(_) => {
+                        Ok(workspace_list_response(vec![workspace("ws-1", "tmp")]))
+                    }
                     _ => unreachable!("unexpected request"),
                 }
             });
@@ -475,11 +584,58 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
-        let AppEvent::RemoteSourceSnapshot { host, agents } = event else {
+        let AppEvent::RemoteSourceSnapshot {
+            host,
+            agents,
+            workspaces,
+        } = event
+        else {
             panic!("expected snapshot event");
         };
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
         assert_eq!(agents[0].terminal_id, "term-1");
+        let workspaces = workspaces.expect("workspace snapshot");
+        assert_eq!(workspaces[0].workspace_id, "ws-1");
+        assert_eq!(workspaces[0].label, "tmp");
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn remote_supervisor_loop_skips_workspace_poll_when_capability_missing() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let thread_calls = Arc::clone(&calls);
+        let host = RemoteHostConfig::new("jafar", "jafar", "default", true);
+
+        let handle = thread::spawn(move || {
+            remote_source_supervisor_loop_with(host, tx, thread_stop, move |_host, request| {
+                thread_calls.fetch_add(1, Ordering::Relaxed);
+                match &request.method {
+                    Method::Ping(_) => Ok(pong_response_without_workspace_list_local()),
+                    Method::AgentListLocal(_) => Ok(agent_list_response(vec![agent("term-1")])),
+                    Method::WorkspaceListLocal(_) => panic!("workspace poll should be skipped"),
+                    _ => unreachable!("unexpected request"),
+                }
+            });
+        });
+
+        let event = rx.blocking_recv().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        let AppEvent::RemoteSourceSnapshot {
+            host,
+            agents,
+            workspaces,
+        } = event
+        else {
+            panic!("expected snapshot event");
+        };
+        assert_eq!(host, RemoteHostKey::new("jafar", "default"));
+        assert_eq!(agents[0].terminal_id, "term-1");
+        assert_eq!(workspaces, None);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
@@ -522,6 +678,7 @@ mod tests {
                 match &request.method {
                     Method::Ping(_) => Ok(old_pong_response_without_federation()),
                     Method::AgentListLocal(_) => panic!("snapshot should not be requested"),
+                    Method::WorkspaceListLocal(_) => panic!("workspace should not be requested"),
                     _ => unreachable!("unexpected request"),
                 }
             });
@@ -557,6 +714,7 @@ mod tests {
                         io::ErrorKind::InvalidData,
                         "remote API ping did not advertise federation method agent.list",
                     )),
+                    Method::WorkspaceListLocal(_) => panic!("workspace should not be requested"),
                     _ => unreachable!("unexpected request"),
                 }
             });
@@ -572,6 +730,39 @@ mod tests {
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
         assert_eq!(status, RemoteConnectionStatus::NeedsUpdate);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn remote_supervisor_loop_marks_bad_workspace_snapshot_as_needs_update() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let thread_calls = Arc::clone(&calls);
+        let host = RemoteHostConfig::new("jafar", "jafar", "default", true);
+
+        let handle = thread::spawn(move || {
+            remote_source_supervisor_loop_with(host, tx, thread_stop, move |_host, request| {
+                thread_calls.fetch_add(1, Ordering::Relaxed);
+                match &request.method {
+                    Method::Ping(_) => Ok(pong_response()),
+                    Method::AgentListLocal(_) => Ok(agent_list_response(vec![agent("term-1")])),
+                    Method::WorkspaceListLocal(_) => Ok("not json".to_string()),
+                    _ => unreachable!("unexpected request"),
+                }
+            });
+        });
+
+        let event = rx.blocking_recv().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        let AppEvent::RemoteSourceDisconnected { host, status } = event else {
+            panic!("expected disconnected event");
+        };
+        assert_eq!(host, RemoteHostKey::new("jafar", "default"));
+        assert_eq!(status, RemoteConnectionStatus::NeedsUpdate);
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
     }
 
     #[test]
@@ -604,6 +795,17 @@ mod tests {
     }
 
     #[test]
+    fn remote_supervisor_parses_workspace_list_success() {
+        let response = workspace_list_response(vec![workspace("ws-1", "tmp")]);
+
+        let workspaces = parse_workspace_list_response(&response).unwrap();
+
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].workspace_id, "ws-1");
+        assert_eq!(workspaces[0].label, "tmp");
+    }
+
+    #[test]
     fn remote_supervisor_rejects_error_response_for_agent_list() {
         let response = serde_json::to_string(&ErrorResponse {
             id: "remote-source.agent-list".to_string(),
@@ -628,6 +830,13 @@ mod tests {
     }
 
     #[test]
+    fn remote_supervisor_rejects_malformed_workspace_list_response() {
+        let err = parse_workspace_list_response("not json").unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn remote_supervisor_rejects_wrong_success_response_type() {
         let response = serde_json::to_string(&SuccessResponse {
             id: "remote-source.agent-list".to_string(),
@@ -639,5 +848,19 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("expected agent.list"));
+    }
+
+    #[test]
+    fn remote_supervisor_rejects_wrong_workspace_success_response_type() {
+        let response = serde_json::to_string(&SuccessResponse {
+            id: "remote-source.workspace-list".to_string(),
+            result: ResponseResult::Ok {},
+        })
+        .unwrap();
+
+        let err = parse_workspace_list_response(&response).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("expected workspace.list_local"));
     }
 }

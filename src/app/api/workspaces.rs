@@ -10,18 +10,23 @@ use super::responses::{encode_error, encode_success};
 
 impl App {
     pub(super) fn handle_workspace_list(&mut self, id: String) -> String {
-        encode_success(
-            id,
-            ResponseResult::WorkspaceList {
-                workspaces: self
-                    .state
-                    .workspaces
-                    .iter()
-                    .enumerate()
-                    .map(|(idx, _)| self.workspace_info(idx))
-                    .collect(),
-            },
-        )
+        encode_success(id, self.local_workspace_list_result())
+    }
+
+    pub(super) fn handle_workspace_list_local(&mut self, id: String) -> String {
+        encode_success(id, self.local_workspace_list_result())
+    }
+
+    fn local_workspace_list_result(&self) -> ResponseResult {
+        ResponseResult::WorkspaceList {
+            workspaces: self
+                .state
+                .workspaces
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| self.workspace_info(idx))
+                .collect(),
+        }
     }
 
     pub(super) fn handle_workspace_get(&mut self, id: String, target: WorkspaceTarget) -> String {
@@ -208,5 +213,21 @@ mod tests {
         assert_eq!(success.id, "req");
         assert_eq!(app.state.request_remove_linked_worktree, None);
         assert!(app.state.workspaces.is_empty());
+    }
+
+    #[test]
+    fn api_workspace_list_local_returns_authoritative_local_workspaces() {
+        let mut app = app_with_linked_worktree();
+
+        let response = app.handle_workspace_list_local("req".into());
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "req");
+        let ResponseResult::WorkspaceList { workspaces } = success.result else {
+            panic!("expected workspace list");
+        };
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].label, "issue");
+        assert_eq!(workspaces[0].workspace_id, app.state.workspaces[0].id);
     }
 }

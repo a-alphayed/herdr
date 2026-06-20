@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::api::schema::AgentInfo;
+use crate::api::schema::{AgentInfo, WorkspaceInfo};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RemoteHostKey {
@@ -103,6 +103,13 @@ pub(crate) struct RemoteAgentEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteWorkspaceEntry {
+    pub(crate) host: RemoteHostKey,
+    pub(crate) workspace: WorkspaceInfo,
+    pub(crate) status: RemoteConnectionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteHostStatusEntry {
     pub(crate) host: RemoteHostKey,
     pub(crate) status: RemoteConnectionStatus,
@@ -124,6 +131,7 @@ pub(crate) struct RemoteSourceCache {
 struct RemoteHostCache {
     status: RemoteConnectionStatus,
     agents: BTreeMap<String, AgentInfo>,
+    workspaces: Option<BTreeMap<String, WorkspaceInfo>>,
 }
 
 impl Default for RemoteHostCache {
@@ -131,6 +139,7 @@ impl Default for RemoteHostCache {
         Self {
             status: RemoteConnectionStatus::Disconnected,
             agents: BTreeMap::new(),
+            workspaces: None,
         }
     }
 }
@@ -145,6 +154,20 @@ impl RemoteHostCache {
                 status: self.status,
             })
             .collect()
+    }
+
+    fn workspace_entries(&self, host: &RemoteHostKey) -> Option<Vec<RemoteWorkspaceEntry>> {
+        Some(
+            self.workspaces
+                .as_ref()?
+                .values()
+                .map(|workspace| RemoteWorkspaceEntry {
+                    host: host.clone(),
+                    workspace: workspace.clone(),
+                    status: self.status,
+                })
+                .collect(),
+        )
     }
 }
 
@@ -162,6 +185,27 @@ impl RemoteSourceCache {
             .collect();
     }
 
+    pub(crate) fn replace_workspace_snapshot(
+        &mut self,
+        host: RemoteHostKey,
+        workspaces: Vec<WorkspaceInfo>,
+    ) {
+        let host_cache = self.hosts.entry(host).or_default();
+        host_cache.status = RemoteConnectionStatus::Connected;
+        host_cache.workspaces = Some(
+            workspaces
+                .into_iter()
+                .map(|workspace| (workspace.workspace_id.clone(), workspace))
+                .collect(),
+        );
+    }
+
+    pub(crate) fn clear_workspace_snapshot(&mut self, host: &RemoteHostKey) {
+        if let Some(host_cache) = self.hosts.get_mut(host) {
+            host_cache.workspaces = None;
+        }
+    }
+
     pub(crate) fn mark_status(&mut self, host: &RemoteHostKey, status: RemoteConnectionStatus) {
         self.hosts.entry(host.clone()).or_default().status = status;
     }
@@ -170,6 +214,7 @@ impl RemoteSourceCache {
         self.hosts.entry(host).or_insert_with(|| RemoteHostCache {
             status,
             agents: BTreeMap::new(),
+            workspaces: None,
         });
     }
 
@@ -177,6 +222,7 @@ impl RemoteSourceCache {
         let host_cache = self.hosts.entry(host).or_insert_with(|| RemoteHostCache {
             status: RemoteConnectionStatus::Connected,
             agents: BTreeMap::new(),
+            workspaces: None,
         });
         host_cache.status = RemoteConnectionStatus::Connected;
 
@@ -208,6 +254,14 @@ impl RemoteSourceCache {
             .collect()
     }
 
+    pub(crate) fn list_workspace_entries(&self) -> Vec<RemoteWorkspaceEntry> {
+        self.hosts
+            .iter()
+            .filter_map(|(host, host_cache)| host_cache.workspace_entries(host))
+            .flatten()
+            .collect()
+    }
+
     pub(crate) fn list_host_statuses(&self) -> Vec<RemoteHostStatusEntry> {
         self.hosts
             .iter()
@@ -224,6 +278,15 @@ impl RemoteSourceCache {
             .get(host)
             .map(|host_cache| host_cache.entries(host))
             .unwrap_or_default()
+    }
+
+    pub(crate) fn workspace_entries_for_host(
+        &self,
+        host: &RemoteHostKey,
+    ) -> Option<Vec<RemoteWorkspaceEntry>> {
+        self.hosts
+            .get(host)
+            .and_then(|host_cache| host_cache.workspace_entries(host))
     }
 
     #[allow(dead_code)] // Staged for target routing/cache lookups in later slices.
@@ -243,7 +306,7 @@ impl RemoteSourceCache {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::api::schema::{AgentInfo, AgentStatus};
+    use crate::api::schema::{AgentInfo, AgentStatus, WorkspaceInfo};
 
     use super::*;
 
@@ -265,6 +328,20 @@ mod tests {
             cwd: None,
             foreground_cwd: None,
             revision,
+        }
+    }
+
+    fn workspace(workspace_id: &str, label: &str) -> WorkspaceInfo {
+        WorkspaceInfo {
+            workspace_id: workspace_id.to_string(),
+            number: 1,
+            label: label.to_string(),
+            focused: false,
+            pane_count: 0,
+            tab_count: 1,
+            active_tab_id: "t1".to_string(),
+            agent_status: AgentStatus::Unknown,
+            worktree: None,
         }
     }
 
@@ -304,6 +381,92 @@ mod tests {
     }
 
     #[test]
+    fn remote_source_workspace_snapshot_stores_authoritative_metadata() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+
+        cache.replace_workspace_snapshot(
+            host.clone(),
+            vec![workspace("ws-b", "blank shell"), workspace("ws-a", "tmp")],
+        );
+
+        let entries = cache.workspace_entries_for_host(&host).expect("snapshot");
+        let labels: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.workspace.workspace_id.as_str(),
+                    entry.workspace.label.as_str(),
+                    entry.status,
+                )
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                ("ws-a", "tmp", RemoteConnectionStatus::Connected),
+                ("ws-b", "blank shell", RemoteConnectionStatus::Connected),
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_source_workspace_snapshot_distinguishes_empty_from_missing() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+
+        assert!(cache.workspace_entries_for_host(&host).is_none());
+        cache.replace_workspace_snapshot(host.clone(), Vec::new());
+
+        assert_eq!(
+            cache.workspace_entries_for_host(&host),
+            Some(Vec::<RemoteWorkspaceEntry>::new())
+        );
+    }
+
+    #[test]
+    fn remote_source_agent_snapshot_preserves_workspace_snapshot() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+        cache.replace_workspace_snapshot(host.clone(), vec![workspace("ws-a", "tmp")]);
+
+        cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
+
+        assert_eq!(cache.list_entries().len(), 1);
+        let workspaces = cache.workspace_entries_for_host(&host).expect("snapshot");
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].workspace.label, "tmp");
+    }
+
+    #[test]
+    fn remote_source_workspace_snapshot_preserves_agents() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+        cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
+
+        cache.replace_workspace_snapshot(host, vec![workspace("ws-a", "tmp")]);
+
+        let entries = cache.list_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].agent.terminal_id, "term-1");
+    }
+
+    #[test]
+    fn remote_source_clear_workspace_snapshot_restores_missing_snapshot_state() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+        cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
+        cache.replace_workspace_snapshot(host.clone(), vec![workspace("ws-a", "tmp")]);
+
+        cache.clear_workspace_snapshot(&host);
+
+        assert!(cache.workspace_entries_for_host(&host).is_none());
+        let entries = cache.list_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].agent.terminal_id, "term-1");
+    }
+
+    #[test]
     fn remote_source_ensure_host_adds_empty_status_without_clobbering_existing() {
         let mut cache = RemoteSourceCache::default();
         let host = RemoteHostKey::new("jafar", "default");
@@ -328,6 +491,7 @@ mod tests {
         let mut cache = RemoteSourceCache::default();
         let host = RemoteHostKey::new("jafar", "default");
         cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
+        cache.replace_workspace_snapshot(host.clone(), vec![workspace("ws-a", "tmp")]);
 
         cache.mark_status(&host, RemoteConnectionStatus::Disconnected);
 
@@ -336,6 +500,11 @@ mod tests {
         assert_eq!(entries[0].status, RemoteConnectionStatus::Disconnected);
         assert_eq!(entries[0].status.stale_label(), Some("disconnected"));
         assert!(entries[0].stale());
+        let workspace_entries = cache.workspace_entries_for_host(&host).expect("snapshot");
+        assert_eq!(
+            workspace_entries[0].status,
+            RemoteConnectionStatus::Disconnected
+        );
     }
 
     #[test]
@@ -531,6 +700,8 @@ mod tests {
         let remove = RemoteHostKey::new("jafar", "agents");
         cache.replace_connected_snapshot(keep.clone(), vec![agent("term-1", "codex", 1)]);
         cache.replace_connected_snapshot(remove.clone(), vec![agent("term-2", "claude", 1)]);
+        cache.replace_workspace_snapshot(keep.clone(), vec![workspace("ws-keep", "keep")]);
+        cache.replace_workspace_snapshot(remove.clone(), vec![workspace("ws-remove", "remove")]);
 
         assert!(cache.remove_host(&remove));
         assert!(!cache.remove_host(&remove));
@@ -539,5 +710,8 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].host, keep);
         assert_eq!(entries[0].agent.terminal_id, "term-1");
+        let workspace_entries = cache.list_workspace_entries();
+        assert_eq!(workspace_entries.len(), 1);
+        assert_eq!(workspace_entries[0].workspace.workspace_id, "ws-keep");
     }
 }

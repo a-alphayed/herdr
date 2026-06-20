@@ -574,6 +574,7 @@ impl App {
                 }
             }
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
+            Method::WorkspaceListLocal(_) => return self.handle_workspace_list_local(request.id),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {
                 return self.handle_workspace_create(request.id, params);
