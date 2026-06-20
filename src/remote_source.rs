@@ -41,6 +41,13 @@ impl RemoteAgentKey {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RemoteSpaceKey {
+    pub(crate) host: String,
+    pub(crate) session: String,
+    pub(crate) workspace_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteAttachTarget {
     pub(crate) host: String,

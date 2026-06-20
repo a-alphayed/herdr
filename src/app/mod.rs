@@ -518,6 +518,7 @@ impl App {
             remote_sources,
             active,
             previous_pane_focus: None,
+            selected_remote_space: None,
             selected_remote_agent: None,
             selected,
             mode,

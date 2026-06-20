@@ -2155,6 +2155,11 @@ impl AppState {
                 Vec::new()
             }
             AppEvent::RemoteSourceRemoved { host } => {
+                if self.selected_remote_space.as_ref().is_some_and(|selected| {
+                    selected.host == host.host && selected.session == host.session
+                }) {
+                    self.selected_remote_space = None;
+                }
                 self.remote_sources.remove_host(&host);
                 Vec::new()
             }
@@ -2451,7 +2456,7 @@ mod tests {
     use super::*;
     use crate::api::schema::{AgentInfo, AgentStatus};
     use crate::detect::{Agent, AgentState};
-    use crate::remote_source::{RemoteAgentKey, RemoteAttachTarget, RemoteHostKey};
+    use crate::remote_source::{RemoteAgentKey, RemoteAttachTarget, RemoteHostKey, RemoteSpaceKey};
     use crate::workspace::Workspace;
     use ratatui::layout::Direction;
 
@@ -3215,8 +3220,10 @@ mod tests {
 
         assert!(updates.is_empty());
         let entries = crate::ui::agent_panel_entries(&state);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].primary_label, "jafar/smoke-agent");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].primary_label, "jafar agents");
+        assert_eq!(entries[1].primary_label, "remote-ws");
+        assert_eq!(entries[2].primary_label, "smoke-agent");
     }
 
     #[test]
@@ -3236,8 +3243,10 @@ mod tests {
 
         assert!(updates.is_empty());
         let entries = crate::ui::agent_panel_entries(&state);
-        assert_eq!(entries.len(), 1);
+        assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].custom_status.as_deref(), Some("unreachable"));
+        assert_eq!(entries[1].custom_status.as_deref(), Some("unreachable"));
+        assert_eq!(entries[2].custom_status.as_deref(), Some("unreachable"));
     }
 
     #[test]
@@ -3254,7 +3263,7 @@ mod tests {
         assert!(updates.is_empty());
         let entries = crate::ui::agent_panel_entries(&state);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].primary_label, "jafar");
+        assert_eq!(entries[0].primary_label, "jafar agents");
         assert_eq!(entries[0].custom_status.as_deref(), Some("needs update"));
     }
 
@@ -3305,9 +3314,9 @@ mod tests {
         assert!(same_updates.is_empty());
         assert!(new_updates.is_empty());
         let entries = crate::ui::agent_panel_entries(&state);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].primary_label, "jafar/new");
-        assert_eq!(entries[0].state, AgentState::Idle);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].primary_label, "new");
+        assert_eq!(entries[2].state, AgentState::Idle);
     }
 
     #[test]
@@ -3334,7 +3343,7 @@ mod tests {
             .into_iter()
             .map(|entry| entry.primary_label)
             .collect();
-        assert_eq!(labels, vec!["jafar/keep"]);
+        assert_eq!(labels, vec!["jafar agents", "remote-ws", "keep"]);
     }
 
     #[test]
@@ -3359,7 +3368,33 @@ mod tests {
             .into_iter()
             .map(|entry| entry.primary_label)
             .collect();
-        assert_eq!(labels, vec!["jafar/keep"]);
+        assert_eq!(labels, vec!["jafar agents", "remote-ws", "keep"]);
+    }
+
+    #[test]
+    fn remote_source_events_host_removed_clears_selected_remote_space_for_host() {
+        let mut state = AppState::test_new();
+        let keep = RemoteHostKey::new("jafar", "default");
+        let remove = RemoteHostKey::new("jafar", "agents");
+        state.selected_remote_space = Some(RemoteSpaceKey {
+            host: "jafar".to_string(),
+            session: "agents".to_string(),
+            workspace_id: "remote-ws".to_string(),
+        });
+        state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            host: keep,
+            agents: vec![remote_agent("keep-term", "keep")],
+        });
+        state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            host: remove.clone(),
+            agents: vec![remote_agent("remove-term", "remove")],
+        });
+
+        let updates = state.handle_app_event(AppEvent::RemoteSourceRemoved { host: remove });
+
+        assert!(updates.is_empty());
+        assert!(state.selected_remote_space.is_none());
+        assert_eq!(state.remote_sources.list_entries().len(), 1);
     }
 
     #[test]
