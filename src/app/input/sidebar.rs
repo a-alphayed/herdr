@@ -308,6 +308,18 @@ impl AppState {
         })
     }
 
+    pub(super) fn workspace_list_remote_target_at(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Option<crate::ui::WorkspaceListRemoteTarget> {
+        if self.sidebar_collapsed {
+            return None;
+        }
+
+        crate::ui::workspace_list_remote_target_at(self, self.view.sidebar_rect, col, row)
+    }
+
     pub(super) fn collapsed_workspace_at_row(&self, row: u16) -> Option<usize> {
         if !self.sidebar_collapsed {
             return None;
@@ -568,12 +580,67 @@ mod tests {
         row_y
     }
 
+    fn workspace_list_remote_row(
+        app: &crate::app::App,
+        target: impl Fn(&crate::ui::WorkspaceListRemoteTarget) -> bool,
+    ) -> crate::ui::WorkspaceListRemoteRowArea {
+        let (_, remote_rows) =
+            crate::ui::compute_workspace_list_areas(&app.state, app.state.view.sidebar_rect);
+        remote_rows
+            .into_iter()
+            .find(|row| target(&row.target))
+            .expect("visible remote workspace row")
+    }
+
     fn remote_space_row_y(app: &crate::app::App) -> u16 {
-        agent_panel_entry_row_y(app, 1)
+        workspace_list_remote_row(app, |target| {
+            matches!(
+                target,
+                crate::ui::WorkspaceListRemoteTarget::RemoteSpace { .. }
+            )
+        })
+        .rect
+        .y
+    }
+
+    fn remote_space_row_x(app: &crate::app::App) -> u16 {
+        workspace_list_remote_row(app, |target| {
+            matches!(
+                target,
+                crate::ui::WorkspaceListRemoteTarget::RemoteSpace { .. }
+            )
+        })
+        .rect
+        .x
+        .saturating_add(1)
+    }
+
+    fn remote_host_spaces_row_y(app: &crate::app::App) -> u16 {
+        workspace_list_remote_row(app, |target| {
+            matches!(
+                target,
+                crate::ui::WorkspaceListRemoteTarget::RemoteHost { .. }
+            )
+        })
+        .rect
+        .y
+        .saturating_add(1)
+    }
+
+    fn remote_host_spaces_row_x(app: &crate::app::App) -> u16 {
+        workspace_list_remote_row(app, |target| {
+            matches!(
+                target,
+                crate::ui::WorkspaceListRemoteTarget::RemoteHost { .. }
+            )
+        })
+        .rect
+        .x
+        .saturating_add(1)
     }
 
     fn remote_agent_row_y(app: &crate::app::App) -> u16 {
-        agent_panel_entry_row_y(app, 2)
+        agent_panel_entry_row_y(app, 1)
     }
 
     fn make_remote_agent_rows_visible(app: &mut crate::app::App) {
@@ -790,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_agent_panel_row_has_no_local_click_target() {
+    fn remote_space_workspace_row_and_remote_agent_panel_row_have_expected_targets() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = Vec::new();
         app.state.active = None;
@@ -803,13 +870,16 @@ mod tests {
         );
         make_remote_agent_rows_visible(&mut app);
 
-        let space_entry = app
+        let space_target = app
             .state
-            .agent_detail_entry_at(remote_space_row_y(&app))
+            .workspace_list_remote_target_at(remote_space_row_x(&app), remote_space_row_y(&app))
             .unwrap();
-        assert_eq!(space_entry.remote_space_key(), Some(remote_space_key()));
-        assert!(space_entry.local_target().is_none());
-        assert!(space_entry.remote_attach_target().is_none());
+        assert_eq!(
+            space_target,
+            crate::ui::WorkspaceListRemoteTarget::RemoteSpace {
+                key: remote_space_key()
+            }
+        );
 
         let entry = app
             .state
@@ -1229,11 +1299,11 @@ mod tests {
             RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
             vec![remote_agent("remote-term", "smoke-agent")],
         );
+        make_remote_agent_rows_visible(&mut app);
 
-        let body = agent_panel_body(&app);
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Right),
-            body.x + 1,
+            remote_space_row_x(&app),
             remote_space_row_y(&app),
         ));
 
@@ -1294,11 +1364,11 @@ mod tests {
             RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
             vec![remote_agent("remote-term", "smoke-agent")],
         );
+        make_remote_agent_rows_visible(&mut app);
 
-        let body = agent_panel_body(&app);
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            body.x + 1,
+            remote_space_row_x(&app),
             remote_space_row_y(&app),
         ));
 
@@ -1309,6 +1379,68 @@ mod tests {
         assert!(app.state.selected_remote_agent.is_none());
         assert!(app.state.request_remote_attach.is_none());
         assert!(app.state.context_menu.is_none());
+    }
+
+    #[test]
+    fn left_click_remote_host_spaces_header_is_noop() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("local")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.state.selected_remote_agent = Some(remote_key());
+        app.state.selected_remote_space = Some(remote_space_key());
+        let focused_pane = app.state.workspaces[0].focused_pane_id();
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![remote_agent("remote-term", "smoke-agent")],
+        );
+        make_remote_agent_rows_visible(&mut app);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            remote_host_spaces_row_x(&app),
+            remote_host_spaces_row_y(&app),
+        ));
+
+        assert_eq!(app.state.active, Some(0));
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), focused_pane);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.selected_remote_agent.is_none());
+        assert_eq!(app.state.selected_remote_space, Some(remote_space_key()));
+        assert!(app.state.request_remote_attach.is_none());
+        assert!(app.state.context_menu.is_none());
+    }
+
+    #[test]
+    fn right_click_remote_host_spaces_header_does_not_open_menu() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("local")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.state.selected_remote_agent = Some(remote_key());
+        app.state.selected_remote_space = Some(remote_space_key());
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![remote_agent("remote-term", "smoke-agent")],
+        );
+        make_remote_agent_rows_visible(&mut app);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            remote_host_spaces_row_x(&app),
+            remote_host_spaces_row_y(&app),
+        ));
+
+        assert!(app.state.context_menu.is_none());
+        assert!(app.state.selected_remote_agent.is_none());
+        assert_eq!(app.state.selected_remote_space, Some(remote_space_key()));
+        assert_eq!(app.state.mode, Mode::Terminal);
     }
 
     #[test]

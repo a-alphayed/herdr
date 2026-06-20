@@ -504,6 +504,21 @@ impl AppState {
                         return None;
                     }
 
+                    if let Some(target) =
+                        self.workspace_list_remote_target_at(mouse.column, mouse.row)
+                    {
+                        match target {
+                            crate::ui::WorkspaceListRemoteTarget::RemoteSpace { key } => {
+                                self.selected_remote_space = Some(key);
+                                self.selected_remote_agent = None;
+                            }
+                            crate::ui::WorkspaceListRemoteTarget::RemoteHost { .. } => {
+                                self.selected_remote_agent = None;
+                            }
+                        }
+                        return None;
+                    }
+
                     let cards = if self.view.workspace_card_areas.is_empty() {
                         crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect)
                     } else {
@@ -569,15 +584,15 @@ impl AppState {
                             self.focus_pane_in_workspace(ws_idx, pane_id);
                             self.mode = Mode::Terminal;
                         } else if let Some(target) = entry.remote_attach_target() {
+                            let selected_key = target.key();
                             self.selected_remote_space = None;
-                            self.selected_remote_agent = Some(target.key());
+                            self.selected_remote_agent = Some(selected_key.clone());
                             if let Some((ws_idx, pane_id)) = self.find_remote_attach_pane(&target) {
                                 self.focus_pane_in_workspace(ws_idx, pane_id);
+                                self.selected_remote_space = None;
+                                self.selected_remote_agent = Some(selected_key);
                                 self.mode = Mode::Terminal;
                             }
-                        } else if let Some(key) = entry.remote_space_key() {
-                            self.selected_remote_space = Some(key);
-                            self.selected_remote_agent = None;
                         } else {
                             self.selected_remote_space = None;
                             self.selected_remote_agent = None;
@@ -939,6 +954,19 @@ impl AppState {
                 {
                     return None;
                 }
+                if let Some(target) = self.workspace_list_remote_target_at(mouse.column, mouse.row)
+                {
+                    match target {
+                        crate::ui::WorkspaceListRemoteTarget::RemoteSpace { key } => {
+                            self.selected_remote_space = Some(key);
+                            self.selected_remote_agent = None;
+                        }
+                        crate::ui::WorkspaceListRemoteTarget::RemoteHost { .. } => {
+                            self.selected_remote_agent = None;
+                        }
+                    }
+                    return None;
+                }
                 if let Some(entry) = self.agent_detail_entry_at(mouse.row) {
                     if let Some(target) = entry.remote_attach_target() {
                         let attached_pane = self.remote_attach_pane_target_for(&target);
@@ -955,9 +983,6 @@ impl AppState {
                             list: MenuListState::new(0),
                         });
                         self.mode = Mode::ContextMenu;
-                    } else if let Some(key) = entry.remote_space_key() {
-                        self.selected_remote_space = Some(key);
-                        self.selected_remote_agent = None;
                     } else {
                         self.selected_remote_space = None;
                         self.selected_remote_agent = None;
@@ -965,6 +990,8 @@ impl AppState {
                     return None;
                 }
                 if let Some(idx) = self.workspace_at_row(mouse.row) {
+                    self.selected_remote_space = None;
+                    self.selected_remote_agent = None;
                     self.selected = idx;
                     let kind = self
                         .workspaces

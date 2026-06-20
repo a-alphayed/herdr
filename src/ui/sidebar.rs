@@ -28,11 +28,6 @@ pub(crate) enum AgentPanelEntryLocation {
         session: String,
         terminal_id: String,
     },
-    RemoteSpace {
-        host: String,
-        session: String,
-        workspace_id: String,
-    },
     RemoteHost {
         host: String,
         session: String,
@@ -59,26 +54,9 @@ impl AgentPanelEntry {
                 tab_idx,
                 pane_id,
             } => Some((ws_idx, tab_idx, pane_id)),
-            AgentPanelEntryLocation::Remote { .. }
-            | AgentPanelEntryLocation::RemoteSpace { .. }
-            | AgentPanelEntryLocation::RemoteHost { .. } => None,
-        }
-    }
-
-    pub(crate) fn remote_space_key(&self) -> Option<crate::remote_source::RemoteSpaceKey> {
-        match &self.location {
-            AgentPanelEntryLocation::RemoteSpace {
-                host,
-                session,
-                workspace_id,
-            } => Some(crate::remote_source::RemoteSpaceKey {
-                host: host.clone(),
-                session: session.clone(),
-                workspace_id: workspace_id.clone(),
-            }),
-            AgentPanelEntryLocation::Local { .. }
-            | AgentPanelEntryLocation::Remote { .. }
-            | AgentPanelEntryLocation::RemoteHost { .. } => None,
+            AgentPanelEntryLocation::Remote { .. } | AgentPanelEntryLocation::RemoteHost { .. } => {
+                None
+            }
         }
     }
 
@@ -94,9 +72,9 @@ impl AgentPanelEntry {
                 terminal_id: terminal_id.clone(),
                 label: remote_attach_label(host, session, &self.primary_label),
             }),
-            AgentPanelEntryLocation::Local { .. }
-            | AgentPanelEntryLocation::RemoteSpace { .. }
-            | AgentPanelEntryLocation::RemoteHost { .. } => None,
+            AgentPanelEntryLocation::Local { .. } | AgentPanelEntryLocation::RemoteHost { .. } => {
+                None
+            }
         }
     }
 }
@@ -281,7 +259,11 @@ fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
     for host_entry in app.remote_sources.list_host_statuses() {
         if let Some(host_agents) = agents_by_host.remove(&host_entry.host) {
             entries.push(remote_host_panel_entry(host_entry));
-            entries.extend(remote_space_panel_entries(app, host_agents));
+            entries.extend(
+                host_agents
+                    .into_iter()
+                    .map(|entry| remote_agent_panel_entry(app, entry)),
+            );
         } else if host_entry.agent_count == 0 && !host_entry.status.is_connected() {
             entries.push(remote_host_panel_entry(host_entry));
         }
@@ -299,73 +281,14 @@ fn remote_agent_panel_entries(app: &AppState) -> Vec<AgentPanelEntry> {
                 agent_count: host_agents.len(),
             },
         ));
-        entries.extend(remote_space_panel_entries(app, host_agents));
-    }
-
-    entries
-}
-
-fn remote_space_panel_entries(
-    app: &AppState,
-    host_agents: Vec<crate::remote_source::RemoteAgentEntry>,
-) -> Vec<AgentPanelEntry> {
-    let mut spaces: std::collections::BTreeMap<
-        String,
-        Vec<crate::remote_source::RemoteAgentEntry>,
-    > = std::collections::BTreeMap::new();
-    for entry in host_agents {
-        spaces
-            .entry(entry.agent.workspace_id.clone())
-            .or_default()
-            .push(entry);
-    }
-
-    let mut entries = Vec::new();
-    for (workspace_id, space_agents) in spaces {
-        let Some(first_agent) = space_agents.first() else {
-            continue;
-        };
-        let key = crate::remote_source::RemoteSpaceKey {
-            host: first_agent.host.host.clone(),
-            session: first_agent.host.session.clone(),
-            workspace_id,
-        };
-        entries.push(remote_space_panel_entry(&key, &space_agents));
         entries.extend(
-            space_agents
+            host_agents
                 .into_iter()
                 .map(|entry| remote_agent_panel_entry(app, entry)),
         );
     }
 
     entries
-}
-
-fn remote_space_panel_entry(
-    key: &crate::remote_source::RemoteSpaceKey,
-    agents: &[crate::remote_source::RemoteAgentEntry],
-) -> AgentPanelEntry {
-    let mut state_labels = std::collections::HashMap::new();
-    state_labels.insert("unknown".to_string(), "remote".to_string());
-    let custom_status = agents
-        .first()
-        .and_then(|entry| entry.status.stale_label())
-        .map(str::to_string);
-
-    AgentPanelEntry {
-        location: AgentPanelEntryLocation::RemoteSpace {
-            host: key.host.clone(),
-            session: key.session.clone(),
-            workspace_id: key.workspace_id.clone(),
-        },
-        primary_label: remote_space_label(agents, &key.workspace_id),
-        primary_tab_label: None,
-        agent_label: None,
-        state: AgentState::Unknown,
-        seen: true,
-        custom_status,
-        state_labels,
-    }
 }
 
 fn remote_agent_panel_entry(
@@ -436,6 +359,10 @@ fn remote_host_panel_entry(entry: crate::remote_source::RemoteHostStatusEntry) -
 
 fn remote_host_header_label(host: &crate::remote_source::RemoteHostKey) -> String {
     format!("{} agents", remote_host_label(host))
+}
+
+fn remote_space_header_label(host: &crate::remote_source::RemoteHostKey) -> String {
+    format!("{} spaces", remote_host_label(host))
 }
 
 fn remote_host_label(host: &crate::remote_source::RemoteHostKey) -> String {
@@ -525,25 +452,20 @@ fn truncate_text(text: &str, max_width: usize) -> String {
 pub(crate) fn agent_panel_entry_content_height(entry: &AgentPanelEntry) -> u16 {
     match &entry.location {
         AgentPanelEntryLocation::RemoteHost { .. } => 2,
-        AgentPanelEntryLocation::Local { .. }
-        | AgentPanelEntryLocation::RemoteSpace { .. }
-        | AgentPanelEntryLocation::Remote { .. } => 2,
+        AgentPanelEntryLocation::Local { .. } | AgentPanelEntryLocation::Remote { .. } => 2,
     }
 }
 
 pub(crate) fn agent_panel_entry_gap_after(entry: &AgentPanelEntry) -> u16 {
     match &entry.location {
         AgentPanelEntryLocation::RemoteHost { .. } => 1,
-        AgentPanelEntryLocation::Local { .. }
-        | AgentPanelEntryLocation::RemoteSpace { .. }
-        | AgentPanelEntryLocation::Remote { .. } => 1,
+        AgentPanelEntryLocation::Local { .. } | AgentPanelEntryLocation::Remote { .. } => 1,
     }
 }
 
 fn agent_panel_primary_label_indent(entry: &AgentPanelEntry, max_width: usize) -> &'static str {
     let indent = match &entry.location {
-        AgentPanelEntryLocation::RemoteSpace { .. } => "  ",
-        AgentPanelEntryLocation::Remote { .. } => "    ",
+        AgentPanelEntryLocation::Remote { .. } => "  ",
         AgentPanelEntryLocation::Local { .. } | AgentPanelEntryLocation::RemoteHost { .. } => "",
     };
     if max_width > indent.chars().count() {
@@ -672,7 +594,41 @@ fn grouped_child_display_label(label: &str, branch: Option<&str>, has_custom_nam
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkspaceListEntry {
-    Workspace { ws_idx: usize, indented: bool },
+    Workspace {
+        ws_idx: usize,
+        indented: bool,
+    },
+    RemoteHost {
+        host: crate::remote_source::RemoteHostKey,
+        status: crate::remote_source::RemoteConnectionStatus,
+    },
+    RemoteSpace {
+        key: crate::remote_source::RemoteSpaceKey,
+        label: String,
+        status: crate::remote_source::RemoteConnectionStatus,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceListRemoteRowArea {
+    pub(crate) target: WorkspaceListRemoteTarget,
+    pub(crate) rect: Rect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceListRowArea {
+    entry: WorkspaceListEntry,
+    rect: Rect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkspaceListRemoteTarget {
+    RemoteHost {
+        host: crate::remote_source::RemoteHostKey,
+    },
+    RemoteSpace {
+        key: crate::remote_source::RemoteSpaceKey,
+    },
 }
 
 fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], idx: usize) -> bool {
@@ -680,6 +636,43 @@ fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], idx: usize) 
         entries.get(idx.saturating_add(1)),
         Some(WorkspaceListEntry::Workspace { indented: true, .. })
     )
+}
+
+fn next_entry_is_remote_space(entries: &[WorkspaceListEntry], idx: usize) -> bool {
+    matches!(
+        entries.get(idx.saturating_add(1)),
+        Some(WorkspaceListEntry::RemoteSpace { .. })
+    )
+}
+
+fn workspace_list_entry_content_height(app: &AppState, entry: &WorkspaceListEntry) -> u16 {
+    match entry {
+        WorkspaceListEntry::Workspace { ws_idx, indented } => {
+            let Some(ws) = app.workspaces.get(*ws_idx) else {
+                return 0;
+            };
+            if *indented {
+                1
+            } else {
+                workspace_row_height(ws)
+            }
+        }
+        WorkspaceListEntry::RemoteHost { .. } => 2,
+        WorkspaceListEntry::RemoteSpace { .. } => 1,
+    }
+}
+
+fn workspace_list_entry_gap_after(entries: &[WorkspaceListEntry], idx: usize) -> u16 {
+    match entries.get(idx) {
+        Some(WorkspaceListEntry::Workspace { indented, .. }) => {
+            u16::from(!(*indented && next_entry_is_indented_workspace(entries, idx)))
+        }
+        Some(WorkspaceListEntry::RemoteHost { .. }) => 1,
+        Some(WorkspaceListEntry::RemoteSpace { .. }) => {
+            u16::from(!next_entry_is_remote_space(entries, idx))
+        }
+        None => 0,
+    }
 }
 
 pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested: usize) -> usize {
@@ -794,6 +787,52 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
             }
         }
     }
+    entries.extend(remote_workspace_list_entries(app));
+    entries
+}
+
+fn remote_workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> {
+    let mut spaces_by_host: std::collections::BTreeMap<
+        crate::remote_source::RemoteHostKey,
+        std::collections::BTreeMap<String, Vec<crate::remote_source::RemoteAgentEntry>>,
+    > = std::collections::BTreeMap::new();
+    for entry in app.remote_sources.list_entries() {
+        spaces_by_host
+            .entry(entry.host.clone())
+            .or_default()
+            .entry(entry.agent.workspace_id.clone())
+            .or_default()
+            .push(entry);
+    }
+
+    let mut entries = Vec::new();
+    for (host, spaces) in spaces_by_host {
+        let status = spaces
+            .values()
+            .find_map(|agents| agents.first().map(|entry| entry.status))
+            .unwrap_or(crate::remote_source::RemoteConnectionStatus::Disconnected);
+        entries.push(WorkspaceListEntry::RemoteHost {
+            host: host.clone(),
+            status,
+        });
+
+        for (workspace_id, agents) in spaces {
+            let status = agents
+                .first()
+                .map(|entry| entry.status)
+                .unwrap_or(crate::remote_source::RemoteConnectionStatus::Disconnected);
+            entries.push(WorkspaceListEntry::RemoteSpace {
+                key: crate::remote_source::RemoteSpaceKey {
+                    host: host.host.clone(),
+                    session: host.session.clone(),
+                    workspace_id: workspace_id.clone(),
+                },
+                label: remote_space_label(&agents, &workspace_id),
+                status,
+            });
+        }
+    }
+
     entries
 }
 
@@ -820,33 +859,7 @@ fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> us
         return 0;
     }
 
-    let mut used_rows = 0u16;
-    let mut visible = 0usize;
-    let entries = workspace_list_entries(app);
-    for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
-        let needed = match entry {
-            WorkspaceListEntry::Workspace { ws_idx, indented } => {
-                let Some(ws) = app.workspaces.get(*ws_idx) else {
-                    continue;
-                };
-                let row_height = if *indented {
-                    1
-                } else {
-                    workspace_row_height(ws)
-                };
-                let gap = u16::from(
-                    !(*indented && next_entry_is_indented_workspace(&entries, entry_idx)),
-                );
-                row_height.saturating_add(gap)
-            }
-        };
-        if used_rows.saturating_add(needed) > body.height {
-            break;
-        }
-        used_rows = used_rows.saturating_add(needed);
-        visible += 1;
-    }
-    visible
+    workspace_list_row_areas_for_body(app, body, scroll).len()
 }
 
 pub(crate) fn workspace_list_scroll_metrics(
@@ -962,7 +975,10 @@ pub(crate) fn agent_panel_scrollbar_rect(app: &AppState, area: Rect) -> Option<R
 pub(crate) fn compute_workspace_list_areas(
     app: &AppState,
     area: Rect,
-) -> (Vec<crate::app::state::WorkspaceCardArea>, Vec<()>) {
+) -> (
+    Vec<crate::app::state::WorkspaceCardArea>,
+    Vec<WorkspaceListRemoteRowArea>,
+) {
     let ws_area = workspace_list_rect(area, app.sidebar_section_split);
     if ws_area == Rect::default() {
         return (Vec::new(), Vec::new());
@@ -974,41 +990,34 @@ pub(crate) fn compute_workspace_list_areas(
         return (Vec::new(), Vec::new());
     }
 
-    let scroll = app.workspace_scroll;
-    let mut row_y = body.y;
-    let body_bottom = body.y + body.height;
     let mut cards = Vec::new();
-    let headers = Vec::new();
+    let mut remote_rows = Vec::new();
 
-    let entries = workspace_list_entries(app);
-    for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
-        match entry {
+    for row in workspace_list_row_areas_for_body(app, body, app.workspace_scroll) {
+        match row.entry {
             WorkspaceListEntry::Workspace { ws_idx, indented } => {
-                let Some(ws) = app.workspaces.get(*ws_idx) else {
-                    continue;
-                };
-                let row_height = if *indented {
-                    1
-                } else {
-                    workspace_row_height(ws)
-                };
-                let gap = u16::from(
-                    !(*indented && next_entry_is_indented_workspace(&entries, entry_idx)),
-                );
-                if row_y.saturating_add(row_height).saturating_add(gap) > body_bottom {
-                    break;
-                }
                 cards.push(crate::app::state::WorkspaceCardArea {
-                    ws_idx: *ws_idx,
-                    rect: Rect::new(body.x, row_y, body.width, row_height),
-                    indented: *indented,
+                    ws_idx,
+                    rect: row.rect,
+                    indented,
                 });
-                row_y = row_y.saturating_add(row_height + gap);
+            }
+            WorkspaceListEntry::RemoteHost { host, .. } => {
+                remote_rows.push(WorkspaceListRemoteRowArea {
+                    target: WorkspaceListRemoteTarget::RemoteHost { host },
+                    rect: row.rect,
+                });
+            }
+            WorkspaceListEntry::RemoteSpace { key, .. } => {
+                remote_rows.push(WorkspaceListRemoteRowArea {
+                    target: WorkspaceListRemoteTarget::RemoteSpace { key },
+                    rect: row.rect,
+                });
             }
         }
     }
 
-    (cards, headers)
+    (cards, remote_rows)
 }
 
 pub(crate) fn compute_workspace_card_areas(
@@ -1016,6 +1025,54 @@ pub(crate) fn compute_workspace_card_areas(
     area: Rect,
 ) -> Vec<crate::app::state::WorkspaceCardArea> {
     compute_workspace_list_areas(app, area).0
+}
+
+pub(crate) fn workspace_list_remote_target_at(
+    app: &AppState,
+    area: Rect,
+    col: u16,
+    row: u16,
+) -> Option<WorkspaceListRemoteTarget> {
+    let (_, remote_rows) = compute_workspace_list_areas(app, area);
+    remote_rows.into_iter().find_map(|area| {
+        (col >= area.rect.x
+            && col < area.rect.x + area.rect.width
+            && row >= area.rect.y
+            && row < area.rect.y + area.rect.height)
+            .then_some(area.target)
+    })
+}
+
+fn workspace_list_row_areas_for_body(
+    app: &AppState,
+    body: Rect,
+    scroll: usize,
+) -> Vec<WorkspaceListRowArea> {
+    let mut rows = Vec::new();
+    if body.width == 0 || body.height == 0 {
+        return rows;
+    }
+
+    let entries = workspace_list_entries(app);
+    let mut row_y = body.y;
+    let body_bottom = body.y + body.height;
+    for (entry_idx, entry) in entries.iter().enumerate().skip(scroll) {
+        let row_height = workspace_list_entry_content_height(app, entry);
+        if row_height == 0 {
+            continue;
+        }
+        let gap = workspace_list_entry_gap_after(&entries, entry_idx);
+        if row_y.saturating_add(row_height).saturating_add(gap) > body_bottom {
+            break;
+        }
+        rows.push(WorkspaceListRowArea {
+            entry: entry.clone(),
+            rect: Rect::new(body.x, row_y, body.width, row_height),
+        });
+        row_y = row_y.saturating_add(row_height + gap);
+    }
+
+    rows
 }
 
 /// Auto-scale sidebar width based on workspace identity + agent summary.
@@ -1240,7 +1297,7 @@ fn render_workspace_list(
     if area.height > 0 {
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
-                " spaces",
+                " local spaces",
                 Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
             )])),
             Rect::new(area.x, area.y, area.width, 1),
@@ -1249,6 +1306,8 @@ fn render_workspace_list(
 
     let metrics = workspace_list_scroll_metrics(app, area);
     let scrollbar_rect = workspace_list_scrollbar_rect(app, area);
+    let body = workspace_list_body_rect(area, should_show_scrollbar(metrics));
+    let row_areas = workspace_list_row_areas_for_body(app, body, app.workspace_scroll);
     let cards = &app.view.workspace_card_areas;
 
     for card in cards {
@@ -1382,6 +1441,19 @@ fn render_workspace_list(
         }
     }
 
+    for row in row_areas {
+        match row.entry {
+            WorkspaceListEntry::Workspace { .. } => {}
+            WorkspaceListEntry::RemoteHost { host, status } => {
+                let label = remote_space_header_label(&host);
+                render_remote_section_header(&label, status.stale_label(), frame, row.rect, p);
+            }
+            WorkspaceListEntry::RemoteSpace { key, label, status } => {
+                render_remote_space_row(app, &key, &label, status, frame, row.rect, p);
+            }
+        }
+    }
+
     if let Some(y) = insertion_row.filter(|y| *y < list_bottom) {
         let indicator_right = scrollbar_rect
             .map(|rect| rect.x)
@@ -1502,12 +1574,7 @@ fn render_agent_detail(
                 .as_ref()
                 .is_some_and(|selected| selected == &target.key())
         });
-        let is_selected_remote_space = detail.remote_space_key().is_some_and(|key| {
-            app.selected_remote_space
-                .as_ref()
-                .is_some_and(|selected| selected == &key)
-        });
-        let is_highlighted = is_active || is_selected_remote || is_selected_remote_space;
+        let is_highlighted = is_active || is_selected_remote;
 
         let (icon, icon_style) = agent_icon(detail.state, detail.seen, app.spinner_tick, p);
         let label_color = state_label_color(detail.state, detail.seen, p);
@@ -1579,6 +1646,22 @@ fn render_agent_detail(
 }
 
 fn render_remote_host_header(detail: &AgentPanelEntry, frame: &mut Frame, rect: Rect, p: &Palette) {
+    render_remote_section_header(
+        &detail.primary_label,
+        detail.custom_status.as_deref(),
+        frame,
+        rect,
+        p,
+    );
+}
+
+fn render_remote_section_header(
+    primary_label: &str,
+    status: Option<&str>,
+    frame: &mut Frame,
+    rect: Rect,
+    p: &Palette,
+) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }
@@ -1593,10 +1676,10 @@ fn render_remote_host_header(detail: &AgentPanelEntry, frame: &mut Frame, rect: 
         return;
     }
 
-    let header = if let Some(status) = detail.custom_status.as_deref() {
-        format!("{} · {}", detail.primary_label, status)
+    let header = if let Some(status) = status {
+        format!("{primary_label} · {status}")
     } else {
-        detail.primary_label.clone()
+        primary_label.to_string()
     };
     let label = truncate_text(&header, rect.width.saturating_sub(1) as usize);
     let line = Line::from(vec![
@@ -1610,6 +1693,55 @@ fn render_remote_host_header(detail: &AgentPanelEntry, frame: &mut Frame, rect: 
     frame.render_widget(
         Paragraph::new(line),
         Rect::new(rect.x, rect.y + 1, rect.width, 1),
+    );
+}
+
+fn render_remote_space_row(
+    app: &AppState,
+    key: &crate::remote_source::RemoteSpaceKey,
+    label: &str,
+    status: crate::remote_source::RemoteConnectionStatus,
+    frame: &mut Frame,
+    rect: Rect,
+    p: &Palette,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+
+    let selected = app
+        .selected_remote_space
+        .as_ref()
+        .is_some_and(|selected| selected == key);
+    if selected {
+        let buf = frame.buffer_mut();
+        for x in rect.x..rect.x + rect.width {
+            buf[(x, rect.y)].set_style(Style::default().bg(p.surface_dim));
+        }
+    }
+
+    let text = if let Some(stale) = status.stale_label() {
+        format!("{label} · {stale}")
+    } else {
+        label.to_string()
+    };
+    let text = truncate_text(&text, rect.width.saturating_sub(2) as usize);
+    let style = if selected {
+        Style::default().fg(p.text).add_modifier(Modifier::BOLD)
+    } else if status.is_connected() {
+        Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(p.overlay0)
+            .add_modifier(Modifier::BOLD | Modifier::DIM)
+    };
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(text, style),
+        ])),
+        Rect::new(rect.x, rect.y, rect.width, 1),
     );
 }
 
@@ -1840,7 +1972,7 @@ mod tests {
 
         let entries = agent_panel_entries(&app);
 
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 3);
         assert!(matches!(
             &entries[0].location,
             AgentPanelEntryLocation::Local { .. }
@@ -1855,21 +1987,11 @@ mod tests {
             }
         );
         assert!(entries[1].remote_attach_target().is_none());
-        assert!(entries[1].remote_space_key().is_none());
         assert_eq!(agent_panel_entry_content_height(&entries[1]), 2);
         assert_eq!(agent_panel_entry_gap_after(&entries[1]), 1);
-        assert_eq!(entries[2].primary_label, "remote-ws");
+        assert_eq!(entries[2].primary_label, "smoke-agent");
         assert_eq!(
             entries[2].location,
-            AgentPanelEntryLocation::RemoteSpace {
-                host: "jafar".to_string(),
-                session: crate::session::DEFAULT_SESSION_NAME.to_string(),
-                workspace_id: "remote-ws".to_string(),
-            }
-        );
-        assert_eq!(entries[3].primary_label, "smoke-agent");
-        assert_eq!(
-            entries[3].location,
             AgentPanelEntryLocation::Remote {
                 host: "jafar".to_string(),
                 session: crate::session::DEFAULT_SESSION_NAME.to_string(),
@@ -1877,11 +1999,11 @@ mod tests {
             }
         );
         assert_eq!(
-            entries[3].remote_attach_target().unwrap().label,
+            entries[2].remote_attach_target().unwrap().label,
             "jafar/smoke-agent"
         );
-        assert_eq!(entries[3].state, AgentState::Working);
-        assert!(entries[3].seen);
+        assert_eq!(entries[2].state, AgentState::Working);
+        assert!(entries[2].seen);
     }
 
     #[test]
@@ -1942,7 +2064,176 @@ mod tests {
     }
 
     #[test]
-    fn all_workspaces_agent_panel_groups_multiple_remote_spaces_under_one_host() {
+    fn workspace_list_header_identifies_local_spaces_section() {
+        let app = crate::app::state::AppState::test_new();
+        let backend = ratatui::backend::TestBackend::new(40, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+
+        terminal
+            .draw(|frame| {
+                render_workspace_list(
+                    &app,
+                    &terminal_runtimes,
+                    frame,
+                    Rect::new(0, 0, 40, 8),
+                    false,
+                )
+            })
+            .unwrap();
+
+        let header_row = (0..40)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect::<String>();
+
+        assert!(header_row.contains(" local spaces"));
+    }
+
+    #[test]
+    fn remote_space_workspace_list_shows_remote_spaces_without_local_workspaces() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = Vec::new();
+        app.active = None;
+        app.selected = 0;
+        let mut agent = remote_agent("remote-term", "fed-detach-smoke", AgentStatus::Working, 1);
+        agent.cwd = Some("/home/amf/tmp".to_string());
+        app.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![agent],
+        );
+
+        let entries = workspace_list_entries(&app);
+
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            &entries[0],
+            WorkspaceListEntry::RemoteHost {
+                host,
+                status: crate::remote_source::RemoteConnectionStatus::Connected,
+            } if host.host == "jafar"
+                && host.session == crate::session::DEFAULT_SESSION_NAME
+        ));
+        assert!(matches!(
+            &entries[1],
+            WorkspaceListEntry::RemoteSpace {
+                key,
+                label,
+                status: crate::remote_source::RemoteConnectionStatus::Connected,
+            } if key.host == "jafar"
+                && key.session == crate::session::DEFAULT_SESSION_NAME
+                && key.workspace_id == "remote-ws"
+                && label == "tmp"
+        ));
+
+        let (cards, remote_rows) = compute_workspace_list_areas(&app, Rect::new(0, 0, 40, 16));
+        assert!(cards.is_empty());
+        assert_eq!(remote_rows.len(), 2);
+        assert!(matches!(
+            &remote_rows[0].target,
+            WorkspaceListRemoteTarget::RemoteHost { host }
+                if host.host == "jafar"
+                    && host.session == crate::session::DEFAULT_SESSION_NAME
+        ));
+        assert!(matches!(
+            &remote_rows[1].target,
+            WorkspaceListRemoteTarget::RemoteSpace { key }
+                if key.host == "jafar"
+                    && key.session == crate::session::DEFAULT_SESSION_NAME
+                    && key.workspace_id == "remote-ws"
+        ));
+
+        let backend = ratatui::backend::TestBackend::new(40, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        terminal
+            .draw(|frame| {
+                render_workspace_list(
+                    &app,
+                    &terminal_runtimes,
+                    frame,
+                    Rect::new(0, 0, 40, 12),
+                    false,
+                )
+            })
+            .unwrap();
+        let rows = (0..12)
+            .map(|y| {
+                (0..40)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(rows.iter().any(|row| row.contains(" jafar spaces")));
+        assert!(rows.iter().any(|row| row.contains("  tmp")));
+    }
+
+    #[test]
+    fn workspace_list_remote_space_hit_testing_respects_scroll_with_local_rows() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
+        app.workspace_scroll = 2;
+        let mut agent = remote_agent("remote-term", "fed-detach-smoke", AgentStatus::Working, 1);
+        agent.cwd = Some("/home/amf/tmp".to_string());
+        app.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![agent],
+        );
+
+        let area = Rect::new(0, 0, 40, 18);
+        let (_, remote_rows) = compute_workspace_list_areas(&app, area);
+        let space_row = remote_rows
+            .iter()
+            .find(|row| matches!(row.target, WorkspaceListRemoteTarget::RemoteSpace { .. }))
+            .expect("visible remote space row");
+
+        assert_eq!(
+            workspace_list_remote_target_at(&app, area, space_row.rect.x + 1, space_row.rect.y),
+            Some(WorkspaceListRemoteTarget::RemoteSpace {
+                key: crate::remote_source::RemoteSpaceKey {
+                    host: "jafar".to_string(),
+                    session: crate::session::DEFAULT_SESSION_NAME.to_string(),
+                    workspace_id: "remote-ws".to_string(),
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn remote_space_workspace_list_moves_space_labels_out_of_agent_panel() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = Vec::new();
+        app.active = None;
+        app.selected = 0;
+        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        let mut agent = remote_agent("remote-term", "fed-detach-smoke", AgentStatus::Working, 1);
+        agent.cwd = Some("/home/amf/tmp".to_string());
+        app.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            vec![agent],
+        );
+
+        let workspace_labels = workspace_list_entries(&app)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                WorkspaceListEntry::RemoteHost { host, .. } => {
+                    Some(remote_space_header_label(&host))
+                }
+                WorkspaceListEntry::RemoteSpace { label, .. } => Some(label),
+                WorkspaceListEntry::Workspace { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let agent_labels = agent_panel_entries(&app)
+            .into_iter()
+            .map(|entry| entry.primary_label)
+            .collect::<Vec<_>>();
+
+        assert_eq!(workspace_labels, vec!["jafar spaces", "tmp"]);
+        assert_eq!(agent_labels, vec!["jafar agents", "fed-detach-smoke"]);
+        assert!(!agent_labels.iter().any(|label| label == "tmp"));
+    }
+
+    #[test]
+    fn remote_agent_panel_lists_remote_agents_directly_under_one_host() {
         let mut app = crate::app::state::AppState::test_new();
         app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         let mut first = remote_agent("term-a", "codex", AgentStatus::Working, 1);
@@ -1960,23 +2251,17 @@ mod tests {
             .map(|entry| entry.primary_label.as_str())
             .collect();
 
-        assert_eq!(
-            labels,
-            vec![
-                "jafar agents",
-                "workspace-a",
-                "codex",
-                "workspace-b",
-                "claude"
-            ]
-        );
+        assert_eq!(labels, vec!["jafar agents", "codex", "claude"]);
+        assert!(entries
+            .iter()
+            .all(|entry| !matches!(&entry.location, AgentPanelEntryLocation::Local { .. })));
         assert!(matches!(
             &entries[1].location,
-            AgentPanelEntryLocation::RemoteSpace { .. }
+            AgentPanelEntryLocation::Remote { .. }
         ));
         assert!(matches!(
-            &entries[3].location,
-            AgentPanelEntryLocation::RemoteSpace { .. }
+            &entries[2].location,
+            AgentPanelEntryLocation::Remote { .. }
         ));
     }
 
@@ -1997,11 +2282,11 @@ mod tests {
             vec![fallback_agent, foreground_agent, cwd_agent],
         );
 
-        let entries = agent_panel_entries(&app);
+        let entries = workspace_list_entries(&app);
         let space_labels: Vec<_> = entries
             .iter()
-            .filter_map(|entry| match &entry.location {
-                AgentPanelEntryLocation::RemoteSpace { .. } => Some(entry.primary_label.as_str()),
+            .filter_map(|entry| match entry {
+                WorkspaceListEntry::RemoteSpace { label, .. } => Some(label.as_str()),
                 _ => None,
             })
             .collect();
@@ -2025,7 +2310,7 @@ mod tests {
 
         let entries = agent_panel_entries(&app);
 
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].primary_label, "jafar/agents agents");
         assert_eq!(entries[0].custom_status.as_deref(), Some("needs update"));
         assert_eq!(
@@ -2035,22 +2320,12 @@ mod tests {
                 session: "agents".to_string(),
             }
         );
-        assert_eq!(entries[1].primary_label, "remote-ws");
+        assert_eq!(entries[1].primary_label, "claude");
+        assert_eq!(entries[1].state, AgentState::Idle);
+        assert!(!entries[1].seen);
         assert_eq!(entries[1].custom_status.as_deref(), Some("needs update"));
         assert_eq!(
             entries[1].location,
-            AgentPanelEntryLocation::RemoteSpace {
-                host: "jafar".to_string(),
-                session: "agents".to_string(),
-                workspace_id: "remote-ws".to_string(),
-            }
-        );
-        assert_eq!(entries[2].primary_label, "claude");
-        assert_eq!(entries[2].state, AgentState::Idle);
-        assert!(!entries[2].seen);
-        assert_eq!(entries[2].custom_status.as_deref(), Some("needs update"));
-        assert_eq!(
-            entries[2].location,
             AgentPanelEntryLocation::Remote {
                 host: "jafar".to_string(),
                 session: "agents".to_string(),
@@ -2058,7 +2333,7 @@ mod tests {
             }
         );
         assert_eq!(
-            entries[2].remote_attach_target().unwrap().label,
+            entries[1].remote_attach_target().unwrap().label,
             "jafar/agents/claude"
         );
     }
@@ -2091,9 +2366,9 @@ mod tests {
 
         let entries = agent_panel_entries(&app);
 
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[2].primary_label, "smoke-agent");
-        assert_eq!(entries[2].custom_status.as_deref(), Some("attached"));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].primary_label, "smoke-agent");
+        assert_eq!(entries[1].custom_status.as_deref(), Some("attached"));
     }
 
     #[test]
@@ -2121,7 +2396,7 @@ mod tests {
 
         let entries = agent_panel_entries(&app);
 
-        assert_eq!(entries[2].custom_status.as_deref(), Some("busy · attached"));
+        assert_eq!(entries[1].custom_status.as_deref(), Some("busy · attached"));
     }
 
     #[test]
@@ -2160,7 +2435,7 @@ mod tests {
     }
 
     #[test]
-    fn all_workspaces_agent_panel_uses_stale_grouped_rows_for_cached_agents() {
+    fn remote_space_and_agent_rows_preserve_stale_status_for_cached_agents() {
         let mut app = crate::app::state::AppState::test_new();
         app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         let workspace = Workspace::test_new("local");
@@ -2187,25 +2462,29 @@ mod tests {
 
         let entries = agent_panel_entries(&app);
 
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].primary_label, "jafar/agents agents");
         assert_eq!(entries[0].custom_status.as_deref(), Some("unreachable"));
         assert!(matches!(
             &entries[0].location,
             AgentPanelEntryLocation::RemoteHost { .. }
         ));
-        assert_eq!(entries[1].primary_label, "remote-ws");
+        assert_eq!(entries[1].primary_label, "claude");
         assert_eq!(entries[1].custom_status.as_deref(), Some("unreachable"));
         assert!(matches!(
             &entries[1].location,
-            AgentPanelEntryLocation::RemoteSpace { .. }
-        ));
-        assert_eq!(entries[2].primary_label, "claude");
-        assert_eq!(entries[2].custom_status.as_deref(), Some("unreachable"));
-        assert!(matches!(
-            &entries[2].location,
             AgentPanelEntryLocation::Remote { .. }
         ));
+
+        let workspace_entries = workspace_list_entries(&app);
+        assert!(workspace_entries.iter().any(|entry| matches!(
+            entry,
+            WorkspaceListEntry::RemoteSpace {
+                key,
+                status: crate::remote_source::RemoteConnectionStatus::Unreachable,
+                ..
+            } if key.host == "jafar" && key.session == "agents" && key.workspace_id == "remote-ws"
+        )));
     }
 
     #[test]
@@ -2238,7 +2517,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_space_and_agent_panel_entries_have_expected_targets() {
+    fn remote_space_and_agent_entries_have_expected_targets() {
         let mut app = crate::app::state::AppState::test_new();
         app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         app.remote_sources.replace_connected_snapshot(
@@ -2252,29 +2531,34 @@ mod tests {
         );
 
         let entries = agent_panel_entries(&app);
+        let workspace_entries = workspace_list_entries(&app);
 
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            workspace_entries.iter().find(|entry| matches!(
+                entry,
+                WorkspaceListEntry::RemoteSpace { .. }
+            )),
+            Some(WorkspaceListEntry::RemoteSpace {
+                key,
+                label,
+                status: crate::remote_source::RemoteConnectionStatus::Connected,
+            }) if key.host == "jafar"
+                && key.session == crate::session::DEFAULT_SESSION_NAME
+                && key.workspace_id == "remote-ws"
+                && label == "remote-ws"
+        ));
         assert!(entries[1].local_target().is_none());
-        assert!(entries[1].remote_attach_target().is_none());
+        assert_eq!(entries[1].custom_status, None);
         assert_eq!(
-            entries[1].remote_space_key(),
-            Some(crate::remote_source::RemoteSpaceKey {
-                host: "jafar".to_string(),
-                session: crate::session::DEFAULT_SESSION_NAME.to_string(),
-                workspace_id: "remote-ws".to_string(),
-            })
-        );
-        assert!(entries[2].local_target().is_none());
-        assert_eq!(entries[2].custom_status, None);
-        assert_eq!(
-            entries[2].remote_attach_target().unwrap().key(),
+            entries[1].remote_attach_target().unwrap().key(),
             crate::remote_source::RemoteAgentKey {
                 host: "jafar".to_string(),
                 session: crate::session::DEFAULT_SESSION_NAME.to_string(),
                 terminal_id: "remote-term".to_string(),
             }
         );
-        assert!(!app.agent_panel_entry_has_remote_attach_pane(&entries[2]));
+        assert!(!app.agent_panel_entry_has_remote_attach_pane(&entries[1]));
     }
 
     #[test]
@@ -2305,8 +2589,8 @@ mod tests {
 
         let entries = agent_panel_entries(&app);
 
-        assert_eq!(entries.len(), 3);
-        assert!(app.agent_panel_entry_has_remote_attach_pane(&entries[2]));
+        assert_eq!(entries.len(), 2);
+        assert!(app.agent_panel_entry_has_remote_attach_pane(&entries[1]));
     }
 
     #[test]

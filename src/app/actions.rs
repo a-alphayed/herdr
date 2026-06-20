@@ -862,6 +862,8 @@ impl AppState {
             let previous_focus = self.current_pane_focus_target();
             self.selection = None;
             self.selection_autoscroll = None;
+            self.selected_remote_space = None;
+            self.selected_remote_agent = None;
             self.active = Some(idx);
             self.selected = idx;
             let workspace_id = self.workspaces[idx].id.clone();
@@ -902,6 +904,8 @@ impl AppState {
         let workspace_changed = self.active != Some(ws_idx);
         self.selection = None;
         self.selection_autoscroll = None;
+        self.selected_remote_space = None;
+        self.selected_remote_agent = None;
         self.active = Some(ws_idx);
         self.selected = ws_idx;
         let workspace_id = self.workspaces[ws_idx].id.clone();
@@ -1052,8 +1056,10 @@ impl AppState {
     pub(crate) fn visible_workspace_order(&self) -> Vec<usize> {
         let order = crate::ui::workspace_list_entries(self)
             .into_iter()
-            .map(|entry| match entry {
-                crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => ws_idx,
+            .filter_map(|entry| match entry {
+                crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => Some(ws_idx),
+                crate::ui::WorkspaceListEntry::RemoteHost { .. }
+                | crate::ui::WorkspaceListEntry::RemoteSpace { .. } => None,
             })
             .collect::<Vec<_>>();
         if order.is_empty() {
@@ -3220,10 +3226,18 @@ mod tests {
 
         assert!(updates.is_empty());
         let entries = crate::ui::agent_panel_entries(&state);
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].primary_label, "jafar agents");
-        assert_eq!(entries[1].primary_label, "remote-ws");
-        assert_eq!(entries[2].primary_label, "smoke-agent");
+        assert_eq!(entries[1].primary_label, "smoke-agent");
+        assert!(crate::ui::workspace_list_entries(&state)
+            .into_iter()
+            .any(|entry| matches!(
+                entry,
+                crate::ui::WorkspaceListEntry::RemoteSpace { key, .. }
+                    if key.host == "jafar"
+                        && key.session == crate::session::DEFAULT_SESSION_NAME
+                        && key.workspace_id == "remote-ws"
+            )));
     }
 
     #[test]
@@ -3243,10 +3257,18 @@ mod tests {
 
         assert!(updates.is_empty());
         let entries = crate::ui::agent_panel_entries(&state);
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].custom_status.as_deref(), Some("unreachable"));
         assert_eq!(entries[1].custom_status.as_deref(), Some("unreachable"));
-        assert_eq!(entries[2].custom_status.as_deref(), Some("unreachable"));
+        assert!(crate::ui::workspace_list_entries(&state)
+            .into_iter()
+            .any(|entry| matches!(
+                entry,
+                crate::ui::WorkspaceListEntry::RemoteSpace {
+                    status: crate::remote_source::RemoteConnectionStatus::Unreachable,
+                    ..
+                }
+            )));
     }
 
     #[test]
@@ -3314,9 +3336,9 @@ mod tests {
         assert!(same_updates.is_empty());
         assert!(new_updates.is_empty());
         let entries = crate::ui::agent_panel_entries(&state);
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[2].primary_label, "new");
-        assert_eq!(entries[2].state, AgentState::Idle);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].primary_label, "new");
+        assert_eq!(entries[1].state, AgentState::Idle);
     }
 
     #[test]
@@ -3343,7 +3365,16 @@ mod tests {
             .into_iter()
             .map(|entry| entry.primary_label)
             .collect();
-        assert_eq!(labels, vec!["jafar agents", "remote-ws", "keep"]);
+        assert_eq!(labels, vec!["jafar agents", "keep"]);
+        assert!(crate::ui::workspace_list_entries(&state)
+            .into_iter()
+            .any(|entry| matches!(
+                entry,
+                crate::ui::WorkspaceListEntry::RemoteSpace { key, .. }
+                    if key.host == "jafar"
+                        && key.session == "default"
+                        && key.workspace_id == "remote-ws"
+            )));
     }
 
     #[test]
@@ -3368,7 +3399,16 @@ mod tests {
             .into_iter()
             .map(|entry| entry.primary_label)
             .collect();
-        assert_eq!(labels, vec!["jafar agents", "remote-ws", "keep"]);
+        assert_eq!(labels, vec!["jafar agents", "keep"]);
+        assert!(crate::ui::workspace_list_entries(&state)
+            .into_iter()
+            .any(|entry| matches!(
+                entry,
+                crate::ui::WorkspaceListEntry::RemoteSpace { key, .. }
+                    if key.host == "jafar"
+                        && key.session == "default"
+                        && key.workspace_id == "remote-ws"
+            )));
     }
 
     #[test]
@@ -3458,6 +3498,47 @@ mod tests {
         state.switch_workspace(2);
         assert_eq!(state.active, Some(2));
         assert_eq!(state.selected, 2);
+    }
+
+    #[test]
+    fn switch_workspace_clears_remote_sidebar_selection() {
+        let mut state = app_with_workspaces(&["a", "b"]);
+        state.selected_remote_agent = Some(RemoteAgentKey {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            terminal_id: "remote-term".into(),
+        });
+        state.selected_remote_space = Some(RemoteSpaceKey {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            workspace_id: "remote-ws".into(),
+        });
+
+        state.switch_workspace(1);
+
+        assert!(state.selected_remote_agent.is_none());
+        assert!(state.selected_remote_space.is_none());
+    }
+
+    #[test]
+    fn next_workspace_clears_remote_sidebar_selection() {
+        let mut state = app_with_workspaces(&["a", "b"]);
+        state.selected_remote_agent = Some(RemoteAgentKey {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            terminal_id: "remote-term".into(),
+        });
+        state.selected_remote_space = Some(RemoteSpaceKey {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            workspace_id: "remote-ws".into(),
+        });
+
+        state.next_workspace();
+
+        assert_eq!(state.active, Some(1));
+        assert!(state.selected_remote_agent.is_none());
+        assert!(state.selected_remote_space.is_none());
     }
 
     #[test]
