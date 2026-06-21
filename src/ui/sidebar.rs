@@ -607,6 +607,9 @@ pub(crate) enum WorkspaceListEntry {
         label: String,
         status: crate::remote_source::RemoteConnectionStatus,
     },
+    RemoteNew {
+        host: crate::remote_source::RemoteHostKey,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -623,11 +626,14 @@ struct WorkspaceListRowArea {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkspaceListRemoteTarget {
-    RemoteHost {
+    Host {
         host: crate::remote_source::RemoteHostKey,
     },
-    RemoteSpace {
+    Space {
         key: crate::remote_source::RemoteSpaceKey,
+    },
+    New {
+        host: crate::remote_source::RemoteHostKey,
     },
 }
 
@@ -641,7 +647,7 @@ fn next_entry_is_indented_workspace(entries: &[WorkspaceListEntry], idx: usize) 
 fn next_entry_is_remote_space(entries: &[WorkspaceListEntry], idx: usize) -> bool {
     matches!(
         entries.get(idx.saturating_add(1)),
-        Some(WorkspaceListEntry::RemoteSpace { .. })
+        Some(WorkspaceListEntry::RemoteSpace { .. } | WorkspaceListEntry::RemoteNew { .. })
     )
 }
 
@@ -659,6 +665,7 @@ fn workspace_list_entry_content_height(app: &AppState, entry: &WorkspaceListEntr
         }
         WorkspaceListEntry::RemoteHost { .. } => 2,
         WorkspaceListEntry::RemoteSpace { .. } => 1,
+        WorkspaceListEntry::RemoteNew { .. } => 1,
     }
 }
 
@@ -671,6 +678,7 @@ fn workspace_list_entry_gap_after(entries: &[WorkspaceListEntry], idx: usize) ->
         Some(WorkspaceListEntry::RemoteSpace { .. }) => {
             u16::from(!next_entry_is_remote_space(entries, idx))
         }
+        Some(WorkspaceListEntry::RemoteNew { .. }) => 1,
         None => 0,
     }
 }
@@ -828,6 +836,8 @@ fn remote_workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> {
     for (host, status) in hosts {
         let mut rows = Vec::new();
         let spaces = agents_by_host.get(&host);
+        let can_create_remote_workspace =
+            status.is_connected() && app.remote_sources.host_supports_workspace_create(&host);
         match app.remote_sources.workspace_entries_for_host(&host) {
             Some(workspaces) if workspaces.is_empty() => {}
             Some(workspaces) => {
@@ -871,7 +881,7 @@ fn remote_workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> {
             }
         }
 
-        if rows.is_empty() {
+        if rows.is_empty() && !can_create_remote_workspace {
             continue;
         }
 
@@ -880,6 +890,9 @@ fn remote_workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> {
             status,
         });
         entries.extend(rows);
+        if can_create_remote_workspace {
+            entries.push(WorkspaceListEntry::RemoteNew { host });
+        }
     }
 
     entries
@@ -1082,13 +1095,19 @@ pub(crate) fn compute_workspace_list_areas(
             }
             WorkspaceListEntry::RemoteHost { host, .. } => {
                 remote_rows.push(WorkspaceListRemoteRowArea {
-                    target: WorkspaceListRemoteTarget::RemoteHost { host },
+                    target: WorkspaceListRemoteTarget::Host { host },
                     rect: row.rect,
                 });
             }
             WorkspaceListEntry::RemoteSpace { key, .. } => {
                 remote_rows.push(WorkspaceListRemoteRowArea {
-                    target: WorkspaceListRemoteTarget::RemoteSpace { key },
+                    target: WorkspaceListRemoteTarget::Space { key },
+                    rect: row.rect,
+                });
+            }
+            WorkspaceListEntry::RemoteNew { host } => {
+                remote_rows.push(WorkspaceListRemoteRowArea {
+                    target: WorkspaceListRemoteTarget::New { host },
                     rect: row.rect,
                 });
             }
@@ -1529,6 +1548,9 @@ fn render_workspace_list(
             WorkspaceListEntry::RemoteSpace { key, label, status } => {
                 render_remote_space_row(app, &key, &label, status, frame, row.rect, p);
             }
+            WorkspaceListEntry::RemoteNew { .. } => {
+                render_remote_new_row(frame, row.rect, p);
+            }
         }
     }
 
@@ -1823,6 +1845,17 @@ fn render_remote_space_row(
     );
 }
 
+fn render_remote_new_row(frame: &mut Frame, rect: Rect, p: &Palette) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(" new", Style::default().fg(p.overlay0))),
+        Rect::new(rect.x, rect.y, rect.width, 1),
+    );
+}
+
 pub(crate) fn collapsed_sidebar_toggle_rect(area: Rect) -> Rect {
     let bottom_y = area.y + area.height.saturating_sub(1);
     let content_w = area.width.saturating_sub(1);
@@ -1863,7 +1896,7 @@ mod tests {
     use crate::{
         api::schema::{AgentInfo, AgentStatus, WorkspaceInfo},
         detect::Agent,
-        remote_source::RemoteHostKey,
+        remote_source::{RemoteHostKey, RemoteSourceCapabilities},
         workspace::Workspace,
     };
 
@@ -1905,6 +1938,16 @@ mod tests {
             agent_status: AgentStatus::Unknown,
             worktree: None,
         }
+    }
+
+    fn enable_remote_workspace_create(app: &mut crate::app::state::AppState, host: &RemoteHostKey) {
+        app.remote_sources.set_capabilities(
+            host,
+            RemoteSourceCapabilities {
+                workspace_list_local: true,
+                workspace_create: true,
+            },
+        );
     }
 
     #[test]
@@ -2222,13 +2265,13 @@ mod tests {
         assert_eq!(remote_rows.len(), 2);
         assert!(matches!(
             &remote_rows[0].target,
-            WorkspaceListRemoteTarget::RemoteHost { host }
+            WorkspaceListRemoteTarget::Host { host }
                 if host.host == "jafar"
                     && host.session == crate::session::DEFAULT_SESSION_NAME
         ));
         assert!(matches!(
             &remote_rows[1].target,
-            WorkspaceListRemoteTarget::RemoteSpace { key }
+            WorkspaceListRemoteTarget::Space { key }
                 if key.host == "jafar"
                     && key.session == crate::session::DEFAULT_SESSION_NAME
                     && key.workspace_id == "remote-ws"
@@ -2292,9 +2335,79 @@ mod tests {
         assert_eq!(remote_rows.len(), 2);
         assert!(matches!(
             &remote_rows[1].target,
-            WorkspaceListRemoteTarget::RemoteSpace { key }
+            WorkspaceListRemoteTarget::Space { key }
                 if key.host == "jafar" && key.workspace_id == "remote-ws"
         ));
+    }
+
+    #[test]
+    fn remote_workspace_new_row_renders_for_connected_capable_host_with_zero_spaces() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = Vec::new();
+        app.active = None;
+        app.selected = 0;
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.remote_sources
+            .replace_connected_snapshot(host.clone(), Vec::new());
+        app.remote_sources
+            .replace_workspace_snapshot(host.clone(), Vec::new());
+        enable_remote_workspace_create(&mut app, &host);
+
+        let entries = workspace_list_entries(&app);
+
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            &entries[0],
+            WorkspaceListEntry::RemoteHost {
+                host,
+                status: crate::remote_source::RemoteConnectionStatus::Connected,
+            } if host.host == "jafar"
+        ));
+        assert!(matches!(
+            &entries[1],
+            WorkspaceListEntry::RemoteNew { host } if host.host == "jafar"
+        ));
+
+        let (cards, remote_rows) = compute_workspace_list_areas(&app, Rect::new(0, 0, 40, 16));
+        assert!(cards.is_empty());
+        assert_eq!(remote_rows.len(), 2);
+        let new_row = remote_rows
+            .iter()
+            .find(|row| matches!(row.target, WorkspaceListRemoteTarget::New { .. }))
+            .expect("remote new row");
+        assert_eq!(
+            workspace_list_remote_target_at(
+                &app,
+                Rect::new(0, 0, 40, 16),
+                new_row.rect.x,
+                new_row.rect.y
+            ),
+            Some(WorkspaceListRemoteTarget::New { host })
+        );
+    }
+
+    #[test]
+    fn remote_workspace_new_row_hides_for_incapable_or_disconnected_hosts() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = Vec::new();
+        app.active = None;
+        let incapable = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        let disconnected = RemoteHostKey::new("work", crate::session::DEFAULT_SESSION_NAME);
+        app.remote_sources
+            .replace_connected_snapshot(incapable.clone(), Vec::new());
+        app.remote_sources
+            .replace_workspace_snapshot(incapable.clone(), Vec::new());
+        app.remote_sources
+            .replace_workspace_snapshot(disconnected.clone(), Vec::new());
+        enable_remote_workspace_create(&mut app, &disconnected);
+        app.remote_sources.mark_status(
+            &disconnected,
+            crate::remote_source::RemoteConnectionStatus::Unreachable,
+        );
+
+        let entries = workspace_list_entries(&app);
+
+        assert!(entries.is_empty());
     }
 
     #[test]
@@ -2390,12 +2503,12 @@ mod tests {
         let (_, remote_rows) = compute_workspace_list_areas(&app, area);
         let space_row = remote_rows
             .iter()
-            .find(|row| matches!(row.target, WorkspaceListRemoteTarget::RemoteSpace { .. }))
+            .find(|row| matches!(row.target, WorkspaceListRemoteTarget::Space { .. }))
             .expect("visible remote space row");
 
         assert_eq!(
             workspace_list_remote_target_at(&app, area, space_row.rect.x + 1, space_row.rect.y),
-            Some(WorkspaceListRemoteTarget::RemoteSpace {
+            Some(WorkspaceListRemoteTarget::Space {
                 key: crate::remote_source::RemoteSpaceKey {
                     host: "jafar".to_string(),
                     session: crate::session::DEFAULT_SESSION_NAME.to_string(),
@@ -2426,7 +2539,7 @@ mod tests {
                     Some(remote_space_header_label(&host))
                 }
                 WorkspaceListEntry::RemoteSpace { label, .. } => Some(label),
-                WorkspaceListEntry::Workspace { .. } => None,
+                WorkspaceListEntry::Workspace { .. } | WorkspaceListEntry::RemoteNew { .. } => None,
             })
             .collect::<Vec<_>>();
         let agent_labels = agent_panel_entries(&app)

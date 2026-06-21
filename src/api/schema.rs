@@ -660,6 +660,7 @@ pub struct FederationCapabilities {
 
 impl FederationCapabilities {
     pub const REMOTE_API_BRIDGE: &'static str = "remote_api_bridge";
+    pub const WORKSPACE_CREATE: &'static str = "workspace_create";
     pub const WORKSPACE_LIST_LOCAL: &'static str = "workspace_list_local";
     pub const AGENT_LIST: &'static str = "agent_list";
     pub const AGENT_LIST_LOCAL: &'static str = "agent_list_local";
@@ -674,6 +675,7 @@ impl FederationCapabilities {
         Self {
             methods: [
                 Self::REMOTE_API_BRIDGE,
+                Self::WORKSPACE_CREATE,
                 Self::WORKSPACE_LIST_LOCAL,
                 Self::AGENT_LIST,
                 Self::AGENT_LIST_LOCAL,
@@ -1455,6 +1457,7 @@ mod tests {
         let federation = capabilities.federation.expect("federation");
 
         assert!(federation.supports_method(FederationCapabilities::REMOTE_API_BRIDGE));
+        assert!(federation.supports_method(FederationCapabilities::WORKSPACE_CREATE));
         assert!(federation.supports_method(FederationCapabilities::WORKSPACE_LIST_LOCAL));
         assert!(federation.supports_method(FederationCapabilities::AGENT_GET));
         assert!(federation.supports_method(FederationCapabilities::AGENT_READ));

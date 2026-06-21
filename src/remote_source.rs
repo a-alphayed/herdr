@@ -116,6 +116,12 @@ pub(crate) struct RemoteHostStatusEntry {
     pub(crate) agent_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RemoteSourceCapabilities {
+    pub(crate) workspace_list_local: bool,
+    pub(crate) workspace_create: bool,
+}
+
 impl RemoteAgentEntry {
     pub(crate) fn stale(&self) -> bool {
         !self.status.is_connected()
@@ -132,6 +138,7 @@ struct RemoteHostCache {
     status: RemoteConnectionStatus,
     agents: BTreeMap<String, AgentInfo>,
     workspaces: Option<BTreeMap<String, WorkspaceInfo>>,
+    capabilities: RemoteSourceCapabilities,
 }
 
 impl Default for RemoteHostCache {
@@ -140,6 +147,7 @@ impl Default for RemoteHostCache {
             status: RemoteConnectionStatus::Disconnected,
             agents: BTreeMap::new(),
             workspaces: None,
+            capabilities: RemoteSourceCapabilities::default(),
         }
     }
 }
@@ -206,6 +214,35 @@ impl RemoteSourceCache {
         }
     }
 
+    pub(crate) fn set_capabilities(
+        &mut self,
+        host: &RemoteHostKey,
+        capabilities: RemoteSourceCapabilities,
+    ) {
+        self.hosts.entry(host.clone()).or_default().capabilities = capabilities;
+    }
+
+    pub(crate) fn host_capabilities(&self, host: &RemoteHostKey) -> RemoteSourceCapabilities {
+        self.hosts
+            .get(host)
+            .map(|host_cache| host_cache.capabilities)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn host_status(&self, host: &RemoteHostKey) -> Option<RemoteConnectionStatus> {
+        self.hosts.get(host).map(|host_cache| host_cache.status)
+    }
+
+    pub(crate) fn host_supports_workspace_create(&self, host: &RemoteHostKey) -> bool {
+        self.host_capabilities(host).workspace_create
+    }
+
+    pub(crate) fn upsert_workspace(&mut self, host: RemoteHostKey, workspace: WorkspaceInfo) {
+        let host_cache = self.hosts.entry(host).or_default();
+        let workspaces = host_cache.workspaces.get_or_insert_with(BTreeMap::new);
+        workspaces.insert(workspace.workspace_id.clone(), workspace);
+    }
+
     pub(crate) fn mark_status(&mut self, host: &RemoteHostKey, status: RemoteConnectionStatus) {
         self.hosts.entry(host.clone()).or_default().status = status;
     }
@@ -215,6 +252,7 @@ impl RemoteSourceCache {
             status,
             agents: BTreeMap::new(),
             workspaces: None,
+            capabilities: RemoteSourceCapabilities::default(),
         });
     }
 
@@ -223,6 +261,7 @@ impl RemoteSourceCache {
             status: RemoteConnectionStatus::Connected,
             agents: BTreeMap::new(),
             workspaces: None,
+            capabilities: RemoteSourceCapabilities::default(),
         });
         host_cache.status = RemoteConnectionStatus::Connected;
 
@@ -406,6 +445,59 @@ mod tests {
             vec![
                 ("ws-a", "tmp", RemoteConnectionStatus::Connected),
                 ("ws-b", "blank shell", RemoteConnectionStatus::Connected),
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_source_capabilities_are_host_scoped() {
+        let mut cache = RemoteSourceCache::default();
+        let capable = RemoteHostKey::new("jafar", "default");
+        let other = RemoteHostKey::new("work", "default");
+
+        assert_eq!(
+            cache.host_capabilities(&capable),
+            RemoteSourceCapabilities::default()
+        );
+        cache.set_capabilities(
+            &capable,
+            RemoteSourceCapabilities {
+                workspace_list_local: true,
+                workspace_create: true,
+            },
+        );
+
+        assert!(cache.host_supports_workspace_create(&capable));
+        assert_eq!(
+            cache.host_capabilities(&capable),
+            RemoteSourceCapabilities {
+                workspace_list_local: true,
+                workspace_create: true,
+            }
+        );
+        assert!(!cache.host_supports_workspace_create(&other));
+    }
+
+    #[test]
+    fn remote_source_upsert_workspace_updates_metadata_snapshot() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+
+        cache.replace_workspace_snapshot(host.clone(), vec![workspace("ws-a", "old")]);
+        cache.upsert_workspace(host.clone(), workspace("ws-b", "blank shell"));
+        cache.upsert_workspace(host.clone(), workspace("ws-a", "tmp"));
+
+        let labels: Vec<_> = cache
+            .workspace_entries_for_host(&host)
+            .expect("snapshot")
+            .into_iter()
+            .map(|entry| (entry.workspace.workspace_id, entry.workspace.label))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                ("ws-a".to_string(), "tmp".to_string()),
+                ("ws-b".to_string(), "blank shell".to_string())
             ]
         );
     }

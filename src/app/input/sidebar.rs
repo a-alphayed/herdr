@@ -506,7 +506,7 @@ mod tests {
         api::schema::{AgentInfo, AgentStatus},
         app::state::{AgentPanelScope, ContextMenuKind, DragTarget, Mode},
         detect::Agent,
-        remote_source::RemoteHostKey,
+        remote_source::{RemoteHostKey, RemoteSourceCapabilities},
         workspace::Workspace,
     };
 
@@ -594,10 +594,7 @@ mod tests {
 
     fn remote_space_row_y(app: &crate::app::App) -> u16 {
         workspace_list_remote_row(app, |target| {
-            matches!(
-                target,
-                crate::ui::WorkspaceListRemoteTarget::RemoteSpace { .. }
-            )
+            matches!(target, crate::ui::WorkspaceListRemoteTarget::Space { .. })
         })
         .rect
         .y
@@ -605,10 +602,7 @@ mod tests {
 
     fn remote_space_row_x(app: &crate::app::App) -> u16 {
         workspace_list_remote_row(app, |target| {
-            matches!(
-                target,
-                crate::ui::WorkspaceListRemoteTarget::RemoteSpace { .. }
-            )
+            matches!(target, crate::ui::WorkspaceListRemoteTarget::Space { .. })
         })
         .rect
         .x
@@ -617,10 +611,7 @@ mod tests {
 
     fn remote_host_spaces_row_y(app: &crate::app::App) -> u16 {
         workspace_list_remote_row(app, |target| {
-            matches!(
-                target,
-                crate::ui::WorkspaceListRemoteTarget::RemoteHost { .. }
-            )
+            matches!(target, crate::ui::WorkspaceListRemoteTarget::Host { .. })
         })
         .rect
         .y
@@ -629,14 +620,17 @@ mod tests {
 
     fn remote_host_spaces_row_x(app: &crate::app::App) -> u16 {
         workspace_list_remote_row(app, |target| {
-            matches!(
-                target,
-                crate::ui::WorkspaceListRemoteTarget::RemoteHost { .. }
-            )
+            matches!(target, crate::ui::WorkspaceListRemoteTarget::Host { .. })
         })
         .rect
         .x
         .saturating_add(1)
+    }
+
+    fn remote_new_row(app: &crate::app::App) -> crate::ui::WorkspaceListRemoteRowArea {
+        workspace_list_remote_row(app, |target| {
+            matches!(target, crate::ui::WorkspaceListRemoteTarget::New { .. })
+        })
     }
 
     fn remote_agent_row_y(app: &crate::app::App) -> u16 {
@@ -876,7 +870,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             space_target,
-            crate::ui::WorkspaceListRemoteTarget::RemoteSpace {
+            crate::ui::WorkspaceListRemoteTarget::Space {
                 key: remote_space_key()
             }
         );
@@ -889,6 +883,50 @@ mod tests {
         assert_eq!(target.host, "jafar");
         assert_eq!(target.session, crate::session::DEFAULT_SESSION_NAME);
         assert_eq!(target.terminal_id, "remote-term");
+    }
+
+    #[test]
+    fn left_click_remote_new_row_requests_create_without_menu_or_attach() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = Vec::new();
+        app.state.active = None;
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        app.state.selected_remote_agent = Some(remote_key());
+        app.state.selected_remote_space = Some(remote_space_key());
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.state
+            .remote_sources
+            .replace_connected_snapshot(host.clone(), Vec::new());
+        app.state
+            .remote_sources
+            .replace_workspace_snapshot(host.clone(), Vec::new());
+        app.state.remote_sources.set_capabilities(
+            &host,
+            RemoteSourceCapabilities {
+                workspace_list_local: true,
+                workspace_create: true,
+            },
+        );
+        make_remote_agent_rows_visible(&mut app);
+        let row = remote_new_row(&app);
+
+        let action = app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                row.rect.x.saturating_add(1),
+                row.rect.y,
+            ),
+        );
+
+        assert!(action.is_none());
+        assert_eq!(app.state.request_remote_workspace_create, Some(host));
+        assert!(app.state.selected_remote_space.is_none());
+        assert!(app.state.selected_remote_agent.is_none());
+        assert!(app.state.request_remote_attach.is_none());
+        assert!(app.state.context_menu.is_none());
     }
 
     #[test]

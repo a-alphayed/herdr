@@ -508,12 +508,17 @@ impl AppState {
                         self.workspace_list_remote_target_at(mouse.column, mouse.row)
                     {
                         match target {
-                            crate::ui::WorkspaceListRemoteTarget::RemoteSpace { key } => {
+                            crate::ui::WorkspaceListRemoteTarget::Space { key } => {
                                 self.selected_remote_space = Some(key);
                                 self.selected_remote_agent = None;
                             }
-                            crate::ui::WorkspaceListRemoteTarget::RemoteHost { .. } => {
+                            crate::ui::WorkspaceListRemoteTarget::Host { .. } => {
                                 self.selected_remote_agent = None;
+                            }
+                            crate::ui::WorkspaceListRemoteTarget::New { host } => {
+                                self.selected_remote_space = None;
+                                self.selected_remote_agent = None;
+                                self.request_remote_workspace_create = Some(host);
                             }
                         }
                         return None;
@@ -957,11 +962,15 @@ impl AppState {
                 if let Some(target) = self.workspace_list_remote_target_at(mouse.column, mouse.row)
                 {
                     match target {
-                        crate::ui::WorkspaceListRemoteTarget::RemoteSpace { key } => {
+                        crate::ui::WorkspaceListRemoteTarget::Space { key } => {
                             self.selected_remote_space = Some(key);
                             self.selected_remote_agent = None;
                         }
-                        crate::ui::WorkspaceListRemoteTarget::RemoteHost { .. } => {
+                        crate::ui::WorkspaceListRemoteTarget::Host { .. } => {
+                            self.selected_remote_agent = None;
+                        }
+                        crate::ui::WorkspaceListRemoteTarget::New { .. } => {
+                            self.selected_remote_space = None;
                             self.selected_remote_agent = None;
                         }
                     }

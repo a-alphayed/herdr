@@ -13,6 +13,7 @@ mod creation;
 mod ids;
 mod input;
 mod remote_attach;
+mod remote_workspace;
 mod runtime;
 mod session;
 pub mod state;
@@ -540,7 +541,10 @@ impl App {
             request_remote_attach: None,
             request_remote_attach_in_new_split: None,
             request_remote_detach_view: None,
+            request_remote_workspace_create: None,
             pending_remote_attach: None,
+            pending_remote_workspace_creates: std::collections::BTreeMap::new(),
+            next_remote_workspace_create_token: 1,
             creating_new_tab: false,
             requested_new_tab_name: None,
             rename_pane_target: None,
@@ -2045,6 +2049,7 @@ mod tests {
             host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
         assert!(app.state.remote_sources.list_entries().is_empty());
@@ -2064,6 +2069,7 @@ mod tests {
             host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
         assert!(app.state.remote_sources.list_entries().is_empty());
@@ -2084,6 +2090,7 @@ mod tests {
             host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
         assert_eq!(app.state.remote_sources.list_entries().len(), 1);
@@ -2530,6 +2537,7 @@ auto_connect = false
             host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
         assert!(app.state.remote_sources.list_host_statuses().is_empty());
         assert!(app.state.remote_sources.list_entries().is_empty());

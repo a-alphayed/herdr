@@ -652,6 +652,9 @@ fn required_federation_methods_for_request(
 
 fn federation_method_for_api_method(method: &crate::api::schema::Method) -> Option<&'static str> {
     match method {
+        crate::api::schema::Method::WorkspaceCreate(_) => {
+            Some(crate::api::schema::FederationCapabilities::WORKSPACE_CREATE)
+        }
         crate::api::schema::Method::WorkspaceListLocal(_) => {
             Some(crate::api::schema::FederationCapabilities::WORKSPACE_LIST_LOCAL)
         }
@@ -2610,6 +2613,30 @@ mod tests {
             vec![
                 crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
                 crate::api::schema::FederationCapabilities::WORKSPACE_LIST_LOCAL
+            ]
+        );
+    }
+
+    #[test]
+    fn required_federation_methods_include_remote_workspace_create_method() {
+        let request = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::WorkspaceCreate(
+                crate::api::schema::WorkspaceCreateParams {
+                    cwd: None,
+                    focus: true,
+                    label: None,
+                },
+            ),
+        };
+
+        let methods = required_federation_methods_for_request(&request);
+
+        assert_eq!(
+            methods,
+            vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::WORKSPACE_CREATE
             ]
         );
     }

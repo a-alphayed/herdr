@@ -19,7 +19,7 @@ use crate::api::schema::{
     AgentInfo, EmptyParams, Method, PingParams, Request, ResponseResult, WorkspaceInfo,
 };
 use crate::events::AppEvent;
-use crate::remote_source::{RemoteConnectionStatus, RemoteHostKey};
+use crate::remote_source::{RemoteConnectionStatus, RemoteHostKey, RemoteSourceCapabilities};
 use crate::remote_target::{RemoteHostConfig, RemoteHostRegistry};
 
 const REMOTE_SOURCE_PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -147,6 +147,7 @@ fn remote_source_supervisor_loop_with<F>(
                         host: host_key.clone(),
                         agents,
                         workspaces,
+                        capabilities,
                     });
                     next_snapshot = now + REMOTE_SOURCE_SNAPSHOT_INTERVAL;
                 }
@@ -193,11 +194,6 @@ fn remote_source_failure_status(err: &io::Error) -> RemoteConnectionStatus {
         crate::remote::RemoteFailureClass::Unreachable => RemoteConnectionStatus::Unreachable,
         crate::remote::RemoteFailureClass::Unknown => RemoteConnectionStatus::Disconnected,
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct RemoteSourceCapabilities {
-    workspace_list_local: bool,
 }
 
 fn send_ping<F>(host: &RemoteHostConfig, send: &F) -> io::Result<RemoteSourceCapabilities>
@@ -287,6 +283,8 @@ pub(crate) fn parse_ping_response(response: &str) -> io::Result<RemoteSourceCapa
                 workspace_list_local: federation.supports_method(
                     crate::api::schema::FederationCapabilities::WORKSPACE_LIST_LOCAL,
                 ),
+                workspace_create: federation
+                    .supports_method(crate::api::schema::FederationCapabilities::WORKSPACE_CREATE),
             })
         }
         other => Err(io::Error::new(
@@ -588,11 +586,14 @@ mod tests {
             host,
             agents,
             workspaces,
+            capabilities,
         } = event
         else {
             panic!("expected snapshot event");
         };
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
+        assert!(capabilities.workspace_list_local);
+        assert!(capabilities.workspace_create);
         assert_eq!(agents[0].terminal_id, "term-1");
         let workspaces = workspaces.expect("workspace snapshot");
         assert_eq!(workspaces[0].workspace_id, "ws-1");
@@ -629,11 +630,14 @@ mod tests {
             host,
             agents,
             workspaces,
+            capabilities,
         } = event
         else {
             panic!("expected snapshot event");
         };
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
+        assert!(!capabilities.workspace_list_local);
+        assert!(!capabilities.workspace_create);
         assert_eq!(agents[0].terminal_id, "term-1");
         assert_eq!(workspaces, None);
         assert_eq!(calls.load(Ordering::Relaxed), 2);

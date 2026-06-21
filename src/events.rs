@@ -8,7 +8,9 @@ use std::time::Instant;
 use crate::api::schema::{AgentInfo, WorkspaceInfo};
 use crate::detect::{Agent, AgentState};
 use crate::layout::PaneId;
-use crate::remote_source::{RemoteAgentKey, RemoteConnectionStatus, RemoteHostKey};
+use crate::remote_source::{
+    RemoteAgentKey, RemoteConnectionStatus, RemoteHostKey, RemoteSourceCapabilities,
+};
 use crate::workspace::{GitStatusCacheEntry, WorkspaceGitStatus};
 
 #[derive(Debug)]
@@ -94,6 +96,7 @@ pub enum AppEvent {
         host: RemoteHostKey,
         agents: Vec<AgentInfo>,
         workspaces: Option<Vec<WorkspaceInfo>>,
+        capabilities: RemoteSourceCapabilities,
     },
     /// A connected authoritative remote host/session reported one newer agent entry.
     #[allow(dead_code)]
@@ -113,6 +116,20 @@ pub enum AppEvent {
     },
     /// A remote host/session was removed from aggregation state.
     RemoteSourceRemoved { host: RemoteHostKey },
+    /// A remote workspace create request succeeded on the authoritative host.
+    RemoteWorkspaceCreateSucceeded {
+        host: RemoteHostKey,
+        token: u64,
+        workspace: WorkspaceInfo,
+    },
+    /// A remote workspace create request failed before a definitive local result.
+    RemoteWorkspaceCreateFailed {
+        host: RemoteHostKey,
+        token: u64,
+        message: String,
+    },
+    /// A remote workspace create request exceeded the local pending deadline.
+    RemoteWorkspaceCreateTimedOut { host: RemoteHostKey, token: u64 },
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
     /// re-emits it through herdr's own clipboard writer.
     ClipboardWrite { content: Vec<u8> },

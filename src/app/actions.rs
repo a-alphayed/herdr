@@ -1059,7 +1059,8 @@ impl AppState {
             .filter_map(|entry| match entry {
                 crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => Some(ws_idx),
                 crate::ui::WorkspaceListEntry::RemoteHost { .. }
-                | crate::ui::WorkspaceListEntry::RemoteSpace { .. } => None,
+                | crate::ui::WorkspaceListEntry::RemoteSpace { .. }
+                | crate::ui::WorkspaceListEntry::RemoteNew { .. } => None,
             })
             .collect::<Vec<_>>();
         if order.is_empty() {
@@ -2148,9 +2149,11 @@ impl AppState {
                 host,
                 agents,
                 workspaces,
+                capabilities,
             } => {
                 self.remote_sources
                     .replace_connected_snapshot(host.clone(), agents);
+                self.remote_sources.set_capabilities(&host, capabilities);
                 match workspaces {
                     Some(workspaces) => self
                         .remote_sources
@@ -2177,7 +2180,28 @@ impl AppState {
                 }) {
                     self.selected_remote_space = None;
                 }
+                self.pending_remote_workspace_creates.remove(&host);
                 self.remote_sources.remove_host(&host);
+                Vec::new()
+            }
+            AppEvent::RemoteWorkspaceCreateSucceeded {
+                host,
+                token,
+                workspace,
+            } => {
+                self.handle_remote_workspace_create_succeeded(host, token, workspace);
+                Vec::new()
+            }
+            AppEvent::RemoteWorkspaceCreateFailed {
+                host,
+                token,
+                message,
+            } => {
+                self.handle_remote_workspace_create_failed(host, token, message);
+                Vec::new()
+            }
+            AppEvent::RemoteWorkspaceCreateTimedOut { host, token } => {
+                self.handle_remote_workspace_create_timed_out(host, token);
                 Vec::new()
             }
             AppEvent::StateChanged {
@@ -3248,6 +3272,7 @@ mod tests {
             host,
             agents: vec![remote_agent("remote-term", "smoke-agent")],
             workspaces: None,
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
         assert!(updates.is_empty());
@@ -3277,6 +3302,7 @@ mod tests {
             host,
             agents: Vec::new(),
             workspaces: Some(vec![remote_workspace("remote-ws", "blank shell")]),
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
         assert!(updates.is_empty());
@@ -3295,6 +3321,32 @@ mod tests {
     }
 
     #[test]
+    fn remote_source_events_snapshot_stores_capabilities() {
+        let mut state = AppState::test_new();
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+
+        let updates = state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            host: host.clone(),
+            agents: Vec::new(),
+            workspaces: Some(Vec::new()),
+            capabilities: crate::remote_source::RemoteSourceCapabilities {
+                workspace_list_local: true,
+                workspace_create: true,
+            },
+        });
+
+        assert!(updates.is_empty());
+        assert!(state.remote_sources.host_supports_workspace_create(&host));
+        assert_eq!(
+            state.remote_sources.host_capabilities(&host),
+            crate::remote_source::RemoteSourceCapabilities {
+                workspace_list_local: true,
+                workspace_create: true,
+            }
+        );
+    }
+
+    #[test]
     fn remote_source_events_snapshot_without_workspace_metadata_restores_agent_fallback() {
         let mut state = AppState::test_new();
         state.workspaces = Vec::new();
@@ -3304,6 +3356,7 @@ mod tests {
             host: host.clone(),
             agents: Vec::new(),
             workspaces: Some(vec![remote_workspace("remote-ws", "metadata label")]),
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
         let mut agent = remote_agent("remote-term", "smoke-agent");
         agent.cwd = Some("/home/amf/tmp".to_string());
@@ -3312,6 +3365,7 @@ mod tests {
             host,
             agents: vec![agent],
             workspaces: None,
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
         assert!(updates.is_empty());
@@ -3334,6 +3388,7 @@ mod tests {
             host: host.clone(),
             agents: vec![remote_agent("remote-term", "smoke-agent")],
             workspaces: None,
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceDisconnected {
@@ -3389,6 +3444,7 @@ mod tests {
                 10,
             )],
             workspaces: None,
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
         let old_updates = state.handle_app_event(AppEvent::RemoteSourceAgentUpdated {
@@ -3438,11 +3494,13 @@ mod tests {
             host: keep.clone(),
             agents: vec![remote_agent("remote-term", "keep")],
             workspaces: None,
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
             host: remove.clone(),
             agents: vec![remote_agent("remote-term", "remove")],
             workspaces: None,
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceAgentRemoved {
@@ -3476,11 +3534,13 @@ mod tests {
             host: keep.clone(),
             agents: vec![remote_agent("keep-term", "keep")],
             workspaces: None,
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
             host: remove.clone(),
             agents: vec![remote_agent("remove-term", "remove")],
             workspaces: None,
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceRemoved { host: remove });
@@ -3516,11 +3576,13 @@ mod tests {
             host: keep,
             agents: vec![remote_agent("keep-term", "keep")],
             workspaces: None,
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
             host: remove.clone(),
             agents: vec![remote_agent("remove-term", "remove")],
             workspaces: None,
+            capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceRemoved { host: remove });

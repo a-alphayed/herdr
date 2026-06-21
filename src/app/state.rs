@@ -1201,6 +1201,12 @@ pub(crate) struct PendingRemoteAttach {
     pub pane: RemoteAttachPaneTarget,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingRemoteWorkspaceCreate {
+    pub(crate) token: u64,
+    pub(crate) deadline: std::time::Instant,
+}
+
 /// All application state — pure data, no channels or async runtime.
 /// Testable without PTYs or a tokio runtime.
 pub struct AppState {
@@ -1242,7 +1248,13 @@ pub struct AppState {
     pub(crate) request_remote_attach: Option<PendingRemoteAttach>,
     pub(crate) request_remote_attach_in_new_split: Option<crate::remote_source::RemoteAttachTarget>,
     pub(crate) request_remote_detach_view: Option<RemoteAttachPaneTarget>,
+    pub(crate) request_remote_workspace_create: Option<crate::remote_source::RemoteHostKey>,
     pub(crate) pending_remote_attach: Option<PendingRemoteAttach>,
+    pub(crate) pending_remote_workspace_creates: std::collections::BTreeMap<
+        crate::remote_source::RemoteHostKey,
+        PendingRemoteWorkspaceCreate,
+    >,
+    pub(crate) next_remote_workspace_create_token: u64,
     pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
     pub rename_pane_target: Option<PaneId>,
@@ -1552,7 +1564,10 @@ impl AppState {
             request_remote_attach: None,
             request_remote_attach_in_new_split: None,
             request_remote_detach_view: None,
+            request_remote_workspace_create: None,
             pending_remote_attach: None,
+            pending_remote_workspace_creates: std::collections::BTreeMap::new(),
+            next_remote_workspace_create_token: 1,
             creating_new_tab: false,
             requested_new_tab_name: None,
             rename_pane_target: None,

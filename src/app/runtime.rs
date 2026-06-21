@@ -168,6 +168,7 @@ impl App {
 
     pub(crate) fn handle_scheduled_tasks(&mut self, now: Instant) -> bool {
         let mut changed = false;
+        let previous_toast = self.state.toast.clone();
 
         self.sync_animation_timer(now);
 
@@ -218,6 +219,11 @@ impl App {
         }
 
         changed |= self.clear_due_selection_highlight(now);
+
+        if self.handle_remote_workspace_create_timeouts(now) {
+            self.sync_toast_deadline(previous_toast);
+            changed = true;
+        }
 
         self.start_git_status_refresh_if_due(now);
 
@@ -497,6 +503,7 @@ impl App {
                 .flatten(),
             self.next_auto_update_check,
             self.agent_metadata_deadline,
+            self.next_remote_workspace_create_deadline(),
             self.session_save_deadline,
             self.selection_autoscroll_deadline,
             self.selection_highlight_clear_deadline,
