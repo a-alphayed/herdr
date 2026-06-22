@@ -3,11 +3,15 @@
 Status: draft proposal  
 Owner: TBD  
 Created: 2026-05-31  
-Updated: 2026-06-01
+Updated: 2026-06-22
 
 ## Summary
 
-Add first-class multi-host agent control to Herdr so agents running on remote machines appear in the normal local Herdr sidebar agent panel and can be controlled through the same Herdr agent APIs as local agents.
+This document records Herdr's federated remote-agent control design and the next sidebar presentation direction.
+
+The current shipped federated MVP adds first-class multi-host agent control to Herdr: agents running on configured remote machines can be aggregated with local agents in the normal local Herdr sidebar/API surfaces and controlled through the same Herdr agent APIs as local agents.
+
+The forward UI direction is source/machine projection. The local Herdr node still aggregates configured remote sources, but the proposed next sidebar presentation selects one source at a time (`local`, `jafar`, `work-mini`) and renders that source through the vanilla Herdr `Spaces` and `Agents` panel chrome plus a source rail. This is a presentation/read-model layer, not a change in remote authority and not current shipped behavior.
 
 The design is **authoritative remote Herdr nodes with local aggregation and proxying**:
 
@@ -19,7 +23,7 @@ Clicking a remote agent focuses/attaches to the exact remote session/tab/pane wh
 Durability remains per authoritative Herdr server.
 ```
 
-This is **not** a "local server owns a remote PTY" design. Remote panes and agents are owned by the Herdr server on the machine where they run. The local Herdr instance acts as a unified control plane: it displays remote agents, routes commands, and opens direct attach/proxy views for interaction.
+This is **not** a "local server owns a remote PTY" design. Remote panes and agents are owned by the Herdr server on the machine where they run. The local Herdr instance acts as an aggregation/control plane: it displays remote metadata, routes allowed commands, and opens direct attach/proxy views for interaction. The current MVP can show local and remote agents together; the next presentation layer should project one selected source at a time without changing ownership.
 
 ## Core Invariants
 
@@ -29,10 +33,13 @@ This is **not** a "local server owns a remote PTY" design. Remote panes and agen
 - Remote hooks report to the remote host's local Herdr socket. They do not relay to the aggregating host.
 - Remote targets are always host-qualified in MVP.
 - Existing `herdr --remote <target>` remains a remote TUI attach mode. Federated agents use a remote API bridge, not the render/client bridge.
+- Source/machine projection is a UI/read-model selection. Selecting a source must not change local workspace ownership, focused PTY ownership, remote PTY lifecycle, or hook authority.
+- The source-projection direction described here does not require a protocol bump by itself. Protocol/version changes are required only when server/client wire or API contracts change.
 
 ## Goals
 
-- Remote agents appear in the normal Herdr sidebar Agents panel alongside local agents.
+- Current MVP: remote agents can appear in the normal Herdr sidebar/API surfaces alongside local agents.
+- Next presentation layer: one selected source (`local`, `jafar`, `work-mini`) is projected through vanilla Herdr `Spaces` and `Agents` sidebar chrome.
 - Clicking a remote agent focuses the exact remote session/tab/pane where that agent lives.
 - `herdr agent list/read/send/focus/wait/start` can target local and remote agents.
 - Agents running in any Herdr pane can use one local API surface to inspect/control agents across configured hosts.
@@ -54,12 +61,18 @@ This is **not** a "local server owns a remote PTY" design. Remote panes and agen
 - Transitive federation/mesh routing in MVP. A node routes only to local agents and explicitly configured remote hosts.
 - Embedded splittable remote panes in the local layout as an MVP. Direct remote terminal attach/proxy is the MVP focus behavior; embedded proxy panes remain an optional later phase.
 - Persisting remote proxy placement in MVP. The aggregator persists remote config only and re-aggregates on restart.
+- Treating a flat unified local+remote sidebar list as the required final UI. It remains valid current aggregation behavior, but source/machine projection is the forward presentation direction.
+- Claiming source projection is shipped before the corresponding UI slice lands.
 
 ## Terminology
 
 - **Local node / aggregator**: the Herdr server whose sidebar/UI the user is currently using, e.g. SteamDeck.
 - **Remote node**: a configured remote Herdr server/session, e.g. Jafar's default Herdr session.
 - **Remote host alias**: local configured name used in targets such as `jafar/codex`.
+- **Source / machine source**: a selectable authority whose state can be projected into the local Herdr UI, e.g. `local`, `jafar`, or `work-mini`.
+- **Source projection**: a UI/read-model selection that renders one source's spaces and agents through normal local Herdr chrome while that source remains authoritative for its own state.
+- **Source rail**: the sidebar affordance for switching the active source projection.
+- **All-machines pseudo-projection**: a possible future overview that intentionally shows multiple sources together; it is deferred and is not the default projection model.
 - **SSH target**: the value passed to `ssh`, e.g. `jafar`, `afayed@host`, or a Tailscale DNS name.
 - **Herdr session**: the named Herdr server/socket context on a host. This is not a workspace/space.
 - **Workspace/space**: a workspace inside one Herdr session.
@@ -173,7 +186,7 @@ AppState.workspaces
   -> AgentPanelEntry
 ```
 
-This design adds a second agent entry source for remote authoritative nodes rather than pretending remote agents are local panes or building a separate dashboard outside the sidebar.
+The current MVP adds a second agent entry source for remote authoritative nodes rather than pretending remote agents are local panes or building a separate dashboard outside the sidebar. Source projection keeps that structured substrate but changes the presentation: the sidebar read model is filtered to one selected source instead of requiring local and remote rows to stay visible side by side.
 
 The existing `herdr --remote <host>` mode is related but not sufficient. It runs a local thin client connected to a full remote Herdr server; the remote server owns the whole UI and the local side blits rendered frames. It cannot merge local and remote agents into one sidebar because the render stream is opaque rendered cells, not structured `AgentInfo`.
 
@@ -203,13 +216,37 @@ SteamDeck Herdr server / UI
   remote source: work-mini/default
     ssh work-mini herdr remote-api-bridge --session default
       -> Work Mini Herdr API socket
+```
 
-Unified local sidebar
+Current shipped aggregation can expose local and configured remote agents together in sidebar/API surfaces:
+
+```text
+Aggregated agent view
   pi
   codex
   jafar/codex
   jafar/claude
   work-mini/pi
+```
+
+The proposed next sidebar presentation keeps the same aggregation substrate but projects one selected source at a time:
+
+```text
+Source rail
+  local
+  jafar
+  work-mini
+
+Active source: jafar
+
+Spaces
+  herdr
+  fleet-api
+  footer: new / menu
+
+Agents
+  codex
+  claude
 ```
 
 Each remote host remains authoritative for its own panes:
@@ -475,9 +512,9 @@ Rules:
 - If no remote hosts are configured, host-qualified parsing is not activated; slash-containing local labels keep the pre-federation local behavior.
 - Later versions may add global unique shorthand, but MVP should not search remotes for bare names.
 
-### 8. Unified sidebar entries
+### 8. Sidebar aggregation and source projection
 
-Extend the native agent panel to append remote agents from the aggregator.
+Current shipped behavior: Herdr aggregates local and configured remote agent metadata, so sidebar/API surfaces can show local and remote agents together. Remote entries are native structured entries, not local pane impostors and not a static dashboard.
 
 Current local path:
 
@@ -486,7 +523,7 @@ agent_panel_entries_with_runtimes(app, runtimes)
   -> local Workspace.pane_details(...)
 ```
 
-New path:
+Current aggregation path:
 
 ```text
 local entries
@@ -515,7 +552,55 @@ Agents
   work-mini/pi       disconnected
 ```
 
-Remote sidebar rows are native sidebar entries, not a static dashboard pane.
+Forward presentation direction: source/machine projection. The same cached local/remote entry sources should feed a projected sidebar read model:
+
+```text
+Source rail
+  local
+  jafar
+  work-mini
+
+Active source: local
+
+Spaces
+  herdr
+  fleet-api
+  footer: new / menu
+
+Agents
+  pi
+  codex
+```
+
+```text
+Source rail
+  local
+  jafar
+  work-mini
+
+Active source: jafar
+
+Spaces
+  herdr
+  fleet-api
+  footer: new / menu
+
+Agents
+  codex
+  claude
+```
+
+Projection rules:
+
+- `local` projection preserves vanilla Herdr sidebar layout/navigation.
+- Only one source projection is expanded at a time.
+- Switching projected source changes the UI/read model only; it must not change active local workspace, focused PTY, or remote PTY lifecycle.
+- Remote projection uses cached metadata from `RemoteSource`/`RemoteSourceCache` and routes only capability-gated commands to the authoritative remote host.
+- The Spaces footer `new` action operates on the active projection: local creates local; remote creates remote only when connected and capable.
+- Adding/provisioning a machine is a remote config/provisioning action, not the Spaces `new` action.
+- A future all-machines/unified overview may be added as an explicit pseudo-projection; it is deferred and should not be confused with the default projected-source model.
+
+This is a presentation-layer direction. It does not remove the current ability for API/list surfaces to aggregate local and configured remote agents, and it does not require a protocol bump unless the implementation changes wire/API contracts.
 
 ### 9. Cross-host command routing
 
@@ -556,7 +641,7 @@ integration.uninstall
 broad workspace/tab destructive mutation
 ```
 
-Workspace/tab creation or pane placement may be allowed only through explicit remote `agent.start` placement features.
+Remote workspace creation is allowed only through explicit capability-gated routes to the owning host, and only when the active source/projection is remote and connected. It must not be confused with adding/provisioning a machine. Broader workspace/tab destructive mutation remains denied by default until confirmations, capabilities, and UX language are settled. Workspace/tab creation or pane placement for agent start may be allowed through explicit remote `agent.start` placement features.
 
 `agent.wait` is not a routable API method — the API exposes no such op. The CLI's `agent wait` is composed from the long-held wait primitives (`events.wait` / `pane.wait_for_output`). Over federation it is realized by proxying those primitives to the owning node on a dedicated bridge and running the wait/match logic locally, not by forwarding an `agent.wait` call.
 
@@ -1184,6 +1269,7 @@ Remaining non-MVP or later polish:
 - automatic remote update/setup orchestration;
 - optional internal SSH ControlMaster optimization;
 - broader multi-host and sleep/offline/wake soak testing.
+- source/machine projection sidebar presentation; current MVP aggregation remains the shipped behavior until that UI layer lands.
 
 Production validation should go beyond the Docker/localhost SSH smoke. Before wider release, test multiple configured hosts, slow/unreachable SSH, sleep/offline/wake reconnect behavior, and a Tailscale/MagicDNS target if that is a supported deployment path. The Docker smoke proves the controlled one-hop federation path, and the Jafar smoke proves one real SSH-reachable host, but neither is a multi-host soak.
 
@@ -1195,9 +1281,28 @@ Acceptance criteria for the MVP hardening slice:
 - `herdr remote status` clearly explains disconnected/auth/incompatible states.
 - The sidebar clearly shows stale remote agents and host-level failure state even when no cached agents exist.
 
+### Next presentation layer — Source/machine projection
+
+Goal: keep the current aggregation/control substrate while changing the sidebar presentation from mixed local/remote sections to one selected source rendered through vanilla Herdr chrome.
+
+Recommended slice order:
+
+1. Restore vanilla local projection so `local` uses the normal `Spaces` and `Agents` panel layout, footer actions, and navigation semantics.
+2. Introduce source rail/projected source state for `local`, `jafar`, `work-mini` style machine selection. Switching sources changes only the sidebar read model.
+3. Render a selected remote source through the same panel shape using existing `RemoteSourceCache`, `RemoteHostKey`, workspace snapshots, remote agent rows, and workspace-create capability gating.
+4. Defer keyboard source cycling, projection persistence fallback, and an all-machines/unified overview until the base projection is stable.
+
+Constraints:
+
+- no local-owned remote PTYs;
+- no remote hook relay;
+- no transitive routing;
+- no protocol bump unless implementation changes a wire/API contract;
+- no claim that source projection is current shipped behavior until the UI slice lands.
+
 ### Phase 6 — Optional embedded remote panes
 
-Only if later required.
+Only if later required, and not as a substitute for source/machine projection.
 
 This phase would revisit the earlier remote-backed local pane idea:
 
@@ -1209,7 +1314,7 @@ It would require:
 
 - real terminal runtime backend abstraction;
 - remote PTY helper;
-- remote hook relay or local proxy strategy;
+- a hook authority strategy that still avoids relaying remote hooks to the local node;
 - handoff/persistence special cases.
 
 This is intentionally not part of the MVP because authoritative remote nodes satisfy the current click-to-focus and agent-to-agent control requirements with far less architectural risk.
@@ -1235,10 +1340,10 @@ Authoritative remote nodes satisfy these directly. Local-owned remote PTYs would
 
 ## Recommended Next Step
 
-Implement Phase 0 on a feature branch:
+Implement the source/machine projection presentation layer in narrow UI slices:
 
-```bash
-git checkout -b feature/federated-remote-agents
-```
+1. restore the vanilla local sidebar projection;
+2. add source rail/projected source state;
+3. render one selected remote source through the same `Spaces` and `Agents` chrome using the existing remote cache and capability gates.
 
-First milestone: local Herdr can connect to Jafar's Herdr API socket over SSH and call `ping`/`agent.list` through a one-request `remote-api-bridge` built from existing `src/remote.rs` primitives.
+Keep the shipped aggregation/API behavior intact while doing this. Source projection is the forward UI direction, not an already-shipped behavior claim.
