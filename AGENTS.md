@@ -76,6 +76,16 @@ just check              # formatting check + cargo nextest + maintenance script 
 
 Default flow: run `just check` before committing. Do not commit until `just check` passes locally unless Can explicitly accepts a narrower validation for that commit.
 
+### Runtime UI validation
+
+For any feature, slice, or work unit with user-visible UI or runtime behavior, do end-to-end testing in **Ghostty Herdr Dev** before asking Ahmed to approve a commit, merge, or push. Be satisfied the feature actually works in the dev app, not only in unit tests.
+
+- Use the dedicated Ghostty Herdr Dev launcher (`ghostty-herdr-dev.desktop` / `~/.local/bin/ghostty-herdr-dev`) and the source-built dev binary it launches. Rebuild that explicit dev binary before testing when needed.
+- Do not launch dev runtime tests inside Ahmed's vanilla Herdr panes, workspaces, default session, or normal named sessions. Ahmed uses vanilla Herdr for work; do not touch or mutate it for validation.
+- Keep dev runtime state isolated with `herdr-dev` config/state or task-scoped temp `XDG_CONFIG_HOME` and `XDG_STATE_HOME`. If running from an existing Herdr environment, the dev config must intentionally allow nesting with `[experimental] allow_nested = true`.
+- Capture screenshot proof through the Omarchy/Ghostty desktop path after the end-to-end test. Inspect the screenshot and report the screenshot path plus what was verified before the commit gate.
+- If the dev launcher, screenshot, or runtime validation fails or is ambiguous, treat the work unit as not ready. Fix it or report the blocker before asking for commit or push approval.
+
 Unit tests live next to the code (`#[cfg(test)] mod tests`). If you add behavior to `AppState` or `Workspace`, it should be testable with `AppState::test_new()` and `Workspace::test_new()` — no PTYs.
 
 ## Conventions
