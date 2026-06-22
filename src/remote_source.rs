@@ -293,14 +293,6 @@ impl RemoteSourceCache {
             .collect()
     }
 
-    pub(crate) fn list_workspace_entries(&self) -> Vec<RemoteWorkspaceEntry> {
-        self.hosts
-            .iter()
-            .filter_map(|(host, host_cache)| host_cache.workspace_entries(host))
-            .flatten()
-            .collect()
-    }
-
     pub(crate) fn list_host_statuses(&self) -> Vec<RemoteHostStatusEntry> {
         self.hosts
             .iter()
@@ -802,8 +794,11 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].host, keep);
         assert_eq!(entries[0].agent.terminal_id, "term-1");
-        let workspace_entries = cache.list_workspace_entries();
+        let workspace_entries = cache
+            .workspace_entries_for_host(&keep)
+            .expect("keep workspace snapshot");
         assert_eq!(workspace_entries.len(), 1);
         assert_eq!(workspace_entries[0].workspace.workspace_id, "ws-keep");
+        assert!(cache.workspace_entries_for_host(&remove).is_none());
     }
 }

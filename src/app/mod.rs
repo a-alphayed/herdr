@@ -517,6 +517,7 @@ impl App {
             pane_id_aliases: std::collections::HashMap::new(),
             workspaces,
             remote_sources,
+            sidebar_source: state::SidebarSource::Local,
             active,
             previous_pane_focus: None,
             selected_remote_space: None,
@@ -578,6 +579,8 @@ impl App {
             view: state::ViewState {
                 layout: state::ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
+                source_rail_rect: Rect::default(),
+                sidebar_panel_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),

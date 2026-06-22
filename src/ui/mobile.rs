@@ -6,7 +6,9 @@ use ratatui::{
     Frame,
 };
 
-use super::sidebar::{agent_panel_entries, agent_panel_entries_from, AgentPanelEntry};
+use super::sidebar::{
+    all_source_agent_panel_entries, all_source_agent_panel_entries_from, AgentPanelEntry,
+};
 use super::status::{agent_icon, state_dot};
 use crate::app::state::{Palette, ToastKind, ToastNotification};
 use crate::app::AppState;
@@ -139,7 +141,7 @@ pub(crate) fn mobile_switcher_target_at(
     }
 
     cursor += 1; // agents title
-    let agents = agent_panel_entries(app);
+    let agents = all_source_agent_panel_entries(app);
     let agents_end = cursor + agents.len() * 2;
     if doc_row >= cursor && doc_row < agents_end {
         let idx = (doc_row - cursor) / 2;
@@ -400,7 +402,7 @@ fn mobile_switcher_content_height(app: &AppState) -> usize {
         .and_then(|idx| app.workspaces.get(idx))
         .map(|ws| 2 + ws.tabs.len())
         .unwrap_or(0);
-    let agents_h = 1 + agent_panel_entries(app).len() * 2;
+    let agents_h = 1 + all_source_agent_panel_entries(app).len() * 2;
     let menu_h = 1 + app.global_menu_labels().len();
     spaces_h + tabs_h + agents_h + menu_h
 }
@@ -549,7 +551,7 @@ fn render_mobile_switcher_content(
         ws.focused_pane_id()
             .map(|pane_id| (ws_idx, ws.active_tab, pane_id))
     });
-    let entries = agent_panel_entries_from(app, terminal_runtimes);
+    let entries = all_source_agent_panel_entries_from(app, terminal_runtimes);
     render_section_title_at(
         frame,
         viewport,

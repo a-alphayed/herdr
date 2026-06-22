@@ -714,7 +714,14 @@ pub enum ViewLayout {
 
 pub struct ViewState {
     pub layout: ViewLayout,
+    /// Total desktop sidebar rect, including the optional source rail and the
+    /// right-edge divider.
     pub sidebar_rect: Rect,
+    /// Optional source rail shown beside the expanded desktop sidebar panel.
+    pub source_rail_rect: Rect,
+    /// Sidebar content panel rect. This is the area used by workspace and
+    /// agent panel render/input helpers.
+    pub sidebar_panel_rect: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
     pub tab_bar_rect: Rect,
     pub tab_hit_areas: Vec<Rect>,
@@ -752,6 +759,12 @@ pub enum Mode {
     GlobalMenu,
     KeybindHelp,
     Navigator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SidebarSource {
+    Local,
+    Remote(crate::remote_source::RemoteHostKey),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1217,6 +1230,7 @@ pub struct AppState {
     pub(crate) pane_id_aliases: std::collections::HashMap<u32, PaneId>,
     pub workspaces: Vec<Workspace>,
     pub remote_sources: crate::remote_source::RemoteSourceCache,
+    pub(crate) sidebar_source: SidebarSource,
     pub active: Option<usize>,
     pub(crate) previous_pane_focus: Option<PaneFocusTarget>,
     pub(crate) selected_remote_space: Option<crate::remote_source::RemoteSpaceKey>,
@@ -1364,6 +1378,29 @@ pub struct AppState {
 impl AppState {
     pub(crate) fn mark_session_dirty(&mut self) {
         self.session_dirty = true;
+    }
+
+    pub(crate) fn select_sidebar_source(&mut self, source: SidebarSource) {
+        if self.sidebar_source == source {
+            return;
+        }
+
+        self.sidebar_source = source;
+        self.selected_remote_space = None;
+        self.selected_remote_agent = None;
+        self.workspace_scroll = 0;
+        self.agent_panel_scroll = 0;
+    }
+
+    pub(crate) fn effective_sidebar_source(&self) -> SidebarSource {
+        if self.view.layout != ViewLayout::Desktop
+            || self.sidebar_collapsed
+            || self.view.source_rail_rect == Rect::default()
+        {
+            return SidebarSource::Local;
+        }
+
+        self.sidebar_source.clone()
     }
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
@@ -1540,6 +1577,7 @@ impl AppState {
             pane_id_aliases: std::collections::HashMap::new(),
             workspaces: Vec::new(),
             remote_sources: crate::remote_source::RemoteSourceCache::default(),
+            sidebar_source: SidebarSource::Local,
             active: None,
             previous_pane_focus: None,
             selected_remote_space: None,
@@ -1592,6 +1630,8 @@ impl AppState {
             view: ViewState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
+                source_rail_rect: Rect::default(),
+                sidebar_panel_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
                 tab_hit_areas: Vec::new(),

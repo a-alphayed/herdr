@@ -946,6 +946,12 @@ impl AppState {
         if self.sidebar_collapsed {
             return;
         }
+        if matches!(
+            self.effective_sidebar_source(),
+            crate::app::state::SidebarSource::Remote(_)
+        ) {
+            return;
+        }
 
         let entries = crate::ui::workspace_list_entries(self);
         let Some(target_entry_idx) = entries.iter().position(|entry| {
@@ -959,10 +965,10 @@ impl AppState {
 
         self.workspace_scroll = crate::ui::normalized_workspace_scroll(
             self,
-            self.view.sidebar_rect,
+            self.view.sidebar_panel_rect,
             self.workspace_scroll,
         );
-        let mut cards = crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect);
+        let mut cards = crate::ui::compute_workspace_card_areas(self, self.view.sidebar_panel_rect);
         if cards.iter().any(|card| card.ws_idx == idx) {
             return;
         }
@@ -980,13 +986,13 @@ impl AppState {
             }
             self.workspace_scroll = crate::ui::normalized_workspace_scroll(
                 self,
-                self.view.sidebar_rect,
+                self.view.sidebar_panel_rect,
                 self.workspace_scroll,
             );
             if self.workspace_scroll == previous_scroll {
                 break;
             }
-            cards = crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect);
+            cards = crate::ui::compute_workspace_card_areas(self, self.view.sidebar_panel_rect);
             if cards.is_empty() {
                 break;
             }
@@ -1054,12 +1060,18 @@ impl AppState {
     }
 
     pub(crate) fn visible_workspace_order(&self) -> Vec<usize> {
+        if matches!(
+            self.effective_sidebar_source(),
+            crate::app::state::SidebarSource::Remote(_)
+        ) {
+            return Vec::new();
+        }
+
         let order = crate::ui::workspace_list_entries(self)
             .into_iter()
             .filter_map(|entry| match entry {
                 crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => Some(ws_idx),
                 crate::ui::WorkspaceListEntry::LocalActions
-                | crate::ui::WorkspaceListEntry::RemoteHost { .. }
                 | crate::ui::WorkspaceListEntry::RemoteSpace { .. }
                 | crate::ui::WorkspaceListEntry::RemoteNew { .. } => None,
             })
@@ -1080,6 +1092,9 @@ impl AppState {
             return;
         }
         let order = self.visible_workspace_order();
+        if order.is_empty() {
+            return;
+        }
         let current_pos = order
             .iter()
             .position(|idx| *idx == self.selected)
@@ -1099,6 +1114,9 @@ impl AppState {
         }
         let current = self.active.unwrap_or(self.selected);
         let order = self.visible_workspace_order();
+        if order.is_empty() {
+            return;
+        }
         let current_pos = order.iter().position(|idx| *idx == current).unwrap_or(0);
         let next = order[(current_pos + 1) % order.len()];
         self.switch_workspace(next);
@@ -1110,6 +1128,9 @@ impl AppState {
         }
         let current = self.active.unwrap_or(self.selected);
         let order = self.visible_workspace_order();
+        if order.is_empty() {
+            return;
+        }
         let current_pos = order.iter().position(|idx| *idx == current).unwrap_or(0);
         let prev = if current_pos == 0 {
             order[order.len() - 1]
@@ -1262,10 +1283,9 @@ impl AppState {
             return;
         }
 
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            self.view.sidebar_rect,
-            self.sidebar_section_split,
-        );
+        let detail_area = self.view.sidebar_panel_rect;
+        let (_, detail_area) =
+            crate::ui::expanded_sidebar_sections(detail_area, self.sidebar_section_split);
         let metrics = crate::ui::agent_panel_scroll_metrics(self, detail_area);
         let visible = metrics.viewport_rows;
         if visible == 0 {
@@ -2176,10 +2196,21 @@ impl AppState {
                 Vec::new()
             }
             AppEvent::RemoteSourceRemoved { host } => {
+                if self.sidebar_source == crate::app::state::SidebarSource::Remote(host.clone()) {
+                    self.select_sidebar_source(crate::app::state::SidebarSource::Local);
+                }
                 if self.selected_remote_space.as_ref().is_some_and(|selected| {
                     selected.host == host.host && selected.session == host.session
                 }) {
                     self.selected_remote_space = None;
+                }
+                if self.selected_remote_agent.as_ref().is_some_and(|selected| {
+                    selected.host == host.host && selected.session == host.session
+                }) {
+                    self.selected_remote_agent = None;
+                }
+                if self.request_remote_workspace_create.as_ref() == Some(&host) {
+                    self.request_remote_workspace_create = None;
                 }
                 self.pending_remote_workspace_creates.remove(&host);
                 self.remote_sources.remove_host(&host);
@@ -2500,7 +2531,7 @@ mod tests {
     use crate::detect::{Agent, AgentState};
     use crate::remote_source::{RemoteAgentKey, RemoteAttachTarget, RemoteHostKey, RemoteSpaceKey};
     use crate::workspace::Workspace;
-    use ratatui::layout::Direction;
+    use ratatui::layout::{Direction, Rect};
 
     fn app_with_workspaces(names: &[&str]) -> AppState {
         let mut state = AppState::test_new();
@@ -3162,6 +3193,13 @@ mod tests {
         }
     }
 
+    fn select_remote_projection(state: &mut AppState, host: &RemoteHostKey) {
+        state.view.layout = crate::app::state::ViewLayout::Desktop;
+        state.view.source_rail_rect = Rect::new(0, 0, 10, 20);
+        state.view.sidebar_panel_rect = Rect::new(10, 0, state.sidebar_width, 20);
+        state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+    }
+
     #[test]
     fn next_agent_cycles_agent_panel_entries_in_all_scope() {
         let mut first = Workspace::test_new("one");
@@ -3270,17 +3308,21 @@ mod tests {
         let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceSnapshot {
-            host,
+            host: host.clone(),
             agents: vec![remote_agent("remote-term", "smoke-agent")],
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
         assert!(updates.is_empty());
+        let all_source_entries = crate::ui::all_source_agent_panel_entries(&state);
+        assert_eq!(all_source_entries.len(), 2);
+        assert_eq!(all_source_entries[0].primary_label, "jafar agents");
+        assert_eq!(all_source_entries[1].primary_label, "smoke-agent");
+        select_remote_projection(&mut state, &host);
         let entries = crate::ui::agent_panel_entries(&state);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].primary_label, "jafar agents");
-        assert_eq!(entries[1].primary_label, "smoke-agent");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].primary_label, "smoke-agent");
         assert!(crate::ui::workspace_list_entries(&state)
             .into_iter()
             .any(|entry| matches!(
@@ -3300,23 +3342,22 @@ mod tests {
         let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceSnapshot {
-            host,
+            host: host.clone(),
             agents: Vec::new(),
             workspaces: Some(vec![remote_workspace("remote-ws", "blank shell")]),
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
         assert!(updates.is_empty());
+        select_remote_projection(&mut state, &host);
         let entries = crate::ui::workspace_list_entries(&state)
             .into_iter()
             .filter(|entry| !matches!(entry, crate::ui::WorkspaceListEntry::LocalActions))
             .collect::<Vec<_>>();
         assert!(matches!(
             &entries[..],
-            [
-                crate::ui::WorkspaceListEntry::RemoteHost { .. },
-                crate::ui::WorkspaceListEntry::RemoteSpace { key, label, .. },
-            ] if key.host == "jafar"
+            [crate::ui::WorkspaceListEntry::RemoteSpace { key, label, .. }]
+                if key.host == "jafar"
                 && key.session == crate::session::DEFAULT_SESSION_NAME
                 && key.workspace_id == "remote-ws"
                 && label == "blank shell"
@@ -3366,13 +3407,14 @@ mod tests {
         agent.cwd = Some("/home/amf/tmp".to_string());
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceSnapshot {
-            host,
+            host: host.clone(),
             agents: vec![agent],
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
         assert!(updates.is_empty());
+        select_remote_projection(&mut state, &host);
         let labels = crate::ui::workspace_list_entries(&state)
             .into_iter()
             .filter_map(|entry| match entry {
@@ -3396,15 +3438,15 @@ mod tests {
         });
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceDisconnected {
-            host,
+            host: host.clone(),
             status: crate::remote_source::RemoteConnectionStatus::Unreachable,
         });
 
         assert!(updates.is_empty());
+        select_remote_projection(&mut state, &host);
         let entries = crate::ui::agent_panel_entries(&state);
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].custom_status.as_deref(), Some("unreachable"));
-        assert_eq!(entries[1].custom_status.as_deref(), Some("unreachable"));
         assert!(crate::ui::workspace_list_entries(&state)
             .into_iter()
             .any(|entry| matches!(
@@ -3423,12 +3465,12 @@ mod tests {
         let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceDisconnected {
-            host,
+            host: host.clone(),
             status: crate::remote_source::RemoteConnectionStatus::NeedsUpdate,
         });
 
         assert!(updates.is_empty());
-        let entries = crate::ui::agent_panel_entries(&state);
+        let entries = crate::ui::all_source_agent_panel_entries(&state);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].primary_label, "jafar agents");
         assert_eq!(entries[0].custom_status.as_deref(), Some("needs update"));
@@ -3470,7 +3512,7 @@ mod tests {
             )),
         });
         let new_updates = state.handle_app_event(AppEvent::RemoteSourceAgentUpdated {
-            host,
+            host: host.clone(),
             agent: Box::new(remote_agent_with_revision(
                 "remote-term",
                 "new",
@@ -3482,10 +3524,11 @@ mod tests {
         assert!(old_updates.is_empty());
         assert!(same_updates.is_empty());
         assert!(new_updates.is_empty());
+        select_remote_projection(&mut state, &host);
         let entries = crate::ui::agent_panel_entries(&state);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[1].primary_label, "new");
-        assert_eq!(entries[1].state, AgentState::Idle);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].primary_label, "new");
+        assert_eq!(entries[0].state, AgentState::Idle);
     }
 
     #[test]
@@ -3512,11 +3555,12 @@ mod tests {
         });
 
         assert!(updates.is_empty());
-        let labels: Vec<_> = crate::ui::agent_panel_entries(&state)
+        let labels: Vec<_> = crate::ui::all_source_agent_panel_entries(&state)
             .into_iter()
             .map(|entry| entry.primary_label)
             .collect();
         assert_eq!(labels, vec!["jafar agents", "keep"]);
+        select_remote_projection(&mut state, &keep);
         assert!(crate::ui::workspace_list_entries(&state)
             .into_iter()
             .any(|entry| matches!(
@@ -3547,14 +3591,17 @@ mod tests {
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
-        let updates = state.handle_app_event(AppEvent::RemoteSourceRemoved { host: remove });
+        let updates = state.handle_app_event(AppEvent::RemoteSourceRemoved {
+            host: remove.clone(),
+        });
 
         assert!(updates.is_empty());
-        let labels: Vec<_> = crate::ui::agent_panel_entries(&state)
+        let labels: Vec<_> = crate::ui::all_source_agent_panel_entries(&state)
             .into_iter()
             .map(|entry| entry.primary_label)
             .collect();
         assert_eq!(labels, vec!["jafar agents", "keep"]);
+        select_remote_projection(&mut state, &keep);
         assert!(crate::ui::workspace_list_entries(&state)
             .into_iter()
             .any(|entry| matches!(
@@ -3576,6 +3623,16 @@ mod tests {
             session: "agents".to_string(),
             workspace_id: "remote-ws".to_string(),
         });
+        state.selected_remote_agent = Some(RemoteAgentKey::new(&remove, "remove-term"));
+        state.sidebar_source = crate::app::state::SidebarSource::Remote(remove.clone());
+        state.request_remote_workspace_create = Some(remove.clone());
+        state.pending_remote_workspace_creates.insert(
+            remove.clone(),
+            crate::app::state::PendingRemoteWorkspaceCreate {
+                token: 42,
+                deadline: std::time::Instant::now(),
+            },
+        );
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
             host: keep,
             agents: vec![remote_agent("keep-term", "keep")],
@@ -3589,10 +3646,19 @@ mod tests {
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
         });
 
-        let updates = state.handle_app_event(AppEvent::RemoteSourceRemoved { host: remove });
+        let updates = state.handle_app_event(AppEvent::RemoteSourceRemoved {
+            host: remove.clone(),
+        });
 
         assert!(updates.is_empty());
         assert!(state.selected_remote_space.is_none());
+        assert!(state.selected_remote_agent.is_none());
+        assert_eq!(
+            state.sidebar_source,
+            crate::app::state::SidebarSource::Local
+        );
+        assert!(state.request_remote_workspace_create.is_none());
+        assert!(!state.pending_remote_workspace_creates.contains_key(&remove));
         assert_eq!(state.remote_sources.list_entries().len(), 1);
     }
 

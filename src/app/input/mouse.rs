@@ -478,12 +478,24 @@ impl AppState {
                         return None;
                     }
 
+                    if self.on_source_rail(mouse.column, mouse.row) {
+                        if let Some(source) = self.source_rail_target_at(mouse.column, mouse.row) {
+                            self.select_sidebar_source(source);
+                        }
+                        return None;
+                    }
+
                     let new_button = self.sidebar_new_button_rect();
                     let on_new_button = mouse.row >= new_button.y
                         && mouse.row < new_button.y + new_button.height
                         && mouse.column >= new_button.x
                         && mouse.column < new_button.x + new_button.width;
-                    if on_new_button {
+                    if on_new_button
+                        && matches!(
+                            self.effective_sidebar_source(),
+                            crate::app::state::SidebarSource::Local
+                        )
+                    {
                         self.request_new_workspace = true;
                         return None;
                     }
@@ -512,9 +524,6 @@ impl AppState {
                                 self.selected_remote_space = Some(key);
                                 self.selected_remote_agent = None;
                             }
-                            crate::ui::WorkspaceListRemoteTarget::Host { .. } => {
-                                self.selected_remote_agent = None;
-                            }
                             crate::ui::WorkspaceListRemoteTarget::New { host } => {
                                 self.selected_remote_space = None;
                                 self.selected_remote_agent = None;
@@ -525,7 +534,7 @@ impl AppState {
                     }
 
                     let cards = if self.view.workspace_card_areas.is_empty() {
-                        crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect)
+                        crate::ui::compute_workspace_card_areas(self, self.view.sidebar_panel_rect)
                     } else {
                         self.view.workspace_card_areas.clone()
                     };
@@ -905,6 +914,9 @@ impl AppState {
             }
 
             MouseEventKind::ScrollUp if in_sidebar => {
+                if self.on_source_rail(mouse.column, mouse.row) {
+                    return None;
+                }
                 let agent_area = self.agent_panel_rect();
                 let over_agent_panel = agent_area != Rect::default()
                     && mouse.row >= agent_area.y
@@ -924,6 +936,9 @@ impl AppState {
                 }
             }
             MouseEventKind::ScrollDown if in_sidebar => {
+                if self.on_source_rail(mouse.column, mouse.row) {
+                    return None;
+                }
                 let agent_area = self.agent_panel_rect();
                 let over_agent_panel = agent_area != Rect::default()
                     && mouse.row >= agent_area.y
@@ -951,6 +966,9 @@ impl AppState {
             }
 
             MouseEventKind::Down(MouseButton::Right) if in_sidebar && !self.sidebar_collapsed => {
+                if self.on_source_rail(mouse.column, mouse.row) {
+                    return None;
+                }
                 self.workspace_press = None;
                 self.tab_press = None;
                 if self
@@ -964,9 +982,6 @@ impl AppState {
                     match target {
                         crate::ui::WorkspaceListRemoteTarget::Space { key } => {
                             self.selected_remote_space = Some(key);
-                            self.selected_remote_agent = None;
-                        }
-                        crate::ui::WorkspaceListRemoteTarget::Host { .. } => {
                             self.selected_remote_agent = None;
                         }
                         crate::ui::WorkspaceListRemoteTarget::New { .. } => {

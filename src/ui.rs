@@ -51,7 +51,10 @@ pub(crate) use self::scrollbar::{
 };
 use self::settings::render_settings_overlay;
 #[cfg(test)]
-pub(crate) use self::sidebar::{compute_workspace_list_areas, WorkspaceListRemoteRowArea};
+pub(crate) use self::sidebar::{
+    all_source_agent_panel_entries, compute_workspace_list_areas, source_rail_entries,
+    WorkspaceListRemoteRowArea,
+};
 use self::sidebar::{render_sidebar, render_sidebar_collapsed};
 use self::status::{
     render_config_diagnostic, render_copy_feedback, render_toast_notification,
@@ -73,7 +76,8 @@ pub(crate) use self::{
         agent_panel_entry_gap_after, agent_panel_scroll_metrics, agent_panel_scrollbar_rect,
         agent_panel_toggle_rect, collapsed_sidebar_sections, collapsed_sidebar_toggle_rect,
         compute_workspace_card_areas, expanded_sidebar_sections, normalized_workspace_scroll,
-        sidebar_section_divider_rect, workspace_drop_indicator_row, workspace_list_entries,
+        sidebar_section_divider_rect, source_rail_should_show, source_rail_target_at,
+        source_rail_width, workspace_drop_indicator_row, workspace_list_entries,
         workspace_list_local_actions_rect, workspace_list_menu_button_rect,
         workspace_list_new_button_rect, workspace_list_rect, workspace_list_remote_target_at,
         workspace_list_scroll_metrics, workspace_list_scrollbar_rect, workspace_parent_group_state,
@@ -183,15 +187,52 @@ fn compute_view_internal(
         return;
     }
 
+    let desired_panel_w = app
+        .sidebar_width
+        .clamp(app.sidebar_min_width, app.sidebar_max_width);
+    let rail_w = if !app.sidebar_collapsed && source_rail_should_show(app, area) {
+        source_rail_width()
+    } else {
+        0
+    };
     let sidebar_w = if app.sidebar_collapsed {
         COLLAPSED_WIDTH
     } else {
-        app.sidebar_width
-            .clamp(app.sidebar_min_width, app.sidebar_max_width)
+        let max_panel_w = area.width.saturating_sub(rail_w).saturating_sub(1);
+        let panel_w = if max_panel_w == 0 {
+            desired_panel_w
+        } else {
+            desired_panel_w
+                .min(max_panel_w)
+                .max(app.sidebar_min_width.min(max_panel_w))
+        };
+        rail_w.saturating_add(panel_w)
     };
 
     let [sidebar_area, main_area] =
         Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(1)]).areas(area);
+    let source_rail_rect = if rail_w > 0 && sidebar_area.width > rail_w {
+        Rect::new(sidebar_area.x, sidebar_area.y, rail_w, sidebar_area.height)
+    } else {
+        Rect::default()
+    };
+    let sidebar_panel_rect = if app.sidebar_collapsed {
+        sidebar_area
+    } else if source_rail_rect != Rect::default() {
+        Rect::new(
+            sidebar_area.x + source_rail_rect.width,
+            sidebar_area.y,
+            sidebar_area.width.saturating_sub(source_rail_rect.width),
+            sidebar_area.height,
+        )
+    } else {
+        sidebar_area
+    };
+
+    app.view.layout = ViewLayout::Desktop;
+    app.view.sidebar_rect = sidebar_area;
+    app.view.source_rail_rect = source_rail_rect;
+    app.view.sidebar_panel_rect = sidebar_panel_rect;
 
     let has_tabs = app.active.and_then(|i| app.workspaces.get(i)).is_some();
     let (tab_bar_rect, terminal_area) = if has_tabs && main_area.height > 1 {
@@ -203,8 +244,10 @@ fn compute_view_internal(
     };
 
     if !app.sidebar_collapsed {
-        app.workspace_scroll = normalized_workspace_scroll(app, sidebar_area, app.workspace_scroll);
-        let (_, detail_area) = expanded_sidebar_sections(sidebar_area, app.sidebar_section_split);
+        app.workspace_scroll =
+            normalized_workspace_scroll(app, sidebar_panel_rect, app.workspace_scroll);
+        let (_, detail_area) =
+            expanded_sidebar_sections(sidebar_panel_rect, app.sidebar_section_split);
         let max_agent_scroll = agent_panel_scroll_metrics(app, detail_area).max_offset_from_bottom;
         app.agent_panel_scroll = app.agent_panel_scroll.min(max_agent_scroll);
     } else {
@@ -217,7 +260,7 @@ fn compute_view_internal(
     let workspace_card_areas = if app.sidebar_collapsed {
         Vec::new()
     } else {
-        compute_workspace_card_areas(app, sidebar_area)
+        compute_workspace_card_areas(app, sidebar_panel_rect)
     };
 
     let tab_bar_view = app
@@ -266,6 +309,8 @@ fn compute_view_internal(
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
         sidebar_rect: sidebar_area,
+        source_rail_rect,
+        sidebar_panel_rect,
         workspace_card_areas,
         tab_bar_rect,
         tab_hit_areas: tab_bar_view.tab_hit_areas,
@@ -335,6 +380,8 @@ fn compute_mobile_view(
     app.view = crate::app::ViewState {
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
+        source_rail_rect: Rect::default(),
+        sidebar_panel_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
         tab_bar_rect: Rect::default(),
         tab_hit_areas: Vec::new(),
@@ -637,6 +684,70 @@ mod tests {
         compute_view(&mut app, Rect::new(0, 0, 100, 20));
 
         assert_eq!(app.view.sidebar_rect.width, 22);
+    }
+
+    #[test]
+    fn compute_view_allocates_source_rail_and_panel_rects_for_remote_sources() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        let default_host =
+            crate::remote_source::RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        let session_host = crate::remote_source::RemoteHostKey::new("jafar", "agents");
+        app.remote_sources.mark_status(
+            &default_host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        app.remote_sources.mark_status(
+            &session_host,
+            crate::remote_source::RemoteConnectionStatus::Disconnected,
+        );
+
+        compute_view(&mut app, Rect::new(0, 0, 100, 20));
+
+        assert_eq!(app.view.source_rail_rect, Rect::new(0, 0, 10, 20));
+        assert_eq!(app.view.sidebar_panel_rect, Rect::new(10, 0, 26, 20));
+        assert_eq!(app.view.sidebar_rect, Rect::new(0, 0, 36, 20));
+        let labels = source_rail_entries(&app)
+            .into_iter()
+            .map(|entry| entry.label)
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["local", "jafar", "jafar/agents"]);
+        assert_eq!(
+            source_rail_target_at(&app, 0, 0),
+            Some(crate::app::state::SidebarSource::Local)
+        );
+        assert_eq!(
+            source_rail_target_at(&app, 0, 1),
+            Some(crate::app::state::SidebarSource::Remote(default_host))
+        );
+    }
+
+    #[test]
+    fn compute_view_suppresses_source_rail_when_width_cannot_fit_minimum_panel() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        let host =
+            crate::remote_source::RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        app.sidebar_source = crate::app::state::SidebarSource::Remote(host);
+
+        compute_view(&mut app, Rect::new(0, 0, 28, 20));
+
+        assert_eq!(app.view.source_rail_rect, Rect::default());
+        assert_eq!(app.view.sidebar_panel_rect, app.view.sidebar_rect);
+        assert_eq!(
+            app.effective_sidebar_source(),
+            crate::app::state::SidebarSource::Local
+        );
     }
 
     #[test]

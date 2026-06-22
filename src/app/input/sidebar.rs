@@ -6,7 +6,7 @@ use super::ScrollbarClickTarget;
 
 impl AppState {
     pub(super) fn workspace_list_rect(&self) -> Rect {
-        let sidebar = self.view.sidebar_rect;
+        let sidebar = self.view.sidebar_panel_rect;
         if self.sidebar_collapsed || sidebar.width <= 1 || sidebar.height == 0 {
             return Rect::default();
         }
@@ -14,7 +14,7 @@ impl AppState {
     }
 
     pub(super) fn agent_panel_rect(&self) -> Rect {
-        let sidebar = self.view.sidebar_rect;
+        let sidebar = self.view.sidebar_panel_rect;
         if self.sidebar_collapsed || sidebar.width <= 1 || sidebar.height == 0 {
             return Rect::default();
         }
@@ -71,7 +71,7 @@ impl AppState {
             .saturating_sub(offset_from_bottom);
         self.workspace_scroll = crate::ui::normalized_workspace_scroll(
             self,
-            self.view.sidebar_rect,
+            self.view.sidebar_panel_rect,
             self.workspace_scroll,
         );
     }
@@ -83,7 +83,7 @@ impl AppState {
                 .saturating_sub(delta.unsigned_abs() as usize);
             self.workspace_scroll = crate::ui::normalized_workspace_scroll(
                 self,
-                self.view.sidebar_rect,
+                self.view.sidebar_panel_rect,
                 self.workspace_scroll,
             );
             return;
@@ -97,7 +97,7 @@ impl AppState {
             .min(metrics.max_offset_from_bottom);
         self.workspace_scroll = crate::ui::normalized_workspace_scroll(
             self,
-            self.view.sidebar_rect,
+            self.view.sidebar_panel_rect,
             self.workspace_scroll,
         );
     }
@@ -175,7 +175,7 @@ impl AppState {
     }
 
     pub(crate) fn sidebar_local_actions_rect(&self) -> Rect {
-        crate::ui::workspace_list_local_actions_rect(self, self.view.sidebar_rect)
+        crate::ui::workspace_list_local_actions_rect(self, self.view.sidebar_panel_rect)
     }
 
     pub(crate) fn sidebar_new_button_rect(&self) -> Rect {
@@ -259,8 +259,8 @@ impl AppState {
     }
 
     pub(super) fn set_manual_sidebar_width(&mut self, divider_col: u16) {
-        let sidebar = self.view.sidebar_rect;
-        let width = divider_col.saturating_sub(sidebar.x).saturating_add(1);
+        let panel = self.view.sidebar_panel_rect;
+        let width = divider_col.saturating_sub(panel.x).saturating_add(1);
         self.sidebar_width = width.clamp(self.sidebar_min_width, self.sidebar_max_width);
         self.sidebar_width_source = crate::app::state::SidebarWidthSource::Manual;
         self.mark_session_dirty();
@@ -271,7 +271,7 @@ impl AppState {
             return false;
         }
         let rect = crate::ui::sidebar_section_divider_rect(
-            self.view.sidebar_rect,
+            self.view.sidebar_panel_rect,
             self.sidebar_section_split,
         );
         rect.width > 0
@@ -282,7 +282,7 @@ impl AppState {
     }
 
     pub(super) fn set_sidebar_section_split(&mut self, row: u16) {
-        let sidebar = self.view.sidebar_rect;
+        let sidebar = self.view.sidebar_panel_rect;
         let content_height = sidebar.height;
         if content_height < 6 {
             return;
@@ -300,7 +300,7 @@ impl AppState {
         }
 
         let cards = if self.view.workspace_card_areas.is_empty() {
-            crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect)
+            crate::ui::compute_workspace_card_areas(self, self.view.sidebar_panel_rect)
         } else {
             self.view.workspace_card_areas.clone()
         };
@@ -319,7 +319,32 @@ impl AppState {
             return None;
         }
 
-        crate::ui::workspace_list_remote_target_at(self, self.view.sidebar_rect, col, row)
+        crate::ui::workspace_list_remote_target_at(self, self.view.sidebar_panel_rect, col, row)
+    }
+
+    pub(super) fn source_rail_target_at(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Option<crate::app::state::SidebarSource> {
+        if self.sidebar_collapsed {
+            return None;
+        }
+
+        crate::ui::source_rail_target_at(self, col, row)
+    }
+
+    pub(super) fn on_source_rail(&self, col: u16, row: u16) -> bool {
+        if self.sidebar_collapsed {
+            return false;
+        }
+        let rect = self.view.source_rail_rect;
+        rect.width > 0
+            && rect.height > 0
+            && col >= rect.x
+            && col < rect.x + rect.width
+            && row >= rect.y
+            && row < rect.y + rect.height
     }
 
     pub(super) fn collapsed_workspace_at_row(&self, row: u16) -> Option<usize> {
@@ -393,7 +418,7 @@ impl AppState {
         }
 
         let cards = if self.view.workspace_card_areas.is_empty() {
-            crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect)
+            crate::ui::compute_workspace_card_areas(self, self.view.sidebar_panel_rect)
         } else {
             self.view.workspace_card_areas.clone()
         };
@@ -443,11 +468,14 @@ impl AppState {
         if self.sidebar_collapsed {
             return false;
         }
+        if matches!(
+            self.effective_sidebar_source(),
+            crate::app::state::SidebarSource::Remote(_)
+        ) {
+            return false;
+        }
 
-        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
-            self.view.sidebar_rect,
-            self.sidebar_section_split,
-        );
+        let detail_area = self.agent_panel_rect();
         let rect = crate::ui::agent_panel_toggle_rect(detail_area, self.agent_panel_scope);
         rect.width > 0
             && col >= rect.x
@@ -587,7 +615,7 @@ mod tests {
         target: impl Fn(&crate::ui::WorkspaceListRemoteTarget) -> bool,
     ) -> crate::ui::WorkspaceListRemoteRowArea {
         let (_, remote_rows) =
-            crate::ui::compute_workspace_list_areas(&app.state, app.state.view.sidebar_rect);
+            crate::ui::compute_workspace_list_areas(&app.state, app.state.view.sidebar_panel_rect);
         remote_rows
             .into_iter()
             .find(|row| target(&row.target))
@@ -611,24 +639,6 @@ mod tests {
         .saturating_add(1)
     }
 
-    fn remote_host_spaces_row_y(app: &crate::app::App) -> u16 {
-        workspace_list_remote_row(app, |target| {
-            matches!(target, crate::ui::WorkspaceListRemoteTarget::Host { .. })
-        })
-        .rect
-        .y
-        .saturating_add(1)
-    }
-
-    fn remote_host_spaces_row_x(app: &crate::app::App) -> u16 {
-        workspace_list_remote_row(app, |target| {
-            matches!(target, crate::ui::WorkspaceListRemoteTarget::Host { .. })
-        })
-        .rect
-        .x
-        .saturating_add(1)
-    }
-
     fn remote_new_row(app: &crate::app::App) -> crate::ui::WorkspaceListRemoteRowArea {
         workspace_list_remote_row(app, |target| {
             matches!(target, crate::ui::WorkspaceListRemoteTarget::New { .. })
@@ -636,11 +646,28 @@ mod tests {
     }
 
     fn remote_agent_row_y(app: &crate::app::App) -> u16 {
-        agent_panel_entry_row_y(app, 1)
+        agent_panel_entry_row_y(app, 0)
+    }
+
+    fn compute_desktop_view(app: &mut crate::app::App) {
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 32));
+    }
+
+    fn blank_source_rail_col_at_row(app: &crate::app::App, row: u16) -> u16 {
+        let rail = app.state.view.source_rail_rect;
+        assert_ne!(rail, Rect::default());
+        assert!(app.state.on_source_rail(rail.x, row));
+        assert!(app.state.source_rail_target_at(rail.x, row).is_none());
+        rail.x
     }
 
     fn make_remote_agent_rows_visible(app: &mut crate::app::App) {
-        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 32));
+        compute_desktop_view(app);
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(
+                RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            ));
+        compute_desktop_view(app);
     }
 
     #[test]
@@ -888,6 +915,216 @@ mod tests {
     }
 
     #[test]
+    fn clicking_source_rail_switches_projection_without_touching_local_focus_or_dirty_state() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(1);
+        app.state.selected = 1;
+        app.state.mode = Mode::Terminal;
+        let focused_before = app.state.workspaces[1].focused_pane_id();
+        let first = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        let second = RemoteHostKey::new("work", crate::session::DEFAULT_SESSION_NAME);
+        app.state.remote_sources.mark_status(
+            &first,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        app.state.remote_sources.mark_status(
+            &second,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        app.state.selected_remote_space = Some(remote_space_key());
+        app.state.selected_remote_agent = Some(remote_key());
+        app.state.workspace_scroll = 2;
+        app.state.agent_panel_scroll = 1;
+        app.state.session_dirty = false;
+        compute_desktop_view(&mut app);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 1));
+
+        assert_eq!(
+            app.state.sidebar_source,
+            crate::app::state::SidebarSource::Remote(first.clone())
+        );
+        assert_eq!(app.state.active, Some(1));
+        assert_eq!(app.state.workspaces[1].focused_pane_id(), focused_before);
+        assert!(app.state.selected_remote_space.is_none());
+        assert!(app.state.selected_remote_agent.is_none());
+        assert_eq!(app.state.workspace_scroll, 0);
+        assert_eq!(app.state.agent_panel_scroll, 0);
+        assert!(!app.state.session_dirty);
+        assert!(app.state.terminal_runtime_shutdowns.is_empty());
+
+        app.state.selected_remote_space = Some(remote_space_key());
+        app.state.selected_remote_agent = Some(remote_key());
+        app.state.workspace_scroll = 3;
+        app.state.agent_panel_scroll = 2;
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 2));
+
+        assert_eq!(
+            app.state.sidebar_source,
+            crate::app::state::SidebarSource::Remote(second)
+        );
+        assert!(app.state.selected_remote_space.is_none());
+        assert!(app.state.selected_remote_agent.is_none());
+        assert_eq!(app.state.workspace_scroll, 0);
+        assert_eq!(app.state.agent_panel_scroll, 0);
+        assert_eq!(app.state.active, Some(1));
+        assert_eq!(app.state.workspaces[1].focused_pane_id(), focused_before);
+        assert!(!app.state.session_dirty);
+    }
+
+    #[test]
+    fn blank_source_rail_left_click_and_drag_are_consumed() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![
+            Workspace::test_new("one"),
+            Workspace::test_new("two"),
+            Workspace::test_new("three"),
+        ];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(1);
+        app.state.selected = 1;
+        app.state.mode = Mode::Terminal;
+        app.state.remote_sources.mark_status(
+            &RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        app.state.selected_remote_space = Some(remote_space_key());
+        app.state.selected_remote_agent = Some(remote_key());
+        compute_desktop_view(&mut app);
+        let focused_before = app.state.workspaces[1].focused_pane_id();
+        let names_before: Vec<_> = app
+            .state
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.display_name())
+            .collect();
+        let rail = app.state.view.source_rail_rect;
+        let blank_row = app
+            .state
+            .view
+            .workspace_card_areas
+            .iter()
+            .map(|card| card.rect.y)
+            .find(|row| {
+                app.state.on_source_rail(rail.x, *row)
+                    && app.state.source_rail_target_at(rail.x, *row).is_none()
+            })
+            .expect("blank source rail row aligned with workspace card");
+        let blank_col = blank_source_rail_col_at_row(&app, blank_row);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            blank_col,
+            blank_row,
+        ));
+
+        assert_eq!(app.state.active, Some(1));
+        assert_eq!(app.state.selected, 1);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert_eq!(app.state.workspaces[1].focused_pane_id(), focused_before);
+        assert_eq!(app.state.selected_remote_space, Some(remote_space_key()));
+        assert_eq!(app.state.selected_remote_agent, Some(remote_key()));
+        assert!(!app.state.request_new_workspace);
+        assert!(app.state.request_remote_workspace_create.is_none());
+        assert!(app.state.request_remote_attach.is_none());
+        assert!(app.state.context_menu.is_none());
+        assert!(app.state.workspace_press.is_none());
+        assert!(app.state.drag.is_none());
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            blank_col,
+            blank_row.saturating_add(6),
+        ));
+        assert!(!matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(DragTarget::WorkspaceReorder { .. })
+        ));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            blank_col,
+            blank_row.saturating_add(6),
+        ));
+        let names_after: Vec<_> = app
+            .state
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.display_name())
+            .collect();
+        assert_eq!(names_after, names_before);
+        assert_eq!(app.state.active, Some(1));
+        assert_eq!(app.state.selected, 1);
+        assert!(app.state.workspace_press.is_none());
+        assert!(app.state.drag.is_none());
+    }
+
+    #[test]
+    fn blank_source_rail_right_click_and_wheel_are_consumed() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![
+            Workspace::test_new("one"),
+            Workspace::test_new("two"),
+            Workspace::test_new("three"),
+        ];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 1;
+        app.state.mode = Mode::Navigate;
+        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.state.remote_sources.replace_connected_snapshot(
+            host,
+            (0..20)
+                .map(|idx| remote_agent(&format!("remote-term-{idx}"), &format!("agent-{idx}")))
+                .collect(),
+        );
+        compute_desktop_view(&mut app);
+
+        let list = app.state.workspace_list_rect();
+        let workspace_row = (list.y..list.y + list.height)
+            .find(|row| {
+                app.state
+                    .on_source_rail(app.state.view.source_rail_rect.x, *row)
+                    && app
+                        .state
+                        .source_rail_target_at(app.state.view.source_rail_rect.x, *row)
+                        .is_none()
+            })
+            .expect("blank source rail row aligned with workspace list");
+        let workspace_col = blank_source_rail_col_at_row(&app, workspace_row);
+        app.handle_mouse(mouse(
+            MouseEventKind::ScrollDown,
+            workspace_col,
+            workspace_row,
+        ));
+        assert_eq!(app.state.selected, 1);
+        assert_eq!(app.state.workspace_scroll, 0);
+
+        make_remote_agent_rows_visible(&mut app);
+        app.state.mode = Mode::Terminal;
+        app.state.selected_remote_space = Some(remote_space_key());
+        app.state.selected_remote_agent = None;
+        let agent_row = remote_agent_row_y(&app);
+        let agent_col = blank_source_rail_col_at_row(&app, agent_row);
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, agent_col, agent_row));
+        assert_eq!(app.state.agent_panel_scroll, 0);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            agent_col,
+            agent_row,
+        ));
+        assert!(app.state.context_menu.is_none());
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert_eq!(app.state.selected_remote_space, Some(remote_space_key()));
+        assert!(app.state.selected_remote_agent.is_none());
+    }
+
+    #[test]
     fn left_click_remote_new_action_requests_create_without_menu_or_attach() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = Vec::new();
@@ -933,7 +1170,7 @@ mod tests {
     }
 
     #[test]
-    fn left_click_local_footer_new_with_remote_new_visible_requests_only_local_workspace() {
+    fn left_click_local_footer_new_with_remote_source_cached_requests_only_local_workspace() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("local")];
         app.state.active = Some(0);
@@ -953,7 +1190,7 @@ mod tests {
                 workspace_create: true,
             },
         );
-        make_remote_agent_rows_visible(&mut app);
+        compute_desktop_view(&mut app);
         let local_new = app.state.sidebar_new_button_rect();
 
         let action = app.state.handle_mouse(
@@ -1385,19 +1622,20 @@ mod tests {
     }
 
     #[test]
-    fn right_click_remote_host_row_does_not_offer_attach() {
+    fn right_click_empty_remote_projection_agent_panel_is_noop() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = Vec::new();
         app.state.active = None;
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
-        app.state.selected_remote_agent = Some(remote_key());
-        app.state.selected_remote_space = Some(remote_space_key());
         app.state.remote_sources.mark_status(
             &RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
             crate::remote_source::RemoteConnectionStatus::Unreachable,
         );
+        make_remote_agent_rows_visible(&mut app);
+        app.state.selected_remote_agent = Some(remote_key());
+        app.state.selected_remote_space = Some(remote_space_key());
 
         let detail_area = app.state.agent_panel_rect();
         let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, detail_area);
@@ -1412,8 +1650,8 @@ mod tests {
         ));
 
         assert!(app.state.context_menu.is_none());
-        assert!(app.state.selected_remote_agent.is_none());
-        assert!(app.state.selected_remote_space.is_none());
+        assert_eq!(app.state.selected_remote_agent, Some(remote_key()));
+        assert_eq!(app.state.selected_remote_space, Some(remote_space_key()));
     }
 
     #[test]
@@ -1552,7 +1790,7 @@ mod tests {
     }
 
     #[test]
-    fn left_click_remote_host_spaces_header_is_noop() {
+    fn remote_workspace_projection_targets_remote_space_directly() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("local")];
         app.state.ensure_test_terminals();
@@ -1562,30 +1800,25 @@ mod tests {
         app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         app.state.selected_remote_agent = Some(remote_key());
         app.state.selected_remote_space = Some(remote_space_key());
-        let focused_pane = app.state.workspaces[0].focused_pane_id();
         app.state.remote_sources.replace_connected_snapshot(
             RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
             vec![remote_agent("remote-term", "smoke-agent")],
         );
         make_remote_agent_rows_visible(&mut app);
 
-        app.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            remote_host_spaces_row_x(&app),
-            remote_host_spaces_row_y(&app),
-        ));
+        let (_, remote_rows) =
+            crate::ui::compute_workspace_list_areas(&app.state, app.state.view.sidebar_panel_rect);
 
-        assert_eq!(app.state.active, Some(0));
-        assert_eq!(app.state.workspaces[0].focused_pane_id(), focused_pane);
-        assert_eq!(app.state.mode, Mode::Terminal);
-        assert!(app.state.selected_remote_agent.is_none());
-        assert_eq!(app.state.selected_remote_space, Some(remote_space_key()));
-        assert!(app.state.request_remote_attach.is_none());
-        assert!(app.state.context_menu.is_none());
+        assert_eq!(remote_rows.len(), 1);
+        assert!(matches!(
+            &remote_rows[0].target,
+            crate::ui::WorkspaceListRemoteTarget::Space { key }
+                if key == &remote_space_key()
+        ));
     }
 
     #[test]
-    fn right_click_remote_host_spaces_header_does_not_open_menu() {
+    fn right_click_remote_projection_without_host_header_does_not_open_menu() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("local")];
         app.state.ensure_test_terminals();
@@ -1600,21 +1833,20 @@ mod tests {
             vec![remote_agent("remote-term", "smoke-agent")],
         );
         make_remote_agent_rows_visible(&mut app);
+        let list = app.state.workspace_list_rect();
 
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Right),
-            remote_host_spaces_row_x(&app),
-            remote_host_spaces_row_y(&app),
+            list.x,
+            list.y.saturating_add(1),
         ));
 
         assert!(app.state.context_menu.is_none());
-        assert!(app.state.selected_remote_agent.is_none());
-        assert_eq!(app.state.selected_remote_space, Some(remote_space_key()));
         assert_eq!(app.state.mode, Mode::Terminal);
     }
 
     #[test]
-    fn left_click_remote_host_row_is_noop() {
+    fn left_click_empty_remote_projection_agent_panel_is_noop() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("local")];
         app.state.ensure_test_terminals();
@@ -1622,12 +1854,14 @@ mod tests {
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
-        app.state.selected_remote_space = Some(remote_space_key());
         let focused_pane = app.state.workspaces[0].focused_pane_id();
         app.state.remote_sources.mark_status(
             &RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
             crate::remote_source::RemoteConnectionStatus::Unreachable,
         );
+        make_remote_agent_rows_visible(&mut app);
+        app.state.selected_remote_agent = Some(remote_key());
+        app.state.selected_remote_space = Some(remote_space_key());
 
         let detail_area = app.state.agent_panel_rect();
         let metrics = crate::ui::agent_panel_scroll_metrics(&app.state, detail_area);
@@ -1644,8 +1878,8 @@ mod tests {
         assert_eq!(app.state.active, Some(0));
         assert_eq!(app.state.workspaces[0].focused_pane_id(), focused_pane);
         assert_eq!(app.state.mode, Mode::Terminal);
-        assert!(app.state.selected_remote_agent.is_none());
-        assert!(app.state.selected_remote_space.is_none());
+        assert_eq!(app.state.selected_remote_agent, Some(remote_key()));
+        assert_eq!(app.state.selected_remote_space, Some(remote_space_key()));
         assert!(app.state.request_remote_attach.is_none());
         assert!(app.state.context_menu.is_none());
     }
