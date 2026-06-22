@@ -598,6 +598,7 @@ pub(crate) enum WorkspaceListEntry {
         ws_idx: usize,
         indented: bool,
     },
+    LocalActions,
     RemoteHost {
         host: crate::remote_source::RemoteHostKey,
         status: crate::remote_source::RemoteConnectionStatus,
@@ -651,6 +652,13 @@ fn next_entry_is_remote_space(entries: &[WorkspaceListEntry], idx: usize) -> boo
     )
 }
 
+fn next_entry_is_local_actions(entries: &[WorkspaceListEntry], idx: usize) -> bool {
+    matches!(
+        entries.get(idx.saturating_add(1)),
+        Some(WorkspaceListEntry::LocalActions)
+    )
+}
+
 fn workspace_list_entry_content_height(app: &AppState, entry: &WorkspaceListEntry) -> u16 {
     match entry {
         WorkspaceListEntry::Workspace { ws_idx, indented } => {
@@ -663,6 +671,7 @@ fn workspace_list_entry_content_height(app: &AppState, entry: &WorkspaceListEntr
                 workspace_row_height(ws)
             }
         }
+        WorkspaceListEntry::LocalActions => 1,
         WorkspaceListEntry::RemoteHost { .. } => 2,
         WorkspaceListEntry::RemoteSpace { .. } => 1,
         WorkspaceListEntry::RemoteNew { .. } => 1,
@@ -671,9 +680,11 @@ fn workspace_list_entry_content_height(app: &AppState, entry: &WorkspaceListEntr
 
 fn workspace_list_entry_gap_after(entries: &[WorkspaceListEntry], idx: usize) -> u16 {
     match entries.get(idx) {
-        Some(WorkspaceListEntry::Workspace { indented, .. }) => {
-            u16::from(!(*indented && next_entry_is_indented_workspace(entries, idx)))
-        }
+        Some(WorkspaceListEntry::Workspace { indented, .. }) => u16::from(
+            !(next_entry_is_local_actions(entries, idx)
+                || *indented && next_entry_is_indented_workspace(entries, idx)),
+        ),
+        Some(WorkspaceListEntry::LocalActions) => 1,
         Some(WorkspaceListEntry::RemoteHost { .. }) => 1,
         Some(WorkspaceListEntry::RemoteSpace { .. }) => {
             u16::from(!next_entry_is_remote_space(entries, idx))
@@ -795,6 +806,7 @@ pub(crate) fn workspace_list_entries(app: &AppState) -> Vec<WorkspaceListEntry> 
             }
         }
     }
+    entries.push(WorkspaceListEntry::LocalActions);
     entries.extend(remote_workspace_list_entries(app));
     entries
 }
@@ -944,6 +956,24 @@ pub(crate) fn workspace_list_body_rect(area: Rect, has_scrollbar: bool) -> Rect 
     Rect::new(area.x, body_y, body_width, body_height)
 }
 
+pub(crate) fn workspace_list_local_actions_rect(app: &AppState, area: Rect) -> Rect {
+    let ws_area = workspace_list_rect(area, app.sidebar_section_split);
+    if ws_area == Rect::default() {
+        return Rect::default();
+    }
+
+    let metrics = workspace_list_scroll_metrics(app, ws_area);
+    let body = workspace_list_body_rect(ws_area, should_show_scrollbar(metrics));
+    if body.width == 0 || body.height == 0 {
+        return Rect::default();
+    }
+
+    workspace_list_row_areas_for_body(app, body, app.workspace_scroll)
+        .into_iter()
+        .find_map(|row| matches!(row.entry, WorkspaceListEntry::LocalActions).then_some(row.rect))
+        .unwrap_or_default()
+}
+
 fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> usize {
     let body = workspace_list_body_rect(area, false);
     if body.width == 0 || body.height == 0 {
@@ -1063,6 +1093,25 @@ pub(crate) fn agent_panel_scrollbar_rect(app: &AppState, area: Rect) -> Option<R
     ))
 }
 
+pub(crate) fn workspace_list_new_button_rect(row_rect: Rect) -> Rect {
+    if row_rect.width == 0 || row_rect.height == 0 {
+        return Rect::default();
+    }
+
+    let width = 5u16.min(row_rect.width.max(1));
+    Rect::new(row_rect.x, row_rect.y, width, 1)
+}
+
+pub(crate) fn workspace_list_menu_button_rect(row_rect: Rect, attention_badge: bool) -> Rect {
+    if row_rect.width == 0 || row_rect.height == 0 {
+        return Rect::default();
+    }
+
+    let width = if attention_badge { 8 } else { 6 }.min(row_rect.width.max(1));
+    let x = row_rect.x + row_rect.width.saturating_sub(width);
+    Rect::new(x, row_rect.y, width, row_rect.height)
+}
+
 pub(crate) fn compute_workspace_list_areas(
     app: &AppState,
     area: Rect,
@@ -1093,6 +1142,7 @@ pub(crate) fn compute_workspace_list_areas(
                     indented,
                 });
             }
+            WorkspaceListEntry::LocalActions => {}
             WorkspaceListEntry::RemoteHost { host, .. } => {
                 remote_rows.push(WorkspaceListRemoteRowArea {
                     target: WorkspaceListRemoteTarget::Host { host },
@@ -1106,10 +1156,13 @@ pub(crate) fn compute_workspace_list_areas(
                 });
             }
             WorkspaceListEntry::RemoteNew { host } => {
-                remote_rows.push(WorkspaceListRemoteRowArea {
-                    target: WorkspaceListRemoteTarget::New { host },
-                    rect: row.rect,
-                });
+                let new_rect = workspace_list_new_button_rect(row.rect);
+                if new_rect != Rect::default() {
+                    remote_rows.push(WorkspaceListRemoteRowArea {
+                        target: WorkspaceListRemoteTarget::New { host },
+                        rect: new_rect,
+                    });
+                }
             }
         }
     }
@@ -1541,6 +1594,15 @@ fn render_workspace_list(
     for row in row_areas {
         match row.entry {
             WorkspaceListEntry::Workspace { .. } => {}
+            WorkspaceListEntry::LocalActions => {
+                render_local_actions_row(
+                    frame,
+                    row.rect,
+                    p,
+                    app.mouse_capture,
+                    app.global_menu_attention_badge_visible(),
+                );
+            }
             WorkspaceListEntry::RemoteHost { host, status } => {
                 let label = remote_space_header_label(&host);
                 render_remote_section_header(&label, status.stale_label(), frame, row.rect, p);
@@ -1567,31 +1629,6 @@ fn render_workspace_list(
 
     if let Some(track) = scrollbar_rect {
         render_scrollbar(frame, metrics, track, p.surface_dim, p.overlay0, "▕");
-    }
-
-    if app.mouse_capture && list_bottom > area.y {
-        let new_rect = app.sidebar_new_button_rect();
-        frame.render_widget(
-            Paragraph::new(Span::styled(" new", Style::default().fg(p.overlay0))),
-            new_rect,
-        );
-
-        let menu_rect = app.global_launcher_rect();
-        let menu_line = if app.global_menu_attention_badge_visible() {
-            Line::from(vec![
-                Span::styled(
-                    "● ",
-                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("menu", Style::default().fg(p.overlay0)),
-            ])
-        } else {
-            Line::from(vec![Span::styled("menu", Style::default().fg(p.overlay0))])
-        };
-        frame.render_widget(
-            Paragraph::new(menu_line).alignment(Alignment::Right),
-            menu_rect,
-        );
     }
 }
 
@@ -1796,6 +1833,53 @@ fn render_remote_section_header(
     );
 }
 
+fn render_local_actions_row(
+    frame: &mut Frame,
+    rect: Rect,
+    p: &Palette,
+    mouse_capture: bool,
+    attention_badge: bool,
+) {
+    if !mouse_capture || rect == Rect::default() {
+        return;
+    }
+
+    let new_rect = workspace_list_new_button_rect(rect);
+    frame.render_widget(
+        Paragraph::new(Span::styled(" new", Style::default().fg(p.overlay0))),
+        new_rect,
+    );
+
+    let menu_rect = workspace_list_menu_button_rect(rect, attention_badge);
+    let menu_line = if attention_badge {
+        Line::from(vec![
+            Span::styled(
+                "● ",
+                Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("menu", Style::default().fg(p.overlay0)),
+        ])
+    } else {
+        Line::from(vec![Span::styled("menu", Style::default().fg(p.overlay0))])
+    };
+    frame.render_widget(
+        Paragraph::new(menu_line).alignment(Alignment::Right),
+        menu_rect,
+    );
+}
+
+fn render_remote_new_row(frame: &mut Frame, rect: Rect, p: &Palette) {
+    let button_rect = workspace_list_new_button_rect(rect);
+    if button_rect == Rect::default() {
+        return;
+    }
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(" new", Style::default().fg(p.overlay0))),
+        button_rect,
+    );
+}
+
 fn render_remote_space_row(
     app: &AppState,
     key: &crate::remote_source::RemoteSpaceKey,
@@ -1841,17 +1925,6 @@ fn render_remote_space_row(
             Span::styled("  ", Style::default()),
             Span::styled(text, style),
         ])),
-        Rect::new(rect.x, rect.y, rect.width, 1),
-    );
-}
-
-fn render_remote_new_row(frame: &mut Frame, rect: Rect, p: &Palette) {
-    if rect.width == 0 || rect.height == 0 {
-        return;
-    }
-
-    frame.render_widget(
-        Paragraph::new(Span::styled(" new", Style::default().fg(p.overlay0))),
         Rect::new(rect.x, rect.y, rect.width, 1),
     );
 }
@@ -1948,6 +2021,30 @@ mod tests {
                 workspace_create: true,
             },
         );
+    }
+
+    fn workspace_entries_without_local_actions(app: &AppState) -> Vec<WorkspaceListEntry> {
+        workspace_list_entries(app)
+            .into_iter()
+            .filter(|entry| !matches!(entry, WorkspaceListEntry::LocalActions))
+            .collect()
+    }
+
+    fn rendered_workspace_rows(app: &AppState, area: Rect) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        terminal
+            .draw(|frame| render_workspace_list(app, &terminal_runtimes, frame, area, false))
+            .unwrap();
+
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
     }
 
     #[test]
@@ -2199,29 +2296,49 @@ mod tests {
     }
 
     #[test]
-    fn workspace_list_header_identifies_local_spaces_section() {
-        let app = crate::app::state::AppState::test_new();
-        let backend = ratatui::backend::TestBackend::new(40, 8);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let terminal_runtimes = TerminalRuntimeRegistry::new();
+    fn workspace_list_places_local_actions_after_local_rows_before_remote_host() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("local")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mouse_capture = true;
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.remote_sources
+            .replace_workspace_snapshot(host, vec![remote_workspace("remote-ws", "blank shell")]);
 
-        terminal
-            .draw(|frame| {
-                render_workspace_list(
-                    &app,
-                    &terminal_runtimes,
-                    frame,
-                    Rect::new(0, 0, 40, 8),
-                    false,
-                )
-            })
-            .unwrap();
-
-        let header_row = (0..40)
-            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
-            .collect::<String>();
+        let area = Rect::new(0, 0, 40, 16);
+        let rows = rendered_workspace_rows(&app, area);
+        let body = workspace_list_body_rect(area, false);
+        let row_areas = workspace_list_row_areas_for_body(&app, body, app.workspace_scroll);
+        let header_row = &rows[0];
+        let local_row = row_areas
+            .iter()
+            .find(|row| matches!(row.entry, WorkspaceListEntry::Workspace { .. }))
+            .expect("local workspace row")
+            .rect
+            .y;
+        let action_row = row_areas
+            .iter()
+            .find(|row| matches!(row.entry, WorkspaceListEntry::LocalActions))
+            .expect("local action row")
+            .rect
+            .y;
+        let remote_header = row_areas
+            .iter()
+            .find(|row| matches!(row.entry, WorkspaceListEntry::RemoteHost { .. }))
+            .expect("remote host header row")
+            .rect
+            .y
+            .saturating_add(1);
 
         assert!(header_row.contains(" local spaces"));
+        assert!(!header_row.contains("new"));
+        assert!(!header_row.contains("menu"));
+        assert!(rows[action_row as usize].contains(" new"));
+        assert!(rows[action_row as usize].trim_end().ends_with("menu"));
+        assert!(rows[remote_header as usize].contains("jafar spaces"));
+        assert!(local_row < action_row);
+        assert!(action_row < remote_header);
     }
 
     #[test]
@@ -2237,7 +2354,7 @@ mod tests {
             vec![agent],
         );
 
-        let entries = workspace_list_entries(&app);
+        let entries = workspace_entries_without_local_actions(&app);
 
         assert_eq!(entries.len(), 2);
         assert!(matches!(
@@ -2245,6 +2362,7 @@ mod tests {
             WorkspaceListEntry::RemoteHost {
                 host,
                 status: crate::remote_source::RemoteConnectionStatus::Connected,
+                ..
             } if host.host == "jafar"
                 && host.session == crate::session::DEFAULT_SESSION_NAME
         ));
@@ -2260,7 +2378,7 @@ mod tests {
                 && label == "tmp"
         ));
 
-        let (cards, remote_rows) = compute_workspace_list_areas(&app, Rect::new(0, 0, 40, 16));
+        let (cards, remote_rows) = compute_workspace_list_areas(&app, Rect::new(0, 0, 40, 32));
         assert!(cards.is_empty());
         assert_eq!(remote_rows.len(), 2);
         assert!(matches!(
@@ -2312,7 +2430,7 @@ mod tests {
         app.remote_sources
             .replace_workspace_snapshot(host, vec![remote_workspace("remote-ws", "blank shell")]);
 
-        let entries = workspace_list_entries(&app);
+        let entries = workspace_entries_without_local_actions(&app);
 
         assert!(matches!(
             &entries[..],
@@ -2320,6 +2438,7 @@ mod tests {
                 WorkspaceListEntry::RemoteHost {
                     host,
                     status: crate::remote_source::RemoteConnectionStatus::Connected,
+                    ..
                 },
                 WorkspaceListEntry::RemoteSpace {
                     key,
@@ -2330,7 +2449,7 @@ mod tests {
                 && key.workspace_id == "remote-ws"
                 && label == "blank shell"
         ));
-        let (cards, remote_rows) = compute_workspace_list_areas(&app, Rect::new(0, 0, 40, 16));
+        let (cards, remote_rows) = compute_workspace_list_areas(&app, Rect::new(0, 0, 40, 32));
         assert!(cards.is_empty());
         assert_eq!(remote_rows.len(), 2);
         assert!(matches!(
@@ -2341,7 +2460,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_workspace_new_row_renders_for_connected_capable_host_with_zero_spaces() {
+    fn remote_workspace_new_action_renders_for_connected_capable_host_with_zero_spaces() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = Vec::new();
         app.active = None;
@@ -2353,7 +2472,7 @@ mod tests {
             .replace_workspace_snapshot(host.clone(), Vec::new());
         enable_remote_workspace_create(&mut app, &host);
 
-        let entries = workspace_list_entries(&app);
+        let entries = workspace_entries_without_local_actions(&app);
 
         assert_eq!(entries.len(), 2);
         assert!(matches!(
@@ -2368,26 +2487,105 @@ mod tests {
             WorkspaceListEntry::RemoteNew { host } if host.host == "jafar"
         ));
 
-        let (cards, remote_rows) = compute_workspace_list_areas(&app, Rect::new(0, 0, 40, 16));
+        let (cards, remote_rows) = compute_workspace_list_areas(&app, Rect::new(0, 0, 40, 32));
         assert!(cards.is_empty());
         assert_eq!(remote_rows.len(), 2);
         let new_row = remote_rows
             .iter()
             .find(|row| matches!(row.target, WorkspaceListRemoteTarget::New { .. }))
-            .expect("remote new row");
+            .expect("remote new action");
         assert_eq!(
             workspace_list_remote_target_at(
                 &app,
-                Rect::new(0, 0, 40, 16),
+                Rect::new(0, 0, 40, 32),
                 new_row.rect.x,
                 new_row.rect.y
             ),
             Some(WorkspaceListRemoteTarget::New { host })
         );
+
+        let backend = ratatui::backend::TestBackend::new(40, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        terminal
+            .draw(|frame| {
+                render_workspace_list(
+                    &app,
+                    &terminal_runtimes,
+                    frame,
+                    Rect::new(0, 0, 40, 12),
+                    false,
+                )
+            })
+            .unwrap();
+        let rows = (0..12)
+            .map(|y| {
+                (0..40)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let header_row = rows
+            .iter()
+            .find(|row| row.contains("jafar spaces"))
+            .expect("remote host header row");
+        assert!(!header_row.trim_end().ends_with("new"));
+        assert_eq!(rows[new_row.rect.y as usize].trim(), "new");
     }
 
     #[test]
-    fn remote_workspace_new_row_hides_for_incapable_or_disconnected_hosts() {
+    fn remote_workspace_new_action_renders_after_remote_spaces_not_header() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = Vec::new();
+        app.active = None;
+        app.selected = 0;
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.remote_sources.replace_workspace_snapshot(
+            host.clone(),
+            vec![remote_workspace("remote-ws", "blank shell")],
+        );
+        enable_remote_workspace_create(&mut app, &host);
+
+        let entries = workspace_entries_without_local_actions(&app);
+        assert!(matches!(
+            &entries[..],
+            [
+                WorkspaceListEntry::RemoteHost { .. },
+                WorkspaceListEntry::RemoteSpace { .. },
+                WorkspaceListEntry::RemoteNew { .. },
+            ]
+        ));
+
+        let (_, remote_rows) = compute_workspace_list_areas(&app, Rect::new(0, 0, 40, 32));
+        let space_row = remote_rows
+            .iter()
+            .find(|row| matches!(row.target, WorkspaceListRemoteTarget::Space { .. }))
+            .expect("remote space row");
+        let new_row = remote_rows
+            .iter()
+            .find(|row| matches!(row.target, WorkspaceListRemoteTarget::New { .. }))
+            .expect("remote new action");
+        assert!(space_row.rect.y < new_row.rect.y);
+
+        let rows = rendered_workspace_rows(&app, Rect::new(0, 0, 40, 18));
+        let header_row = rows
+            .iter()
+            .find(|row| row.contains("jafar spaces"))
+            .expect("remote host header row");
+        assert!(!header_row.contains("new"));
+        let rendered_space_row = rows
+            .iter()
+            .position(|row| row.contains("blank shell"))
+            .expect("rendered remote space row");
+        let rendered_new_row = rows
+            .iter()
+            .position(|row| row.trim() == "new")
+            .expect("rendered remote new row");
+        assert!(rendered_space_row < rendered_new_row);
+    }
+
+    #[test]
+    fn remote_workspace_new_action_hides_for_incapable_or_disconnected_hosts() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = Vec::new();
         app.active = None;
@@ -2405,7 +2603,7 @@ mod tests {
             crate::remote_source::RemoteConnectionStatus::Unreachable,
         );
 
-        let entries = workspace_list_entries(&app);
+        let entries = workspace_entries_without_local_actions(&app);
 
         assert!(entries.is_empty());
     }
@@ -2457,7 +2655,7 @@ mod tests {
         app.remote_sources
             .replace_workspace_snapshot(host, Vec::new());
 
-        let entries = workspace_list_entries(&app);
+        let entries = workspace_entries_without_local_actions(&app);
 
         assert!(entries.is_empty());
     }
@@ -2491,7 +2689,7 @@ mod tests {
     fn workspace_list_remote_space_hit_testing_respects_scroll_with_local_rows() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
-        app.workspace_scroll = 2;
+        app.workspace_scroll = 3;
         let mut agent = remote_agent("remote-term", "fed-detach-smoke", AgentStatus::Working, 1);
         agent.cwd = Some("/home/amf/tmp".to_string());
         app.remote_sources.replace_connected_snapshot(
@@ -2539,7 +2737,9 @@ mod tests {
                     Some(remote_space_header_label(&host))
                 }
                 WorkspaceListEntry::RemoteSpace { label, .. } => Some(label),
-                WorkspaceListEntry::Workspace { .. } | WorkspaceListEntry::RemoteNew { .. } => None,
+                WorkspaceListEntry::Workspace { .. }
+                | WorkspaceListEntry::LocalActions
+                | WorkspaceListEntry::RemoteNew { .. } => None,
             })
             .collect::<Vec<_>>();
         let agent_labels = agent_panel_entries(&app)
@@ -3022,7 +3222,7 @@ mod tests {
             workspace_with_worktree_space("review", Some("repo-key"), "/repo/herdr-review"),
         ];
 
-        let entries = workspace_list_entries(&app);
+        let entries = workspace_entries_without_local_actions(&app);
 
         assert_eq!(
             entries,
@@ -3073,8 +3273,8 @@ mod tests {
         let metrics = workspace_list_scroll_metrics(&app, ws_area);
 
         assert_eq!(metrics.viewport_rows, 1);
-        assert_eq!(metrics.max_offset_from_bottom, 1);
-        assert_eq!(metrics.offset_from_bottom, 1);
+        assert_eq!(metrics.max_offset_from_bottom, 2);
+        assert_eq!(metrics.offset_from_bottom, 2);
     }
 
     #[test]
@@ -3106,7 +3306,7 @@ mod tests {
         ];
 
         assert_eq!(
-            workspace_list_entries(&app),
+            workspace_entries_without_local_actions(&app),
             vec![
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
@@ -3130,7 +3330,7 @@ mod tests {
         ];
 
         assert_eq!(
-            workspace_list_entries(&app),
+            workspace_entries_without_local_actions(&app),
             vec![
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
@@ -3157,7 +3357,7 @@ mod tests {
         ];
 
         assert_eq!(
-            workspace_list_entries(&app),
+            workspace_entries_without_local_actions(&app),
             vec![
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
@@ -3181,7 +3381,7 @@ mod tests {
         ];
 
         assert_eq!(
-            workspace_list_entries(&app),
+            workspace_entries_without_local_actions(&app),
             vec![
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
@@ -3208,7 +3408,7 @@ mod tests {
         ];
 
         assert_eq!(
-            workspace_list_entries(&app),
+            workspace_entries_without_local_actions(&app),
             vec![
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
@@ -3234,7 +3434,7 @@ mod tests {
         app.collapsed_space_keys.insert("repo-key".into());
 
         assert_eq!(
-            workspace_list_entries(&app),
+            workspace_entries_without_local_actions(&app),
             vec![
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
@@ -3250,7 +3450,7 @@ mod tests {
         app.active = None;
         app.mode = Mode::Terminal;
         assert_eq!(
-            workspace_list_entries(&app),
+            workspace_entries_without_local_actions(&app),
             vec![WorkspaceListEntry::Workspace {
                 ws_idx: 0,
                 indented: false,
@@ -3271,7 +3471,7 @@ mod tests {
         app.collapsed_space_keys.insert("repo-key".into());
 
         assert_eq!(
-            workspace_list_entries(&app),
+            workspace_entries_without_local_actions(&app),
             vec![
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,

@@ -174,10 +174,12 @@ impl AppState {
         Rect::new(ws_area.x, y, ws_area.width, 1)
     }
 
+    pub(crate) fn sidebar_local_actions_rect(&self) -> Rect {
+        crate::ui::workspace_list_local_actions_rect(self, self.view.sidebar_rect)
+    }
+
     pub(crate) fn sidebar_new_button_rect(&self) -> Rect {
-        let footer = self.sidebar_footer_rect();
-        let width = 5u16.min(footer.width.max(1));
-        Rect::new(footer.x, footer.y, width, footer.height)
+        crate::ui::workspace_list_new_button_rect(self.sidebar_local_actions_rect())
     }
 
     pub(crate) fn global_launcher_rect(&self) -> Rect {
@@ -185,15 +187,10 @@ impl AppState {
             return self.view.mobile_menu_hit_area;
         }
 
-        let footer = self.sidebar_footer_rect();
-        let width = if self.global_menu_attention_badge_visible() {
-            8
-        } else {
-            6
-        }
-        .min(footer.width.max(1));
-        let x = footer.x + footer.width.saturating_sub(width);
-        Rect::new(x, footer.y, width, footer.height)
+        crate::ui::workspace_list_menu_button_rect(
+            self.sidebar_local_actions_rect(),
+            self.global_menu_attention_badge_visible(),
+        )
     }
 
     pub(crate) fn global_menu_labels(&self) -> Vec<&'static str> {
@@ -229,7 +226,12 @@ impl AppState {
         let max_x = screen.x + screen.width.saturating_sub(menu_w);
         let desired_x = launcher.x + launcher.width.saturating_sub(menu_w);
         let x = desired_x.min(max_x);
-        let y = launcher.y.saturating_sub(menu_h);
+        let max_y = screen.y + screen.height.saturating_sub(menu_h);
+        let y = if launcher.y >= menu_h {
+            launcher.y - menu_h
+        } else {
+            launcher.y.saturating_add(launcher.height).min(max_y)
+        };
         Rect::new(x, y, menu_w, menu_h)
     }
 
@@ -853,8 +855,8 @@ mod tests {
     #[test]
     fn remote_space_workspace_row_and_remote_agent_panel_row_have_expected_targets() {
         let mut app = app_for_mouse_test();
-        app.state.workspaces = Vec::new();
-        app.state.active = None;
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
@@ -886,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn left_click_remote_new_row_requests_create_without_menu_or_attach() {
+    fn left_click_remote_new_action_requests_create_without_menu_or_attach() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = Vec::new();
         app.state.active = None;
@@ -925,8 +927,138 @@ mod tests {
         assert_eq!(app.state.request_remote_workspace_create, Some(host));
         assert!(app.state.selected_remote_space.is_none());
         assert!(app.state.selected_remote_agent.is_none());
+        assert!(!app.state.request_new_workspace);
         assert!(app.state.request_remote_attach.is_none());
         assert!(app.state.context_menu.is_none());
+    }
+
+    #[test]
+    fn left_click_local_footer_new_with_remote_new_visible_requests_only_local_workspace() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("local")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.state
+            .remote_sources
+            .replace_connected_snapshot(host.clone(), Vec::new());
+        app.state
+            .remote_sources
+            .replace_workspace_snapshot(host.clone(), Vec::new());
+        app.state.remote_sources.set_capabilities(
+            &host,
+            RemoteSourceCapabilities {
+                workspace_list_local: true,
+                workspace_create: true,
+            },
+        );
+        make_remote_agent_rows_visible(&mut app);
+        let local_new = app.state.sidebar_new_button_rect();
+
+        let action = app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                local_new.x.saturating_add(1),
+                local_new.y,
+            ),
+        );
+
+        assert!(action.is_none());
+        assert!(app.state.request_new_workspace);
+        assert!(app.state.request_remote_workspace_create.is_none());
+        assert!(app.state.context_menu.is_none());
+    }
+
+    #[test]
+    fn scrolled_off_local_actions_have_no_stale_new_or_menu_hit_targets() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = (0..10)
+            .map(|idx| Workspace::test_new(&format!("local-{idx}")))
+            .collect();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.state.remote_sources.replace_workspace_snapshot(
+            host,
+            vec![crate::api::schema::WorkspaceInfo {
+                workspace_id: "remote-ws".to_string(),
+                number: 1,
+                label: "remote".to_string(),
+                focused: false,
+                pane_count: 0,
+                tab_count: 1,
+                active_tab_id: "remote-tab".to_string(),
+                agent_status: AgentStatus::Unknown,
+                worktree: None,
+            }],
+        );
+        make_remote_agent_rows_visible(&mut app);
+        app.state.workspace_scroll = app.state.workspaces.len() + 1;
+
+        assert_eq!(app.state.sidebar_new_button_rect(), Rect::default());
+        assert_eq!(app.state.global_launcher_rect(), Rect::default());
+
+        let list = app.state.workspace_list_rect();
+        let old_action_row = list.y.saturating_add(1);
+        let action = app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                list.x.saturating_add(1),
+                old_action_row,
+            ),
+        );
+
+        assert!(action.is_none());
+        assert!(!app.state.request_new_workspace);
+        assert_eq!(app.state.mode, Mode::Terminal);
+
+        app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                list.x + list.width.saturating_sub(1),
+                old_action_row,
+            ),
+        );
+
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.context_menu.is_none());
+    }
+
+    #[test]
+    fn global_menu_rect_opens_from_visible_local_footer_row() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = Vec::new();
+        app.state.active = None;
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 140, 32));
+
+        let top_launcher = app.state.global_launcher_rect();
+        let top_menu = app.state.global_menu_rect();
+        assert_ne!(top_launcher, Rect::default());
+        assert!(top_launcher.y < top_menu.height);
+        assert_eq!(top_menu.y, top_launcher.y + top_launcher.height);
+
+        app.state.workspaces = vec![
+            Workspace::test_new("one"),
+            Workspace::test_new("two"),
+            Workspace::test_new("three"),
+        ];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.workspace_scroll = 0;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 140, 32));
+
+        let lower_launcher = app.state.global_launcher_rect();
+        let lower_menu = app.state.global_menu_rect();
+        assert_ne!(lower_launcher, Rect::default());
+        assert!(lower_launcher.y >= lower_menu.height);
+        assert_eq!(lower_menu.y + lower_menu.height, lower_launcher.y);
     }
 
     #[test]

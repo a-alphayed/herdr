@@ -1058,7 +1058,8 @@ impl AppState {
             .into_iter()
             .filter_map(|entry| match entry {
                 crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => Some(ws_idx),
-                crate::ui::WorkspaceListEntry::RemoteHost { .. }
+                crate::ui::WorkspaceListEntry::LocalActions
+                | crate::ui::WorkspaceListEntry::RemoteHost { .. }
                 | crate::ui::WorkspaceListEntry::RemoteSpace { .. }
                 | crate::ui::WorkspaceListEntry::RemoteNew { .. } => None,
             })
@@ -3306,7 +3307,10 @@ mod tests {
         });
 
         assert!(updates.is_empty());
-        let entries = crate::ui::workspace_list_entries(&state);
+        let entries = crate::ui::workspace_list_entries(&state)
+            .into_iter()
+            .filter(|entry| !matches!(entry, crate::ui::WorkspaceListEntry::LocalActions))
+            .collect::<Vec<_>>();
         assert!(matches!(
             &entries[..],
             [
