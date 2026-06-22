@@ -146,6 +146,28 @@ fn source_rail_session_rank(session: &str) -> u8 {
     }
 }
 
+fn source_rail_status_marker(
+    status: crate::remote_source::RemoteConnectionStatus,
+    p: &Palette,
+) -> (&'static str, Style) {
+    match status {
+        crate::remote_source::RemoteConnectionStatus::Connected => {
+            ("●", Style::default().fg(p.green))
+        }
+        crate::remote_source::RemoteConnectionStatus::Disconnected => (
+            "○",
+            Style::default().fg(p.overlay0).add_modifier(Modifier::DIM),
+        ),
+        crate::remote_source::RemoteConnectionStatus::NeedsUpdate => (
+            "↑",
+            Style::default().fg(p.yellow).add_modifier(Modifier::BOLD),
+        ),
+        crate::remote_source::RemoteConnectionStatus::Unreachable => {
+            ("×", Style::default().fg(p.red).add_modifier(Modifier::BOLD))
+        }
+    }
+}
+
 fn source_rail_row_areas(app: &AppState, area: Rect) -> Vec<SourceRailRowArea> {
     if area.width == 0 || area.height == 0 {
         return Vec::new();
@@ -1560,13 +1582,15 @@ fn render_source_rail(app: &AppState, frame: &mut Frame, area: Rect) {
         buf[(separator_x, y)].set_style(Style::default().fg(p.surface_dim));
     }
 
-    let label_width = area.width.saturating_sub(1) as usize;
-    for row in source_rail_row_areas(app, area) {
-        let Some(entry) = source_rail_entries(app)
-            .into_iter()
-            .find(|entry| entry.source == row.source)
-        else {
-            continue;
+    let entries = source_rail_entries(app);
+    for (idx, entry) in entries.iter().enumerate() {
+        let y = area.y.saturating_add(idx as u16);
+        if y >= area.y + area.height {
+            break;
+        }
+        let row = SourceRailRowArea {
+            source: entry.source.clone(),
+            rect: Rect::new(area.x, y, area.width, 1),
         };
         let selected = entry.source == selected_source;
         let stale = entry.status.is_some_and(|status| !status.is_connected());
@@ -1586,10 +1610,32 @@ fn render_source_rail(app: &AppState, frame: &mut Frame, area: Rect) {
                 buf[(x, row.rect.y)].set_style(Style::default().bg(p.surface0));
             }
         }
+        let content_width = row.rect.width.saturating_sub(1);
+        let marker_rect = entry.status.and_then(|_| {
+            (content_width > 0).then_some(Rect::new(
+                row.rect.x + content_width.saturating_sub(1),
+                row.rect.y,
+                1,
+                1,
+            ))
+        });
+        let label_width = content_width.saturating_sub(u16::from(marker_rect.is_some()));
         frame.render_widget(
-            Paragraph::new(truncate_text(&entry.label, label_width)).style(style),
-            Rect::new(row.rect.x, row.rect.y, row.rect.width.saturating_sub(1), 1),
+            Paragraph::new(truncate_text(&entry.label, label_width as usize)).style(style),
+            Rect::new(row.rect.x, row.rect.y, label_width, 1),
         );
+        if let (Some(status), Some(marker_rect)) = (entry.status, marker_rect) {
+            let (symbol, marker_style) = source_rail_status_marker(status, p);
+            let marker_style = if selected {
+                marker_style.bg(p.surface0)
+            } else {
+                marker_style
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(symbol, marker_style)),
+                marker_rect,
+            );
+        }
     }
 }
 
@@ -2221,6 +2267,16 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    fn rendered_source_rail_buffer(app: &AppState, area: Rect) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_source_rail(app, frame, area))
+            .unwrap();
+
+        terminal.backend().buffer().clone()
     }
 
     #[test]
@@ -3253,6 +3309,101 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert!(app.agent_panel_entry_has_remote_attach_pane(&entries[0]));
+    }
+
+    #[test]
+    fn source_rail_remote_status_markers_render_in_status_column() {
+        let mut app = crate::app::state::AppState::test_new();
+        for (host, status) in [
+            (
+                "alpha",
+                crate::remote_source::RemoteConnectionStatus::Connected,
+            ),
+            (
+                "bravo",
+                crate::remote_source::RemoteConnectionStatus::Disconnected,
+            ),
+            (
+                "charlie",
+                crate::remote_source::RemoteConnectionStatus::NeedsUpdate,
+            ),
+            (
+                "delta",
+                crate::remote_source::RemoteConnectionStatus::Unreachable,
+            ),
+        ] {
+            app.remote_sources.mark_status(
+                &RemoteHostKey::new(host, crate::session::DEFAULT_SESSION_NAME),
+                status,
+            );
+        }
+        let area = Rect::new(0, 0, source_rail_width(), 8);
+        app.view.source_rail_rect = area;
+
+        let buffer = rendered_source_rail_buffer(&app, area);
+        let marker_x = area.x + area.width - 2;
+
+        assert_eq!(buffer[(marker_x, 1)].symbol(), "●");
+        assert_eq!(buffer[(marker_x, 1)].style().fg, Some(app.palette.green));
+        assert_eq!(buffer[(marker_x, 2)].symbol(), "○");
+        assert_eq!(buffer[(marker_x, 2)].style().fg, Some(app.palette.overlay0));
+        assert!(buffer[(marker_x, 2)]
+            .style()
+            .add_modifier
+            .contains(Modifier::DIM));
+        assert_eq!(buffer[(marker_x, 3)].symbol(), "↑");
+        assert_eq!(buffer[(marker_x, 3)].style().fg, Some(app.palette.yellow));
+        assert!(buffer[(marker_x, 3)]
+            .style()
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(buffer[(marker_x, 4)].symbol(), "×");
+        assert_eq!(buffer[(marker_x, 4)].style().fg, Some(app.palette.red));
+        assert!(buffer[(marker_x, 4)]
+            .style()
+            .add_modifier
+            .contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn source_rail_selected_remote_marker_keeps_surface_background() {
+        let mut app = crate::app::state::AppState::test_new();
+        let host = RemoteHostKey::new("charlie", crate::session::DEFAULT_SESSION_NAME);
+        app.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::NeedsUpdate,
+        );
+        let area = Rect::new(0, 0, source_rail_width(), 4);
+        app.view.source_rail_rect = area;
+        app.view.sidebar_panel_rect = Rect::new(source_rail_width(), 0, app.sidebar_width, 4);
+        app.select_sidebar_source(SidebarSource::Remote(host));
+
+        let buffer = rendered_source_rail_buffer(&app, area);
+        let marker_x = area.x + area.width - 2;
+        let marker_style = buffer[(marker_x, 1)].style();
+
+        assert_eq!(buffer[(marker_x, 1)].symbol(), "↑");
+        assert_eq!(marker_style.fg, Some(app.palette.yellow));
+        assert_eq!(marker_style.bg, Some(app.palette.surface0));
+        assert!(marker_style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn source_rail_remote_label_truncates_before_marker() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.remote_sources.mark_status(
+            &RemoteHostKey::new("verylongremotehost", crate::session::DEFAULT_SESSION_NAME),
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        let area = Rect::new(0, 0, source_rail_width(), 4);
+        app.view.source_rail_rect = area;
+
+        let buffer = rendered_source_rail_buffer(&app, area);
+        let row = (0..area.width)
+            .map(|x| buffer[(x, 1)].symbol())
+            .collect::<String>();
+
+        assert_eq!(row, "verylon…●│");
     }
 
     #[test]
