@@ -7,6 +7,15 @@ use crate::detect::AgentState;
 use crate::layout::{PaneId, PaneInfo, SplitBorder};
 use crate::selection::Selection;
 
+pub(crate) type InstalledPluginRegistry =
+    std::collections::HashMap<String, crate::api::schema::InstalledPluginInfo>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PluginPaneRecord {
+    pub plugin_id: String,
+    pub entrypoint: String,
+}
+
 // ---------------------------------------------------------------------------
 // Selection autoscroll types
 // ---------------------------------------------------------------------------
@@ -31,7 +40,13 @@ pub(crate) struct SelectionAutoscroll {
     pub last_mouse_screen_row: u16,
     pub inner_rect: Rect,
 }
-use crate::terminal_theme::TerminalTheme;
+
+#[derive(Clone)]
+pub(crate) struct RightClickPassthroughGesture {
+    pub pane_info: PaneInfo,
+    pub modifiers: KeyModifiers,
+}
+use crate::terminal_theme::{HostAppearance, TerminalTheme};
 use crate::workspace::Workspace;
 
 // ---------------------------------------------------------------------------
@@ -40,7 +55,7 @@ use crate::workspace::Workspace;
 
 /// All colors used by the UI. Derived from a base accent color for now,
 /// but structured so a full theme system can replace it later.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)] // all fields defined for theming — some used later
 pub struct Palette {
     /// Primary accent (highlight, active borders).
@@ -821,14 +836,21 @@ pub(crate) struct CopyModeState {
     pub pane_id: PaneId,
     pub cursor_row: u16,
     pub cursor_col: u16,
-    pub selecting: bool,
+    pub entry_offset_from_bottom: usize,
+    pub selection: Option<CopyModeSelection>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum AgentPanelScope {
-    CurrentWorkspace,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyModeSelection {
+    Character,
+    Linewise { anchor_row: u32 },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AgentPanelSort {
     #[default]
-    AllWorkspaces,
+    Spaces,
+    Priority,
 }
 
 // ---------------------------------------------------------------------------
@@ -864,6 +886,34 @@ impl SettingsSection {
             Self::PaneLabels => "pane labels",
             Self::Experiments => "experiments",
             Self::Integrations => "integrations",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExperimentSetting {
+    PaneHistory,
+    SwitchAsciiInputSourceInPrefix,
+}
+
+impl ExperimentSetting {
+    pub(crate) const ALL: [Self; 2] = [Self::PaneHistory, Self::SwitchAsciiInputSourceInPrefix];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PaneHistory => "pane screen history",
+            Self::SwitchAsciiInputSourceInPrefix => {
+                "switch to ascii input source in prefix (macOS)"
+            }
+        }
+    }
+
+    pub(crate) fn enabled(self, state: &AppState) -> bool {
+        match self {
+            Self::PaneHistory => state.pane_history_persistence_enabled(),
+            Self::SwitchAsciiInputSourceInPrefix => {
+                state.switch_ascii_input_source_in_prefix_enabled()
+            }
         }
     }
 }
@@ -942,6 +992,16 @@ impl SelectionListState {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ThemeRuntimeConfig {
+    pub manual_name: String,
+    pub dark_name: String,
+    pub light_name: String,
+    pub auto_switch: bool,
+    pub custom: Option<crate::config::CustomThemeColors>,
+    pub legacy_accent: Option<String>,
+}
+
 pub struct SettingsState {
     /// Which section tab is active.
     pub section: SettingsSection,
@@ -973,6 +1033,7 @@ pub(crate) enum DragTarget {
         path: Vec<bool>,
         direction: Direction,
         area: Rect,
+        grab_offset: u16,
     },
     PaneScrollbar {
         pane_id: crate::layout::PaneId,
@@ -1025,7 +1086,10 @@ pub enum ContextMenuKind {
         tab_idx: usize,
     },
     Pane {
+        ws_idx: usize,
+        tab_idx: usize,
         pane_id: PaneId,
+        source_pane_id: Option<PaneId>,
         has_manual_label: bool,
         remote_attach_pane: Option<RemoteAttachPaneTarget>,
     },
@@ -1085,48 +1149,106 @@ impl ContextMenuState {
             ContextMenuKind::Pane {
                 has_manual_label: true,
                 remote_attach_pane: Some(_),
+                source_pane_id: Some(_),
                 ..
             } => &[
                 "Detach view",
                 "Rename pane",
                 "Clear pane name",
-                "Split vertical",
-                "Split horizontal",
+                "Swap with focused pane",
+                "Split right",
+                "Split down",
                 "Zoom",
                 "Close pane",
             ],
             ContextMenuKind::Pane {
                 has_manual_label: false,
                 remote_attach_pane: Some(_),
+                source_pane_id: Some(_),
                 ..
             } => &[
                 "Detach view",
                 "Rename pane",
-                "Split vertical",
-                "Split horizontal",
+                "Swap with focused pane",
+                "Split right",
+                "Split down",
+                "Zoom",
+                "Close pane",
+            ],
+            ContextMenuKind::Pane {
+                has_manual_label: true,
+                remote_attach_pane: Some(_),
+                source_pane_id: None,
+                ..
+            } => &[
+                "Detach view",
+                "Rename pane",
+                "Clear pane name",
+                "Split right",
+                "Split down",
+                "Zoom",
+                "Close pane",
+            ],
+            ContextMenuKind::Pane {
+                has_manual_label: false,
+                remote_attach_pane: Some(_),
+                source_pane_id: None,
+                ..
+            } => &[
+                "Detach view",
+                "Rename pane",
+                "Split right",
+                "Split down",
                 "Zoom",
                 "Close pane",
             ],
             ContextMenuKind::Pane {
                 has_manual_label: true,
                 remote_attach_pane: None,
+                source_pane_id: Some(_),
                 ..
             } => &[
                 "Rename pane",
                 "Clear pane name",
-                "Split vertical",
-                "Split horizontal",
+                "Swap with focused pane",
+                "Split right",
+                "Split down",
                 "Zoom",
                 "Close pane",
             ],
             ContextMenuKind::Pane {
                 has_manual_label: false,
                 remote_attach_pane: None,
+                source_pane_id: Some(_),
                 ..
             } => &[
                 "Rename pane",
-                "Split vertical",
-                "Split horizontal",
+                "Swap with focused pane",
+                "Split right",
+                "Split down",
+                "Zoom",
+                "Close pane",
+            ],
+            ContextMenuKind::Pane {
+                has_manual_label: true,
+                source_pane_id: None,
+                ..
+            } => &[
+                "Rename pane",
+                "Clear pane name",
+                "Split right",
+                "Split down",
+                "Zoom",
+                "Close pane",
+            ],
+            ContextMenuKind::Pane {
+                has_manual_label: false,
+                source_pane_id: None,
+                ..
+            } => &[
+                "Rename pane",
+                "Split right",
+                "Split down",
                 "Zoom",
                 "Close pane",
             ],
@@ -1160,7 +1282,31 @@ pub struct ToastNotification {
     pub kind: ToastKind,
     pub title: String,
     pub context: String,
+    pub position: Option<crate::config::ToastHerdrPosition>,
     pub target: Option<ToastTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAgentNotification {
+    pub pane_id: PaneId,
+    pub workspace_id: String,
+    pub agent_label: String,
+    pub known_agent: Option<crate::detect::Agent>,
+    pub kind: ToastKind,
+    pub state: AgentState,
+    pub deadline: std::time::Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentNotificationDelivery {
+    pub pane_id: PaneId,
+    pub workspace_id: String,
+    pub agent_label: String,
+    pub known_agent: Option<crate::detect::Agent>,
+    pub kind: ToastKind,
+    pub toast: Option<ToastNotification>,
+    pub client_notification: Option<ToastNotification>,
+    pub sound: Option<crate::sound::Sound>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1228,6 +1374,7 @@ pub struct AppState {
     /// Terminal ids whose size is currently owned by a direct attach client.
     pub direct_attach_resize_locks: std::collections::HashSet<crate::terminal::TerminalId>,
     pub(crate) pane_id_aliases: std::collections::HashMap<u32, PaneId>,
+    pub(crate) public_pane_id_aliases: std::collections::HashMap<String, PaneId>,
     pub workspaces: Vec<Workspace>,
     pub remote_sources: crate::remote_source::RemoteSourceCache,
     pub(crate) sidebar_source: SidebarSource,
@@ -1305,6 +1452,7 @@ pub struct AppState {
     pub update_dismissed: bool,
     pub config_diagnostic: Option<String>,
     pub toast: Option<ToastNotification>,
+    pub pending_agent_notifications: std::collections::HashMap<PaneId, PendingAgentNotification>,
     pub copy_feedback: Option<CopyFeedback>,
     /// Last reported focus state for the outer terminal hosting herdr.
     /// None means unsupported or not yet reported, which preserves active-pane suppression.
@@ -1320,17 +1468,24 @@ pub struct AppState {
     pub sidebar_width_source: SidebarWidthSource,
     pub sidebar_width_auto: bool,
     pub sidebar_collapsed: bool,
+    pub sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig,
     /// Ratio of sidebar height allocated to the workspaces section.
     pub sidebar_section_split: f32,
-    pub agent_panel_scope: AgentPanelScope,
+    pub agent_panel_sort: AgentPanelSort,
+    pub next_agent_state_change_seq: u64,
     /// Capture mouse input for Herdr's own mouse UI. When false, Herdr only
     /// captures mouse while the focused pane app requests mouse reporting.
     pub mouse_capture: bool,
+    pub right_click_passthrough_modifiers: Option<KeyModifiers>,
+    pub right_click_passthrough: Option<RightClickPassthroughGesture>,
     pub redraw_on_focus_gained: bool,
     pub mouse_scroll_lines: usize,
     pub confirm_close: bool,
     pub prompt_new_tab_name: bool,
+    pub pane_borders: bool,
+    pub pane_gaps: bool,
     pub show_agent_labels_on_pane_borders: bool,
+    pub hide_tab_bar_when_single_tab: bool,
     pub pane_history_persistence: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
@@ -1341,6 +1496,11 @@ pub struct AppState {
     pub cjk_ime_agents: Vec<crate::detect::Agent>,
     /// DECSCUSR shape parameter (1–6) for the IME anchor cursor.
     pub cjk_ime_cursor_shape: u8,
+    /// While prefix mode is active, switch the macOS host input source to an
+    /// ASCII-capable layout so prefix commands register as ASCII even when a
+    /// CJK IME is active. macOS only; a no-op elsewhere. See
+    /// `[experimental] switch_ascii_input_source_in_prefix`.
+    pub switch_ascii_input_source_in_prefix: bool,
     pub kitty_graphics_enabled: bool,
     pub default_shell: String,
     pub shell_mode: crate::config::ShellModeConfig,
@@ -1358,12 +1518,30 @@ pub struct AppState {
     pub palette: Palette,
     /// Currently applied theme name (for settings UI).
     pub theme_name: String,
+    /// Runtime theme configuration used to resolve manual and auto-switch palettes.
+    pub theme_runtime: ThemeRuntimeConfig,
+    /// Last known foreground host terminal appearance.
+    pub host_terminal_appearance: Option<HostAppearance>,
+    /// True when the foreground host explicitly reported appearance via Mode 2031.
+    pub host_terminal_appearance_explicit: bool,
     /// Settings panel state.
     pub settings: SettingsState,
     /// Cached integration recommendations for onboarding/settings UI.
     pub integration_recommendations: Vec<crate::integration::IntegrationRecommendation>,
+    /// Cached detection manifest source/version summaries for runtime/API status.
+    pub agent_manifest_summaries: Vec<crate::detect::manifest::AgentManifestSummary>,
+    /// Cached remote detection manifest update diagnostics for runtime/API status.
+    pub agent_manifest_update_status: crate::detect::manifest_update::ManifestUpdateStatus,
     /// Result messages from the latest integration install action.
     pub integration_install_messages: Vec<String>,
+    /// Installed or linked plugins known to this running Herdr instance.
+    pub(crate) installed_plugins: InstalledPluginRegistry,
+    /// Pane ids opened through the plugin pane API.
+    pub(crate) plugin_panes: std::collections::HashMap<PaneId, PluginPaneRecord>,
+    /// Recent plugin action/event command executions.
+    pub(crate) plugin_command_logs: Vec<crate::api::schema::PluginCommandLogInfo>,
+    pub(crate) next_plugin_command_log_id: u64,
+    pub(crate) plugin_commands_in_flight: usize,
     /// Highlight state for the bottom-right global launcher menu.
     pub global_menu: MenuListState,
     /// Resolved host terminal default colors for theming embedded panes.
@@ -1423,10 +1601,26 @@ impl AppState {
         self.pane_history_persistence
     }
 
+    pub fn switch_ascii_input_source_in_prefix_enabled(&self) -> bool {
+        self.switch_ascii_input_source_in_prefix
+    }
+
+    pub(crate) fn pane_exposes_host_cursor(
+        &self,
+        _ws_idx: usize,
+        _pane_id: crate::layout::PaneId,
+    ) -> bool {
+        true
+    }
+
     pub(crate) fn integration_updates_available(&self) -> bool {
         self.integration_recommendations
             .iter()
             .any(|item| item.state == crate::integration::IntegrationStatusKind::Outdated)
+    }
+
+    pub(crate) fn refresh_agent_manifest_summaries(&mut self) {
+        self.agent_manifest_summaries = crate::detect::manifest::manifest_summaries();
     }
 
     pub(crate) fn global_menu_attention_badge_visible(&self) -> bool {
@@ -1575,6 +1769,7 @@ impl AppState {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pane_id_aliases: std::collections::HashMap::new(),
+            public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces: Vec::new(),
             remote_sources: crate::remote_source::RemoteSourceCache::default(),
             sidebar_source: SidebarSource::Local,
@@ -1657,6 +1852,7 @@ impl AppState {
             update_dismissed: false,
             config_diagnostic: None,
             toast: None,
+            pending_agent_notifications: std::collections::HashMap::new(),
             copy_feedback: None,
             outer_terminal_focus: None,
             prefix_code: KeyCode::Char('b'),
@@ -1669,19 +1865,27 @@ impl AppState {
             sidebar_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_width_auto: false,
             sidebar_collapsed: false,
+            sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
             sidebar_section_split: 0.5,
-            agent_panel_scope: AgentPanelScope::AllWorkspaces,
+            agent_panel_sort: AgentPanelSort::Spaces,
+            next_agent_state_change_seq: 0,
             mouse_capture: true,
+            right_click_passthrough_modifiers: None,
+            right_click_passthrough: None,
             redraw_on_focus_gained: true,
             mouse_scroll_lines: crate::config::DEFAULT_MOUSE_SCROLL_LINES,
             confirm_close: true,
             prompt_new_tab_name: true,
+            pane_borders: true,
+            pane_gaps: false,
             show_agent_labels_on_pane_borders: false,
+            hide_tab_bar_when_single_tab: false,
             pane_history_persistence: false,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,
             cjk_ime_agents: Vec::new(),
             cjk_ime_cursor_shape: 2, // steady_block
+            switch_ascii_input_source_in_prefix: false,
             kitty_graphics_enabled: false,
             default_shell: String::new(),
             shell_mode: crate::config::ShellModeConfig::Auto,
@@ -1698,6 +1902,16 @@ impl AppState {
             spinner_tick: 0,
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
+            theme_runtime: ThemeRuntimeConfig {
+                manual_name: "catppuccin".to_string(),
+                dark_name: "catppuccin".to_string(),
+                light_name: "catppuccin-latte".to_string(),
+                auto_switch: false,
+                custom: None,
+                legacy_accent: None,
+            },
+            host_terminal_appearance: None,
+            host_terminal_appearance_explicit: false,
             settings: SettingsState {
                 section: SettingsSection::Theme,
                 list: SelectionListState::new(0),
@@ -1705,7 +1919,15 @@ impl AppState {
                 original_theme: None,
             },
             integration_recommendations: Vec::new(),
+            agent_manifest_summaries: Vec::new(),
+            agent_manifest_update_status:
+                crate::detect::manifest_update::ManifestUpdateStatus::default(),
             integration_install_messages: Vec::new(),
+            installed_plugins: std::collections::HashMap::new(),
+            plugin_panes: std::collections::HashMap::new(),
+            plugin_command_logs: Vec::new(),
+            next_plugin_command_log_id: 1,
+            plugin_commands_in_flight: 0,
             global_menu: MenuListState::new(0),
             host_terminal_theme: TerminalTheme::default(),
             session_dirty: false,
@@ -1732,6 +1954,316 @@ impl AppState {
         }
     }
 
+    pub fn test_with_adversarial_identity_state() -> Self {
+        let mut state = Self::test_new();
+        state.workspaces = vec![crate::workspace::Workspace::test_adversarial_identity_state()];
+        state.active = Some(0);
+        state.selected = 0;
+        state.ensure_test_terminals();
+        state
+    }
+
+    pub fn assert_invariants_for_test(&self) {
+        if self.workspaces.is_empty() {
+            assert!(
+                self.active.is_none(),
+                "empty app state must not have active workspace {:?}",
+                self.active
+            );
+            assert_eq!(
+                self.selected, 0,
+                "empty app state should keep selected workspace at 0"
+            );
+            assert!(
+                self.pane_id_aliases.is_empty(),
+                "empty app state must not keep raw pane aliases"
+            );
+            assert!(
+                self.public_pane_id_aliases.is_empty(),
+                "empty app state must not keep public pane aliases"
+            );
+            assert!(
+                self.previous_pane_focus.is_none(),
+                "empty app state must not keep previous pane focus"
+            );
+            assert!(
+                self.plugin_panes.is_empty(),
+                "empty app state must not keep plugin pane records"
+            );
+            assert!(
+                self.pending_agent_notifications.is_empty(),
+                "empty app state must not keep pending agent notifications"
+            );
+            assert!(
+                self.copy_mode.is_none(),
+                "empty app state must not keep copy mode"
+            );
+            assert!(
+                self.rename_pane_target.is_none(),
+                "empty app state must not keep rename pane target"
+            );
+            assert!(
+                self.selection.is_none(),
+                "empty app state must not keep text selection"
+            );
+            assert!(
+                self.selection_autoscroll.is_none(),
+                "empty app state must not keep selection autoscroll"
+            );
+            if let Some(toast) = &self.toast {
+                assert!(
+                    toast.target.is_none(),
+                    "empty app state must not keep pane-targeted toast"
+                );
+            }
+            assert!(
+                self.right_click_passthrough.is_none(),
+                "empty app state must not keep right-click passthrough gesture"
+            );
+            assert!(
+                self.drag.is_none(),
+                "empty app state must not keep drag state"
+            );
+            assert!(
+                self.workspace_press.is_none(),
+                "empty app state must not keep workspace press state"
+            );
+            assert!(
+                self.tab_press.is_none(),
+                "empty app state must not keep tab press state"
+            );
+            assert!(
+                self.context_menu.is_none(),
+                "empty app state must not keep context menu"
+            );
+            return;
+        }
+
+        assert!(
+            self.selected < self.workspaces.len(),
+            "selected workspace {} out of bounds for {} workspaces",
+            self.selected,
+            self.workspaces.len()
+        );
+        let active = self
+            .active
+            .expect("non-empty app state must have active workspace");
+        assert!(
+            active < self.workspaces.len(),
+            "active workspace {} out of bounds for {} workspaces",
+            active,
+            self.workspaces.len()
+        );
+
+        let mut workspace_ids = std::collections::HashSet::new();
+        let mut workspace_id_to_idx = std::collections::HashMap::new();
+        let mut pane_ids = std::collections::HashSet::new();
+        let mut attached_terminal_ids = std::collections::HashSet::new();
+        for (ws_idx, ws) in self.workspaces.iter().enumerate() {
+            assert!(
+                workspace_ids.insert(ws.id.clone()),
+                "duplicate workspace id {} at workspace index {}",
+                ws.id,
+                ws_idx
+            );
+            workspace_id_to_idx.insert(ws.id.clone(), ws_idx);
+            ws.assert_invariants_for_test();
+
+            for tab in &ws.tabs {
+                for (pane_id, pane) in &tab.panes {
+                    assert!(
+                        pane_ids.insert(*pane_id),
+                        "pane {:?} appears in more than one workspace",
+                        pane_id
+                    );
+                    assert!(
+                        attached_terminal_ids.insert(pane.attached_terminal_id.clone()),
+                        "terminal {} is attached to more than one app pane",
+                        pane.attached_terminal_id
+                    );
+                    assert!(
+                        self.terminals.contains_key(&pane.attached_terminal_id),
+                        "pane {:?} is attached to missing terminal {}",
+                        pane_id,
+                        pane.attached_terminal_id
+                    );
+                }
+            }
+        }
+
+        let assert_live_pane = |pane_id: PaneId, context: &str| {
+            assert!(
+                pane_ids.contains(&pane_id),
+                "{context} references missing pane {:?}",
+                pane_id
+            );
+        };
+        let assert_workspace_pane = |workspace_id: &str, pane_id: PaneId, context: &str| {
+            let ws_idx = workspace_id_to_idx
+                .get(workspace_id)
+                .copied()
+                .unwrap_or_else(|| panic!("{context} references missing workspace {workspace_id}"));
+            assert!(
+                self.workspaces[ws_idx].pane_state(pane_id).is_some(),
+                "{context} references pane {:?} outside workspace {}",
+                pane_id,
+                workspace_id
+            );
+        };
+        let assert_workspace_index = |ws_idx: usize, context: &str| {
+            assert!(
+                ws_idx < self.workspaces.len(),
+                "{context} references workspace index {} out of bounds for {} workspaces",
+                ws_idx,
+                self.workspaces.len()
+            );
+        };
+        let assert_tab_index = |ws_idx: usize, tab_idx: usize, context: &str| {
+            assert_workspace_index(ws_idx, context);
+            assert!(
+                tab_idx < self.workspaces[ws_idx].tabs.len(),
+                "{context} references tab index {} out of bounds for workspace {} with {} tabs",
+                tab_idx,
+                ws_idx,
+                self.workspaces[ws_idx].tabs.len()
+            );
+        };
+
+        for (&raw, &pane_id) in &self.pane_id_aliases {
+            assert_live_pane(pane_id, &format!("raw pane alias {raw}"));
+        }
+        for (public_id, &pane_id) in &self.public_pane_id_aliases {
+            assert_live_pane(pane_id, &format!("public pane alias {public_id}"));
+        }
+        if let Some(focus) = &self.previous_pane_focus {
+            assert_workspace_pane(&focus.workspace_id, focus.pane_id, "previous pane focus");
+        }
+        if let Some(toast) = &self.toast {
+            if let Some(target) = &toast.target {
+                assert_workspace_pane(&target.workspace_id, target.pane_id, "toast target");
+            }
+        }
+        for (&pane_id, notification) in &self.pending_agent_notifications {
+            assert_eq!(
+                pane_id, notification.pane_id,
+                "pending agent notification map key must match payload pane id"
+            );
+            assert_workspace_pane(
+                &notification.workspace_id,
+                notification.pane_id,
+                "pending agent notification",
+            );
+        }
+        for &pane_id in self.plugin_panes.keys() {
+            assert_live_pane(pane_id, "plugin pane record");
+        }
+        if let Some(copy_mode) = &self.copy_mode {
+            assert_live_pane(copy_mode.pane_id, "copy mode");
+        }
+        if let Some(pane_id) = self.rename_pane_target {
+            assert_live_pane(pane_id, "rename pane target");
+        }
+        if let Some(selection) = &self.selection {
+            assert_live_pane(selection.pane_id, "text selection");
+        } else {
+            assert!(
+                self.selection_autoscroll.is_none(),
+                "selection autoscroll must not remain without an active text selection"
+            );
+        }
+        if let Some(gesture) = &self.right_click_passthrough {
+            assert_live_pane(gesture.pane_info.id, "right-click passthrough gesture");
+        }
+        if let Some(drag) = &self.drag {
+            match &drag.target {
+                DragTarget::WorkspaceReorder {
+                    source_ws_idx,
+                    insert_idx,
+                } => {
+                    assert_workspace_index(*source_ws_idx, "workspace drag source");
+                    if let Some(insert_idx) = insert_idx {
+                        assert!(
+                            *insert_idx <= self.workspaces.len(),
+                            "workspace drag insert index {} out of bounds for {} workspaces",
+                            insert_idx,
+                            self.workspaces.len()
+                        );
+                    }
+                }
+                DragTarget::TabReorder {
+                    ws_idx,
+                    source_tab_idx,
+                    insert_idx,
+                } => {
+                    assert_tab_index(*ws_idx, *source_tab_idx, "tab drag source");
+                    if let Some(insert_idx) = insert_idx {
+                        assert!(
+                            *insert_idx <= self.workspaces[*ws_idx].tabs.len(),
+                            "tab drag insert index {} out of bounds for workspace {} with {} tabs",
+                            insert_idx,
+                            ws_idx,
+                            self.workspaces[*ws_idx].tabs.len()
+                        );
+                    }
+                }
+                DragTarget::PaneScrollbar { pane_id, .. } => {
+                    assert_live_pane(*pane_id, "pane scrollbar drag")
+                }
+                _ => {}
+            }
+        }
+        if let Some(press) = &self.workspace_press {
+            assert_workspace_index(press.ws_idx, "workspace press");
+        }
+        if let Some(press) = &self.tab_press {
+            assert_tab_index(press.ws_idx, press.tab_idx, "tab press");
+        }
+        if let Some(menu) = &self.context_menu {
+            match menu.kind {
+                ContextMenuKind::Workspace { ws_idx }
+                | ContextMenuKind::GitWorkspace { ws_idx, .. } => {
+                    assert_workspace_index(ws_idx, "context menu workspace")
+                }
+                ContextMenuKind::Tab { ws_idx, tab_idx } => {
+                    assert_tab_index(ws_idx, tab_idx, "context menu tab")
+                }
+                ContextMenuKind::Pane {
+                    ws_idx,
+                    tab_idx,
+                    pane_id,
+                    source_pane_id,
+                    ..
+                } => {
+                    assert_tab_index(ws_idx, tab_idx, "context menu pane tab");
+                    assert!(
+                        self.workspaces[ws_idx].tabs[tab_idx]
+                            .panes
+                            .contains_key(&pane_id),
+                        "context menu pane references pane {:?} outside workspace {} tab {}",
+                        pane_id,
+                        ws_idx,
+                        tab_idx
+                    );
+                    if let Some(source_pane_id) = source_pane_id {
+                        assert_live_pane(source_pane_id, "context menu source pane");
+                    }
+                }
+                ContextMenuKind::RemoteAgent {
+                    ref focused_pane,
+                    ref attached_pane,
+                    ..
+                } => {
+                    if let Some(pane) = focused_pane {
+                        assert_live_pane(pane.pane_id, "remote agent focused pane");
+                    }
+                    if let Some(pane) = attached_pane {
+                        assert_live_pane(pane.pane_id, "remote agent attached pane");
+                    }
+                }
+            }
+        }
+    }
+
     pub fn insert_test_runtime(
         &mut self,
         pane_id: crate::layout::PaneId,
@@ -1751,6 +2283,43 @@ impl AppState {
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+
+    #[test]
+    fn agent_terminal_keeps_final_child_cursor_exposed() {
+        let mut state = AppState::test_new();
+        let ws = crate::workspace::Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        state.terminals.insert(
+            ws.tabs[0].panes[&pane_id].attached_terminal_id.clone(),
+            crate::terminal::TerminalState::new(
+                ws.tabs[0].panes[&pane_id].attached_terminal_id.clone(),
+                std::path::PathBuf::from("/tmp"),
+            ),
+        );
+        state
+            .terminals
+            .get_mut(&ws.tabs[0].panes[&pane_id].attached_terminal_id)
+            .expect("terminal state")
+            .launch_argv = Some(vec!["codex".to_string()]);
+        state.workspaces = vec![ws];
+
+        assert!(state.pane_exposes_host_cursor(0, pane_id));
+    }
+
+    #[test]
+    fn adversarial_identity_state_satisfies_app_invariants_after_mutation() {
+        let mut state = AppState::test_with_adversarial_identity_state();
+        state.assert_invariants_for_test();
+
+        let ws = &mut state.workspaces[0];
+        let active_public = ws.tabs[ws.active_tab].number;
+        assert_ne!(ws.active_tab + 1, active_public);
+        let new_pane = ws.test_split(ratatui::layout::Direction::Horizontal);
+        assert!(ws.public_pane_number(new_pane).is_some());
+        state.ensure_test_terminals();
+
+        state.assert_invariants_for_test();
+    }
 
     #[test]
     fn built_in_theme_names_resolve() {

@@ -22,6 +22,7 @@ pub(crate) fn remote_workspace_create_request(token: u64) -> Request {
             cwd: None,
             focus: true,
             label: None,
+            env: Default::default(),
         }),
     }
 }
@@ -88,6 +89,7 @@ fn show_toast(app: &mut App, kind: ToastKind, title: String, context: String) {
         kind,
         title,
         context,
+        position: None,
         target: None,
     });
 }
@@ -291,6 +293,7 @@ impl crate::app::state::AppState {
             kind: ToastKind::Finished,
             title: format!("Created space on {}", remote_host_label(&host)),
             context: workspace_label,
+            position: None,
             target: None,
         });
     }
@@ -314,6 +317,7 @@ impl crate::app::state::AppState {
                 kind: ToastKind::NeedsAttention,
                 title: "create unavailable".to_string(),
                 context: format!("{}: {message}", remote_host_label(&host)),
+                position: None,
                 target: None,
             });
         } else {
@@ -324,6 +328,7 @@ impl crate::app::state::AppState {
                     remote_host_label(&host)
                 ),
                 context: message,
+                position: None,
                 target: None,
             });
         }
@@ -347,6 +352,7 @@ impl crate::app::state::AppState {
             kind: ToastKind::NeedsAttention,
             title: format!("Create on {host_label} may not have completed"),
             context: format!("Check {host_label} spaces"),
+            position: None,
             target: None,
         });
     }

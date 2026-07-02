@@ -45,12 +45,7 @@ impl App {
             if action == super::navigate::NavigateAction::EditScrollback {
                 self.launch_focused_scrollback_editor();
             } else {
-                super::navigate::execute_navigate_action_in_context(
-                    &mut self.state,
-                    &mut self.terminal_runtimes,
-                    action,
-                    super::navigate::ActionContext::Direct,
-                );
+                self.execute_tui_navigate_action(action, super::navigate::ActionContext::Direct);
             }
             return None;
         }
@@ -197,9 +192,9 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::layout::Rect;
 
-    use super::super::{
-        app_for_mouse_test, mouse, numbered_lines_bytes, unique_temp_path, wait_for_file,
-    };
+    use super::super::{app_for_mouse_test, mouse, numbered_lines_bytes};
+    #[cfg(unix)]
+    use super::super::{unique_temp_path, wait_for_file};
     use super::*;
     use crate::{config::Config, events::AppEvent, workspace::Workspace};
 
@@ -259,6 +254,45 @@ mod tests {
             .selection
             .as_ref()
             .is_some_and(crate::selection::Selection::is_visible));
+    }
+
+    #[cfg(unix)]
+    fn install_test_link_handler(app: &mut App) {
+        let plugin_root = std::env::temp_dir();
+        app.state.installed_plugins = std::collections::HashMap::from([(
+            "example.links".to_string(),
+            crate::api::schema::InstalledPluginInfo {
+                plugin_id: "example.links".into(),
+                name: "Links".into(),
+                version: "0.1.0".into(),
+                min_herdr_version: "0.6.10".into(),
+                description: None,
+                manifest_path: plugin_root.join("herdr-plugin.toml").display().to_string(),
+                plugin_root: plugin_root.display().to_string(),
+                enabled: true,
+                platforms: None,
+                build: Vec::new(),
+                actions: vec![crate::api::schema::PluginManifestAction {
+                    id: "open".into(),
+                    title: "Open link".into(),
+                    description: None,
+                    contexts: Vec::new(),
+                    platforms: None,
+                    command: vec!["sh".into(), "-c".into(), ":".into()],
+                }],
+                events: Vec::new(),
+                panes: Vec::new(),
+                link_handlers: vec![crate::api::schema::PluginManifestLinkHandler {
+                    id: "github-issue".into(),
+                    title: "Open GitHub issue".into(),
+                    pattern: "^https://github\\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$".into(),
+                    action: "open".into(),
+                    platforms: None,
+                }],
+                source: crate::api::schema::PluginSourceInfo::default(),
+                warnings: Vec::new(),
+            },
+        )]);
     }
 
     #[tokio::test]
@@ -465,6 +499,41 @@ mod tests {
         assert!(app.selection_highlight_clear_deadline.is_none());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ctrl_click_url_invokes_plugin_link_handler_but_super_click_does_not() {
+        let line = "see https://github.com/ogulcancelik/herdr/issues/398";
+        let col = line.find("github").expect("url host") as u16;
+
+        let (mut ctrl_app, ctrl_info) = app_with_screen_bytes(line.as_bytes());
+        install_test_link_handler(&mut ctrl_app);
+        ctrl_app.handle_mouse(modified_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            ctrl_info.inner_rect.x + col,
+            ctrl_info.inner_rect.y,
+            KeyModifiers::CONTROL,
+        ));
+
+        let ctrl_log = ctrl_app
+            .state
+            .plugin_command_logs
+            .last()
+            .expect("ctrl-click should start plugin link handler");
+        assert_eq!(ctrl_log.plugin_id, "example.links");
+        assert_eq!(ctrl_log.action_id.as_deref(), Some("open"));
+
+        let (mut super_app, super_info) = app_with_screen_bytes(line.as_bytes());
+        install_test_link_handler(&mut super_app);
+        super_app.handle_mouse(modified_mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            super_info.inner_rect.x + col,
+            super_info.inner_rect.y,
+            KeyModifiers::SUPER,
+        ));
+
+        assert!(super_app.state.plugin_command_logs.is_empty());
+    }
+
     #[tokio::test]
     async fn pane_cell_url_resolver_finds_visible_url() {
         let line = "see https://example.com/pr/307.";
@@ -519,7 +588,7 @@ mod tests {
         let deadline = app
             .selection_highlight_clear_deadline
             .expect("highlight clear deadline");
-        assert!(app.handle_scheduled_tasks(deadline + std::time::Duration::from_millis(1)));
+        assert!(app.handle_scheduled_tasks(deadline + std::time::Duration::from_millis(1), false));
         assert!(app.state.selection.is_none());
     }
 
@@ -652,7 +721,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clicking_unfocused_pane_with_mouse_reporting_focuses_it_via_right_button() {
+    async fn right_clicking_unfocused_mouse_reporting_pane_keeps_focus_for_context_menu() {
         let mut app = app_for_mouse_test();
         let mut ws = Workspace::test_new("test");
         let first_pane = ws.tabs[0].root_pane;
@@ -702,12 +771,10 @@ mod tests {
             second_info.inner_rect.y + 2,
         ));
 
-        assert_eq!(
-            app.state.workspaces[0].tabs[0].layout.focused(),
-            second_pane
-        );
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.focused(), first_pane);
         assert_eq!(app.state.mode, Mode::ContextMenu);
-        assert!(app.state.context_menu.is_some());
+        let menu = app.state.context_menu.as_ref().expect("pane context menu");
+        assert!(menu.items().contains(&"Swap with focused pane"));
     }
 
     #[tokio::test]
@@ -740,6 +807,7 @@ mod tests {
         assert_eq!(app.state.mode, Mode::Terminal);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn terminal_direct_edit_scrollback_opens_editor_pane() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -793,6 +861,7 @@ mod tests {
         let _ = std::fs::remove_file(output_path);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn direct_custom_command_runs_before_forwarding_to_pane() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -829,6 +898,7 @@ mod tests {
         let _ = std::fs::remove_file(output_path);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn direct_custom_pane_command_opens_overlay_pane() {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();

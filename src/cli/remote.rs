@@ -307,9 +307,21 @@ fn protocol_label(protocol: Option<u32>) -> String {
 fn remote_start_guidance(host: &crate::remote_target::RemoteHostConfig) -> String {
     format!(
         "run herdr --remote {} --session {} interactively to start it",
-        crate::remote::shell_quote(&host.target),
-        crate::remote::shell_quote(&host.session)
+        shell_quote(&host.target),
+        shell_quote(&host.session)
     )
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '\'' | '"' | '\\' | '$' | '`' | '!' | '|'))
+    {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    } else {
+        value.to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -619,6 +631,7 @@ mod tests {
         let status = classify_running_remote_api_status(&running_response(Some(
             crate::api::schema::ServerCapabilities {
                 live_handoff: true,
+                detached_server_daemon: false,
                 federation: None,
             },
         )));

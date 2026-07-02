@@ -240,17 +240,25 @@ impl AppState {
             return false;
         }
         let sidebar = self.view.sidebar_rect;
+        let toggle = crate::ui::expanded_sidebar_toggle_rect(sidebar);
+        let on_toggle = toggle.width > 0
+            && col >= toggle.x
+            && col < toggle.x + toggle.width
+            && row >= toggle.y
+            && row < toggle.y + toggle.height;
         sidebar.width > 0
+            && !on_toggle
             && col == sidebar.x + sidebar.width.saturating_sub(1)
             && row >= sidebar.y
             && row < sidebar.y + sidebar.height
     }
 
-    pub(super) fn on_collapsed_sidebar_toggle(&self, col: u16, row: u16) -> bool {
-        if !self.sidebar_collapsed {
-            return false;
-        }
-        let rect = crate::ui::collapsed_sidebar_toggle_rect(self.view.sidebar_rect);
+    pub(super) fn on_sidebar_toggle(&self, col: u16, row: u16) -> bool {
+        let rect = if self.sidebar_collapsed {
+            crate::ui::collapsed_sidebar_toggle_rect(self.view.sidebar_rect)
+        } else {
+            crate::ui::expanded_sidebar_toggle_rect(self.view.sidebar_rect)
+        };
         rect.width > 0
             && col >= rect.x
             && col < rect.x + rect.width
@@ -464,7 +472,7 @@ impl AppState {
         best.map(|(insert_idx, _)| insert_idx)
     }
 
-    pub(super) fn on_agent_panel_scope_toggle(&self, col: u16, row: u16) -> bool {
+    pub(super) fn on_agent_panel_sort_toggle(&self, col: u16, row: u16) -> bool {
         if self.sidebar_collapsed {
             return false;
         }
@@ -475,8 +483,11 @@ impl AppState {
             return false;
         }
 
-        let detail_area = self.agent_panel_rect();
-        let rect = crate::ui::agent_panel_toggle_rect(detail_area, self.agent_panel_scope);
+        let (_, detail_area) = crate::ui::expanded_sidebar_sections(
+            self.view.sidebar_rect,
+            self.sidebar_section_split,
+        );
+        let rect = crate::ui::agent_panel_toggle_rect(detail_area, self.agent_panel_sort);
         rect.width > 0
             && col >= rect.x
             && col < rect.x + rect.width
@@ -529,12 +540,12 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
     use ratatui::layout::Rect;
 
-    use super::super::{
-        app_for_mouse_test, capture_snapshot, handle_context_menu_key, mouse, unique_temp_path,
-    };
+    use super::super::{app_for_mouse_test, capture_snapshot, mouse, unique_temp_path};
+    use crate::app::input::modal::handle_context_menu_key;
     use crate::{
         api::schema::{AgentInfo, AgentStatus},
-        app::state::{AgentPanelScope, ContextMenuKind, DragTarget, Mode},
+        app::state::{AgentPanelSort, ContextMenuKind, DragTarget, Mode},
+        config::SidebarCollapsedModeConfig,
         detect::Agent,
         remote_source::{RemoteHostKey, RemoteSourceCapabilities},
         workspace::Workspace,
@@ -573,6 +584,7 @@ mod tests {
             title: None,
             display_agent: Some(label.to_string()),
             agent_status: AgentStatus::Working,
+            screen_detection_skipped: false,
             custom_status: None,
             state_labels: HashMap::new(),
             agent_session: None,
@@ -886,7 +898,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         app.state.remote_sources.replace_connected_snapshot(
             RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
             vec![remote_agent("remote-term", "smoke-agent")],
@@ -1073,7 +1084,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 1;
         app.state.mode = Mode::Navigate;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
         app.state.remote_sources.replace_connected_snapshot(
             host,
@@ -1131,7 +1141,6 @@ mod tests {
         app.state.active = None;
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         app.state.selected_remote_agent = Some(remote_key());
         app.state.selected_remote_space = Some(remote_space_key());
         let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
@@ -1306,7 +1315,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         app.state.remote_sources.replace_connected_snapshot(
             RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
             vec![remote_agent("remote-term", "smoke-agent")],
@@ -1355,7 +1363,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         app.state.remote_sources.replace_connected_snapshot(
             RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
             vec![remote_agent("remote-term", "smoke-agent")],
@@ -1401,7 +1408,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         let attached_pane = app.state.workspaces[1].tabs[0].root_pane;
         let attached_terminal_id = app.state.workspaces[1]
             .terminal_id(attached_pane)
@@ -1457,7 +1463,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         let attached_pane = app.state.workspaces[1].tabs[0].root_pane;
         let attached_terminal_id = app.state.workspaces[1]
             .terminal_id(attached_pane)
@@ -1510,7 +1515,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         let attached_pane = app.state.workspaces[1].tabs[0].root_pane;
         let attached_terminal_id = app.state.workspaces[1]
             .terminal_id(attached_pane)
@@ -1565,7 +1569,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         let attached_pane = app.state.workspaces[1].tabs[0].root_pane;
         let attached_terminal_id = app.state.workspaces[1]
             .terminal_id(attached_pane)
@@ -1628,7 +1631,6 @@ mod tests {
         app.state.active = None;
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         app.state.remote_sources.mark_status(
             &RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
             crate::remote_source::RemoteConnectionStatus::Unreachable,
@@ -1662,7 +1664,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         app.state.selected_remote_agent = Some(remote_key());
         app.state.selected_remote_space = Some(remote_space_key());
         let pane_id = app.state.workspaces[0].tabs[0].root_pane;
@@ -1701,7 +1702,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         app.state.selected_remote_agent = Some(remote_key());
         app.state.remote_sources.replace_connected_snapshot(
             RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
@@ -1729,7 +1729,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         let focused_pane = app.state.workspaces[0].focused_pane_id();
         app.state.remote_sources.replace_connected_snapshot(
             RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
@@ -1766,7 +1765,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         let focused_pane = app.state.workspaces[0].focused_pane_id();
         app.state.remote_sources.replace_connected_snapshot(
             RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
@@ -1797,7 +1795,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         app.state.selected_remote_agent = Some(remote_key());
         app.state.selected_remote_space = Some(remote_space_key());
         app.state.remote_sources.replace_connected_snapshot(
@@ -1825,7 +1822,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         app.state.selected_remote_agent = Some(remote_key());
         app.state.selected_remote_space = Some(remote_space_key());
         app.state.remote_sources.replace_connected_snapshot(
@@ -1853,7 +1849,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         let focused_pane = app.state.workspaces[0].focused_pane_id();
         app.state.remote_sources.mark_status(
             &RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
@@ -1895,7 +1890,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
         let attached_pane = app.state.workspaces[1].tabs[0].root_pane;
         let attached_terminal_id = app.state.workspaces[1]
             .terminal_id(attached_pane)
@@ -1939,7 +1933,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_agent_panel_toggle_switches_scope() {
+    fn clicking_agent_panel_toggle_switches_sort() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("test")];
         app.state.active = Some(0);
@@ -1951,23 +1945,15 @@ mod tests {
             app.state.view.sidebar_rect,
             app.state.sidebar_section_split,
         );
-        let toggle = crate::ui::agent_panel_toggle_rect(detail_area, app.state.agent_panel_scope);
+        let toggle = crate::ui::agent_panel_toggle_rect(detail_area, app.state.agent_panel_sort);
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
             toggle.x,
             toggle.y,
         ));
 
-        assert_eq!(
-            app.state.agent_panel_scope,
-            AgentPanelScope::CurrentWorkspace
-        );
+        assert_eq!(app.state.agent_panel_sort, AgentPanelSort::Priority);
         assert_eq!(app.state.agent_panel_scroll, 0);
-        let snapshot = capture_snapshot(&app.state);
-        assert_eq!(
-            snapshot.agent_panel_scope,
-            AgentPanelScope::CurrentWorkspace
-        );
     }
 
     #[test]
@@ -2000,7 +1986,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
 
         let (_, detail_area) = crate::ui::expanded_sidebar_sections(
             app.state.view.sidebar_rect,
@@ -2203,6 +2188,37 @@ mod tests {
         ));
 
         assert!(!app.state.sidebar_collapsed);
+    }
+
+    #[test]
+    fn hidden_collapsed_sidebar_has_no_mouse_expand_hotspot() {
+        let mut app = app_for_mouse_test();
+        app.state.sidebar_collapsed = true;
+        app.state.sidebar_collapsed_mode = SidebarCollapsedModeConfig::Hidden;
+        app.state.view.sidebar_rect = Rect::new(0, 0, 0, 20);
+        app.state.view.terminal_area = Rect::new(0, 0, 80, 20);
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 19));
+
+        assert!(app.state.sidebar_collapsed);
+    }
+
+    #[test]
+    fn clicking_expanded_sidebar_toggle_collapses_sidebar() {
+        let mut app = app_for_mouse_test();
+        app.state.sidebar_collapsed = false;
+        app.state.view.sidebar_rect = Rect::new(0, 0, 26, 20);
+        app.state.view.terminal_area = Rect::new(26, 0, 80, 20);
+
+        let toggle = crate::ui::expanded_sidebar_toggle_rect(app.state.view.sidebar_rect);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            toggle.x,
+            toggle.y,
+        ));
+
+        assert!(app.state.sidebar_collapsed);
+        assert!(app.state.drag.is_none());
     }
 
     #[test]
@@ -2508,7 +2524,8 @@ mod tests {
         let labels: Vec<_> = app.state.workspaces[0]
             .tabs
             .iter()
-            .map(|tab| tab.display_name())
+            .enumerate()
+            .map(|(tab_idx, _)| app.state.workspaces[0].tab_display_name(tab_idx).unwrap())
             .collect();
         assert_eq!(labels, vec!["foo", "2", "3"]);
         assert_eq!(
@@ -2517,6 +2534,9 @@ mod tests {
         );
         assert!(app.state.workspaces[0].tabs[1].custom_name.is_none());
         assert!(app.state.workspaces[0].tabs[2].custom_name.is_none());
+        assert_eq!(app.state.workspaces[0].tabs[0].number, 2);
+        assert_eq!(app.state.workspaces[0].tabs[1].number, 3);
+        assert_eq!(app.state.workspaces[0].tabs[2].number, 1);
         assert_eq!(app.state.workspaces[0].tabs[2].root_pane, moved_root);
         assert_eq!(app.state.workspaces[0].active_tab, 2);
     }
@@ -2688,6 +2708,26 @@ mod tests {
         assert_eq!(app.state.sidebar_width, 31);
         let snapshot = capture_snapshot(&app.state);
         assert_eq!(snapshot.sidebar_width, Some(31));
+    }
+
+    #[test]
+    fn dragging_sidebar_bottom_divider_still_sets_manual_width() {
+        let mut app = app_for_mouse_test();
+        let divider_col = app.state.view.sidebar_rect.x + app.state.view.sidebar_rect.width - 1;
+        let bottom_row = app.state.view.sidebar_rect.y + app.state.view.sidebar_rect.height - 1;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            divider_col,
+            bottom_row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            divider_col + 5,
+            bottom_row,
+        ));
+
+        assert_eq!(app.state.sidebar_width, 31);
     }
 
     #[test]

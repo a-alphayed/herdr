@@ -3,7 +3,8 @@
 # Run tests
 test:
     cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never
-    python3 -m unittest scripts.test_changelog scripts.test_vendor_libghostty_vt
+    python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
+    just plugin-marketplace-test
 
 # Run one nextest filter, e.g. `just test-one codex_stale_working`
 test-one filter:
@@ -15,18 +16,25 @@ lint:
     cargo clippy --all-targets --locked -- -D warnings
 
 # Run PR CI checks
-ci: lint
-    cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never
+ci filter='all()': lint
+    cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
+    just plugin-marketplace-test
 
-# Check formatting + run unit tests + maintenance script tests
-check: ci
-    python3 -m unittest scripts.test_changelog scripts.test_vendor_libghostty_vt
+# Run Windows target lint from Unix/macOS to catch cfg(windows) compile and clippy failures before CI
+windows-lint:
+    rustup target add x86_64-pc-windows-msvc
+    LIBGHOSTTY_VT_SIMD=false cargo clippy --bin herdr --locked --target x86_64-pc-windows-msvc -- -D warnings
+
+# Check formatting + run unit tests + Windows target lint + maintenance script tests
+check: ci windows-lint
+    python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
     @echo "docs reminder: if this changes user-facing behavior, make sure the relevant release docs are updated or called out before release."
 
 # Install repo-local git hooks
 install-hooks:
     git config core.hooksPath .githooks
     chmod +x .githooks/pre-commit
+    chmod +x .githooks/commit-msg
     @echo "installed git hooks from .githooks"
 
 # Build release binary
@@ -37,12 +45,17 @@ build:
 website-build:
     cd website && bun install --frozen-lockfile && bun run build
 
+# Run plugin marketplace Worker tests
+plugin-marketplace-test:
+    cd workers/plugin-marketplace && bun test
+
 # Build the vendored libghostty-vt source dist
 build-libghostty-vt:
     scripts/build_vendored_libghostty_vt.sh
 
 # Check that release docs and changelog have been finalized from docs/next before release
 release-docs-check:
+    python3 scripts/agent_detection_manifest_check.py --require-website
     @for file in README.md CHANGELOG.md; do \
         if ! diff -u "$file" "docs/next/$file"; then \
             echo "error: $file differs from docs/next/$file; finalize release docs before releasing"; \

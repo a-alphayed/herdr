@@ -353,6 +353,7 @@ mod tests {
             title: None,
             display_agent: Some("Codex".to_string()),
             agent_status: AgentStatus::Working,
+            screen_detection_skipped: false,
             custom_status: None,
             state_labels: HashMap::new(),
             agent_session: None,
@@ -400,6 +401,7 @@ mod tests {
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities: Some(crate::api::schema::ServerCapabilities {
                     live_handoff: true,
+                    detached_server_daemon: false,
                     federation: None,
                 }),
             },
@@ -415,6 +417,7 @@ mod tests {
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities: Some(crate::api::schema::ServerCapabilities {
                     live_handoff: true,
+                    detached_server_daemon: false,
                     federation: Some(crate::api::schema::FederationCapabilities {
                         methods: vec![
                             crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE

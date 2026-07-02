@@ -5,7 +5,8 @@ import { docsSchema } from '@astrojs/starlight/schema';
 
 function docsPath({ entry }: { entry: string }) {
   const slug = entry.replace(/\.(md|mdx|markdown|mdown|mkdn|mkd|mdwn)$/i, '');
-  return slug === 'index' ? 'docs' : `docs/${slug}`;
+  const normalized = slug.replace(/\/index$/, '');
+  return normalized === 'index' ? 'docs' : `docs/${normalized}`;
 }
 
 export const collections = {
@@ -17,17 +18,7 @@ export const collections = {
       description: z.string(),
       date: z.coerce.date(),
       draft: z.boolean().default(false),
-    }),
-  }),
-  releases: defineCollection({
-    loader: glob({ pattern: '*.md', base: './src/content/releases' }),
-    schema: z.object({
-      title: z.string(),
-      version: z.string(),
-      path: z.string(),
-      description: z.string(),
-      date: z.coerce.date(),
-      draft: z.boolean().default(false),
+      ogImage: z.string().optional(),
     }),
   }),
 };

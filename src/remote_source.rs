@@ -349,6 +349,7 @@ mod tests {
             title: None,
             display_agent: Some(label.to_string()),
             agent_status: AgentStatus::Working,
+            screen_detection_skipped: false,
             custom_status: None,
             state_labels: HashMap::new(),
             agent_session: None,

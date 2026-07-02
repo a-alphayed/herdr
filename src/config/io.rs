@@ -4,6 +4,20 @@ use tracing::warn;
 
 use super::{model::LoadedConfig, Config, CONFIG_PATH_ENV_VAR};
 
+const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
+    "advanced",
+    "experimental",
+    "keys",
+    "onboarding",
+    "remote",
+    "session",
+    "terminal",
+    "theme",
+    "ui",
+    "update",
+    "worktrees",
+];
+
 pub fn app_dir_name() -> &'static str {
     if cfg!(debug_assertions) {
         "herdr-dev"
@@ -14,21 +28,67 @@ pub fn app_dir_name() -> &'static str {
 
 pub fn config_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(dir).join(app_dir_name())
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(format!(".config/{}", app_dir_name()))
-    } else {
-        PathBuf::from(format!("/tmp/{}", app_dir_name()))
+        return PathBuf::from(dir).join(app_dir_name());
     }
+    platform_config_dir()
 }
 
 pub fn state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
-        PathBuf::from(dir).join(app_dir_name())
-    } else if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(dir).join(app_dir_name());
+    }
+    platform_state_dir()
+}
+
+#[cfg(windows)]
+fn platform_config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("APPDATA") {
+        return PathBuf::from(dir).join(app_dir_name());
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        return PathBuf::from(profile)
+            .join("AppData")
+            .join("Roaming")
+            .join(app_dir_name());
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(format!(".config/{}", app_dir_name()));
+    }
+    std::env::temp_dir().join(app_dir_name())
+}
+
+#[cfg(not(windows))]
+fn platform_config_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(format!(".config/{}", app_dir_name()))
+    } else {
+        std::env::temp_dir().join(app_dir_name())
+    }
+}
+
+#[cfg(windows)]
+fn platform_state_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("LOCALAPPDATA") {
+        return PathBuf::from(dir).join(app_dir_name());
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        return PathBuf::from(profile)
+            .join("AppData")
+            .join("Local")
+            .join(app_dir_name());
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(format!(".local/state/{}", app_dir_name()));
+    }
+    std::env::temp_dir().join(format!("{}-state", app_dir_name()))
+}
+
+#[cfg(not(windows))]
+fn platform_state_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join(format!(".local/state/{}", app_dir_name()))
     } else {
-        PathBuf::from(format!("/tmp/{}-state", app_dir_name()))
+        std::env::temp_dir().join(format!("{}-state", app_dir_name()))
     }
 }
 
@@ -39,7 +99,9 @@ impl Config {
             match std::fs::read_to_string(&path) {
                 Ok(content) => match toml::from_str::<Config>(&content) {
                     Ok(config) => {
-                        let diagnostics = config.collect_diagnostics();
+                        let mut diagnostics =
+                            unknown_top_level_section_diagnostics_from_str(&content);
+                        diagnostics.extend(config.collect_diagnostics());
                         return LoadedConfig {
                             config,
                             diagnostics,
@@ -137,7 +199,7 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
     })?;
 
     let mut config = Config::default();
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = unknown_top_level_section_diagnostics(table);
     let mut invalid_sections = Vec::new();
 
     if let Some(value) = table.get("onboarding") {
@@ -183,11 +245,11 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
     );
     load_live_section(
         table,
-        "remote",
-        "remote config",
+        "update",
+        "update config",
         &mut diagnostics,
         &mut invalid_sections,
-        |section| config.remote = section,
+        |section| config.update = section,
     );
     load_live_section(
         table,
@@ -221,12 +283,62 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         &mut invalid_sections,
         |section| config.experimental = section,
     );
+    load_live_section(
+        table,
+        "remote",
+        "remote config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.remote = section,
+    );
 
     Ok(LoadedConfig {
         config,
         diagnostics,
         invalid_sections,
     })
+}
+
+fn unknown_top_level_section_diagnostics_from_str(content: &str) -> Vec<String> {
+    content
+        .parse::<toml::Value>()
+        .ok()
+        .and_then(|value| value.as_table().map(unknown_top_level_section_diagnostics))
+        .unwrap_or_default()
+}
+
+fn unknown_top_level_section_diagnostics(
+    table: &toml::map::Map<String, toml::Value>,
+) -> Vec<String> {
+    table
+        .iter()
+        .filter_map(|(key, value)| unknown_top_level_section_diagnostic(key, value))
+        .collect()
+}
+
+fn unknown_top_level_section_diagnostic(key: &str, value: &toml::Value) -> Option<String> {
+    if KNOWN_TOP_LEVEL_CONFIG_KEYS.contains(&key) {
+        return None;
+    }
+
+    let header = if value.is_table() {
+        format!("[{key}]")
+    } else if value
+        .as_array()
+        .is_some_and(|items| !items.is_empty() && items.iter().all(toml::Value::is_table))
+    {
+        format!("[[{key}]]")
+    } else {
+        return None;
+    };
+
+    if key == "toast" {
+        Some(format!(
+            "unknown config section {header}; did you mean [ui.toast]? ignoring section"
+        ))
+    } else {
+        Some(format!("unknown config section {header}; ignoring section"))
+    }
 }
 
 fn load_live_section<T>(
@@ -516,8 +628,87 @@ target = "jafar"
             crate::session::DEFAULT_SESSION_NAME
         );
         assert!(loaded.config.remote.hosts[0].auto_connect);
+        assert!(loaded.config.remote.manage_ssh_config);
         assert!(loaded.diagnostics.is_empty());
         assert!(loaded.invalid_sections.is_empty());
+    }
+
+    #[test]
+    fn load_live_config_warns_about_unknown_top_level_sections() {
+        let loaded = load_live_config_from_str(
+            r#"
+[toast]
+delivery = "system"
+
+[ui.toast]
+delivery = "herdr"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            loaded.diagnostics,
+            vec!["unknown config section [toast]; did you mean [ui.toast]? ignoring section"]
+        );
+        assert!(loaded.invalid_sections.is_empty());
+        assert_eq!(
+            loaded.config.ui.toast.delivery,
+            super::super::ToastDelivery::Herdr
+        );
+    }
+
+    #[test]
+    fn load_live_config_does_not_warn_about_unknown_top_level_scalar_values() {
+        let loaded = load_live_config_from_str(
+            r#"
+plugin = []
+
+[ui.toast]
+delivery = "herdr"
+"#,
+        )
+        .unwrap();
+
+        assert!(loaded.diagnostics.is_empty());
+        assert_eq!(
+            loaded.config.ui.toast.delivery,
+            super::super::ToastDelivery::Herdr
+        );
+    }
+
+    #[test]
+    fn startup_config_load_warns_about_unknown_top_level_sections() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "herdr-config-unknown-section-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"
+[[plugin]]
+id = "example"
+
+[ui.toast]
+delivery = "system"
+"#,
+        )
+        .unwrap();
+        std::env::set_var(CONFIG_PATH_ENV_VAR, &path);
+
+        let loaded = Config::load();
+
+        assert_eq!(
+            loaded.diagnostics,
+            vec!["unknown config section [[plugin]]; ignoring section"]
+        );
+        assert_eq!(
+            loaded.config.ui.toast.delivery,
+            super::super::ToastDelivery::System
+        );
+
+        std::env::remove_var(CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -30,6 +30,7 @@ pub struct AgentSoundOverrides {
     pub codex: AgentSoundSetting,
     pub gemini: AgentSoundSetting,
     pub cursor: AgentSoundSetting,
+    pub devin: AgentSoundSetting,
     pub agy: AgentSoundSetting,
     pub cline: AgentSoundSetting,
     pub open_code: AgentSoundSetting,
@@ -40,6 +41,7 @@ pub struct AgentSoundOverrides {
     pub amp: AgentSoundSetting,
     pub grok: AgentSoundSetting,
     pub hermes: AgentSoundSetting,
+    pub kilo: AgentSoundSetting,
     pub qodercli: AgentSoundSetting,
 }
 
@@ -121,8 +123,10 @@ impl AgentSoundOverrides {
             Some(Agent::Codex) => self.codex,
             Some(Agent::Gemini) => self.gemini,
             Some(Agent::Cursor) => self.cursor,
+            Some(Agent::Devin) => self.devin,
             Some(Agent::Antigravity) => self.agy,
             Some(Agent::Cline) => self.cline,
+            Some(Agent::Omp) => AgentSoundSetting::Default,
             Some(Agent::OpenCode) => self.open_code,
             Some(Agent::GithubCopilot) => self.github_copilot,
             Some(Agent::Kimi) => self.kimi,
@@ -131,6 +135,7 @@ impl AgentSoundOverrides {
             Some(Agent::Amp) => self.amp,
             Some(Agent::Grok) => self.grok,
             Some(Agent::Hermes) => self.hermes,
+            Some(Agent::Kilo) => self.kilo,
             Some(Agent::Qodercli) => self.qodercli,
             None => AgentSoundSetting::Default,
         }
@@ -157,6 +162,7 @@ impl Default for AgentSoundOverrides {
             codex: AgentSoundSetting::Default,
             gemini: AgentSoundSetting::Default,
             cursor: AgentSoundSetting::Default,
+            devin: AgentSoundSetting::Default,
             agy: AgentSoundSetting::Default,
             cline: AgentSoundSetting::Default,
             open_code: AgentSoundSetting::Default,
@@ -167,6 +173,7 @@ impl Default for AgentSoundOverrides {
             amp: AgentSoundSetting::Default,
             grok: AgentSoundSetting::Default,
             hermes: AgentSoundSetting::Default,
+            kilo: AgentSoundSetting::Default,
             qodercli: AgentSoundSetting::Default,
         }
     }

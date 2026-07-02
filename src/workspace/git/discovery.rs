@@ -44,12 +44,13 @@ pub fn git_worktree_info(cwd: &Path) -> Option<GitWorktreeInfo> {
     let git_dir = canonicalize_best_effort_path(&git_dir_for_repo_root(&repo_root)?);
     let git_common_dir = canonicalize_best_effort_path(&git_common_dir_for_git_dir(&git_dir));
     let is_linked_worktree = git_dir != git_common_dir;
+    let is_bare = git_dir_is_bare(&git_dir);
 
     Some(GitWorktreeInfo {
         repo_root,
         git_dir,
         git_common_dir,
-        is_bare: false,
+        is_bare,
         is_linked_worktree,
     })
 }
@@ -58,9 +59,6 @@ pub fn git_space_metadata(cwd: &Path) -> Option<GitSpaceMetadata> {
     git_repo_root(cwd)?;
 
     let info = git_worktree_info(cwd)?;
-    if info.is_bare {
-        return None;
-    }
     let key = canonicalize_best_effort_path(&info.git_common_dir)
         .display()
         .to_string();
@@ -111,6 +109,11 @@ fn git_common_dir_for_git_dir(git_dir: &Path) -> PathBuf {
 pub fn git_branch(cwd: &Path) -> Option<String> {
     let repo_root = git_repo_root(cwd)?;
     let git_dir = git_dir_for_repo_root(&repo_root)?;
+    let git_common_dir = git_common_dir_for_git_dir(&git_dir);
+    if git_ref_storage_is_reftable(&git_common_dir) {
+        return git_symbolic_head_short(&repo_root);
+    }
+
     let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
     parse_git_head_branch(&head)
 }
@@ -121,19 +124,111 @@ pub(super) fn git_dir_for_repo_root(repo_root: &Path) -> Option<PathBuf> {
         return Some(git_path);
     }
 
-    let gitdir = std::fs::read_to_string(&git_path).ok()?;
-    let relative = gitdir.trim().strip_prefix("gitdir:")?.trim();
-    let resolved = Path::new(relative);
-    Some(if resolved.is_absolute() {
-        resolved.to_path_buf()
-    } else {
-        repo_root.join(resolved)
-    })
+    if let Ok(gitdir) = std::fs::read_to_string(&git_path) {
+        if let Some(relative) = gitdir.trim().strip_prefix("gitdir:").map(str::trim) {
+            let resolved = Path::new(relative);
+            return Some(if resolved.is_absolute() {
+                resolved.to_path_buf()
+            } else {
+                repo_root.join(resolved)
+            });
+        }
+    }
+
+    if path_is_git_dir_layout(repo_root) && git_dir_is_bare(repo_root) {
+        return Some(repo_root.to_path_buf());
+    }
+
+    None
+}
+
+fn path_is_git_dir_layout(path: &Path) -> bool {
+    path.join("HEAD").is_file() && path.join("objects").is_dir() && path.join("refs").is_dir()
+}
+
+pub(super) fn git_symbolic_head_full(repo_root: &Path) -> Option<String> {
+    git_trimmed_stdout(repo_root, &["symbolic-ref", "--quiet", "HEAD"])
+}
+
+fn git_symbolic_head_short(repo_root: &Path) -> Option<String> {
+    git_trimmed_stdout(repo_root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+}
+
+pub(super) fn git_rev_parse_verify(repo_root: &Path, revision: &str) -> Option<String> {
+    git_trimmed_stdout(repo_root, &["rev-parse", "--verify", revision])
+}
+
+pub(super) fn git_ref_storage_is_reftable(git_common_dir: &Path) -> bool {
+    read_git_config_value(&git_common_dir.join("config"), "extensions", "refstorage")
+        .is_some_and(|value| value.eq_ignore_ascii_case("reftable"))
+}
+
+fn git_dir_is_bare(git_dir: &Path) -> bool {
+    read_git_config_value(&git_dir.join("config"), "core", "bare")
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
 fn parse_git_head_branch(head: &str) -> Option<String> {
     let branch = head.trim().strip_prefix("ref: refs/heads/")?;
     (!branch.is_empty()).then(|| branch.to_string())
+}
+
+fn read_git_config_value(path: &Path, section: &str, key: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut in_section = false;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(section_name) = simple_git_config_section(line) {
+            in_section = section_name.eq_ignore_ascii_case(section);
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case(key) {
+            return Some(strip_git_config_comment(value).trim().to_string());
+        }
+    }
+    None
+}
+
+fn simple_git_config_section(line: &str) -> Option<&str> {
+    let section = line.strip_prefix('[')?.split_once(']')?.0.trim();
+    (!section.contains('"')).then_some(section)
+}
+
+fn strip_git_config_comment(value: &str) -> &str {
+    let value = value.trim();
+    for marker in ['#', ';'] {
+        if let Some((prefix, _)) = value.split_once(marker) {
+            if prefix.chars().next_back().is_some_and(char::is_whitespace) {
+                return prefix;
+            }
+        }
+    }
+    value
+}
+
+fn git_trimmed_stdout(repo_root: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let stdout = stdout.trim();
+    (!stdout.is_empty()).then(|| stdout.to_string())
 }
 
 pub(super) fn git_repo_root(start: &Path) -> Option<PathBuf> {
@@ -187,6 +282,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::workspace::git::test_support::run_git;
 
     fn temp_test_dir(name: &str) -> PathBuf {
         let unique = format!(
@@ -239,6 +335,24 @@ mod tests {
     }
 
     #[test]
+    fn git_branch_reads_symbolic_head_from_reftable_repo() {
+        let root = temp_test_dir("reftable-branch");
+        let root_arg = root.to_string_lossy().to_string();
+        let output = std::process::Command::new("git")
+            .args(["init", "--ref-format=reftable", "-b", "main", &root_arg])
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
+        assert_eq!(git_branch(&root).as_deref(), Some("main"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn git_repo_root_ignores_invalid_git_marker() {
         let base = temp_test_dir("invalid-git-root");
         let cwd = base.join("workspace");
@@ -248,6 +362,62 @@ mod tests {
         assert_eq!(git_repo_root(&cwd), None);
 
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn git_repo_root_ignores_standalone_non_bare_git_dir_layout() {
+        let root = temp_test_dir("standalone-non-bare-git-dir");
+        std::fs::write(root.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(root.join("objects")).unwrap();
+        std::fs::create_dir_all(root.join("refs")).unwrap();
+        std::fs::write(root.join("config"), "[core]\n\tbare = false\n").unwrap();
+
+        assert_eq!(git_repo_root(&root.join("refs")), None);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_space_metadata_supports_standalone_bare_repo() {
+        let bare = temp_test_dir("bare-space");
+        run_git(&bare, &["init", "--bare", "."]);
+        let nested = bare.join("refs");
+
+        let info = git_worktree_info(&nested).expect("bare repo should be discovered");
+        assert!(info.is_bare);
+        assert!(!info.is_linked_worktree);
+        assert_eq!(info.git_dir, canonicalize_best_effort_path(&bare));
+
+        let metadata = git_space_metadata(&nested).expect("bare repo should map to a git space");
+        assert_eq!(
+            canonicalize_best_effort_path(&metadata.repo_root),
+            canonicalize_best_effort_path(&bare)
+        );
+        assert!(!metadata.is_linked_worktree);
+
+        std::fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn git_space_metadata_marks_bare_dot_git_repo() {
+        let root = temp_test_dir("bare-dot-git");
+        run_git(&root, &["init", "--bare", ".git"]);
+
+        let info = git_worktree_info(&root).expect("bare .git repo should be discovered");
+        assert!(info.is_bare);
+        assert!(!info.is_linked_worktree);
+        assert_eq!(
+            info.git_dir,
+            canonicalize_best_effort_path(&root.join(".git"))
+        );
+
+        let metadata = git_space_metadata(&root).expect("bare .git repo should map to a git space");
+        assert_eq!(
+            canonicalize_best_effort_path(&metadata.repo_root),
+            canonicalize_best_effort_path(&root)
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -272,6 +442,33 @@ mod tests {
         let label = root.file_name().and_then(|name| name.to_str()).unwrap();
 
         assert_eq!(derive_label_from_cwd(Path::new(&root)), label);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_rev_parse_verify_reads_reftable_refs() {
+        let root = temp_test_dir("reftable-ref-oid");
+        let root_arg = root.to_string_lossy().to_string();
+        let output = std::process::Command::new("git")
+            .args(["init", "--ref-format=reftable", "-b", "main", &root_arg])
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+
+        run_git(&root, &["config", "user.email", "herdr@example.invalid"]);
+        run_git(&root, &["config", "user.name", "Herdr Test"]);
+        run_git(&root, &["commit", "--allow-empty", "-m", "initial"]);
+
+        let head_oid = git_rev_parse_verify(&root, "HEAD").unwrap();
+
+        assert_eq!(
+            git_rev_parse_verify(&root, "refs/heads/main").as_deref(),
+            Some(head_oid.as_str())
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }

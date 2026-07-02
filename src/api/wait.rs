@@ -1,4 +1,3 @@
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -13,11 +12,12 @@ use crate::api::server::{
 };
 use crate::api::subscriptions::{match_output, output_match_read_source};
 use crate::api::ApiRequestSender;
+use crate::ipc::LocalStream;
 
 pub(super) fn wait_for_output(
     request_id: String,
     params: crate::api::schema::PaneWaitForOutputParams,
-    stream: &mut UnixStream,
+    stream: &mut LocalStream,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<Option<String>> {
@@ -95,7 +95,7 @@ pub(super) fn wait_for_output(
                 serde_json::to_string(&SuccessResponse {
                     id: request_id,
                     result: ResponseResult::OutputMatched {
-                        pane_id: params.pane_id,
+                        pane_id: read.pane_id.clone(),
                         revision,
                         matched_line,
                         read,

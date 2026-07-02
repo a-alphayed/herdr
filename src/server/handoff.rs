@@ -5,8 +5,6 @@ use std::os::fd::{AsRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Child, Command};
@@ -22,6 +20,8 @@ use tracing::{info, warn};
 const HANDOFF_VERSION: u32 = 1;
 #[cfg(unix)]
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(unix)]
+const OWNED_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(unix)]
 pub(crate) const MAX_FDS_PER_HANDOFF: usize = 64;
 #[cfg(unix)]
@@ -77,10 +77,10 @@ pub(crate) fn spawn_handoff_import(
         .arg("--handoff-import")
         .arg(socket_path)
         .arg(token)
-        .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    crate::platform::detach_server_daemon_command(&mut command);
     command.spawn().map_err(|err| {
         io::Error::new(
             err.kind(),
@@ -198,7 +198,7 @@ pub(crate) fn report_committed(stream: &mut UnixStream) -> io::Result<()> {
 
 #[cfg(unix)]
 pub(crate) fn wait_owned_ack(stream: &mut UnixStream) {
-    if let Err(err) = stream.set_read_timeout(Some(READY_TIMEOUT)) {
+    if let Err(err) = stream.set_read_timeout(Some(OWNED_ACK_TIMEOUT)) {
         warn!(err = %err, "failed to set handoff ownership ack timeout");
         return;
     }
@@ -245,12 +245,12 @@ pub(crate) fn receive(socket_path: &Path, token: &str) -> io::Result<ReceivedHan
     if manifest
         .expected_version
         .as_deref()
-        .is_some_and(|version| version != env!("CARGO_PKG_VERSION"))
+        .is_some_and(|version| version != crate::build_info::version())
     {
         return Err(io::Error::other(format!(
             "handoff expected herdr v{}, but this server is v{}",
             manifest.expected_version.as_deref().unwrap_or("unknown"),
-            env!("CARGO_PKG_VERSION")
+            crate::build_info::version()
         )));
     }
     stream.write_all(b"validated\n")?;
@@ -300,7 +300,7 @@ pub(crate) fn manifest_for(
 ) -> HandoffManifest {
     HandoffManifest {
         version: HANDOFF_VERSION,
-        source_version: env!("CARGO_PKG_VERSION").to_string(),
+        source_version: crate::build_info::version(),
         source_protocol: crate::protocol::PROTOCOL_VERSION,
         expected_version,
         expected_protocol,

@@ -120,12 +120,28 @@ impl ActiveSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceRenamed,
                 last_sequence: 0,
             })),
+            Subscription::WorkspaceMoved {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::WorkspaceMoved,
+                last_sequence: 0,
+            })),
             Subscription::WorkspaceClosed {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceClosed,
                 last_sequence: 0,
             })),
             Subscription::WorkspaceFocused {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceFocused,
+                last_sequence: 0,
+            })),
+            Subscription::WorktreeCreated {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::WorktreeCreated,
+                last_sequence: 0,
+            })),
+            Subscription::WorktreeOpened {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::WorktreeOpened,
+                last_sequence: 0,
+            })),
+            Subscription::WorktreeRemoved {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::WorktreeRemoved,
                 last_sequence: 0,
             })),
             Subscription::TabCreated {} => Ok(Self::Event(ActiveEventSubscription {
@@ -144,6 +160,10 @@ impl ActiveSubscription {
                 event_kind: crate::api::schema::EventKind::TabRenamed,
                 last_sequence: 0,
             })),
+            Subscription::TabMoved {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::TabMoved,
+                last_sequence: 0,
+            })),
             Subscription::PaneCreated {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneCreated,
                 last_sequence: 0,
@@ -154,6 +174,10 @@ impl ActiveSubscription {
             })),
             Subscription::PaneFocused {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::PaneFocused,
+                last_sequence: 0,
+            })),
+            Subscription::PaneMoved {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::PaneMoved,
                 last_sequence: 0,
             })),
             Subscription::PaneExited {} => Ok(Self::Event(ActiveEventSubscription {
@@ -219,7 +243,7 @@ impl ActiveSubscription {
                 let initial_event = agent_status
                     .is_some_and(|wanted| wanted == probe.agent_status)
                     .then_some(PaneAgentStatusChangedEvent {
-                        pane_id: probe.pane_id,
+                        pane_id: probe.pane_id.clone(),
                         workspace_id: probe.workspace_id,
                         agent_status: probe.agent_status,
                         agent: probe.agent,
@@ -231,7 +255,7 @@ impl ActiveSubscription {
 
                 Ok(Self::AgentStatusChanged(Box::new(
                     ActiveAgentStatusChangedSubscription {
-                        pane_id,
+                        pane_id: probe.pane_id,
                         status_filter: agent_status,
                         last_status: Some(last_status),
                         last_presentation: Some(last_presentation),
@@ -295,7 +319,7 @@ impl ActiveOutputMatchedSubscription {
                 Some(SubscriptionEventEnvelope {
                     event: SubscriptionEventKind::PaneOutputMatched,
                     data: SubscriptionEventData::PaneOutputMatched(PaneOutputMatchedEvent {
-                        pane_id: self.pane_id.clone(),
+                        pane_id: read.pane_id.clone(),
                         matched_line,
                         read,
                     }),

@@ -148,6 +148,7 @@ pub(crate) struct RemoteHostConfig {
 }
 
 impl RemoteHostConfig {
+    #[cfg(any(unix, test))]
     pub(crate) fn new(
         name: impl Into<String>,
         target: impl Into<String>,
@@ -460,6 +461,7 @@ mod tests {
             title: title.map(str::to_string),
             display_agent: display_agent.map(str::to_string),
             agent_status: AgentStatus::Working,
+            screen_detection_skipped: false,
             custom_status: None,
             state_labels: HashMap::new(),
             agent_session: None,

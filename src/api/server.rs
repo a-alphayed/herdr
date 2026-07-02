@@ -1,13 +1,13 @@
 use std::io::{self, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
 use tracing::{debug, error, info, warn};
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::fs;
 
 use crate::api::schema::{
@@ -16,7 +16,10 @@ use crate::api::schema::{
 use crate::api::subscriptions::ActiveSubscription;
 use crate::api::wait::wait_for_output;
 use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
-use crate::ipc::{remove_socket_file_if_owned, socket_file_identity, SocketFileIdentity};
+use crate::ipc::{
+    bind_local_listener, remove_socket_file_if_owned, socket_file_identity, LocalStream,
+    SocketFileIdentity,
+};
 
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -46,7 +49,7 @@ impl Drop for ServerHandle {
 
 impl ServerHandle {
     pub(crate) fn remove_socket_file_if_owned(&self) -> std::io::Result<()> {
-        remove_socket_file_if_owned(&self.path, self.identity)
+        remove_socket_file_if_owned(&self.path, &self.identity)
     }
 }
 
@@ -54,7 +57,11 @@ pub fn start_server(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
 ) -> std::io::Result<ServerHandle> {
-    start_server_with_capabilities(api_tx, event_hub, Some(ServerCapabilities::current()))
+    let mut capabilities = ServerCapabilities::current();
+    capabilities.live_handoff = crate::platform::capabilities().live_handoff;
+    capabilities.detached_server_daemon =
+        crate::platform::current_process_is_detached_server_daemon();
+    start_server_with_capabilities(api_tx, event_hub, Some(capabilities))
 }
 
 pub fn start_server_with_capabilities(
@@ -65,7 +72,7 @@ pub fn start_server_with_capabilities(
     let path = socket_path();
     prepare_socket_path(&path)?;
 
-    let listener = UnixListener::bind(&path)?;
+    let listener = bind_local_listener(&path)?;
     restrict_socket_permissions(&path)?;
     let identity = socket_file_identity(&path)?;
     info!(path = %path.display(), "api server listening");
@@ -123,13 +130,13 @@ fn restrict_socket_permissions(path: &Path) -> std::io::Result<()> {
 }
 
 fn handle_connection(
-    mut stream: UnixStream,
+    mut stream: LocalStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
 ) -> std::io::Result<()> {
-    if let Err(err) = stream.set_write_timeout(Some(STREAM_WRITE_TIMEOUT)) {
+    if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
         debug!(err = %err, "api connection write timeout unavailable");
     }
 
@@ -248,7 +255,7 @@ fn handle_request(
         Method::Ping(_) => serde_json::to_string(&SuccessResponse {
             id: request.id,
             result: ResponseResult::Pong {
-                version: env!("CARGO_PKG_VERSION").into(),
+                version: crate::build_info::version(),
                 protocol: crate::protocol::PROTOCOL_VERSION,
                 capabilities,
             },
@@ -267,12 +274,19 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::ServerStop(_) => "server.stop",
         Method::ServerLiveHandoff(_) => "server.live_handoff",
         Method::ServerReloadConfig(_) => "server.reload_config",
+        Method::ServerAgentManifests(_) => "server.agent_manifests",
+        Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
+        Method::NotificationShow(_) => "notification.show",
+        Method::ClientWindowTitleSet(_) => "client.window_title.set",
+        Method::ClientWindowTitleClear(_) => "client.window_title.clear",
+        Method::SessionSnapshot(_) => "session.snapshot",
         Method::WorkspaceCreate(_) => "workspace.create",
         Method::WorkspaceList(_) => "workspace.list",
         Method::WorkspaceListLocal(_) => "workspace.list_local",
         Method::WorkspaceGet(_) => "workspace.get",
         Method::WorkspaceFocus(_) => "workspace.focus",
         Method::WorkspaceRename(_) => "workspace.rename",
+        Method::WorkspaceMove(_) => "workspace.move",
         Method::WorkspaceClose(_) => "workspace.close",
         Method::WorktreeList(_) => "worktree.list",
         Method::WorktreeCreate(_) => "worktree.create",
@@ -283,24 +297,41 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::TabGet(_) => "tab.get",
         Method::TabFocus(_) => "tab.focus",
         Method::TabRename(_) => "tab.rename",
+        Method::TabMove(_) => "tab.move",
         Method::TabClose(_) => "tab.close",
         Method::AgentList(_) => "agent.list",
         Method::AgentListLocal(_) => "agent.list_local",
         Method::AgentGet(_) => "agent.get",
         Method::AgentRead(_) => "agent.read",
+        Method::AgentExplain(_) => "agent.explain",
         Method::AgentSend(_) => "agent.send",
         Method::AgentRename(_) => "agent.rename",
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
         Method::PaneSplit(_) => "pane.split",
+        Method::PaneSwap(_) => "pane.swap",
+        Method::PaneMove(_) => "pane.move",
+        Method::PaneZoom(_) => "pane.zoom",
+        Method::PaneLayout(_) => "pane.layout",
+        Method::PaneProcessInfo(_) => "pane.process_info",
+        Method::LayoutExport(_) => "layout.export",
+        Method::LayoutApply(_) => "layout.apply",
+        Method::LayoutSetSplitRatio(_) => "layout.set_split_ratio",
+        Method::PaneNeighbor(_) => "pane.neighbor",
+        Method::PaneEdges(_) => "pane.edges",
+        Method::PaneFocusDirection(_) => "pane.focus_direction",
+        Method::PaneResize(_) => "pane.resize",
         Method::PaneList(_) => "pane.list",
+        Method::PaneCurrent(_) => "pane.current",
         Method::PaneGet(_) => "pane.get",
+        Method::PaneFocus(_) => "pane.focus",
         Method::PaneRename(_) => "pane.rename",
         Method::PaneSendText(_) => "pane.send_text",
         Method::PaneSendKeys(_) => "pane.send_keys",
         Method::PaneSendInput(_) => "pane.send_input",
         Method::PaneRead(_) => "pane.read",
         Method::PaneReportAgent(_) => "pane.report_agent",
+        Method::PaneReportAgentSession(_) => "pane.report_agent_session",
         Method::PaneReportMetadata(_) => "pane.report_metadata",
         Method::PaneClearAgentAuthority(_) => "pane.clear_agent_authority",
         Method::PaneReleaseAgent(_) => "pane.release_agent",
@@ -310,6 +341,17 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneWaitForOutput(_) => "pane.wait_for_output",
         Method::IntegrationInstall(_) => "integration.install",
         Method::IntegrationUninstall(_) => "integration.uninstall",
+        Method::PluginLink(_) => "plugin.link",
+        Method::PluginList(_) => "plugin.list",
+        Method::PluginUnlink(_) => "plugin.unlink",
+        Method::PluginEnable(_) => "plugin.enable",
+        Method::PluginDisable(_) => "plugin.disable",
+        Method::PluginActionList(_) => "plugin.action.list",
+        Method::PluginActionInvoke(_) => "plugin.action.invoke",
+        Method::PluginLogList(_) => "plugin.log.list",
+        Method::PluginPaneOpen(_) => "plugin.pane.open",
+        Method::PluginPaneFocus(_) => "plugin.pane.focus",
+        Method::PluginPaneClose(_) => "plugin.pane.close",
     }
 }
 
@@ -329,7 +371,7 @@ fn api_response_outcome(response: &str) -> &'static str {
     }
 }
 
-fn read_initial_request_line(stream: &mut UnixStream) -> std::io::Result<Option<String>> {
+fn read_initial_request_line(stream: &mut LocalStream) -> std::io::Result<Option<String>> {
     stream.set_nonblocking(true)?;
     let deadline = Instant::now() + INITIAL_REQUEST_TIMEOUT;
     let mut bytes = Vec::new();
@@ -376,7 +418,7 @@ fn read_initial_request_line(stream: &mut UnixStream) -> std::io::Result<Option<
 }
 
 fn stream_subscriptions(
-    mut stream: UnixStream,
+    mut stream: LocalStream,
     request_id: String,
     params: crate::api::schema::EventsSubscribeParams,
     api_tx: &ApiRequestSender,
@@ -433,27 +475,30 @@ fn stream_subscriptions(
     }
 }
 
-fn write_text_line(stream: &mut UnixStream, value: &str) -> std::io::Result<()> {
+fn write_text_line(stream: &mut LocalStream, value: &str) -> std::io::Result<()> {
     stream.write_all(value.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()
 }
 
-fn write_text_line_allow_disconnect(stream: &mut UnixStream, value: &str) -> std::io::Result<()> {
+fn write_text_line_allow_disconnect(stream: &mut LocalStream, value: &str) -> std::io::Result<()> {
     match write_text_line(stream, value) {
         Err(err) if is_connection_closed_error(&err) => Ok(()),
         result => result,
     }
 }
 
-fn write_json_line<T: serde::Serialize>(stream: &mut UnixStream, value: &T) -> std::io::Result<()> {
+fn write_json_line<T: serde::Serialize>(
+    stream: &mut LocalStream,
+    value: &T,
+) -> std::io::Result<()> {
     let encoded = serde_json::to_string(value)
         .map_err(|err| std::io::Error::other(format!("failed to encode json: {err}")))?;
     write_text_line(stream, &encoded)
 }
 
 fn write_json_line_allow_disconnect<T: serde::Serialize>(
-    stream: &mut UnixStream,
+    stream: &mut LocalStream,
     value: &T,
 ) -> std::io::Result<()> {
     let encoded = serde_json::to_string(value)
@@ -462,7 +507,7 @@ fn write_json_line_allow_disconnect<T: serde::Serialize>(
 }
 
 pub(super) fn should_stop_connection(
-    stream: &mut UnixStream,
+    stream: &mut LocalStream,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<bool> {
     if !running.load(Ordering::Relaxed) {
@@ -472,7 +517,7 @@ pub(super) fn should_stop_connection(
     probe_stream_closed(stream)
 }
 
-fn probe_stream_closed(stream: &mut UnixStream) -> std::io::Result<bool> {
+fn probe_stream_closed(stream: &mut LocalStream) -> std::io::Result<bool> {
     stream.set_nonblocking(true)?;
     let mut probe = [0u8; 1];
     let status = match stream.read(&mut probe) {
@@ -570,11 +615,13 @@ fn error_response_json(id: String, code: &str, message: String) -> String {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use interprocess::local_socket::traits::Listener as _;
     use std::io::{BufRead, BufReader};
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
     use std::sync::{Mutex, OnceLock};
     use tokio::sync::mpsc;
 
@@ -591,11 +638,19 @@ mod tests {
         std::env::temp_dir().join(format!("herdr-{name}-{}-{nanos}", std::process::id()))
     }
 
-    fn read_line(stream: &mut UnixStream) -> String {
+    fn read_line(stream: &mut LocalStream) -> String {
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
         line
+    }
+
+    fn local_stream_pair(name: &str) -> (LocalStream, LocalStream, PathBuf) {
+        let path = unique_test_path(name);
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let client = crate::ipc::connect_local_stream(&path).unwrap();
+        let server = listener.accept().unwrap();
+        (client, server, path)
     }
 
     #[test]
@@ -688,7 +743,11 @@ mod tests {
                 method: Method::Ping(crate::api::schema::PingParams::default()),
             },
             &tx,
-            Some(ServerCapabilities::current()),
+            Some(ServerCapabilities {
+                live_handoff: true,
+                detached_server_daemon: true,
+                federation: Some(crate::api::schema::FederationCapabilities::current()),
+            }),
         );
 
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -759,7 +818,7 @@ mod tests {
             }
         });
 
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server, _path) = local_stream_pair("api-wait-disconnect");
         client
             .write_all(br#"{"id":"req_wait","method":"pane.wait_for_output","params":{"pane_id":"pane_1","source":"recent","match":{"type":"substring","value":"never"}}}"#)
             .unwrap();
@@ -789,7 +848,7 @@ mod tests {
     #[test]
     fn subscriptions_stop_when_client_disconnects() {
         let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server, _path) = local_stream_pair("api-sub-disconnect");
         client
             .write_all(
                 br#"{"id":"sub_1","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.created"}]}}"#,
@@ -821,7 +880,7 @@ mod tests {
     #[test]
     fn subscriptions_stop_when_server_shuts_down() {
         let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
-        let (mut client, server) = UnixStream::pair().unwrap();
+        let (mut client, server, _path) = local_stream_pair("api-sub-shutdown");
         client
             .write_all(
                 br#"{"id":"sub_2","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.created"}]}}"#,

@@ -105,6 +105,7 @@ fn toast_error(app: &mut App, title: &str, detail: impl Into<String>) {
         kind: ToastKind::NeedsAttention,
         title: title.to_string(),
         context: detail.into(),
+        position: None,
         target: None,
     });
     app.sync_toast_deadline(None);
@@ -115,6 +116,7 @@ fn toast_finished(app: &mut App, title: &str, detail: impl Into<String>) {
         kind: ToastKind::Finished,
         title: title.to_string(),
         context: detail.into(),
+        position: None,
         target: None,
     });
     app.sync_toast_deadline(None);
@@ -339,6 +341,9 @@ impl App {
             .get(&terminal_id)
             .map(crate::terminal::TerminalRuntime::current_size)
             .unwrap_or_else(|| self.state.estimate_pane_size());
+        let launch_env = self
+            .pane_launch_env(ws_idx, pane.pane_id, Vec::new())
+            .unwrap_or_default();
 
         let runtime = crate::terminal::TerminalRuntime::spawn(
             pane.pane_id,
@@ -348,6 +353,7 @@ impl App {
             self.state.pane_scrollback_limit_bytes,
             self.state.host_terminal_theme,
             crate::pane::PaneShellConfig::new(&self.state.default_shell, self.state.shell_mode),
+            &launch_env,
             self.event_tx.clone(),
             self.render_notify.clone(),
             self.render_dirty.clone(),
@@ -441,16 +447,20 @@ impl App {
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return Err(RemoteAttachApplyError::PaneMissing);
         };
-        let new_pane = ws
-            .split_focused_argv_command(
+        let (_tab_idx, new_pane) = ws
+            .split_pane_argv_command(
+                focused_pane,
                 Direction::Horizontal,
                 new_rows,
                 new_cols,
                 cwd,
                 &argv,
+                Vec::new(),
                 self.state.pane_scrollback_limit_bytes,
                 self.state.host_terminal_theme,
+                true,
             )
+            .ok_or(RemoteAttachApplyError::PaneMissing)?
             .map_err(|err| RemoteAttachApplyError::Spawn(err.to_string()))?;
         let pane_id = new_pane.pane_id;
         let terminal_id = new_pane.terminal.id.clone();
@@ -501,6 +511,9 @@ impl App {
             .get(&terminal_id)
             .map(crate::terminal::TerminalRuntime::current_size)
             .unwrap_or_else(|| self.state.estimate_pane_size());
+        let launch_env = self
+            .pane_launch_env(ws_idx, request.pane.pane_id, Vec::new())
+            .unwrap_or_default();
         let argv = remote_attach_argv_from_exe(exe, &request.target);
         let runtime = crate::terminal::TerminalRuntime::spawn_argv_command(
             request.pane.pane_id,
@@ -508,6 +521,7 @@ impl App {
             cols,
             cwd,
             &argv,
+            &launch_env,
             self.state.pane_scrollback_limit_bytes,
             self.state.host_terminal_theme,
             self.event_tx.clone(),
@@ -565,6 +579,7 @@ mod tests {
             title: None,
             display_agent: Some("codex".into()),
             agent_status: AgentStatus::Working,
+            screen_detection_skipped: false,
             custom_status: None,
             state_labels: HashMap::new(),
             agent_session: None,

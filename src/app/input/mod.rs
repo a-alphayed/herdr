@@ -23,6 +23,16 @@ enum WheelRouting {
 const WORKSPACE_DRAG_THRESHOLD: u16 = 1;
 const TAB_DRAG_THRESHOLD: u16 = 1;
 
+fn modified_url_click_modifier() -> KeyModifiers {
+    KeyModifiers::CONTROL
+}
+
+#[cfg(test)]
+#[test]
+fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
+    assert_eq!(modified_url_click_modifier(), KeyModifiers::CONTROL);
+}
+
 mod copy_mode;
 mod modal;
 mod mouse;
@@ -35,8 +45,8 @@ mod terminal;
 
 pub(crate) use self::{
     modal::{
-        handle_confirm_close_key, handle_context_menu_key, handle_global_menu_key,
-        handle_keybind_help_key, handle_navigator_key, handle_rename_key, handle_resize_key,
+        handle_global_menu_key, handle_keybind_help_key, handle_navigator_key,
+        insert_navigator_search_text, insert_rename_input_text,
     },
     navigate::terminal_direct_navigation_action,
     settings::open_settings_at,
@@ -45,6 +55,7 @@ use self::{
     modal::{
         modal_action_from_key, ModalAction, ONBOARDING_WELCOME_ACTIONS, RELEASE_NOTES_ACTIONS,
     },
+    mouse::MouseAction,
     settings::SettingsAction,
 };
 use super::state::{AppState, Mode};
@@ -56,42 +67,45 @@ use super::App;
 
 impl App {
     pub(super) async fn handle_key(&mut self, key: TerminalKey) {
+        let key_event = key.as_key_event();
+        if modal_paste_target_active(&self.state) && is_modal_paste_shortcut(&key_event) {
+            if let Some(text) = crate::platform::read_clipboard_text() {
+                self.paste_into_active_text_input(&text);
+            }
+            return;
+        }
+
         let previous_toast = self.state.toast.clone();
         match self.state.mode {
             Mode::Terminal => self.handle_terminal_key(key).await,
             Mode::Prefix => self.handle_prefix_key(key),
             Mode::Navigate => self.handle_navigate_key(key),
             Mode::Copy => self.handle_copy_mode_key(key),
-            _ => {
-                let key_event = key.as_key_event();
-                match self.state.mode {
-                    Mode::Onboarding => self.handle_onboarding_key(key_event),
-                    Mode::ReleaseNotes => self.handle_release_notes_key(key_event),
-                    Mode::ProductAnnouncement => self.handle_product_announcement_key(key_event),
-                    Mode::Prefix | Mode::Navigate | Mode::Copy => unreachable!(),
-                    Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
-                        handle_rename_key(&mut self.state, key_event)
-                    }
-                    Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
-                    Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
-                    Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
-                    Mode::Resize => handle_resize_key(&mut self.state, key),
-                    Mode::ConfirmClose => handle_confirm_close_key(&mut self.state, key_event),
-                    Mode::ConfirmRemoteAttach => self.handle_confirm_remote_attach_key(key_event),
-                    Mode::ContextMenu => {
-                        handle_context_menu_key(
-                            &mut self.state,
-                            &mut self.terminal_runtimes,
-                            key_event,
-                        );
-                    }
-                    Mode::Settings => self.handle_settings_key(key_event),
-                    Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key_event),
-                    Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key_event),
-                    Mode::Navigator => handle_navigator_key(&mut self.state, key_event),
-                    Mode::Terminal => unreachable!(),
+            _ => match self.state.mode {
+                Mode::Onboarding => self.handle_onboarding_key(key_event),
+                Mode::ReleaseNotes => self.handle_release_notes_key(key_event),
+                Mode::ProductAnnouncement => self.handle_product_announcement_key(key_event),
+                Mode::Prefix | Mode::Navigate | Mode::Copy => unreachable!(),
+                Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
+                    self.handle_rename_key_via_api(key_event)
                 }
-            }
+                Mode::NewLinkedWorktree => self.handle_worktree_create_key(key_event),
+                Mode::OpenExistingWorktree => self.handle_worktree_open_key(key_event),
+                Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
+                Mode::Resize => self.handle_resize_key_via_api(key),
+                Mode::ConfirmClose => self.handle_confirm_close_key_via_api(key_event),
+                Mode::ConfirmRemoteAttach => self.handle_confirm_remote_attach_key(key_event),
+                Mode::ContextMenu => {
+                    self.handle_context_menu_key_via_api(key_event);
+                }
+                Mode::Settings => self.handle_settings_key(key_event),
+                Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key_event),
+                Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key_event),
+                Mode::Navigator => {
+                    handle_navigator_key(&mut self.state, &self.terminal_runtimes, key_event)
+                }
+                Mode::Terminal => unreachable!(),
+            },
         }
         self.drain_remote_attach_request();
         self.drain_remote_attach_in_new_split_request();
@@ -102,8 +116,10 @@ impl App {
 
     pub(super) async fn handle_paste(&mut self, text: String) {
         if self.state.mode != Mode::Terminal {
+            self.paste_into_active_text_input(&text);
             return;
         }
+
         if let Some(ws_idx) = self.state.active {
             if let Some(rt) = self
                 .state
@@ -111,6 +127,39 @@ impl App {
             {
                 let _ = rt.send_paste(text).await;
             }
+        }
+    }
+
+    pub(crate) fn paste_into_active_text_input(&mut self, text: &str) -> bool {
+        match self.state.mode {
+            Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
+                insert_rename_input_text(&mut self.state, text);
+                true
+            }
+            Mode::NewLinkedWorktree => {
+                self.insert_worktree_create_text(text);
+                true
+            }
+            Mode::OpenExistingWorktree => {
+                if !self
+                    .state
+                    .worktree_open
+                    .as_ref()
+                    .is_some_and(|open| open.search_focused)
+                {
+                    return false;
+                }
+                self.insert_worktree_open_search_text(text);
+                true
+            }
+            Mode::Navigator => {
+                if !self.state.navigator.search_focused {
+                    return false;
+                }
+                insert_navigator_search_text(&mut self.state, &self.terminal_runtimes, text);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -215,24 +264,86 @@ impl App {
         let handled_pane_double_click = self.handle_pane_double_click(mouse);
 
         let previous_toast = self.state.toast.clone();
-        let previous_agent_panel_scope = self.state.agent_panel_scope;
+        let previous_agent_panel_sort = self.state.agent_panel_sort;
         let previous_settings_section = self.state.settings.section;
         if !handled_pane_double_click {
+            let right_button = matches!(
+                mouse.kind,
+                MouseEventKind::Down(MouseButton::Right)
+                    | MouseEventKind::Up(MouseButton::Right)
+                    | MouseEventKind::Drag(MouseButton::Right)
+            );
+            let intentional_pane_press = matches!(
+                mouse.kind,
+                MouseEventKind::Down(MouseButton::Left | MouseButton::Middle)
+            );
+            if !right_button
+                && intentional_pane_press
+                && matches!(self.state.mode, Mode::Terminal | Mode::Resize)
+            {
+                if let (Some(ws_idx), Some(info)) = (
+                    self.state.active,
+                    self.state.pane_at(mouse.column, mouse.row).cloned(),
+                ) {
+                    self.focus_pane_internal_via_api(ws_idx, info.id);
+                }
+            }
             if let Some(action) = self.state.handle_mouse(&mut self.terminal_runtimes, mouse) {
                 match action {
-                    SettingsAction::SaveTheme(name) => self.save_theme(&name),
-                    SettingsAction::SaveSound(enabled) => self.save_sound(enabled),
-                    SettingsAction::SaveToastDelivery(delivery) => {
-                        self.save_toast_delivery(delivery)
+                    MouseAction::Settings(action) => match action {
+                        SettingsAction::SaveTheme(name) => self.save_theme(&name),
+                        SettingsAction::SaveSound(enabled) => self.save_sound(enabled),
+                        SettingsAction::SaveToastDelivery(delivery) => {
+                            self.save_toast_delivery(delivery)
+                        }
+                        SettingsAction::SaveAgentBorderLabels(enabled) => {
+                            self.save_agent_border_labels(enabled)
+                        }
+                        SettingsAction::SavePaneHistory(enabled) => {
+                            self.save_pane_history_persistence(enabled)
+                        }
+                        SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
+                            self.save_switch_ascii_input_source_in_prefix(enabled)
+                        }
+                        SettingsAction::InstallRecommendedIntegrations => {
+                            self.install_recommended_integrations()
+                        }
+                    },
+                    MouseAction::FocusWorkspace { ws_idx } => {
+                        self.focus_workspace_idx_via_api(ws_idx)
                     }
-                    SettingsAction::SaveAgentBorderLabels(enabled) => {
-                        self.save_agent_border_labels(enabled)
+                    MouseAction::FocusTab { tab_idx } => self.focus_tab_idx_via_api(tab_idx),
+                    MouseAction::FocusPane { ws_idx, pane_id } => {
+                        self.focus_pane_internal_via_api(ws_idx, pane_id)
                     }
-                    SettingsAction::SavePaneHistory(enabled) => {
-                        self.save_pane_history_persistence(enabled)
+                    MouseAction::FocusRemoteAttachPane {
+                        ws_idx,
+                        pane_id,
+                        selected_remote_agent,
+                    } => {
+                        self.focus_pane_internal_via_api(ws_idx, pane_id);
+                        self.state.selected_remote_space = None;
+                        self.state.selected_remote_agent = Some(selected_remote_agent);
                     }
-                    SettingsAction::InstallRecommendedIntegrations => {
-                        self.install_recommended_integrations()
+                    MouseAction::FocusToastTarget => self.focus_toast_target_via_api(),
+                    MouseAction::MoveWorkspace {
+                        source_ws_idx,
+                        insert_idx,
+                    } => self.move_workspace_via_api(source_ws_idx, insert_idx),
+                    MouseAction::MoveTab {
+                        ws_idx,
+                        source_tab_idx,
+                        insert_idx,
+                    } => self.move_tab_via_api(ws_idx, source_tab_idx, insert_idx),
+                    MouseAction::SetSplitRatio { path, ratio } => {
+                        self.set_split_ratio_via_api(path, ratio)
+                    }
+                    MouseAction::RenameModal(action) => {
+                        self.apply_rename_mouse_action_via_api(action)
+                    }
+                    MouseAction::ConfirmCloseAccept => self.confirm_close_accept_via_api(),
+                    MouseAction::ContextMenu { menu, idx } => {
+                        self.apply_context_menu_action_via_api(menu, idx)
                     }
                 }
             }
@@ -247,8 +358,8 @@ impl App {
         {
             self.refresh_integration_recommendations();
         }
-        if self.state.agent_panel_scope != previous_agent_panel_scope {
-            self.save_agent_panel_scope(self.state.agent_panel_scope);
+        if self.state.agent_panel_sort != previous_agent_panel_sort {
+            self.save_agent_panel_sort(self.state.agent_panel_sort);
         }
 
         self.queue_pending_clipboard_write();
@@ -266,7 +377,7 @@ impl App {
     fn handle_modified_url_click(&mut self, mouse: MouseEvent) -> bool {
         if self.state.mode != Mode::Terminal
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            || !mouse.modifiers.contains(KeyModifiers::CONTROL)
+            || !mouse.modifiers.contains(modified_url_click_modifier())
         {
             return false;
         }
@@ -284,6 +395,13 @@ impl App {
         };
 
         self.last_pane_click = None;
+        match self.invoke_plugin_link_handler_for_url(&url, info.id) {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
+            }
+        }
         if let Err(err) = crate::platform::open_url(&url) {
             tracing::warn!(err = %err, url = %url, "failed to open pane URL");
         }
@@ -384,6 +502,36 @@ impl App {
     }
 }
 
+pub(crate) fn is_modal_paste_shortcut(key: &KeyEvent) -> bool {
+    if !matches!(key.code, KeyCode::Char('v' | 'V')) {
+        return false;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::CONTROL)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        key.modifiers.contains(KeyModifiers::CONTROL)
+    }
+}
+
+pub(crate) fn modal_paste_target_active(state: &AppState) -> bool {
+    match state.mode {
+        Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane | Mode::NewLinkedWorktree => {
+            true
+        }
+        Mode::OpenExistingWorktree => state
+            .worktree_open
+            .as_ref()
+            .is_some_and(|open| open.search_focused),
+        Mode::Navigator => state.navigator.search_focused,
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mouse handling
 // ---------------------------------------------------------------------------
@@ -427,6 +575,7 @@ impl AppState {
                 self.pane_scrollback_limit_bytes,
                 self.host_terminal_theme,
                 crate::pane::PaneShellConfig::new(&self.default_shell, self.shell_mode),
+                Vec::new(),
             ) {
                 let new_id = new_pane.pane_id;
                 terminal_runtimes.insert(new_pane.terminal.id.clone(), new_pane.runtime);
@@ -506,7 +655,6 @@ fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
         &terminal_runtimes,
         state.active,
         state.selected,
-        state.agent_panel_scope,
         state.sidebar_width,
         state.sidebar_section_split,
         state.collapsed_space_keys.clone(),
@@ -531,13 +679,116 @@ fn unique_temp_path(name: &str) -> std::path::PathBuf {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 fn wait_for_file(path: &std::path::Path) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
         if let Ok(content) = std::fs::read_to_string(path) {
-            return content;
+            if !content.is_empty() {
+                return content;
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     panic!("timed out waiting for {}", path.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> App {
+        App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn paste_routes_to_rename_modal_input() {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::RenameTab;
+        app.state.name_input = "2".into();
+        app.state.name_input_replace_on_type = true;
+
+        app.handle_paste("feature/logs".into()).await;
+
+        assert_eq!(app.state.name_input, "feature/logs");
+        assert!(!app.state.name_input_replace_on_type);
+    }
+
+    #[tokio::test]
+    async fn paste_routes_to_new_linked_worktree_input() {
+        let mut app = test_app();
+        app.state.mode = Mode::NewLinkedWorktree;
+        app.state.name_input = "generated-branch".into();
+        app.state.name_input_replace_on_type = true;
+        app.state.worktree_create = Some(crate::app::state::WorktreeCreateState {
+            source_workspace_id: "source".into(),
+            source_checkout_path: "/repo/herdr".into(),
+            source_existing_membership: None,
+            source_repo_root: "/repo/herdr".into(),
+            repo_key: "repo-key".into(),
+            repo_name: "herdr".into(),
+            branch: "generated-branch".into(),
+            checkout_path: "/repo/herdr-generated-branch".into(),
+            error: None,
+            creating: false,
+        });
+
+        app.handle_paste("feature/linear-302".into()).await;
+
+        assert_eq!(app.state.name_input, "feature/linear-302");
+        assert_eq!(
+            app.state
+                .worktree_create
+                .as_ref()
+                .map(|create| create.branch.as_str()),
+            Some("feature/linear-302")
+        );
+    }
+
+    #[test]
+    fn modal_paste_shortcut_matches_platform_primary_v() {
+        #[cfg(target_os = "macos")]
+        let modifiers = KeyModifiers::SUPER;
+        #[cfg(not(target_os = "macos"))]
+        let modifiers = KeyModifiers::CONTROL;
+
+        assert!(is_modal_paste_shortcut(&KeyEvent::new(
+            KeyCode::Char('v'),
+            modifiers
+        )));
+        assert!(is_modal_paste_shortcut(&KeyEvent::new(
+            KeyCode::Char('V'),
+            modifiers | KeyModifiers::SHIFT
+        )));
+        assert!(!is_modal_paste_shortcut(&KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::ALT
+        )));
+    }
+
+    #[test]
+    fn modal_paste_target_is_active_only_for_text_inputs() {
+        let mut state = AppState::test_new();
+
+        state.mode = Mode::RenameTab;
+        assert!(modal_paste_target_active(&state));
+
+        state.mode = Mode::Navigator;
+        state.navigator.search_focused = false;
+        assert!(!modal_paste_target_active(&state));
+        state.navigator.search_focused = true;
+        assert!(modal_paste_target_active(&state));
+
+        state.mode = Mode::ConfirmClose;
+        assert!(!modal_paste_target_active(&state));
+    }
 }
