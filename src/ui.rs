@@ -82,11 +82,11 @@ pub(crate) use self::{
         compute_workspace_card_areas, expanded_sidebar_sections, expanded_sidebar_toggle_rect,
         normalized_workspace_scroll, sidebar_section_divider_rect, source_rail_should_show,
         source_rail_target_at, source_rail_width, workspace_drop_indicator_row,
-        workspace_list_entries, workspace_list_entries_expanded, workspace_list_local_actions_rect,
-        workspace_list_menu_button_rect, workspace_list_new_button_rect, workspace_list_rect,
-        workspace_list_remote_target_at, workspace_list_scroll_metrics,
-        workspace_list_scrollbar_rect, workspace_parent_group_state, AgentPanelEntry,
-        WorkspaceListEntry, WorkspaceListRemoteTarget,
+        workspace_list_entries, workspace_list_entries_expanded, workspace_list_footer_rect,
+        workspace_list_local_actions_rect, workspace_list_menu_button_rect,
+        workspace_list_new_button_rect, workspace_list_rect, workspace_list_remote_target_at,
+        workspace_list_scroll_metrics, workspace_list_scrollbar_rect, workspace_parent_group_state,
+        AgentPanelEntry, WorkspaceListEntry, WorkspaceListRemoteTarget,
     },
 };
 pub(crate) use self::{

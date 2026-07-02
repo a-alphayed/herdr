@@ -166,12 +166,7 @@ impl AppState {
     }
 
     pub(crate) fn sidebar_footer_rect(&self) -> Rect {
-        let ws_area = self.workspace_list_rect();
-        if ws_area == Rect::default() {
-            return Rect::default();
-        }
-        let y = ws_area.y + ws_area.height.saturating_sub(1);
-        Rect::new(ws_area.x, y, ws_area.width, 1)
+        crate::ui::workspace_list_footer_rect(self.workspace_list_rect())
     }
 
     pub(crate) fn sidebar_local_actions_rect(&self) -> Rect {
@@ -1218,11 +1213,68 @@ mod tests {
     }
 
     #[test]
-    fn scrolled_off_local_actions_have_no_stale_new_or_menu_hit_targets() {
+    fn scrolled_local_workspace_list_keeps_footer_new_and_menu_hit_targets() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = (0..10)
             .map(|idx| Workspace::test_new(&format!("local-{idx}")))
             .collect();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        compute_desktop_view(&mut app);
+        app.state.workspace_scroll = app.state.workspaces.len();
+
+        let new_button = app.state.sidebar_new_button_rect();
+        let launcher = app.state.global_launcher_rect();
+        let footer = app.state.sidebar_footer_rect();
+        assert_ne!(new_button, Rect::default());
+        assert_ne!(launcher, Rect::default());
+        assert_eq!(new_button.y, footer.y);
+        assert_eq!(launcher.y, footer.y);
+
+        let list = app.state.workspace_list_rect();
+        let old_body_row = list.y.saturating_add(2);
+        let action = app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                list.x.saturating_add(1),
+                old_body_row,
+            ),
+        );
+
+        assert!(action.is_none());
+        assert!(!app.state.request_new_workspace);
+        assert_eq!(app.state.mode, Mode::Terminal);
+
+        let action = app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                new_button.x.saturating_add(1),
+                new_button.y,
+            ),
+        );
+
+        assert!(action.is_none());
+        assert!(app.state.request_new_workspace);
+
+        app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                launcher.x + launcher.width.saturating_sub(1),
+                launcher.y,
+            ),
+        );
+
+        assert_eq!(app.state.mode, Mode::GlobalMenu);
+    }
+
+    #[test]
+    fn desktop_remote_source_has_no_local_footer_new_or_menu_hit_targets() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("local")];
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
@@ -1242,32 +1294,31 @@ mod tests {
             }],
         );
         make_remote_agent_rows_visible(&mut app);
-        app.state.workspace_scroll = app.state.workspaces.len() + 1;
 
         assert_eq!(app.state.sidebar_new_button_rect(), Rect::default());
         assert_eq!(app.state.global_launcher_rect(), Rect::default());
 
-        let list = app.state.workspace_list_rect();
-        let old_action_row = list.y.saturating_add(1);
+        let footer = app.state.sidebar_footer_rect();
         let action = app.state.handle_mouse(
             &mut app.terminal_runtimes,
             mouse(
                 MouseEventKind::Down(MouseButton::Left),
-                list.x.saturating_add(1),
-                old_action_row,
+                footer.x.saturating_add(1),
+                footer.y,
             ),
         );
 
         assert!(action.is_none());
         assert!(!app.state.request_new_workspace);
+        assert!(app.state.request_remote_workspace_create.is_none());
         assert_eq!(app.state.mode, Mode::Terminal);
 
         app.state.handle_mouse(
             &mut app.terminal_runtimes,
             mouse(
                 MouseEventKind::Down(MouseButton::Left),
-                list.x + list.width.saturating_sub(1),
-                old_action_row,
+                footer.x + footer.width.saturating_sub(1),
+                footer.y,
             ),
         );
 
@@ -1276,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn global_menu_rect_opens_from_visible_local_footer_row() {
+    fn global_menu_rect_opens_from_fixed_local_footer_row() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = Vec::new();
         app.state.active = None;
@@ -1284,11 +1335,15 @@ mod tests {
         app.state.mode = Mode::Terminal;
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 140, 32));
 
-        let top_launcher = app.state.global_launcher_rect();
-        let top_menu = app.state.global_menu_rect();
-        assert_ne!(top_launcher, Rect::default());
-        assert!(top_launcher.y < top_menu.height);
-        assert_eq!(top_menu.y, top_launcher.y + top_launcher.height);
+        let empty_launcher = app.state.global_launcher_rect();
+        let empty_menu = app.state.global_menu_rect();
+        let empty_render_footer =
+            crate::ui::workspace_list_footer_rect(app.state.workspace_list_rect());
+        assert_ne!(empty_launcher, Rect::default());
+        assert_eq!(empty_render_footer.y, app.state.sidebar_footer_rect().y);
+        assert_eq!(empty_launcher.y, app.state.sidebar_footer_rect().y);
+        assert!(empty_launcher.y >= empty_menu.height);
+        assert_eq!(empty_menu.y + empty_menu.height, empty_launcher.y);
 
         app.state.workspaces = vec![
             Workspace::test_new("one"),
@@ -1300,11 +1355,18 @@ mod tests {
         app.state.workspace_scroll = 0;
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 140, 32));
 
-        let lower_launcher = app.state.global_launcher_rect();
-        let lower_menu = app.state.global_menu_rect();
-        assert_ne!(lower_launcher, Rect::default());
-        assert!(lower_launcher.y >= lower_menu.height);
-        assert_eq!(lower_menu.y + lower_menu.height, lower_launcher.y);
+        let populated_launcher = app.state.global_launcher_rect();
+        let populated_menu = app.state.global_menu_rect();
+        let populated_render_footer =
+            crate::ui::workspace_list_footer_rect(app.state.workspace_list_rect());
+        assert_ne!(populated_launcher, Rect::default());
+        assert_eq!(populated_render_footer.y, app.state.sidebar_footer_rect().y);
+        assert_eq!(populated_launcher.y, app.state.sidebar_footer_rect().y);
+        assert!(populated_launcher.y >= populated_menu.height);
+        assert_eq!(
+            populated_menu.y + populated_menu.height,
+            populated_launcher.y
+        );
     }
 
     #[test]

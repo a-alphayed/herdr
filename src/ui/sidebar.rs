@@ -731,7 +731,6 @@ pub(crate) enum WorkspaceListEntry {
         ws_idx: usize,
         indented: bool,
     },
-    LocalActions,
     RemoteSpace {
         key: crate::remote_source::RemoteSpaceKey,
         label: String,
@@ -790,7 +789,6 @@ fn workspace_list_entry_content_height(app: &AppState, entry: &WorkspaceListEntr
                 workspace_row_height(ws)
             }
         }
-        WorkspaceListEntry::LocalActions => 1,
         WorkspaceListEntry::RemoteSpace { .. } => 1,
         WorkspaceListEntry::RemoteNew { .. } => 1,
     }
@@ -801,7 +799,6 @@ fn workspace_list_entry_gap_after(entries: &[WorkspaceListEntry], idx: usize) ->
         Some(WorkspaceListEntry::Workspace { indented, .. }) => {
             u16::from(!(*indented && next_entry_is_indented_workspace(entries, idx)))
         }
-        Some(WorkspaceListEntry::LocalActions) => 0,
         Some(WorkspaceListEntry::RemoteSpace { .. }) => {
             u16::from(!next_entry_is_remote_space(entries, idx))
         }
@@ -812,7 +809,7 @@ fn workspace_list_entry_gap_after(entries: &[WorkspaceListEntry], idx: usize) ->
 
 pub(crate) fn normalized_workspace_scroll(app: &AppState, area: Rect, requested: usize) -> usize {
     let ws_area = workspace_list_rect(area, app.sidebar_section_split);
-    let body = workspace_list_body_rect(ws_area, false);
+    let body = workspace_list_body_rect_for_source(app, ws_area, false);
     if body.height == 0 {
         return requested;
     }
@@ -939,7 +936,6 @@ fn local_workspace_list_entries_inner(
             }
         }
     }
-    entries.push(WorkspaceListEntry::LocalActions);
     entries
 }
 
@@ -1062,37 +1058,54 @@ pub(crate) fn workspace_list_rect(area: Rect, split_ratio: f32) -> Rect {
 }
 
 pub(crate) fn workspace_list_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
+    workspace_list_body_rect_inner(area, has_scrollbar, true)
+}
+
+fn workspace_list_body_rect_for_source(app: &AppState, area: Rect, has_scrollbar: bool) -> Rect {
+    if matches!(app.effective_sidebar_source(), SidebarSource::Local) {
+        workspace_list_body_rect(area, has_scrollbar)
+    } else {
+        workspace_list_body_rect_inner(area, has_scrollbar, false)
+    }
+}
+
+fn workspace_list_body_rect_inner(area: Rect, has_scrollbar: bool, reserve_footer: bool) -> Rect {
     if area.width == 0 || area.height <= WORKSPACE_SECTION_HEADER_ROWS {
         return Rect::default();
     }
 
     let body_y = area.y.saturating_add(WORKSPACE_SECTION_HEADER_ROWS);
-    let footer_y = area.y + area.height.saturating_sub(1);
-    let body_height = footer_y.saturating_sub(body_y);
+    let body_bottom = if reserve_footer {
+        area.y + area.height.saturating_sub(1)
+    } else {
+        area.y + area.height
+    };
+    let body_height = body_bottom.saturating_sub(body_y);
     let body_width = area.width.saturating_sub(u16::from(has_scrollbar));
     Rect::new(area.x, body_y, body_width, body_height)
 }
 
+/// Returns the fixed footer row for an already-computed workspace-list area.
+pub(crate) fn workspace_list_footer_rect(area: Rect) -> Rect {
+    if area == Rect::default() {
+        return Rect::default();
+    }
+
+    let y = area.y + area.height.saturating_sub(1);
+    Rect::new(area.x, y, area.width, 1)
+}
+
 pub(crate) fn workspace_list_local_actions_rect(app: &AppState, area: Rect) -> Rect {
+    if !matches!(app.effective_sidebar_source(), SidebarSource::Local) {
+        return Rect::default();
+    }
+
     let ws_area = workspace_list_rect(area, app.sidebar_section_split);
-    if ws_area == Rect::default() {
-        return Rect::default();
-    }
-
-    let metrics = workspace_list_scroll_metrics(app, ws_area);
-    let body = workspace_list_body_rect(ws_area, should_show_scrollbar(metrics));
-    if body.width == 0 || body.height == 0 {
-        return Rect::default();
-    }
-
-    workspace_list_row_areas_for_body(app, body, app.workspace_scroll)
-        .into_iter()
-        .find_map(|row| matches!(row.entry, WorkspaceListEntry::LocalActions).then_some(row.rect))
-        .unwrap_or_default()
+    workspace_list_footer_rect(ws_area)
 }
 
 fn workspace_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> usize {
-    let body = workspace_list_body_rect(area, false);
+    let body = workspace_list_body_rect_for_source(app, area, false);
     if body.width == 0 || body.height == 0 {
         return 0;
     }
@@ -1122,7 +1135,7 @@ pub(crate) fn workspace_list_scroll_metrics(
 
 pub(crate) fn workspace_list_scrollbar_rect(app: &AppState, area: Rect) -> Option<Rect> {
     let metrics = workspace_list_scroll_metrics(app, area);
-    let body = workspace_list_body_rect(area, true);
+    let body = workspace_list_body_rect_for_source(app, area, true);
     (should_show_scrollbar(metrics) && body.width > 0 && body.height > 0).then_some(Rect::new(
         area.x + area.width.saturating_sub(1),
         body.y,
@@ -1242,7 +1255,7 @@ pub(crate) fn compute_workspace_list_areas(
     }
 
     let metrics = workspace_list_scroll_metrics(app, ws_area);
-    let body = workspace_list_body_rect(ws_area, should_show_scrollbar(metrics));
+    let body = workspace_list_body_rect_for_source(app, ws_area, should_show_scrollbar(metrics));
     if body.width == 0 || body.height == 0 {
         return (Vec::new(), Vec::new());
     }
@@ -1259,7 +1272,6 @@ pub(crate) fn compute_workspace_list_areas(
                     indented,
                 });
             }
-            WorkspaceListEntry::LocalActions => {}
             WorkspaceListEntry::RemoteSpace { key, .. } => {
                 remote_rows.push(WorkspaceListRemoteRowArea {
                     target: WorkspaceListRemoteTarget::Space { key },
@@ -1636,7 +1648,11 @@ fn render_workspace_list(
         _ => None,
     };
 
-    let list_bottom = area.y + area.height.saturating_sub(1);
+    let list_bottom = if matches!(app.effective_sidebar_source(), SidebarSource::Local) {
+        area.y + area.height.saturating_sub(1)
+    } else {
+        area.y + area.height
+    };
     if area.height > 0 {
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
@@ -1649,7 +1665,7 @@ fn render_workspace_list(
 
     let metrics = workspace_list_scroll_metrics(app, area);
     let scrollbar_rect = workspace_list_scrollbar_rect(app, area);
-    let body = workspace_list_body_rect(area, should_show_scrollbar(metrics));
+    let body = workspace_list_body_rect_for_source(app, area, should_show_scrollbar(metrics));
     let row_areas = workspace_list_row_areas_for_body(app, body, app.workspace_scroll);
     let cards = &app.view.workspace_card_areas;
 
@@ -1783,15 +1799,6 @@ fn render_workspace_list(
     for row in row_areas {
         match row.entry {
             WorkspaceListEntry::Workspace { .. } => {}
-            WorkspaceListEntry::LocalActions => {
-                render_local_actions_row(
-                    frame,
-                    row.rect,
-                    p,
-                    app.mouse_capture,
-                    app.global_menu_attention_badge_visible(),
-                );
-            }
             WorkspaceListEntry::RemoteSpace { key, label, status } => {
                 render_remote_space_row(app, &key, &label, status, frame, row.rect, p);
             }
@@ -1799,6 +1806,16 @@ fn render_workspace_list(
                 render_remote_new_row(frame, row.rect, p);
             }
         }
+    }
+
+    if matches!(app.effective_sidebar_source(), SidebarSource::Local) {
+        render_local_actions_row(
+            frame,
+            workspace_list_footer_rect(area),
+            p,
+            app.mouse_capture,
+            app.global_menu_attention_badge_visible(),
+        );
     }
 
     if let Some(y) = insertion_row.filter(|y| *y < list_bottom) {
@@ -2225,11 +2242,8 @@ mod tests {
         );
     }
 
-    fn workspace_entries_without_local_actions(app: &AppState) -> Vec<WorkspaceListEntry> {
+    fn workspace_entries(app: &AppState) -> Vec<WorkspaceListEntry> {
         workspace_list_entries(app)
-            .into_iter()
-            .filter(|entry| !matches!(entry, WorkspaceListEntry::LocalActions))
-            .collect()
     }
 
     fn select_remote_projection(app: &mut AppState, host: &RemoteHostKey) {
@@ -2605,22 +2619,45 @@ mod tests {
             .expect("local workspace row")
             .rect
             .y;
-        let action_row = row_areas
-            .iter()
-            .find(|row| matches!(row.entry, WorkspaceListEntry::LocalActions))
-            .expect("local action row")
-            .rect
-            .y;
+        let footer = workspace_list_footer_rect(area);
 
         assert!(header_row.contains(" spaces"));
         assert!(!header_row.contains("new"));
         assert!(!header_row.contains("menu"));
-        assert!(rows[action_row as usize].contains(" new"));
-        assert!(rows[action_row as usize].trim_end().ends_with("menu"));
-        assert!(local_row < action_row);
+        assert_eq!(workspace_list_entries(&app).len(), 1);
+        assert!(matches!(
+            workspace_list_entries(&app).first(),
+            Some(WorkspaceListEntry::Workspace { ws_idx: 0, .. })
+        ));
+        assert!(!row_areas.iter().any(|row| row.rect.y == footer.y));
+        for y in body.y..footer.y {
+            assert!(!rows[y as usize].contains(" new"));
+            assert!(!rows[y as usize].contains("menu"));
+        }
+        assert!(rows[footer.y as usize].contains(" new"));
+        assert!(rows[footer.y as usize].trim_end().ends_with("menu"));
+        assert!(local_row < footer.y);
         assert!(!row_areas
             .iter()
             .any(|row| matches!(row.entry, WorkspaceListEntry::RemoteSpace { .. })));
+    }
+
+    #[test]
+    fn empty_local_workspace_list_renders_footer_actions() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = Vec::new();
+        app.active = None;
+        app.selected = 0;
+        app.mouse_capture = true;
+
+        let area = Rect::new(0, 0, 40, 16);
+        let rows = rendered_workspace_rows(&app, area);
+        let footer = workspace_list_footer_rect(area);
+
+        assert!(workspace_list_entries(&app).is_empty());
+        assert_ne!(footer, Rect::default());
+        assert!(rows[footer.y as usize].contains(" new"));
+        assert!(rows[footer.y as usize].trim_end().ends_with("menu"));
     }
 
     #[test]
@@ -2636,7 +2673,7 @@ mod tests {
             .replace_connected_snapshot(host.clone(), vec![agent]);
         select_remote_projection(&mut app, &host);
 
-        let entries = workspace_entries_without_local_actions(&app);
+        let entries = workspace_entries(&app);
 
         assert_eq!(entries.len(), 1);
         assert!(matches!(
@@ -2700,7 +2737,7 @@ mod tests {
         );
         select_remote_projection(&mut app, &host);
 
-        let entries = workspace_entries_without_local_actions(&app);
+        let entries = workspace_entries(&app);
 
         assert!(matches!(
             &entries[..],
@@ -2735,7 +2772,7 @@ mod tests {
         enable_remote_workspace_create(&mut app, &host);
         select_remote_projection(&mut app, &host);
 
-        let entries = workspace_entries_without_local_actions(&app);
+        let entries = workspace_entries(&app);
 
         assert_eq!(entries.len(), 1);
         assert!(matches!(
@@ -2799,7 +2836,7 @@ mod tests {
         enable_remote_workspace_create(&mut app, &host);
         select_remote_projection(&mut app, &host);
 
-        let entries = workspace_entries_without_local_actions(&app);
+        let entries = workspace_entries(&app);
         assert!(matches!(
             &entries[..],
             [
@@ -2833,6 +2870,36 @@ mod tests {
     }
 
     #[test]
+    fn remote_workspace_list_uses_bottom_row_without_local_footer() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = Vec::new();
+        app.active = None;
+        app.selected = 0;
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.remote_sources.replace_workspace_snapshot(
+            host.clone(),
+            vec![remote_workspace("remote-ws", "blank shell")],
+        );
+        enable_remote_workspace_create(&mut app, &host);
+        select_remote_projection(&mut app, &host);
+
+        let area = Rect::new(0, 0, 40, WORKSPACE_SECTION_HEADER_ROWS + 3);
+        let bottom_y = area.y + area.height.saturating_sub(1);
+        let body = workspace_list_body_rect_for_source(&app, area, false);
+        let row_areas = workspace_list_row_areas_for_body(&app, body, app.workspace_scroll);
+        let new_row = row_areas
+            .iter()
+            .find(|row| matches!(row.entry, WorkspaceListEntry::RemoteNew { .. }))
+            .expect("remote new action");
+
+        assert_eq!(new_row.rect.y, bottom_y);
+
+        let rows = rendered_workspace_rows(&app, area);
+        assert_eq!(rows[bottom_y as usize].trim(), "new");
+        assert!(!rows[bottom_y as usize].contains("menu"));
+    }
+
+    #[test]
     fn remote_workspace_new_action_hides_for_incapable_or_disconnected_hosts() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = Vec::new();
@@ -2852,11 +2919,11 @@ mod tests {
         );
         select_remote_projection(&mut app, &incapable);
 
-        let entries = workspace_entries_without_local_actions(&app);
+        let entries = workspace_entries(&app);
 
         assert!(entries.is_empty());
         select_remote_projection(&mut app, &disconnected);
-        assert!(workspace_entries_without_local_actions(&app).is_empty());
+        assert!(workspace_entries(&app).is_empty());
     }
 
     #[test]
@@ -2908,7 +2975,7 @@ mod tests {
             .replace_workspace_snapshot(host.clone(), Vec::new());
         select_remote_projection(&mut app, &host);
 
-        let entries = workspace_entries_without_local_actions(&app);
+        let entries = workspace_entries(&app);
 
         assert!(entries.is_empty());
     }
@@ -2987,9 +3054,7 @@ mod tests {
             .into_iter()
             .filter_map(|entry| match entry {
                 WorkspaceListEntry::RemoteSpace { label, .. } => Some(label),
-                WorkspaceListEntry::Workspace { .. }
-                | WorkspaceListEntry::LocalActions
-                | WorkspaceListEntry::RemoteNew { .. } => None,
+                WorkspaceListEntry::Workspace { .. } | WorkspaceListEntry::RemoteNew { .. } => None,
             })
             .collect::<Vec<_>>();
         let agent_labels = agent_panel_entries(&app)
@@ -3569,7 +3634,7 @@ mod tests {
             workspace_with_worktree_space("review", Some("repo-key"), "/repo/herdr-review"),
         ];
 
-        let entries = workspace_entries_without_local_actions(&app);
+        let entries = workspace_entries(&app);
 
         assert_eq!(
             entries,
@@ -3620,8 +3685,8 @@ mod tests {
         let metrics = workspace_list_scroll_metrics(&app, ws_area);
 
         assert_eq!(metrics.viewport_rows, 1);
-        assert_eq!(metrics.max_offset_from_bottom, 2);
-        assert_eq!(metrics.offset_from_bottom, 2);
+        assert_eq!(metrics.max_offset_from_bottom, 1);
+        assert_eq!(metrics.offset_from_bottom, 1);
     }
 
     #[test]
@@ -3653,7 +3718,7 @@ mod tests {
         ];
 
         assert_eq!(
-            workspace_entries_without_local_actions(&app),
+            workspace_entries(&app),
             vec![
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
@@ -3677,7 +3742,7 @@ mod tests {
         ];
 
         assert_eq!(
-            workspace_entries_without_local_actions(&app),
+            workspace_entries(&app),
             vec![
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
@@ -3704,7 +3769,7 @@ mod tests {
         ];
 
         assert_eq!(
-            workspace_entries_without_local_actions(&app),
+            workspace_entries(&app),
             vec![
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
@@ -3728,7 +3793,7 @@ mod tests {
         ];
 
         assert_eq!(
-            workspace_entries_without_local_actions(&app),
+            workspace_entries(&app),
             vec![
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
@@ -3755,7 +3820,7 @@ mod tests {
         ];
 
         assert_eq!(
-            workspace_entries_without_local_actions(&app),
+            workspace_entries(&app),
             vec![
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
@@ -3781,7 +3846,7 @@ mod tests {
         app.collapsed_space_keys.insert("repo-key".into());
 
         assert_eq!(
-            workspace_entries_without_local_actions(&app),
+            workspace_entries(&app),
             vec![
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
@@ -3797,7 +3862,7 @@ mod tests {
         app.active = None;
         app.mode = Mode::Terminal;
         assert_eq!(
-            workspace_entries_without_local_actions(&app),
+            workspace_entries(&app),
             vec![WorkspaceListEntry::Workspace {
                 ws_idx: 0,
                 indented: false,
@@ -3818,7 +3883,7 @@ mod tests {
         app.collapsed_space_keys.insert("repo-key".into());
 
         assert_eq!(
-            workspace_entries_without_local_actions(&app),
+            workspace_entries(&app),
             vec![
                 WorkspaceListEntry::Workspace {
                     ws_idx: 0,
