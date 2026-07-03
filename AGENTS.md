@@ -15,6 +15,19 @@ Terminal workspace manager for AI coding agents. Rust + ratatui.
 
 Read-only investigation can happen in the shared checkout.
 
+## Ahmed's production and dev Herdr installs
+
+Ahmed's daily Herdr is this fork, not vanilla/upstream Herdr. Do not reinstall or switch him back to a package-managed vanilla Herdr unless he explicitly asks.
+
+- Linux main workflow command: `/home/amf/.local/bin/herdr`, installed from this fork's release build.
+- Linux main launcher/shortcut: `SUPER+Return` runs `/home/amf/.local/bin/ghostty-herdr`, which opens Ghostty around `/home/amf/.local/bin/herdr`.
+- Linux dev launcher: `herdr-dev` / `/home/amf/.local/bin/ghostty-herdr-dev`, which opens Ghostty around `/home/amf/Projects/herdr/target/debug/herdr`.
+- Main config/state: `~/.config/herdr` and `~/.local/state/herdr`.
+- Dev config/state: `~/.config/herdr-dev` and `~/.local/state/herdr-dev`.
+- `home-mini` main command: `/opt/homebrew/bin/herdr -> /Users/afayed/.local/bin/herdr`, installed from the same fork build shape. The source checkout lives at `/Users/afayed/Projects/herdr`.
+
+Use the main install for Ahmed's real workflow. Use the dev launcher or explicit source-built dev binary for runtime validation. Keep main and dev servers/config/state separate; do not run dev tests in the main workflow server.
+
 Small changes or small tasks are fine in the default main worktree. If you find unrelated implementation changes already in progress in the main worktree, use a dedicated worktree instead. Use a dedicated worktree for bigger features too.
 
 Use this layout:
@@ -81,7 +94,7 @@ Default flow: run `just check` before committing. Do not commit until `just chec
 For any feature, slice, or work unit with user-visible UI or runtime behavior, do end-to-end testing in **Ghostty Herdr Dev** before asking Ahmed to approve a commit, merge, or push. Be satisfied the feature actually works in the dev app, not only in unit tests.
 
 - Use the dedicated Ghostty Herdr Dev launcher (`ghostty-herdr-dev.desktop` / `~/.local/bin/ghostty-herdr-dev`) and the source-built dev binary it launches. Rebuild that explicit dev binary before testing when needed.
-- Do not launch dev runtime tests inside Ahmed's vanilla Herdr panes, workspaces, default session, or normal named sessions. Ahmed uses vanilla Herdr for work; do not touch or mutate it for validation.
+- Do not launch dev runtime tests inside Ahmed's main workflow Herdr panes, workspaces, default session, or normal named sessions. Ahmed uses this fork in production for work; do not touch or mutate the main workflow server for validation.
 - Keep dev runtime state isolated with `herdr-dev` config/state or task-scoped temp `XDG_CONFIG_HOME` and `XDG_STATE_HOME`. If running from an existing Herdr environment, the dev config must intentionally allow nesting with `[experimental] allow_nested = true`.
 - Capture screenshot proof through the Omarchy/Ghostty desktop path after the end-to-end test. Inspect the screenshot and report the screenshot path plus what was verified before the commit gate.
 - If the dev launcher, screenshot, or runtime validation fails or is ambiguous, treat the work unit as not ready. Fix it or report the blocker before asking for commit or push approval.
