@@ -443,6 +443,8 @@ mod tests {
             RemoteSourceCapabilities {
                 workspace_list_local: false,
                 workspace_create: true,
+                tab_list: false,
+                layout_export: false,
             },
         );
         assert_eq!(

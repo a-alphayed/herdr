@@ -717,6 +717,12 @@ fn federation_method_for_api_method(method: &crate::api::schema::Method) -> Opti
         crate::api::schema::Method::AgentStart(_) => {
             Some(crate::api::schema::FederationCapabilities::AGENT_START)
         }
+        crate::api::schema::Method::TabList(_) => {
+            Some(crate::api::schema::FederationCapabilities::TAB_LIST)
+        }
+        crate::api::schema::Method::LayoutExport(_) => {
+            Some(crate::api::schema::FederationCapabilities::LAYOUT_EXPORT)
+        }
         _ => None,
     }
 }
@@ -3134,6 +3140,49 @@ mod tests {
             vec![
                 crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
                 crate::api::schema::FederationCapabilities::WORKSPACE_CREATE
+            ]
+        );
+    }
+
+    #[test]
+    fn required_federation_methods_include_remote_tab_list_method() {
+        let request = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::TabList(
+                crate::api::schema::TabListParams::default(),
+            ),
+        };
+
+        let methods = required_federation_methods_for_request(&request);
+
+        assert_eq!(
+            methods,
+            vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::TAB_LIST
+            ]
+        );
+    }
+
+    #[test]
+    fn required_federation_methods_include_remote_layout_export_method() {
+        let request = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::LayoutExport(
+                crate::api::schema::LayoutExportParams {
+                    tab_id: Some("w1:1".to_string()),
+                    pane_id: None,
+                },
+            ),
+        };
+
+        let methods = required_federation_methods_for_request(&request);
+
+        assert_eq!(
+            methods,
+            vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::LAYOUT_EXPORT
             ]
         );
     }

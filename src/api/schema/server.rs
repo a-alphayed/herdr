@@ -49,6 +49,8 @@ impl FederationCapabilities {
     pub const AGENT_SEND: &'static str = "agent_send";
     pub const AGENT_FOCUS: &'static str = "agent_focus";
     pub const AGENT_START: &'static str = "agent_start";
+    pub const TAB_LIST: &'static str = "tab_list";
+    pub const LAYOUT_EXPORT: &'static str = "layout_export";
     pub const TERMINAL_ATTACH: &'static str = "terminal_attach";
 
     pub fn current() -> Self {
@@ -64,6 +66,8 @@ impl FederationCapabilities {
                 Self::AGENT_SEND,
                 Self::AGENT_FOCUS,
                 Self::AGENT_START,
+                Self::TAB_LIST,
+                Self::LAYOUT_EXPORT,
                 Self::TERMINAL_ATTACH,
             ]
             .into_iter()

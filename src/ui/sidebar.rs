@@ -2238,6 +2238,8 @@ mod tests {
             RemoteSourceCapabilities {
                 workspace_list_local: true,
                 workspace_create: true,
+                tab_list: true,
+                layout_export: true,
             },
         );
     }

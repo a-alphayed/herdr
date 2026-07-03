@@ -1150,6 +1150,8 @@ mod tests {
             RemoteSourceCapabilities {
                 workspace_list_local: true,
                 workspace_create: true,
+                tab_list: true,
+                layout_export: true,
             },
         );
         make_remote_agent_rows_visible(&mut app);
@@ -1192,6 +1194,8 @@ mod tests {
             RemoteSourceCapabilities {
                 workspace_list_local: true,
                 workspace_create: true,
+                tab_list: true,
+                layout_export: true,
             },
         );
         compute_desktop_view(&mut app);

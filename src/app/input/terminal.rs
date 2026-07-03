@@ -81,6 +81,16 @@ impl App {
             return None;
         }
 
+        // A projected remote space is read-only: never forward keys to a local
+        // terminal runtime (or any remote session) while one is selected.
+        if self.state.selected_remote_space.is_some() {
+            debug!(
+                code = ?key_event.code,
+                "dropping terminal key event while projected remote space is selected"
+            );
+            return None;
+        }
+
         let ws_idx = self.state.active?;
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane_id = ws.focused_pane_id()?;
@@ -1190,5 +1200,43 @@ mod tests {
             .expect("scroll metrics after PageUp");
         // Forwarded to pane, so test runtime doesn't process it — scroll stays at bottom.
         assert_eq!(end_metrics.offset_from_bottom, 0);
+    }
+
+    #[tokio::test]
+    async fn prepare_terminal_key_forward_drops_keys_while_remote_space_projected() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let mut ws = Workspace::test_new("test");
+        let root_pane = ws.tabs[0].root_pane;
+        ws.insert_test_runtime(
+            root_pane,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b""),
+        );
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
+            host: "jafar".to_string(),
+            session: "default".to_string(),
+            workspace_id: "ws-remote".to_string(),
+        });
+
+        // A plain char key that would otherwise resolve the focused pane runtime
+        // and forward to it; the projection guard must drop it before lookup.
+        let prepared = app.prepare_terminal_key_forward(TerminalKey::new(
+            KeyCode::Char('a'),
+            KeyModifiers::empty(),
+        ));
+        assert!(
+            prepared.is_none(),
+            "terminal key must not forward while a remote space is projected"
+        );
     }
 }

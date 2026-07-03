@@ -16,10 +16,14 @@ use tracing::debug;
 
 use crate::api::client::{parse_response_value, ApiClientError};
 use crate::api::schema::{
-    AgentInfo, EmptyParams, Method, PingParams, Request, ResponseResult, WorkspaceInfo,
+    AgentInfo, EmptyParams, LayoutDescription, LayoutExportParams, Method, PingParams, Request,
+    ResponseResult, WorkspaceInfo,
 };
 use crate::events::AppEvent;
-use crate::remote_source::{RemoteConnectionStatus, RemoteHostKey, RemoteSourceCapabilities};
+use crate::remote_source::{
+    RemoteConnectionStatus, RemoteHostKey, RemoteProjectionSnapshot, RemoteProjectionStatus,
+    RemoteSourceCapabilities,
+};
 use crate::remote_target::{RemoteHostConfig, RemoteHostRegistry};
 
 const REMOTE_SOURCE_PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -139,7 +143,7 @@ fn remote_source_supervisor_loop_with<F>(
         let now = Instant::now();
         if now >= next_snapshot {
             match send_remote_source_snapshot(&host, &send, capabilities) {
-                Ok((agents, workspaces)) => {
+                Ok((agents, workspaces, projections)) => {
                     if stop.load(Ordering::Relaxed) {
                         break;
                     }
@@ -148,6 +152,7 @@ fn remote_source_supervisor_loop_with<F>(
                         agents,
                         workspaces,
                         capabilities,
+                        projections,
                     });
                     next_snapshot = now + REMOTE_SOURCE_SNAPSHOT_INTERVAL;
                 }
@@ -204,11 +209,18 @@ where
     parse_ping_response(&response)
 }
 
+/// Core snapshot + projected layouts produced by [`send_remote_source_snapshot`].
+type RemoteSourceSnapshotParts = (
+    Vec<AgentInfo>,
+    Option<Vec<WorkspaceInfo>>,
+    Vec<RemoteProjectionSnapshot>,
+);
+
 fn send_remote_source_snapshot<F>(
     host: &RemoteHostConfig,
     send: &F,
     capabilities: RemoteSourceCapabilities,
-) -> io::Result<(Vec<AgentInfo>, Option<Vec<WorkspaceInfo>>)>
+) -> io::Result<RemoteSourceSnapshotParts>
 where
     F: Fn(&RemoteHostConfig, &Request) -> io::Result<String>,
 {
@@ -218,7 +230,91 @@ where
     } else {
         None
     };
-    Ok((agents, workspaces))
+    // Bounded eager projection fetch: at most one layout.export per remote
+    // workspace active tab, and only when both tab_list and layout_export are
+    // advertised. Per-workspace failures become unavailable/stale projection
+    // metadata, never an io::Err that would drive RemoteSourceDisconnected.
+    let projections = build_projections(host, send, capabilities, workspaces.as_deref());
+    Ok((agents, workspaces, projections))
+}
+
+fn build_projections<F>(
+    host: &RemoteHostConfig,
+    send: &F,
+    capabilities: RemoteSourceCapabilities,
+    workspaces: Option<&[WorkspaceInfo]>,
+) -> Vec<RemoteProjectionSnapshot>
+where
+    F: Fn(&RemoteHostConfig, &Request) -> io::Result<String>,
+{
+    if !capabilities.tab_list || !capabilities.layout_export {
+        return Vec::new();
+    }
+    let Some(workspaces) = workspaces else {
+        return Vec::new();
+    };
+    let mut projections = Vec::new();
+    for workspace in workspaces {
+        let active_tab_id = workspace.active_tab_id.trim();
+        if active_tab_id.is_empty() {
+            projections.push(RemoteProjectionSnapshot {
+                workspace_id: workspace.workspace_id.clone(),
+                tab_id: None,
+                tab_label: None,
+                status: RemoteProjectionStatus::Unavailable,
+                layout: None,
+            });
+            continue;
+        }
+        match send_layout_export(host, send, active_tab_id) {
+            Ok(layout) => projections.push(RemoteProjectionSnapshot {
+                workspace_id: workspace.workspace_id.clone(),
+                tab_id: Some(layout.tab_id.clone()),
+                tab_label: None,
+                status: RemoteProjectionStatus::Available,
+                layout: Some(layout),
+            }),
+            Err(err) => {
+                debug!(
+                    host = %host.name,
+                    session = %host.session,
+                    workspace = %workspace.workspace_id,
+                    err = %err,
+                    "remote projection fetch failed"
+                );
+                projections.push(RemoteProjectionSnapshot {
+                    workspace_id: workspace.workspace_id.clone(),
+                    tab_id: Some(active_tab_id.to_string()),
+                    tab_label: None,
+                    status: RemoteProjectionStatus::Unavailable,
+                    layout: None,
+                });
+            }
+        }
+    }
+    projections
+}
+
+fn send_layout_export<F>(
+    host: &RemoteHostConfig,
+    send: &F,
+    tab_id: &str,
+) -> io::Result<LayoutDescription>
+where
+    F: Fn(&RemoteHostConfig, &Request) -> io::Result<String>,
+{
+    let response = send(host, &layout_export_request(tab_id))?;
+    parse_layout_export_response(&response)
+}
+
+fn parse_layout_export_response(response: &str) -> io::Result<LayoutDescription> {
+    match parse_success_response(response)? {
+        ResponseResult::LayoutExport { layout } => Ok(layout),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected layout.export response, got {other:?}"),
+        )),
+    }
 }
 
 fn send_agent_list<F>(host: &RemoteHostConfig, send: &F) -> io::Result<Vec<AgentInfo>>
@@ -258,6 +354,16 @@ pub(crate) fn workspace_list_request() -> Request {
     }
 }
 
+pub(crate) fn layout_export_request(tab_id: &str) -> Request {
+    Request {
+        id: "remote-source.layout-export".to_string(),
+        method: Method::LayoutExport(LayoutExportParams {
+            tab_id: Some(tab_id.to_string()),
+            pane_id: None,
+        }),
+    }
+}
+
 pub(crate) fn parse_ping_response(response: &str) -> io::Result<RemoteSourceCapabilities> {
     match parse_success_response(response)? {
         ResponseResult::Pong { capabilities, .. } => {
@@ -285,6 +391,10 @@ pub(crate) fn parse_ping_response(response: &str) -> io::Result<RemoteSourceCapa
                 ),
                 workspace_create: federation
                     .supports_method(crate::api::schema::FederationCapabilities::WORKSPACE_CREATE),
+                tab_list: federation
+                    .supports_method(crate::api::schema::FederationCapabilities::TAB_LIST),
+                layout_export: federation
+                    .supports_method(crate::api::schema::FederationCapabilities::LAYOUT_EXPORT),
             })
         }
         other => Err(io::Error::new(
@@ -341,7 +451,9 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::AtomicUsize;
 
-    use crate::api::schema::{AgentStatus, ErrorBody, ErrorResponse, SuccessResponse};
+    use crate::api::schema::{
+        AgentStatus, ErrorBody, ErrorResponse, LayoutNode, LayoutPane, SuccessResponse,
+    };
 
     use super::*;
 
@@ -444,6 +556,27 @@ mod tests {
         serde_json::to_string(&SuccessResponse {
             id: "remote-source.workspace-list".to_string(),
             result: ResponseResult::WorkspaceList { workspaces },
+        })
+        .unwrap()
+    }
+
+    fn layout_export_response(workspace_id: &str, tab_id: &str) -> String {
+        serde_json::to_string(&SuccessResponse {
+            id: "remote-source.layout-export".to_string(),
+            result: ResponseResult::LayoutExport {
+                layout: LayoutDescription {
+                    workspace_id: workspace_id.to_string(),
+                    tab_id: tab_id.to_string(),
+                    zoomed: false,
+                    focused_pane_id: format!("{tab_id}-1"),
+                    root: LayoutNode::Pane {
+                        pane: LayoutPane {
+                            label: Some("shell".to_string()),
+                            ..Default::default()
+                        },
+                    },
+                },
+            },
         })
         .unwrap()
     }
@@ -576,6 +709,7 @@ mod tests {
                     Method::WorkspaceListLocal(_) => {
                         Ok(workspace_list_response(vec![workspace("ws-1", "tmp")]))
                     }
+                    Method::LayoutExport(_) => Ok(layout_export_response("ws-1", "tab-1")),
                     _ => unreachable!("unexpected request"),
                 }
             });
@@ -590,6 +724,7 @@ mod tests {
             agents,
             workspaces,
             capabilities,
+            projections,
         } = event
         else {
             panic!("expected snapshot event");
@@ -597,11 +732,17 @@ mod tests {
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
         assert!(capabilities.workspace_list_local);
         assert!(capabilities.workspace_create);
+        assert!(capabilities.tab_list);
+        assert!(capabilities.layout_export);
         assert_eq!(agents[0].terminal_id, "term-1");
         let workspaces = workspaces.expect("workspace snapshot");
         assert_eq!(workspaces[0].workspace_id, "ws-1");
         assert_eq!(workspaces[0].label, "tmp");
-        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].workspace_id, "ws-1");
+        assert_eq!(projections[0].status, RemoteProjectionStatus::Available);
+        assert_eq!(projections[0].layout.as_ref().unwrap().tab_id, "tab-1");
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
     }
 
     #[test]
@@ -634,6 +775,7 @@ mod tests {
             agents,
             workspaces,
             capabilities,
+            projections,
         } = event
         else {
             panic!("expected snapshot event");
@@ -641,8 +783,11 @@ mod tests {
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
         assert!(!capabilities.workspace_list_local);
         assert!(!capabilities.workspace_create);
+        assert!(!capabilities.tab_list);
+        assert!(!capabilities.layout_export);
         assert_eq!(agents[0].terminal_id, "term-1");
         assert_eq!(workspaces, None);
+        assert!(projections.is_empty());
         assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
@@ -869,5 +1014,55 @@ mod tests {
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("expected workspace.list_local"));
+    }
+
+    #[test]
+    fn remote_supervisor_parse_ping_advertises_tab_list_and_layout_export() {
+        let capabilities = parse_ping_response(&pong_response()).unwrap();
+        assert!(capabilities.workspace_list_local);
+        assert!(capabilities.workspace_create);
+        assert!(capabilities.tab_list);
+        assert!(capabilities.layout_export);
+    }
+
+    #[test]
+    fn remote_supervisor_loop_returns_snapshot_with_unavailable_projection_on_layout_export_failure(
+    ) {
+        let (tx, mut rx) = mpsc::channel(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let host = RemoteHostConfig::new("jafar", "jafar", "default", true);
+
+        let handle = thread::spawn(move || {
+            remote_source_supervisor_loop_with(host, tx, thread_stop, move |_host, request| {
+                match &request.method {
+                    Method::Ping(_) => Ok(pong_response()),
+                    Method::AgentListLocal(_) => Ok(agent_list_response(vec![agent("term-1")])),
+                    Method::WorkspaceListLocal(_) => {
+                        Ok(workspace_list_response(vec![workspace("ws-1", "tmp")]))
+                    }
+                    Method::LayoutExport(_) => Err(io::Error::other("layout export denied")),
+                    _ => unreachable!("unexpected request"),
+                }
+            });
+        });
+
+        let event = rx.blocking_recv().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        // A projection fetch failure must NOT drive RemoteSourceDisconnected; the
+        // core snapshot is still delivered with an unavailable projection entry.
+        let AppEvent::RemoteSourceSnapshot {
+            host, projections, ..
+        } = event
+        else {
+            panic!("expected snapshot event, not disconnected");
+        };
+        assert_eq!(host, RemoteHostKey::new("jafar", "default"));
+        assert_eq!(projections.len(), 1);
+        assert_eq!(projections[0].workspace_id, "ws-1");
+        assert_eq!(projections[0].status, RemoteProjectionStatus::Unavailable);
+        assert!(projections[0].layout.is_none());
     }
 }

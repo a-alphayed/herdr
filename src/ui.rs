@@ -300,6 +300,44 @@ fn compute_view_internal(
         compute_workspace_card_areas(app, sidebar_panel_rect)
     };
 
+    // A projected remote space renders read-only in the main area. Local tab/pane
+    // geometry, hit targets, split borders, and background pane resizing are all
+    // suppressed so no local terminal runtime or remote session can be touched
+    // through mouse/keyboard while the projection is active.
+    if app.selected_remote_space.is_some() {
+        let toast_hit_area = app
+            .toast
+            .as_ref()
+            .map(|toast| {
+                toast_notification_rect(
+                    area,
+                    toast,
+                    app.config_diagnostic.is_some(),
+                    toast.position.unwrap_or(app.toast_config.herdr.position),
+                )
+            })
+            .unwrap_or_default();
+        app.view = crate::app::ViewState {
+            layout: ViewLayout::Desktop,
+            sidebar_rect: sidebar_area,
+            source_rail_rect,
+            sidebar_panel_rect,
+            workspace_card_areas,
+            tab_bar_rect: Rect::default(),
+            tab_hit_areas: Vec::new(),
+            tab_scroll_left_hit_area: Rect::default(),
+            tab_scroll_right_hit_area: Rect::default(),
+            new_tab_hit_area: Rect::default(),
+            terminal_area: main_area,
+            mobile_header_rect: Rect::default(),
+            mobile_menu_hit_area: Rect::default(),
+            toast_hit_area,
+            pane_infos: Vec::new(),
+            split_borders: Vec::new(),
+        };
+        return;
+    }
+
     let tab_bar_view = app
         .active
         .and_then(|ws_idx| app.workspaces.get(ws_idx))
@@ -393,6 +431,35 @@ fn compute_mobile_view(
         app.mobile_switcher_scroll = app.mobile_switcher_scroll.min(max_scroll);
     }
 
+    // A projected remote space renders read-only on mobile too: no local split
+    // borders, pane infos, or background pane resizing.
+    if app.selected_remote_space.is_some() {
+        let toast_hit_area = app
+            .toast
+            .as_ref()
+            .map(|_| mobile_toast_banner_rect(area, app.config_diagnostic.is_some()))
+            .unwrap_or_default();
+        app.view = crate::app::ViewState {
+            layout: ViewLayout::Mobile,
+            sidebar_rect: Rect::default(),
+            source_rail_rect: Rect::default(),
+            sidebar_panel_rect: Rect::default(),
+            workspace_card_areas: Vec::new(),
+            tab_bar_rect: Rect::default(),
+            tab_hit_areas: Vec::new(),
+            tab_scroll_left_hit_area: Rect::default(),
+            tab_scroll_right_hit_area: Rect::default(),
+            new_tab_hit_area: Rect::default(),
+            terminal_area,
+            mobile_header_rect: header_rect,
+            mobile_menu_hit_area: Rect::default(),
+            toast_hit_area,
+            pane_infos: Vec::new(),
+            split_borders: Vec::new(),
+        };
+        return;
+    }
+
     let split_borders = app
         .active
         .and_then(|i| app.workspaces.get(i))
@@ -468,10 +535,15 @@ pub fn render_with_runtime_registry(
             render_sidebar(app, terminal_runtimes, frame, sidebar_area);
         }
     }
-    if app.view.layout != ViewLayout::Mobile {
+    let remote_projection_active = app.selected_remote_space.is_some();
+    if app.view.layout != ViewLayout::Mobile && !remote_projection_active {
         render_tab_bar(app, frame, tab_bar_area);
     }
-    render_panes(app, terminal_runtimes, frame, terminal_area);
+    if remote_projection_active {
+        render_remote_projection(app, frame, terminal_area);
+    } else {
+        render_panes(app, terminal_runtimes, frame, terminal_area);
+    }
 
     // Ambient notifications sit above panes, but below interactive overlays.
     render_notifications(app, frame, terminal_area);
@@ -507,6 +579,137 @@ pub fn render_with_runtime_registry(
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
         Mode::Terminal => {}
+    }
+}
+
+/// Render a read-only projected remote workspace in the main area.
+///
+/// This is intentionally non-interactive: it draws the host/session/workspace/
+/// tab identity, a live/stale/unavailable status, and (when available) the remote
+/// layout as plain bordered boxes. It never forwards input or mutates any local
+/// or remote terminal runtime.
+fn render_remote_projection(app: &AppState, frame: &mut Frame, terminal_area: Rect) {
+    use ratatui::layout::Alignment;
+    use ratatui::text::Line;
+    use ratatui::widgets::Paragraph;
+
+    use crate::remote_source::RemoteProjectionStatus;
+
+    let Some(selected) = app.selected_remote_space.as_ref() else {
+        return;
+    };
+    let projection = app.remote_sources.projection_for_space(selected);
+    let status = projection.as_ref().map(|projection| projection.status);
+    let workspace_label = projection
+        .as_ref()
+        .map(|projection| projection.workspace_id.clone())
+        .unwrap_or_else(|| selected.workspace_id.clone());
+    let tab_label = projection
+        .as_ref()
+        .and_then(|projection| {
+            projection
+                .tab_label
+                .clone()
+                .or_else(|| projection.tab_id.clone())
+        })
+        .unwrap_or_else(|| "<no active tab>".to_string());
+    let layout_root = projection
+        .as_ref()
+        .and_then(|projection| projection.layout.as_ref())
+        .map(|layout| layout.root.clone());
+
+    let (status_label, status_style) = match status {
+        Some(RemoteProjectionStatus::Available) => {
+            ("live", Style::default().add_modifier(Modifier::BOLD))
+        }
+        Some(RemoteProjectionStatus::StaleLastKnown) => ("stale (last known)", Style::default()),
+        Some(RemoteProjectionStatus::Unavailable) | None => ("unavailable", Style::default()),
+    };
+
+    let header = Line::from(vec![
+        Span::raw("remote  "),
+        Span::styled(
+            format!("{} / {}", selected.host, selected.session),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   workspace "),
+        Span::raw(workspace_label),
+        Span::raw("   tab "),
+        Span::raw(tab_label),
+        Span::raw("   "),
+        Span::styled(status_label, status_style),
+    ]);
+
+    if terminal_area.height < 3 {
+        frame.render_widget(
+            Paragraph::new(vec![header]).alignment(Alignment::Left),
+            terminal_area,
+        );
+        return;
+    }
+
+    let [header_area, body_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(terminal_area);
+    frame.render_widget(
+        Paragraph::new(vec![header]).alignment(Alignment::Left),
+        header_area,
+    );
+
+    match status {
+        Some(RemoteProjectionStatus::Available) | Some(RemoteProjectionStatus::StaleLastKnown)
+            if layout_root.is_some() =>
+        {
+            render_projection_layout(frame, &layout_root.expect("layout root"), body_area);
+        }
+        _ => frame.render_widget(
+            Paragraph::new(vec![Line::from(vec![Span::raw(format!(
+                "remote projection {status_label}"
+            ))])])
+            .alignment(Alignment::Center),
+            body_area,
+        ),
+    }
+}
+
+/// Recursively draw a projected remote layout as non-interactive bordered boxes.
+fn render_projection_layout(frame: &mut Frame, node: &crate::api::schema::LayoutNode, area: Rect) {
+    use crate::api::schema::{LayoutNode, SplitDirection};
+    use ratatui::widgets::{Block, Borders};
+
+    match node {
+        LayoutNode::Pane { pane } => {
+            let title = pane
+                .label
+                .clone()
+                .or_else(|| pane.pane_id.clone())
+                .unwrap_or_else(|| "pane".to_string());
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(Span::raw(format!(" {title} ")));
+            frame.render_widget(block, area);
+        }
+        LayoutNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            if area.width < 2 || area.height < 2 {
+                return;
+            }
+            let weight = ((*ratio).clamp(0.05, 0.95) * 1000.0).round() as u32;
+            let other = 1000u32.saturating_sub(weight);
+            let constraints = [
+                Constraint::Ratio(weight, 1000),
+                Constraint::Ratio(other.max(1), 1000),
+            ];
+            let [first_area, second_area] = match direction {
+                SplitDirection::Right => Layout::horizontal(constraints).areas(area),
+                SplitDirection::Down => Layout::vertical(constraints).areas(area),
+            };
+            render_projection_layout(frame, first, first_area);
+            render_projection_layout(frame, second, second_area);
+        }
     }
 }
 
@@ -629,6 +832,44 @@ mod tests {
     use crate::{app::state::ViewLayout, layout::PaneInfo, workspace::Workspace};
     use ratatui::style::Color;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[tokio::test]
+    async fn desktop_view_with_selected_remote_space_hides_local_hit_targets_and_skips_resize() {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("test");
+        let _ = ws.test_split(ratatui::layout::Direction::Horizontal);
+        ws.insert_test_runtime(
+            ws.tabs[0].root_pane,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"local"),
+        );
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
+            host: "jafar".to_string(),
+            session: "default".to_string(),
+            workspace_id: "ws-remote".to_string(),
+        });
+
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+
+        // No local tab bar or tab hit targets while a projected remote space is
+        // selected.
+        assert_eq!(app.view.tab_bar_rect, Rect::default());
+        assert!(app.view.tab_hit_areas.is_empty());
+        assert_eq!(app.view.tab_scroll_left_hit_area, Rect::default());
+        assert_eq!(app.view.tab_scroll_right_hit_area, Rect::default());
+        assert_eq!(app.view.new_tab_hit_area, Rect::default());
+        // No local pane hit targets or split-border resize handles: because the
+        // projection branch skips compute_pane_infos and the background/desktop
+        // pane resize entirely, no local pane is resized and no mouse click/drag
+        // can resolve a local pane.
+        assert!(app.view.pane_infos.is_empty());
+        assert!(app.view.split_borders.is_empty());
+        // The projection renders across the whole main area.
+        assert!(app.view.terminal_area.width > 0);
+    }
 
     #[test]
     fn copy_feedback_offset_only_increases_when_toast_rect_overlaps() {

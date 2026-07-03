@@ -2359,6 +2359,7 @@ mod tests {
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
+            projections: Vec::new(),
         });
 
         assert!(app.state.remote_sources.list_entries().is_empty());
@@ -2379,6 +2380,7 @@ mod tests {
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
+            projections: Vec::new(),
         });
 
         assert!(app.state.remote_sources.list_entries().is_empty());
@@ -2400,6 +2402,7 @@ mod tests {
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
+            projections: Vec::new(),
         });
 
         assert_eq!(app.state.remote_sources.list_entries().len(), 1);
@@ -3256,6 +3259,7 @@ auto_connect = false
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
+            projections: Vec::new(),
         });
         assert!(app.state.remote_sources.list_host_statuses().is_empty());
         assert!(app.state.remote_sources.list_entries().is_empty());

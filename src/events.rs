@@ -9,7 +9,8 @@ use crate::api::schema::{AgentInfo, WorkspaceInfo};
 use crate::detect::{Agent, AgentState};
 use crate::layout::PaneId;
 use crate::remote_source::{
-    RemoteAgentKey, RemoteConnectionStatus, RemoteHostKey, RemoteSourceCapabilities,
+    RemoteAgentKey, RemoteConnectionStatus, RemoteHostKey, RemoteProjectionSnapshot,
+    RemoteSourceCapabilities,
 };
 use crate::workspace::{GitStatusCacheEntry, WorkspaceGitStatus};
 
@@ -134,6 +135,7 @@ pub enum AppEvent {
         agents: Vec<AgentInfo>,
         workspaces: Option<Vec<WorkspaceInfo>>,
         capabilities: RemoteSourceCapabilities,
+        projections: Vec<RemoteProjectionSnapshot>,
     },
     /// A connected authoritative remote host/session reported one newer agent entry.
     #[allow(dead_code)]

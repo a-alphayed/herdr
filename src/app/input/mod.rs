@@ -120,6 +120,12 @@ impl App {
             return;
         }
 
+        // A projected remote space is read-only: never paste into a local
+        // terminal runtime (or any remote session) while one is selected.
+        if self.state.selected_remote_space.is_some() {
+            return;
+        }
+
         if let Some(ws_idx) = self.state.active {
             if let Some(rt) = self
                 .state
@@ -721,6 +727,36 @@ mod tests {
 
         assert_eq!(app.state.name_input, "feature/logs");
         assert!(!app.state.name_input_replace_on_type);
+    }
+
+    #[tokio::test]
+    async fn paste_does_nothing_while_remote_space_projected() {
+        let mut app = test_app();
+        let mut ws = crate::workspace::Workspace::test_new("test");
+        let root_pane = ws.tabs[0].root_pane;
+        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(20, 5);
+        ws.insert_test_runtime(root_pane, runtime);
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
+            host: "jafar".to_string(),
+            session: "default".to_string(),
+            workspace_id: "ws-remote".to_string(),
+        });
+
+        // The projection guard must short-circuit before any local runtime or
+        // remote session receives the paste, so no bytes reach the runtime's
+        // input channel.
+        app.handle_paste("injected".into()).await;
+
+        assert!(
+            input_rx.try_recv().is_err(),
+            "paste must not reach the focused pane runtime while a remote space is projected"
+        );
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.selected_remote_space.is_some());
     }
 
     #[tokio::test]

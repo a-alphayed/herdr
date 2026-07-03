@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::api::schema::{AgentInfo, WorkspaceInfo};
+use crate::api::schema::{AgentInfo, LayoutDescription, WorkspaceInfo};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RemoteHostKey {
@@ -120,6 +120,45 @@ pub(crate) struct RemoteHostStatusEntry {
 pub(crate) struct RemoteSourceCapabilities {
     pub(crate) workspace_list_local: bool,
     pub(crate) workspace_create: bool,
+    pub(crate) tab_list: bool,
+    pub(crate) layout_export: bool,
+}
+
+/// Projection availability for a single remote workspace's active-tab layout.
+///
+/// Projections are rebuildable soft state, like the rest of this cache: a fetch
+/// failure never disconnects the host or drops agents/workspaces, and a
+/// disconnect preserves the last-known layout but marks it stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteProjectionStatus {
+    /// A fresh `layout.export` succeeded for the workspace's active tab.
+    Available,
+    /// The most recent projection fetch failed (or there is no active tab) and
+    /// no prior layout is cached.
+    Unavailable,
+    /// A prior layout is cached but the most recent fetch failed or the host
+    /// went non-connected. The cached layout is kept for read-only display.
+    StaleLastKnown,
+}
+
+/// One remote workspace's projected layout, cached for read-only display.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RemoteProjectionEntry {
+    pub(crate) workspace_id: String,
+    pub(crate) tab_id: Option<String>,
+    pub(crate) tab_label: Option<String>,
+    pub(crate) status: RemoteProjectionStatus,
+    pub(crate) layout: Option<LayoutDescription>,
+}
+
+/// A projection snapshot flowing from a supervisor into the cache reducer.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RemoteProjectionSnapshot {
+    pub(crate) workspace_id: String,
+    pub(crate) tab_id: Option<String>,
+    pub(crate) tab_label: Option<String>,
+    pub(crate) status: RemoteProjectionStatus,
+    pub(crate) layout: Option<LayoutDescription>,
 }
 
 impl RemoteAgentEntry {
@@ -139,6 +178,7 @@ struct RemoteHostCache {
     agents: BTreeMap<String, AgentInfo>,
     workspaces: Option<BTreeMap<String, WorkspaceInfo>>,
     capabilities: RemoteSourceCapabilities,
+    projections: BTreeMap<String, RemoteProjectionEntry>,
 }
 
 impl Default for RemoteHostCache {
@@ -148,6 +188,7 @@ impl Default for RemoteHostCache {
             agents: BTreeMap::new(),
             workspaces: None,
             capabilities: RemoteSourceCapabilities::default(),
+            projections: BTreeMap::new(),
         }
     }
 }
@@ -244,7 +285,74 @@ impl RemoteSourceCache {
     }
 
     pub(crate) fn mark_status(&mut self, host: &RemoteHostKey, status: RemoteConnectionStatus) {
-        self.hosts.entry(host.clone()).or_default().status = status;
+        let host_cache = self.hosts.entry(host.clone()).or_default();
+        host_cache.status = status;
+        // A non-connected host keeps its cached projections for read-only display
+        // but they are no longer fresh, so available projections become stale.
+        if !status.is_connected() {
+            for projection in host_cache.projections.values_mut() {
+                if projection.status == RemoteProjectionStatus::Available {
+                    projection.status = RemoteProjectionStatus::StaleLastKnown;
+                }
+            }
+        }
+    }
+
+    /// Replace the cached projections for a host with a fresh supervisor snapshot.
+    ///
+    /// Per-workspace projection fetch failures never disconnect the host or drop
+    /// agents/workspaces: they only turn the affected workspace's projection
+    /// unavailable, or stale-last-known when a prior layout is still cached.
+    pub(crate) fn apply_projection_snapshot(
+        &mut self,
+        host: &RemoteHostKey,
+        projections: Vec<RemoteProjectionSnapshot>,
+    ) {
+        let host_cache = self.hosts.entry(host.clone()).or_default();
+        let mut next: BTreeMap<String, RemoteProjectionEntry> = BTreeMap::new();
+        for snapshot in projections {
+            let entry = match snapshot.status {
+                RemoteProjectionStatus::Available => RemoteProjectionEntry {
+                    workspace_id: snapshot.workspace_id.clone(),
+                    tab_id: snapshot.tab_id.clone(),
+                    tab_label: snapshot.tab_label.clone(),
+                    status: RemoteProjectionStatus::Available,
+                    layout: snapshot.layout.clone(),
+                },
+                RemoteProjectionStatus::Unavailable | RemoteProjectionStatus::StaleLastKnown => {
+                    // A fetch failure keeps the last-known layout when present so the
+                    // read-only view can still show it (marked stale); otherwise the
+                    // projection is simply unavailable for this workspace.
+                    let (status, layout) = host_cache
+                        .projections
+                        .get(&snapshot.workspace_id)
+                        .and_then(|existing| existing.layout.clone())
+                        .map(|layout| (RemoteProjectionStatus::StaleLastKnown, Some(layout)))
+                        .unwrap_or((RemoteProjectionStatus::Unavailable, None));
+                    RemoteProjectionEntry {
+                        workspace_id: snapshot.workspace_id.clone(),
+                        tab_id: snapshot.tab_id.clone(),
+                        tab_label: snapshot.tab_label.clone(),
+                        status,
+                        layout,
+                    }
+                }
+            };
+            next.insert(snapshot.workspace_id, entry);
+        }
+        host_cache.projections = next;
+    }
+
+    /// Look up the cached projection for a selected remote space.
+    pub(crate) fn projection_for_space(
+        &self,
+        key: &RemoteSpaceKey,
+    ) -> Option<RemoteProjectionEntry> {
+        let host = RemoteHostKey::new(key.host.clone(), key.session.clone());
+        self.hosts
+            .get(&host)
+            .and_then(|host_cache| host_cache.projections.get(&key.workspace_id))
+            .cloned()
     }
 
     pub(crate) fn ensure_host(&mut self, host: RemoteHostKey, status: RemoteConnectionStatus) {
@@ -253,6 +361,7 @@ impl RemoteSourceCache {
             agents: BTreeMap::new(),
             workspaces: None,
             capabilities: RemoteSourceCapabilities::default(),
+            projections: BTreeMap::new(),
         });
     }
 
@@ -262,6 +371,7 @@ impl RemoteSourceCache {
             agents: BTreeMap::new(),
             workspaces: None,
             capabilities: RemoteSourceCapabilities::default(),
+            projections: BTreeMap::new(),
         });
         host_cache.status = RemoteConnectionStatus::Connected;
 
@@ -337,7 +447,9 @@ impl RemoteSourceCache {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::api::schema::{AgentInfo, AgentStatus, WorkspaceInfo};
+    use crate::api::schema::{
+        AgentInfo, AgentStatus, LayoutDescription, LayoutNode, LayoutPane, WorkspaceInfo,
+    };
 
     use super::*;
 
@@ -457,6 +569,8 @@ mod tests {
             RemoteSourceCapabilities {
                 workspace_list_local: true,
                 workspace_create: true,
+                tab_list: true,
+                layout_export: true,
             },
         );
 
@@ -466,6 +580,8 @@ mod tests {
             RemoteSourceCapabilities {
                 workspace_list_local: true,
                 workspace_create: true,
+                tab_list: true,
+                layout_export: true,
             }
         );
         assert!(!cache.host_supports_workspace_create(&other));
@@ -801,5 +917,152 @@ mod tests {
         assert_eq!(workspace_entries.len(), 1);
         assert_eq!(workspace_entries[0].workspace.workspace_id, "ws-keep");
         assert!(cache.workspace_entries_for_host(&remove).is_none());
+    }
+
+    fn layout_for(tab_id: &str) -> LayoutDescription {
+        LayoutDescription {
+            workspace_id: "w1".to_string(),
+            tab_id: tab_id.to_string(),
+            zoomed: false,
+            focused_pane_id: format!("{tab_id}-1"),
+            root: LayoutNode::Pane {
+                pane: LayoutPane {
+                    label: Some("shell".to_string()),
+                    ..Default::default()
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn remote_source_apply_projection_snapshot_caches_available_layout() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+
+        cache.apply_projection_snapshot(
+            &host,
+            vec![RemoteProjectionSnapshot {
+                workspace_id: "ws-1".to_string(),
+                tab_id: Some("w1:1".to_string()),
+                tab_label: Some("dev".to_string()),
+                status: RemoteProjectionStatus::Available,
+                layout: Some(layout_for("w1:1")),
+            }],
+        );
+
+        let entry = cache
+            .projection_for_space(&RemoteSpaceKey {
+                host: "jafar".to_string(),
+                session: "default".to_string(),
+                workspace_id: "ws-1".to_string(),
+            })
+            .expect("projection cached");
+        assert_eq!(entry.status, RemoteProjectionStatus::Available);
+        assert_eq!(entry.workspace_id, "ws-1");
+        assert_eq!(entry.tab_label.as_deref(), Some("dev"));
+        assert_eq!(entry.layout.as_ref().unwrap().tab_id, "w1:1");
+    }
+
+    #[test]
+    fn remote_source_apply_projection_snapshot_keeps_last_known_layout_as_stale_on_failure() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+
+        // First snapshot delivers an available projection for ws-1 and a fresh
+        // unavailable one for ws-2 (no prior layout).
+        cache.apply_projection_snapshot(
+            &host,
+            vec![
+                RemoteProjectionSnapshot {
+                    workspace_id: "ws-1".to_string(),
+                    tab_id: Some("w1:1".to_string()),
+                    tab_label: None,
+                    status: RemoteProjectionStatus::Available,
+                    layout: Some(layout_for("w1:1")),
+                },
+                RemoteProjectionSnapshot {
+                    workspace_id: "ws-2".to_string(),
+                    tab_id: Some("w2:1".to_string()),
+                    tab_label: None,
+                    status: RemoteProjectionStatus::Unavailable,
+                    layout: None,
+                },
+            ],
+        );
+
+        // Second snapshot reports both as unavailable (fetch failures). ws-1 must
+        // keep its last-known layout but become stale; ws-2 has no prior layout
+        // and stays unavailable.
+        cache.apply_projection_snapshot(
+            &host,
+            vec![
+                RemoteProjectionSnapshot {
+                    workspace_id: "ws-1".to_string(),
+                    tab_id: Some("w1:1".to_string()),
+                    tab_label: None,
+                    status: RemoteProjectionStatus::Unavailable,
+                    layout: None,
+                },
+                RemoteProjectionSnapshot {
+                    workspace_id: "ws-2".to_string(),
+                    tab_id: Some("w2:1".to_string()),
+                    tab_label: None,
+                    status: RemoteProjectionStatus::Unavailable,
+                    layout: None,
+                },
+            ],
+        );
+
+        let ws1 = cache
+            .projection_for_space(&RemoteSpaceKey {
+                host: "jafar".to_string(),
+                session: "default".to_string(),
+                workspace_id: "ws-1".to_string(),
+            })
+            .expect("ws-1 projection");
+        assert_eq!(ws1.status, RemoteProjectionStatus::StaleLastKnown);
+        assert_eq!(ws1.layout.as_ref().unwrap().tab_id, "w1:1");
+
+        let ws2 = cache
+            .projection_for_space(&RemoteSpaceKey {
+                host: "jafar".to_string(),
+                session: "default".to_string(),
+                workspace_id: "ws-2".to_string(),
+            })
+            .expect("ws-2 projection");
+        assert_eq!(ws2.status, RemoteProjectionStatus::Unavailable);
+        assert!(ws2.layout.is_none());
+    }
+
+    #[test]
+    fn remote_source_disconnect_marks_available_projection_stale_and_preserves_layout() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+        cache.apply_projection_snapshot(
+            &host,
+            vec![RemoteProjectionSnapshot {
+                workspace_id: "ws-1".to_string(),
+                tab_id: Some("w1:1".to_string()),
+                tab_label: None,
+                status: RemoteProjectionStatus::Available,
+                layout: Some(layout_for("w1:1")),
+            }],
+        );
+
+        // Disconnect must preserve agents/workspaces/projections; it only marks
+        // the available projection stale.
+        cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
+        cache.mark_status(&host, RemoteConnectionStatus::Disconnected);
+
+        let entry = cache
+            .projection_for_space(&RemoteSpaceKey {
+                host: "jafar".to_string(),
+                session: "default".to_string(),
+                workspace_id: "ws-1".to_string(),
+            })
+            .expect("projection kept");
+        assert_eq!(entry.status, RemoteProjectionStatus::StaleLastKnown);
+        assert_eq!(entry.layout.as_ref().unwrap().tab_id, "w1:1");
+        assert_eq!(cache.list_entries().len(), 1);
     }
 }
