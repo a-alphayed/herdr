@@ -1640,6 +1640,13 @@
                     "null"
                   ]
                 },
+                "terminal_id": {
+                  "description": "Server-owned transient terminal id; omitted by older remotes (read-only fallback).",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "type": {
                   "const": "pane",
                   "type": "string"
@@ -6090,6 +6097,13 @@
                   ]
                 },
                 "pane_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "terminal_id": {
+                  "description": "Server-owned transient terminal id; omitted by older remotes (read-only fallback).",
                   "type": [
                     "string",
                     "null"

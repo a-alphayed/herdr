@@ -11,6 +11,9 @@
 - Added `herdr terminal session control` for bridge processes that need live ANSI frames plus input, resize, scroll, release, and takeover authority.
 - Added `agent.submit` socket API method and `herdr agent submit <target> <text>` CLI command to submit a prompt (text plus Enter) to a composer-style agent target. `agent send` remains literal text injection; `agent submit` is the headless/controller-side way to actually submit a prompt without an interactive attach.
 - Added `ui.hide_tab_bar_when_single_tab` to hide the tab row when a workspace has one tab. (#448)
+- Added `terminal_id` field to `layout.export` pane nodes so the server-assigned transient terminal id is available to remote projection consumers.
+- Added `<host>/terminal:<terminal_id>` CLI target form (`herdr agent attach <host>/terminal:<id>`) to attach directly to a specific terminal on a configured remote host using a terminal id from `layout.export`.
+- Remote workspace projection (source projection) is now interactive: clicking a live projected pane or pressing Enter on its focused pane opens a local attach split directly without requiring a separate `agent attach` command. Stale and no-terminal-id panes remain read-only. Paste and non-Enter keys are still swallowed while a remote projection is selected.
 
 ### Changed
 - Bumped the client/server protocol version to 15 for socket API placement mutation event and response compatibility.

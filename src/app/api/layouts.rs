@@ -324,6 +324,7 @@ impl App {
                 .map(|cwd| cwd.display().to_string()),
             command: terminal.and_then(|terminal| terminal.launch_argv.clone()),
             env: Default::default(),
+            terminal_id: Some(terminal_id.to_string()),
         })
     }
 

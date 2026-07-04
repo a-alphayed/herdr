@@ -686,6 +686,40 @@ impl AppState {
                         }
                         return None;
                     }
+                } else if self.selected_remote_space.is_some() {
+                    // Left-click in the projection body area. Projection hit
+                    // areas take precedence: a click on a live pane schedules
+                    // an attach split and clears the selection; a click on a
+                    // stale/read-only pane is silently consumed; a miss is a
+                    // no-op — the else-if chain disables local pane hit-testing
+                    // while a remote projection is selected.
+                    let col = mouse.column;
+                    let row = mouse.row;
+                    if let Some(hit) = self
+                        .view
+                        .remote_projection_hit_areas
+                        .iter()
+                        .find(|h| {
+                            col >= h.rect.x
+                                && col < h.rect.x + h.rect.width
+                                && row >= h.rect.y
+                                && row < h.rect.y + h.rect.height
+                        })
+                        .cloned()
+                    {
+                        if hit.live {
+                            if let Some(terminal_id) = hit.terminal_id {
+                                self.request_remote_attach_in_new_split =
+                                    Some(crate::remote_source::RemoteAttachTarget {
+                                        host: hit.host,
+                                        session: hit.session,
+                                        terminal_id,
+                                        label: hit.label,
+                                    });
+                                self.selected_remote_space = None;
+                            }
+                        }
+                    }
                 } else if let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() {
                     if self.mode != Mode::Terminal {
                         self.mode = Mode::Terminal;

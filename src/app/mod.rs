@@ -696,6 +696,7 @@ impl App {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                remote_projection_hit_areas: Vec::new(),
             },
             drag: None,
             workspace_press: None,
@@ -1718,6 +1719,8 @@ impl App {
                 crate::raw_input::RawInputEvent::Paste(text) => {
                     if self.state.mode != Mode::Terminal {
                         self.paste_into_active_text_input(&text);
+                    } else if self.state.selected_remote_space.is_some() {
+                        // A projected remote space is read-only; drop the paste.
                     } else {
                         if let Some(ws_idx) = self.state.active {
                             if let Some(ws) = self.state.workspaces.get(ws_idx) {
@@ -5364,6 +5367,38 @@ last_pane = "prefix+tab"
         app.route_client_input(b"\x1b]".to_vec());
 
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn route_client_events_paste_does_nothing_while_remote_space_projected() {
+        let mut app = test_app();
+        let mut ws = Workspace::test_new("test");
+        let root_pane = ws.tabs[0].root_pane;
+        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(20, 5);
+        ws.insert_test_runtime(root_pane, runtime);
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
+            host: "jafar".to_string(),
+            session: "default".to_string(),
+            workspace_id: "ws-remote".to_string(),
+        });
+
+        app.route_client_events(
+            vec![crate::raw_input::RawInputEvent::Paste("injected".into())],
+            true,
+        );
+
+        assert!(
+            input_rx.try_recv().is_err(),
+            "route_client_events paste must not reach runtime while a remote space is projected"
+        );
+        assert!(
+            app.state.selected_remote_space.is_some(),
+            "projection selection must remain after dropped paste"
+        );
     }
 
     #[test]

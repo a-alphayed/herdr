@@ -45,6 +45,28 @@ Remote submit is federation-routed like `agent.send`: the controller resolves a 
 
 The controller-only headless orchestration path is `place -> submit prompt -> agent reacts -> controller reads reaction`, with no SSH/manual attach step. `agent.submit` provides the submit primitive; full end-to-end controller-only runtime proof for composer-style agents is the E.0 validation step.
 
+### Interactive projected pane attach (Phase E.1)
+
+Phase E.1 makes remote workspace projection interactive: a projected pane that has a live `terminal_id` can be clicked or focused-and-Enter'd to open a local attach split, replacing the previous read-only view.
+
+Mechanism:
+
+- `layout.export` pane nodes now carry `terminal_id` (the server-assigned transient id; omitted by older remotes).
+- `compute_view_internal` computes `RemoteProjectionHitArea` geometry for each projected pane, carrying `host`, `session`, `terminal_id`, `focused`, and `live` state.
+- Mouse click on a live hit area, or plain Enter on the focused live pane, sets `request_remote_attach_in_new_split` to a `RemoteAttachTarget { host, session, terminal_id, label }` and clears `selected_remote_space`.
+- `precheck_remote_attach_target` validates host connectivity via `host_status()` only; it does not require the `terminal_id` to be in the local agent cache — the remote server validates it.
+- Paste and all non-Enter keys continue to be swallowed while a remote projection is selected. The plain-Enter exception is narrow: plain Enter (no modifiers) only, and only when the hit area is both focused and live with a `terminal_id`.
+- Stale projections (last-known snapshots from a disconnected host) remain fully read-only; their panes render without the live border style and do not respond to click or Enter.
+- `<host>/terminal:<id>` is also exposed as a CLI target form: `herdr agent attach <host>/terminal:<id> [--takeover]`.
+
+Invariants preserved:
+
+- `RemoteSpaceKey { host, session, workspace_id }` is SELECTION-ONLY — it is not a `RemoteAttachTarget`.
+- No-takeover default; `--takeover` is CLI-only.
+- The runtime-only attach split is not persisted.
+- Projection hit areas take precedence in mouse routing when a projection is selected.
+- Remote source authority, hook relay, and PTY ownership are unchanged.
+
 ### Teardown (still future)
 
 A narrow future teardown capability should be host/session-qualified, capability-gated, and explicit about destructive semantics for federation-placed panes/workspaces/lane surfaces. It is not broad remote host/process management.

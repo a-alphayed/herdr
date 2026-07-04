@@ -317,6 +317,7 @@ fn compute_view_internal(
                 )
             })
             .unwrap_or_default();
+        let remote_projection_hit_areas = compute_remote_projection_hit_areas(app, main_area);
         app.view = crate::app::ViewState {
             layout: ViewLayout::Desktop,
             sidebar_rect: sidebar_area,
@@ -334,6 +335,7 @@ fn compute_view_internal(
             toast_hit_area,
             pane_infos: Vec::new(),
             split_borders: Vec::new(),
+            remote_projection_hit_areas,
         };
         return;
     }
@@ -406,6 +408,7 @@ fn compute_view_internal(
         toast_hit_area,
         pane_infos,
         split_borders,
+        remote_projection_hit_areas: Vec::new(),
     };
 }
 
@@ -439,6 +442,7 @@ fn compute_mobile_view(
             .as_ref()
             .map(|_| mobile_toast_banner_rect(area, app.config_diagnostic.is_some()))
             .unwrap_or_default();
+        let remote_projection_hit_areas = compute_remote_projection_hit_areas(app, terminal_area);
         app.view = crate::app::ViewState {
             layout: ViewLayout::Mobile,
             sidebar_rect: Rect::default(),
@@ -456,6 +460,7 @@ fn compute_mobile_view(
             toast_hit_area,
             pane_infos: Vec::new(),
             split_borders: Vec::new(),
+            remote_projection_hit_areas,
         };
         return;
     }
@@ -507,6 +512,7 @@ fn compute_mobile_view(
         toast_hit_area,
         pane_infos,
         split_borders,
+        remote_projection_hit_areas: Vec::new(),
     };
 }
 
@@ -582,6 +588,100 @@ pub fn render_with_runtime_registry(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Projection geometry — shared between compute_view and render
+// ---------------------------------------------------------------------------
+
+/// Recursively decompose a layout tree into `(pane, rect, is_focused)` tuples
+/// using the same split math as the renderer. The `focused_pane_id` argument
+/// marks which leaf is the remote-focused pane.
+pub(crate) fn project_layout_rects<'a>(
+    node: &'a crate::api::schema::LayoutNode,
+    area: Rect,
+    focused_pane_id: &str,
+) -> Vec<(&'a crate::api::schema::LayoutPane, Rect, bool)> {
+    use crate::api::schema::{LayoutNode, SplitDirection};
+    match node {
+        LayoutNode::Pane { pane } => {
+            let is_focused = pane
+                .pane_id
+                .as_deref()
+                .is_some_and(|id| id == focused_pane_id);
+            vec![(pane, area, is_focused)]
+        }
+        LayoutNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            if area.width < 2 || area.height < 2 {
+                return Vec::new();
+            }
+            let weight = ((*ratio).clamp(0.05, 0.95) * 1000.0).round() as u32;
+            let other = 1000u32.saturating_sub(weight);
+            let constraints = [
+                Constraint::Ratio(weight, 1000),
+                Constraint::Ratio(other.max(1), 1000),
+            ];
+            let [first_area, second_area] = match direction {
+                SplitDirection::Right => Layout::horizontal(constraints).areas(area),
+                SplitDirection::Down => Layout::vertical(constraints).areas(area),
+            };
+            let mut out = project_layout_rects(first, first_area, focused_pane_id);
+            out.extend(project_layout_rects(second, second_area, focused_pane_id));
+            out
+        }
+    }
+}
+
+/// Build the projection hit-area list for `compute_view`. Called only when
+/// `selected_remote_space` is Some.
+fn compute_remote_projection_hit_areas(
+    app: &crate::app::AppState,
+    body_area: Rect,
+) -> Vec<crate::app::state::RemoteProjectionHitArea> {
+    use crate::remote_source::RemoteProjectionStatus;
+    let Some(selected) = app.selected_remote_space.as_ref() else {
+        return Vec::new();
+    };
+    let Some(projection) = app.remote_sources.projection_for_space(selected) else {
+        return Vec::new();
+    };
+    let live = projection.status == RemoteProjectionStatus::Available;
+    let Some(layout) = &projection.layout else {
+        return Vec::new();
+    };
+
+    // The header row takes 1 line; body starts after it.
+    let actual_body = if body_area.height < 3 {
+        return Vec::new();
+    } else {
+        let [_, b] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(body_area);
+        b
+    };
+
+    project_layout_rects(&layout.root, actual_body, &layout.focused_pane_id)
+        .into_iter()
+        .map(
+            |(pane, rect, focused)| crate::app::state::RemoteProjectionHitArea {
+                rect,
+                host: selected.host.clone(),
+                session: selected.session.clone(),
+                pane_id: pane.pane_id.clone(),
+                terminal_id: pane.terminal_id.clone(),
+                label: pane
+                    .label
+                    .clone()
+                    .or_else(|| pane.pane_id.clone())
+                    .unwrap_or_else(|| "pane".to_string()),
+                focused,
+                live: live && pane.terminal_id.is_some(),
+            },
+        )
+        .collect()
+}
+
 /// Render a read-only projected remote workspace in the main area.
 ///
 /// This is intentionally non-interactive: it draws the host/session/workspace/
@@ -613,10 +713,16 @@ fn render_remote_projection(app: &AppState, frame: &mut Frame, terminal_area: Re
                 .or_else(|| projection.tab_id.clone())
         })
         .unwrap_or_else(|| "<no active tab>".to_string());
-    let layout_root = projection
+    let layout = projection
         .as_ref()
         .and_then(|projection| projection.layout.as_ref())
-        .map(|layout| layout.root.clone());
+        .cloned();
+    let layout_root = layout.as_ref().map(|l| l.root.clone());
+    let focused_pane_id = layout
+        .as_ref()
+        .map(|l| l.focused_pane_id.as_str())
+        .unwrap_or("");
+    let live = matches!(status, Some(RemoteProjectionStatus::Available));
 
     let (status_label, status_style) = match status {
         Some(RemoteProjectionStatus::Available) => {
@@ -659,7 +765,13 @@ fn render_remote_projection(app: &AppState, frame: &mut Frame, terminal_area: Re
         Some(RemoteProjectionStatus::Available) | Some(RemoteProjectionStatus::StaleLastKnown)
             if layout_root.is_some() =>
         {
-            render_projection_layout(frame, &layout_root.expect("layout root"), body_area);
+            render_projection_layout(
+                frame,
+                &layout_root.expect("layout root"),
+                body_area,
+                focused_pane_id,
+                live,
+            );
         }
         _ => frame.render_widget(
             Paragraph::new(vec![Line::from(vec![Span::raw(format!(
@@ -671,45 +783,49 @@ fn render_remote_projection(app: &AppState, frame: &mut Frame, terminal_area: Re
     }
 }
 
-/// Recursively draw a projected remote layout as non-interactive bordered boxes.
-fn render_projection_layout(frame: &mut Frame, node: &crate::api::schema::LayoutNode, area: Rect) {
-    use crate::api::schema::{LayoutNode, SplitDirection};
+/// Draw projected remote layout panes using the shared geometry helper.
+/// Live panes (attachable) and the focused pane get distinct visual treatment.
+fn render_projection_layout(
+    frame: &mut Frame,
+    node: &crate::api::schema::LayoutNode,
+    area: Rect,
+    focused_pane_id: &str,
+    live: bool,
+) {
+    use ratatui::style::Color;
     use ratatui::widgets::{Block, Borders};
 
-    match node {
-        LayoutNode::Pane { pane } => {
-            let title = pane
-                .label
-                .clone()
-                .or_else(|| pane.pane_id.clone())
-                .unwrap_or_else(|| "pane".to_string());
-            let block = Block::default()
+    for (pane, rect, is_focused) in project_layout_rects(node, area, focused_pane_id) {
+        let title = pane
+            .label
+            .clone()
+            .or_else(|| pane.pane_id.clone())
+            .unwrap_or_else(|| "pane".to_string());
+        let pane_live = live && pane.terminal_id.is_some();
+        let block = if is_focused && pane_live {
+            Block::default()
                 .borders(Borders::ALL)
-                .title(Span::raw(format!(" {title} ")));
-            frame.render_widget(block, area);
-        }
-        LayoutNode::Split {
-            direction,
-            ratio,
-            first,
-            second,
-        } => {
-            if area.width < 2 || area.height < 2 {
-                return;
-            }
-            let weight = ((*ratio).clamp(0.05, 0.95) * 1000.0).round() as u32;
-            let other = 1000u32.saturating_sub(weight);
-            let constraints = [
-                Constraint::Ratio(weight, 1000),
-                Constraint::Ratio(other.max(1), 1000),
-            ];
-            let [first_area, second_area] = match direction {
-                SplitDirection::Right => Layout::horizontal(constraints).areas(area),
-                SplitDirection::Down => Layout::vertical(constraints).areas(area),
-            };
-            render_projection_layout(frame, first, first_area);
-            render_projection_layout(frame, second, second_area);
-        }
+                .border_style(Style::default().fg(Color::Green))
+                .title(Span::styled(
+                    format!(" {title} ▶ "),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ))
+        } else if pane_live {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(
+                    format!(" {title} ▶ "),
+                    Style::default().fg(Color::DarkGray),
+                ))
+        } else {
+            Block::default()
+                .borders(Borders::ALL)
+                .title(Span::raw(format!(" {title} ")))
+        };
+        frame.render_widget(block, rect);
     }
 }
 
@@ -869,6 +985,82 @@ mod tests {
         assert!(app.view.split_borders.is_empty());
         // The projection renders across the whole main area.
         assert!(app.view.terminal_area.width > 0);
+    }
+
+    #[test]
+    fn project_layout_rects_partitions_area_and_identifies_focused_pane() {
+        use crate::api::schema::{LayoutNode, LayoutPane, SplitDirection};
+
+        let left_id = "left-pane";
+        let right_id = "right-pane";
+        let area = Rect::new(0, 0, 80, 24);
+
+        let node = LayoutNode::Split {
+            direction: SplitDirection::Right,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::Pane {
+                pane: LayoutPane {
+                    pane_id: Some(left_id.to_string()),
+                    terminal_id: Some("term-left".to_string()),
+                    ..Default::default()
+                },
+            }),
+            second: Box::new(LayoutNode::Pane {
+                pane: LayoutPane {
+                    pane_id: Some(right_id.to_string()),
+                    terminal_id: Some("term-right".to_string()),
+                    ..Default::default()
+                },
+            }),
+        };
+
+        let rects = project_layout_rects(&node, area, right_id);
+
+        assert_eq!(rects.len(), 2, "two leaf panes");
+
+        // Non-overlapping: each rect must not contain any point of the other.
+        let (_, r0, _) = rects[0];
+        let (_, r1, _) = rects[1];
+        let overlap_x = r0.x < r1.x + r1.width && r1.x < r0.x + r0.width;
+        let overlap_y = r0.y < r1.y + r1.height && r1.y < r0.y + r0.height;
+        assert!(!overlap_x || !overlap_y, "rects must not overlap");
+
+        // Together they must cover the full area width (horizontal split).
+        assert_eq!(r0.width + r1.width, area.width);
+        assert_eq!(r0.height, area.height);
+        assert_eq!(r1.height, area.height);
+
+        // Focused flag is only on the right pane.
+        let focused_ids: Vec<_> = rects
+            .iter()
+            .filter(|(_, _, focused)| *focused)
+            .map(|(p, _, _)| p.pane_id.as_deref())
+            .collect();
+        assert_eq!(focused_ids, vec![Some(right_id)]);
+    }
+
+    #[test]
+    fn project_layout_rects_minimum_size_guard_returns_empty_for_tiny_area() {
+        use crate::api::schema::{LayoutNode, LayoutPane, SplitDirection};
+
+        let area = Rect::new(0, 0, 1, 1);
+        let node = LayoutNode::Split {
+            direction: SplitDirection::Right,
+            ratio: 0.5,
+            first: Box::new(LayoutNode::Pane {
+                pane: LayoutPane {
+                    ..Default::default()
+                },
+            }),
+            second: Box::new(LayoutNode::Pane {
+                pane: LayoutPane {
+                    ..Default::default()
+                },
+            }),
+        };
+
+        let rects = project_layout_rects(&node, area, "");
+        assert!(rects.is_empty(), "below minimum size must yield no rects");
     }
 
     #[test]

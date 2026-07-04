@@ -174,6 +174,9 @@ pub struct LayoutPane {
     pub command: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// Server-owned transient terminal id; omitted by older remotes (read-only fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

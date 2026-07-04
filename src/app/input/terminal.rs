@@ -34,6 +34,42 @@ impl App {
 
         let key_event = key.as_key_event();
 
+        // A projected remote space is read-only: never forward keys, trigger
+        // navigation, launch custom commands, or enter prefix mode while one is
+        // selected. This guard must precede all direct-navigation,
+        // custom-command, and prefix-key checks so none of those handlers fire
+        // while a projection is active.
+        if self.state.selected_remote_space.is_some() {
+            debug!(
+                code = ?key_event.code,
+                "dropping terminal key event while projected remote space is selected"
+            );
+            // Narrow exception: plain Enter (no modifiers) on the focused live
+            // projection pane schedules a runtime-only attach split and clears the
+            // selection. Modified Enter, and every other key, remain dropped.
+            if key_event.code == KeyCode::Enter && key_event.modifiers.is_empty() {
+                if let Some(target) = self
+                    .state
+                    .view
+                    .remote_projection_hit_areas
+                    .iter()
+                    .find(|h| h.focused && h.live)
+                    .and_then(|h| {
+                        Some(crate::remote_source::RemoteAttachTarget {
+                            host: h.host.clone(),
+                            session: h.session.clone(),
+                            terminal_id: h.terminal_id.clone()?,
+                            label: h.label.clone(),
+                        })
+                    })
+                {
+                    self.state.request_remote_attach_in_new_split = Some(target);
+                    self.state.selected_remote_space = None;
+                }
+            }
+            return None;
+        }
+
         if let Some(action) = super::terminal_direct_navigation_action(&self.state, key) {
             debug!(
                 code = ?key_event.code,
@@ -77,16 +113,6 @@ impl App {
                 modifiers = ?key_event.modifiers,
                 kind = ?key_event.kind,
                 "dropping modifier-only terminal key event instead of forwarding it to pane"
-            );
-            return None;
-        }
-
-        // A projected remote space is read-only: never forward keys to a local
-        // terminal runtime (or any remote session) while one is selected.
-        if self.state.selected_remote_space.is_some() {
-            debug!(
-                code = ?key_event.code,
-                "dropping terminal key event while projected remote space is selected"
             );
             return None;
         }
@@ -1237,6 +1263,218 @@ mod tests {
         assert!(
             prepared.is_none(),
             "terminal key must not forward while a remote space is projected"
+        );
+        // Projection selection must remain: the key was dropped, not an attach.
+        assert!(
+            app.state.selected_remote_space.is_some(),
+            "projection selection must remain after non-Enter key drop"
+        );
+        assert!(
+            app.state.request_remote_attach_in_new_split.is_none(),
+            "no attach must be scheduled for a non-Enter key while projected"
+        );
+    }
+
+    fn app_projected_with_live_pane(live: bool, focused: bool, has_terminal_id: bool) -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.mode = Mode::Terminal;
+        app.state.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
+            host: "jafar".to_string(),
+            session: "default".to_string(),
+            workspace_id: "ws-remote".to_string(),
+        });
+        app.state.view.remote_projection_hit_areas =
+            vec![crate::app::state::RemoteProjectionHitArea {
+                rect: Rect::new(0, 0, 10, 5),
+                host: "jafar".to_string(),
+                session: "default".to_string(),
+                pane_id: Some("remote-pane".to_string()),
+                terminal_id: if has_terminal_id {
+                    Some("term-99".to_string())
+                } else {
+                    None
+                },
+                label: "remote-pane".to_string(),
+                focused,
+                live,
+            }];
+        app
+    }
+
+    #[test]
+    fn plain_enter_on_live_focused_projection_pane_schedules_attach() {
+        let mut app = app_projected_with_live_pane(true, true, true);
+
+        let result = app
+            .prepare_terminal_key_forward(TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert!(result.is_none(), "Enter must not forward bytes");
+        assert!(
+            app.state.selected_remote_space.is_none(),
+            "projection must be cleared after Enter attach"
+        );
+        let attach = app
+            .state
+            .request_remote_attach_in_new_split
+            .as_ref()
+            .expect("attach must be scheduled");
+        assert_eq!(attach.host, "jafar");
+        assert_eq!(attach.terminal_id, "term-99");
+    }
+
+    #[test]
+    fn plain_enter_on_projection_without_terminal_id_does_not_schedule_attach() {
+        let mut app = app_projected_with_live_pane(true, true, false);
+
+        app.prepare_terminal_key_forward(TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert!(
+            app.state.request_remote_attach_in_new_split.is_none(),
+            "no attach when focused pane has no terminal_id"
+        );
+        assert!(
+            app.state.selected_remote_space.is_some(),
+            "projection stays selected when no terminal_id"
+        );
+    }
+
+    #[test]
+    fn plain_enter_on_stale_projection_pane_does_not_schedule_attach() {
+        let mut app = app_projected_with_live_pane(false, true, true);
+
+        app.prepare_terminal_key_forward(TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert!(
+            app.state.request_remote_attach_in_new_split.is_none(),
+            "no attach for stale/unavailable projection pane"
+        );
+    }
+
+    #[test]
+    fn plain_enter_on_non_focused_live_pane_does_not_schedule_attach() {
+        let mut app = app_projected_with_live_pane(true, false, true);
+
+        app.prepare_terminal_key_forward(TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        assert!(
+            app.state.request_remote_attach_in_new_split.is_none(),
+            "no attach when the pane is not focused"
+        );
+    }
+
+    #[test]
+    fn modified_enter_while_projected_does_not_schedule_attach() {
+        let mut app = app_projected_with_live_pane(true, true, true);
+
+        app.prepare_terminal_key_forward(TerminalKey::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+        assert!(
+            app.state.request_remote_attach_in_new_split.is_none(),
+            "modified Enter must not schedule attach"
+        );
+        assert!(
+            app.state.selected_remote_space.is_some(),
+            "projection stays selected for modified Enter"
+        );
+    }
+
+    #[test]
+    fn prefix_key_does_not_enter_prefix_mode_while_projected() {
+        let mut app = app_projected_with_live_pane(true, true, true);
+        // Default prefix is ctrl+b per AppState::test_new.
+        app.prepare_terminal_key_forward(TerminalKey::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        ));
+
+        assert_eq!(
+            app.state.mode,
+            Mode::Terminal,
+            "prefix key must not enter prefix mode while a remote space is projected"
+        );
+        assert!(
+            app.state.selected_remote_space.is_some(),
+            "projection selection must remain after dropped prefix key"
+        );
+    }
+
+    #[test]
+    fn direct_navigation_key_does_not_change_focus_while_projected() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("test")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        // test_split focuses the returned (right) pane; focus_pane_left from
+        // here would move to the original (left) pane without the guard.
+        let right_pane = app.state.workspaces[0].test_split(ratatui::layout::Direction::Horizontal);
+        app.state.view.pane_infos = app.state.workspaces[0]
+            .active_tab()
+            .unwrap()
+            .layout
+            .panes(Rect::new(0, 0, 80, 24));
+        app.state.keybinds.focus_pane_left = crate::config::ActionKeybinds::direct("alt+h");
+        app.state.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
+            host: "jafar".to_string(),
+            session: "default".to_string(),
+            workspace_id: "ws-remote".to_string(),
+        });
+
+        app.prepare_terminal_key_forward(TerminalKey::new(KeyCode::Char('h'), KeyModifiers::ALT));
+
+        assert_eq!(
+            app.state.workspaces[0].layout.focused(),
+            right_pane,
+            "direct navigation must not change focus while a remote space is projected"
+        );
+        assert!(
+            app.state.selected_remote_space.is_some(),
+            "projection selection must remain after dropped navigation key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_custom_command_key_does_not_launch_while_projected() {
+        let mut app = app_projected_with_live_pane(true, true, true);
+        let output_path = unique_temp_path("projected-custom-command");
+        let command = format!("printf launched > '{}'", output_path.display());
+        app.state.keybinds.custom_commands = vec![crate::config::CustomCommandKeybind {
+            bindings: crate::config::ActionKeybinds::direct("ctrl+alt+g"),
+            label: "ctrl+alt+g".into(),
+            command,
+            action: crate::config::CustomCommandAction::Shell,
+            description: None,
+        }];
+
+        app.prepare_terminal_key_forward(TerminalKey::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.selected_remote_space.is_some());
+        // Allow time for a subprocess to write the file if it was accidentally launched.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !output_path.exists(),
+            "custom command must not have been launched while a remote space is projected"
         );
     }
 }

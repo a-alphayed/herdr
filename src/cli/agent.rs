@@ -495,6 +495,20 @@ fn agent_attach(args: &[String]) -> std::io::Result<i32> {
             Ok(parsed) => parsed,
             Err(code) => return Ok(code),
         };
+
+    // Projection-derived `<host>/terminal:<id>` targets bypass `agent.get`: the
+    // terminal id may not be an agent pane, and the authoritative remote attach
+    // server validates it. Only the explicit `terminal:` form bypasses; agent
+    // names/labels/legacy ids still resolve via `agent.get` unchanged.
+    if let Some(terminal_id) = remote_terminal_attach_target(&target) {
+        let Some(host) = configured_remote_attach_host(&target) else {
+            eprintln!("agent attach failed: {target} is not a configured remote host");
+            return Ok(1);
+        };
+        crate::remote::run_remote_terminal_attach(&host, terminal_id, takeover)?;
+        return Ok(0);
+    }
+
     let remote_host = configured_remote_attach_host(&target);
 
     let response = resolve_agent_target(&target, "cli:agent:attach:resolve")?;
@@ -517,6 +531,20 @@ fn agent_attach(args: &[String]) -> std::io::Result<i32> {
 fn configured_remote_attach_host(target: &str) -> Option<crate::remote_target::RemoteHostConfig> {
     let loaded = crate::config::Config::load();
     configured_remote_attach_host_from_config(&loaded.config, target)
+}
+
+/// Detect the explicit `<host>/terminal:<id>` attach form used by projected
+/// remote panes. Only the FIRST `/` is structural (the host qualifier); the
+/// remainder is checked for the `terminal:` prefix and is not re-split. Returns
+/// the terminal id when the target is in this form, or `None` for agent-name /
+/// label / legacy-id / local targets, which must still resolve via `agent.get`.
+fn remote_terminal_attach_target(target: &str) -> Option<String> {
+    let (_host, remainder) = target.split_once('/')?;
+    let id = remainder.strip_prefix("terminal:")?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(id.to_string())
 }
 
 fn configured_remote_attach_host_from_config(
@@ -984,5 +1012,31 @@ mod tests {
         // Insufficient args must surface usage before any request is sent.
         let code = agent_submit(&[]).unwrap();
         assert_eq!(code, 2);
+    }
+
+    #[test]
+    fn remote_terminal_attach_target_detects_explicit_form() {
+        // `<host>/terminal:<id>` → Some(id).
+        assert_eq!(
+            remote_terminal_attach_target("jafar/terminal:abc123"),
+            Some("abc123".to_string())
+        );
+        // Nested slash in id: only the FIRST slash is structural.
+        assert_eq!(
+            remote_terminal_attach_target("jafar/terminal:abc/suffix"),
+            Some("abc/suffix".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_terminal_attach_target_rejects_non_terminal_forms() {
+        // Agent name target → None (must still resolve via agent.get).
+        assert_eq!(remote_terminal_attach_target("codex"), None);
+        // Host-qualified agent name → None.
+        assert_eq!(remote_terminal_attach_target("jafar/codex"), None);
+        // Empty terminal id → None.
+        assert_eq!(remote_terminal_attach_target("jafar/terminal:"), None);
+        // No slash → None.
+        assert_eq!(remote_terminal_attach_target("terminal:abc"), None);
     }
 }

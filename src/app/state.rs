@@ -749,6 +749,27 @@ pub struct ViewState {
     pub toast_hit_area: Rect,
     pub pane_infos: Vec<PaneInfo>,
     pub split_borders: Vec<SplitBorder>,
+    /// Hit areas for projected remote panes; non-empty only while a remote
+    /// projection is selected. Computed by `compute_view` so both the mouse
+    /// handler and keyboard handler can use them without re-running the
+    /// recursive layout math.
+    pub remote_projection_hit_areas: Vec<RemoteProjectionHitArea>,
+}
+
+/// A single projected pane's screen rect and attach metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteProjectionHitArea {
+    pub rect: Rect,
+    pub host: String,
+    pub session: String,
+    pub pane_id: Option<String>,
+    pub terminal_id: Option<String>,
+    pub label: String,
+    /// True when this pane is the remote-focused pane.
+    pub focused: bool,
+    /// True when the projection is live (Available status) and `terminal_id`
+    /// is present so an attach can be scheduled.
+    pub live: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1839,6 +1860,7 @@ impl AppState {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                remote_projection_hit_areas: Vec::new(),
             },
             drag: None,
             workspace_press: None,

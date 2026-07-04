@@ -14,7 +14,6 @@ use crate::remote_target::{plan_target_route, PlannedTargetRoute, RemoteTargetSe
 pub(crate) enum RemoteAttachPrecheckError {
     RemoteNotConfigured,
     RouteMismatch(String),
-    TargetNotCached,
     TargetNotConnected(&'static str),
 }
 
@@ -28,7 +27,6 @@ impl std::fmt::Display for RemoteAttachPrecheckError {
                 )
             }
             Self::RouteMismatch(detail) => write!(f, "remote attach target is invalid: {detail}"),
-            Self::TargetNotCached => write!(f, "remote agent is not in the live cache"),
             Self::TargetNotConnected(status) => {
                 write!(
                     f,
@@ -302,15 +300,19 @@ impl App {
             Err(err) => return Err(RemoteAttachPrecheckError::RouteMismatch(err.to_string())),
         }
 
-        let key = target.key();
-        let entry = self
-            .state
-            .remote_sources
-            .agent(&key)
-            .ok_or(RemoteAttachPrecheckError::TargetNotCached)?;
-        if !entry.status.is_connected() {
+        // The host must be connected. Projection-derived terminal ids may not
+        // be in the local agent cache; the authoritative remote attach server
+        // rejects unknown/stale ids with a clear error, so a connected host is
+        // sufficient to allow the attach attempt. This keeps cached agent
+        // targets gated on the same host connection status.
+        let host_key =
+            crate::remote_source::RemoteHostKey::new(target.host.clone(), target.session.clone());
+        let host_status = self.state.remote_sources.host_status(&host_key).ok_or(
+            RemoteAttachPrecheckError::TargetNotConnected("disconnected"),
+        )?;
+        if !host_status.is_connected() {
             return Err(RemoteAttachPrecheckError::TargetNotConnected(
-                entry.status.stale_label().unwrap_or("disconnected"),
+                host_status.stale_label().unwrap_or("disconnected"),
             ));
         }
         Ok(())
@@ -704,12 +706,17 @@ mod tests {
     }
 
     #[test]
-    fn remote_attach_precheck_rejects_stale_or_missing_target() {
+    fn remote_attach_precheck_rejects_disconnected_host() {
+        // No snapshot → host_status returns None → TargetNotConnected("disconnected").
+        // This covers both an unknown terminal_id (projection-derived) and a
+        // cached-but-host-unreachable case; the remote server validates the id.
         let mut app = app_with_remote("default");
 
         assert_eq!(
             app.precheck_remote_attach_target(&target()),
-            Err(RemoteAttachPrecheckError::TargetNotCached)
+            Err(RemoteAttachPrecheckError::TargetNotConnected(
+                "disconnected"
+            ))
         );
 
         let host = RemoteHostKey::new("jafar", "default");
@@ -723,6 +730,29 @@ mod tests {
         assert_eq!(
             app.precheck_remote_attach_target(&target()),
             Err(RemoteAttachPrecheckError::TargetNotConnected("unreachable"))
+        );
+    }
+
+    #[test]
+    fn remote_attach_precheck_accepts_projection_terminal_id_not_in_agent_cache() {
+        // Projection-derived terminal ids are not in the agent cache; the precheck
+        // must allow them as long as the host is connected.
+        let mut app = app_with_remote("default");
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![], // no agents in cache
+        );
+
+        let projection_target = RemoteAttachTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: "proj-term-99".into(),
+            label: "projection pane".into(),
+        };
+
+        assert_eq!(
+            app.precheck_remote_attach_target(&projection_target),
+            Ok(())
         );
     }
 
