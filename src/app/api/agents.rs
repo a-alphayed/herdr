@@ -1,8 +1,9 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentReadParams, AgentRenameParams, AgentSendParams, AgentStartParams, AgentTarget, ErrorBody,
-    Method, PaneReadResult, ReadFormat, ReadSource, Request, ResponseResult,
+    AgentReadParams, AgentRenameParams, AgentSendParams, AgentStartParams, AgentSubmitParams,
+    AgentTarget, ErrorBody, Method, PaneReadResult, ReadFormat, ReadSource, Request,
+    ResponseResult,
 };
 use crate::app::App;
 
@@ -11,6 +12,8 @@ use crate::remote_target::{
     plan_target_route, resolve_remote_agent_target, PlannedTargetRoute, RemoteAgentResolveError,
     RemoteRoutePlanError, RemoteTargetSelector,
 };
+
+use super::super::api_helpers::{encode_api_keys, encode_api_text};
 
 impl App {
     pub(super) fn handle_agent_list(&mut self, id: String) -> String {
@@ -260,6 +263,42 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    pub(super) fn handle_agent_submit(&mut self, id: String, params: AgentSubmitParams) -> String {
+        match self.plan_agent_api_target(&params.target) {
+            Ok(PlannedTargetRoute::Local { .. }) => {}
+            Ok(PlannedTargetRoute::Remote { host, target }) => {
+                return self.handle_remote_agent_submit(id, host, target, params);
+            }
+            Err(err) => return encode_error_body(id, remote_route_plan_error_body(err)),
+        }
+
+        let resolved = match self.resolve_terminal_target(&params.target) {
+            Ok(resolved) => resolved,
+            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        };
+        let Some(runtime) = self.lookup_runtime_sender(resolved.ws_idx, resolved.pane_id) else {
+            return agent_not_found(id, &params.target);
+        };
+        // Validate the submit key (enter) before writing anything, mirroring
+        // handle_pane_send_input so an invalid key never partially mutates the
+        // target runtime. Then write the prompt text followed by encoded Enter.
+        let encoded_keys = match encode_api_keys(runtime, &["enter".to_string()]) {
+            Ok(encoded_keys) => encoded_keys,
+            Err(key) => return encode_error(id, "invalid_key", format!("unsupported key {key}")),
+        };
+        let text_bytes = encode_api_text(runtime, &params.text);
+        if let Err(err) = runtime.try_send_bytes(Bytes::from(text_bytes)) {
+            return encode_error(id, "agent_submit_failed", err.to_string());
+        }
+        for bytes in encoded_keys {
+            if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
+                return encode_error(id, "agent_submit_failed", err.to_string());
+            }
+        }
+
+        encode_success(id, ResponseResult::Ok {})
+    }
+
     fn plan_agent_api_target(
         &self,
         target: &str,
@@ -347,6 +386,31 @@ impl App {
         }
     }
 
+    fn handle_remote_agent_submit(
+        &self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        selector: RemoteTargetSelector,
+        params: AgentSubmitParams,
+    ) -> String {
+        let resolved =
+            match resolve_remote_agent_target(&self.state.remote_sources, &host, &selector) {
+                Ok(resolved) => resolved,
+                Err(err) => return encode_error_body(id, remote_agent_resolve_error_body(err)),
+            };
+        let request = remote_agent_submit_request(
+            id.clone(),
+            params,
+            resolved.entry.agent.terminal_id.as_str(),
+        );
+        match crate::remote::send_remote_api_request_to_host_noninteractive(&host, &request)
+            .and_then(|response| rewrite_response_id(&response, &id))
+        {
+            Ok(response) => response,
+            Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
+        }
+    }
+
     fn handle_remote_agent_start(
         &self,
         id: String,
@@ -400,6 +464,18 @@ fn remote_agent_send_request(
     Request {
         id,
         method: Method::AgentSend(params),
+    }
+}
+
+fn remote_agent_submit_request(
+    id: String,
+    mut params: AgentSubmitParams,
+    terminal_id: &str,
+) -> Request {
+    params.target = terminal_id.to_string();
+    Request {
+        id,
+        method: Method::AgentSubmit(params),
     }
 }
 
@@ -810,6 +886,25 @@ mod tests {
     }
 
     #[test]
+    fn remote_agent_submit_request_uses_resolved_terminal_id() {
+        let request = remote_agent_submit_request(
+            "req-1".to_string(),
+            crate::api::schema::AgentSubmitParams {
+                target: "jafar/codex".to_string(),
+                text: "continue".to_string(),
+            },
+            "term-1",
+        );
+
+        let Method::AgentSubmit(params) = request.method else {
+            panic!("expected agent.submit");
+        };
+        assert_eq!(request.id, "req-1");
+        assert_eq!(params.target, "term-1");
+        assert_eq!(params.text, "continue");
+    }
+
+    #[test]
     fn remote_agent_start_request_strips_host_and_defaults_to_new_workspace() {
         let request = remote_agent_start_request(
             "req-1".to_string(),
@@ -960,5 +1055,78 @@ mod tests {
         let err = rewrite_response_id(r#"{"id":"remote-id"}"#, "local-id").unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    fn app_with_submit_runtime() -> (App, String, tokio::sync::mpsc::Receiver<bytes::Bytes>) {
+        let mut app = test_app(&crate::config::Config::default());
+        let workspace = crate::workspace::Workspace::test_new("agent-submit");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let target = app.public_pane_id(0, pane_id).unwrap();
+        let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel_capacity(80, 24, 4);
+        app.state.insert_test_runtime(pane_id, runtime);
+        (app, target, rx)
+    }
+
+    #[tokio::test]
+    async fn local_agent_submit_reaches_handler_through_public_dispatch() {
+        let (mut app, target, mut rx) = app_with_submit_runtime();
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "dispatch".into(),
+            method: crate::api::schema::Method::AgentSubmit(
+                crate::api::schema::AgentSubmitParams {
+                    target: target.clone(),
+                    text: "hello world".into(),
+                },
+            ),
+        });
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "dispatch");
+        assert_eq!(success.result, ResponseResult::Ok {});
+        // Public dispatch reached the handler and wrote text then encoded Enter.
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from("hello world"));
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from(vec![b'\r']));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_agent_submit_writes_text_before_enter_in_order() {
+        let (mut app, target, mut rx) = app_with_submit_runtime();
+
+        let response = app.handle_agent_submit(
+            "handler".into(),
+            crate::api::schema::AgentSubmitParams {
+                target,
+                text: "prompt text".into(),
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "handler");
+        assert_eq!(success.result, ResponseResult::Ok {});
+        // The prompt text must arrive before the encoded Enter key.
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from("prompt text"));
+        assert_eq!(rx.try_recv().unwrap(), bytes::Bytes::from(vec![b'\r']));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn local_agent_submit_reports_not_found_for_missing_target() {
+        let mut app = test_app(&crate::config::Config::default());
+
+        let response = app.handle_agent_submit(
+            "missing".into(),
+            crate::api::schema::AgentSubmitParams {
+                target: "does-not-exist".into(),
+                text: "hi".into(),
+            },
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.id, "missing");
+        assert_eq!(parsed.error.code, "agent_not_found");
     }
 }

@@ -1083,6 +1083,22 @@
           ],
           "type": "string"
         },
+        "AgentSubmitParams": {
+          "description": "Submit a prompt to a composer-style agent target.\n\nUnlike `AgentSendParams` (literal text injection), submit writes the text\nfollowed by an encoded `enter` key so the target agent processes the prompt.",
+          "properties": {
+            "target": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target",
+            "text"
+          ],
+          "type": "object"
+        },
         "AgentTarget": {
           "properties": {
             "target": {
@@ -4086,6 +4102,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentSendParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.submit",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentSubmitParams"
             }
           },
           "required": [

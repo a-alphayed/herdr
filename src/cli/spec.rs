@@ -273,6 +273,12 @@ fn agent_command() -> Command {
                 .arg(required("text", "TEXT")),
         )
         .subcommand(
+            Command::new("submit")
+                .about("Submit a prompt to an agent (text plus Enter)")
+                .arg(required("target", "TARGET"))
+                .arg(required("text", "TEXT")),
+        )
+        .subcommand(
             Command::new("rename")
                 .about("Rename an agent")
                 .arg(required("target", "TARGET"))
@@ -920,6 +926,19 @@ mod tests {
         assert!(values.contains(&"working".to_string()));
         assert!(values.contains(&"blocked".to_string()));
         assert!(!values.contains(&"done".to_string()));
+    }
+
+    #[test]
+    fn spec_includes_agent_submit_subcommand() {
+        let cmd = super::command();
+        let submit = command_path(&cmd, &["agent", "submit"]);
+        assert!(submit.get_about().is_some());
+        assert!(submit
+            .get_arguments()
+            .any(|arg| arg.get_id() == "target" && arg.is_required_set()));
+        assert!(submit
+            .get_arguments()
+            .any(|arg| arg.get_id() == "text" && arg.is_required_set()));
     }
 
     #[test]

@@ -47,6 +47,7 @@ impl FederationCapabilities {
     pub const AGENT_GET: &'static str = "agent_get";
     pub const AGENT_READ: &'static str = "agent_read";
     pub const AGENT_SEND: &'static str = "agent_send";
+    pub const AGENT_SUBMIT: &'static str = "agent_submit";
     pub const AGENT_FOCUS: &'static str = "agent_focus";
     pub const AGENT_START: &'static str = "agent_start";
     pub const TAB_LIST: &'static str = "tab_list";
@@ -64,6 +65,7 @@ impl FederationCapabilities {
                 Self::AGENT_GET,
                 Self::AGENT_READ,
                 Self::AGENT_SEND,
+                Self::AGENT_SUBMIT,
                 Self::AGENT_FOCUS,
                 Self::AGENT_START,
                 Self::TAB_LIST,

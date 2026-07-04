@@ -25,16 +25,27 @@ Durability remains per authoritative Herdr server.
 
 This is **not** a "local server owns a remote PTY" design. Remote panes and agents are owned by the Herdr server on the machine where they run. The local Herdr instance acts as an aggregation/control plane: it displays remote metadata, routes allowed commands, and opens direct attach/proxy views for interaction. The current MVP can show local and remote agents together; the next presentation layer should project one selected source at a time without changing ownership.
 
-## Known limitation: headless prompt submit and teardown
+## Headless prompt submit and teardown
 
 Verified on 2026-07-03 with both the controller and remote host running Herdr 0.7.1 / protocol 15:
 
 - `agent start --host ...` can place a remote lane and the controller can detect it as `<node>/<name>`.
 - `agent read <node>/<target>` can read remote pane content.
-- `agent send <node>/<target> "text"` writes text into a composer-style target, but does not submit the composer prompt; the remote prompt-processing agent remains idle. Readback of text sitting in the composer proves only text injection, not agent processing.
+- `agent send <node>/<target> "text"` writes text into a composer-style target, but does not submit the composer prompt; the remote prompt-processing agent remains idle. Readback of text sitting in the composer proves only text injection, not agent processing. `agent send` remains literal text injection by design.
 - No federation-only controller teardown path currently exists for remote panes/workspaces/lane surfaces placed by the controller.
 
-The controller-only headless orchestration target is therefore not satisfied yet. The required path is `place -> submit prompt -> agent reacts -> controller reads reaction`, with no SSH/manual attach step. Until a submit-capable federation command/API exists and is proven for composer-style agents, `agent send` should be treated as text injection, not prompt submission.
+### Submit-capable route (Phase E.0)
+
+`agent.submit` (`herdr agent submit <target> <text>`) is the submit-capable controller route for composer-style agent targets. Submit writes the text followed by an encoded Enter so the prompt is actually submitted, without an interactive attach. It is distinct from `agent send`:
+
+- `agent send` = literal text injection (no Enter).
+- `agent submit` = text plus Enter (prompt submission).
+
+Remote submit is federation-routed like `agent.send`: the controller resolves a host-qualified target against its `RemoteSourceCache`, rewrites it to the remote terminal id, and sends an `agent.submit` request to the authoritative remote Herdr over the SSH-bridged JSON API. It is gated by a new `agent_submit` federation capability: a remote that does not advertise `agent_submit` fails through the existing needs-update path and does not fall back to `agent.send`. Submit is non-idempotent and is not retried after uncertain delivery; the remote host remains the PTY/process authority.
+
+The controller-only headless orchestration path is `place -> submit prompt -> agent reacts -> controller reads reaction`, with no SSH/manual attach step. `agent.submit` provides the submit primitive; full end-to-end controller-only runtime proof for composer-style agents is the E.0 validation step.
+
+### Teardown (still future)
 
 A narrow future teardown capability should be host/session-qualified, capability-gated, and explicit about destructive semantics for federation-placed panes/workspaces/lane surfaces. It is not broad remote host/process management.
 
@@ -131,11 +142,12 @@ jafar/codex    working
 
 ```bash
 herdr agent read jafar/codex --lines 80
-herdr agent send jafar/codex "continue"  # text injection only in verified 0.7.1/protocol 15 behavior
+herdr agent send jafar/codex "continue"    # text injection only; does not submit the composer prompt
+herdr agent submit jafar/codex "continue"  # text plus Enter; submits composer-style prompts
 herdr agent wait jafar/codex --status done
 ```
 
-The local Herdr server parses the host-qualified target and proxies the API request to the owning remote node. In the verified 0.7.1/protocol 15 behavior, `agent send` reaches the remote pane and writes text to a composer-style agent, but it does not submit the prompt. A submit-capable command/API remains future work for headless controller-only prompt handoff.
+The local Herdr server parses the host-qualified target and proxies the API request to the owning remote node. `agent send` reaches the remote pane and writes text to a composer-style agent, but it does not submit the prompt. Use `agent submit` (`agent.submit`) for headless controller-only prompt submission; `agent send` stays literal text injection.
 
 ### 4. Click/focus a remote agent
 
@@ -154,10 +166,11 @@ An agent running on SteamDeck can inspect Jafar agents and route allowed command
 ```bash
 herdr agent list
 herdr agent read jafar/codex
-herdr agent send jafar/claude "continue"  # text injection only until submit-capable federation is proven
+herdr agent send jafar/claude "continue"    # text injection only; does not submit the composer prompt
+herdr agent submit jafar/claude "continue"  # text plus Enter; submits composer-style prompts
 ```
 
-An agent running on Jafar can inspect/control SteamDeck agents only if Jafar's Herdr session also has SteamDeck configured as a remote host. MVP has no transitive routing; each node routes only to local agents and explicitly configured remotes. For composer-style agents, controller-only headless prompt submission is not yet proven by federation alone.
+An agent running on Jafar can inspect/control SteamDeck agents only if Jafar's Herdr session also has SteamDeck configured as a remote host. MVP has no transitive routing; each node routes only to local agents and explicitly configured remotes. For composer-style agents, `agent submit` provides the federation-routed prompt-submission route; full controller-only runtime proof is the E.0 validation step.
 
 ### 6. Plain SSH is unmanaged
 
@@ -209,6 +222,7 @@ The structured substrate for federation is the Herdr JSON socket API:
 agent.list
 agent.read
 agent.send
+agent.submit
 agent.focus
 agent.start
 events.subscribe
@@ -630,6 +644,7 @@ agent.list_local  # hidden/internal local-only snapshot primitive for supervisor
 agent.get
 agent.read
 agent.send
+agent.submit
 agent.rename
 agent.focus
 agent.wait (composed via events.wait / pane.wait_for_output; not a single API method)
@@ -643,7 +658,7 @@ pane.send_input
 events.subscribe for cache/wait state
 ```
 
-Being in the allowlist means the operation may be routed to the authoritative host; it does not prove higher-level composer semantics. In verified Herdr 0.7.1 / protocol 15 behavior, routed `agent.send` writes text into a composer-style agent but does not submit the prompt. The lower-level `pane.send_keys` and `pane.send_input` primitives are listed as routable categories, but a safe federation-only prompt-submit choreography for composer-style agents remains unverified/future work.
+Being in the allowlist means the operation may be routed to the authoritative host; it does not prove higher-level composer semantics. Routed `agent.send` writes text into a composer-style agent but does not submit the prompt; routed `agent.submit` (gated by the `agent_submit` federation capability) writes the text plus an encoded Enter to submit it. The lower-level `pane.send_keys` and `pane.send_input` primitives are listed as routable categories; end-to-end controller-only runtime proof for composer-style submit is the E.0 validation step.
 
 Denied by default over federation:
 
@@ -664,7 +679,7 @@ Current spike API shape: aggregated `agent.list` host-qualifies label fields so 
 
 Non-idempotent retry rule:
 
-- `agent.send`, `pane.send_text`, `pane.send_keys`, and `pane.send_input` are not idempotent.
+- `agent.send`, `agent.submit`, `pane.send_text`, `pane.send_keys`, and `pane.send_input` are not idempotent.
 - If the bridge drops after dispatch but before acknowledgement, surface an uncertain-delivery error and do not auto-retry.
 - `agent.list`, `agent.get`, `pane.read`, and status/ping calls are safe to retry within bounded timeout rules.
 
@@ -818,13 +833,14 @@ Remote agent commands:
 herdr agent list
 herdr agent list --host jafar
 herdr agent read jafar/codex --lines 80
-herdr agent send jafar/codex "continue"  # text injection for composer-style agents; submit is unverified/future
+herdr agent send jafar/codex "continue"    # text injection for composer-style agents; does not submit
+herdr agent submit jafar/codex "continue"  # text plus Enter; submits composer-style prompts
 herdr agent focus jafar/codex
 herdr agent wait jafar/codex --status done
 herdr agent start --host jafar --name codex --cwd /Users/afayed/projects/mentat -- codex
 ```
 
-In verified Herdr 0.7.1 / protocol 15 behavior, `agent send` is a routed text-write primitive for composer-style agents: readback can show the text in the composer, but the target agent may not process it. A submit-capable federation command/API remains a future requirement for controller-only headless orchestration.
+`agent send` is a routed text-write primitive for composer-style agents: readback can show the text in the composer, but the target agent may not process it. `agent submit` is the federation-routed submit primitive (gated by `agent_submit`); full controller-only runtime proof is the E.0 validation step.
 
 Avoid using subcommand `--remote` for this feature because root-level `--remote <ssh-target>` already means remote TUI attach.
 
@@ -1253,7 +1269,7 @@ Implemented in this spike:
 - sidebar host-state rows for configured auto-connect remotes when no cached agents exist;
 - Docker smoke coverage for the configured one-hop path: get/read/send/focus/start, disconnect, and reconnect;
 - real-host Jafar smoke for capability/status commands and isolated `fed-*` host-qualified control after updating the remote binary;
-- verified real-host gap: `agent send` writes text into a composer-style remote agent but does not submit the prompt, and no federation-only controller teardown exists for remote lanes/surfaces placed by the controller.
+- verified real-host gap (0.7.1/protocol 15): `agent send` writes text into a composer-style remote agent but does not submit the prompt. Phase E.0 adds the submit-capable `agent.submit` route (`herdr agent submit`), capability-gated by `agent_submit`; full controller-only runtime proof is the E.0 validation step. No federation-only controller teardown exists yet for remote lanes/surfaces placed by the controller.
 
 Still intentionally out of MVP scope:
 
@@ -1278,7 +1294,7 @@ Implemented Phase 5 hardening:
 - Remote failure classification is shared between CLI status/check and the live `RemoteSource` supervisor, including longer retry backoff for missing/incompatible binaries.
 - The sidebar preserves stale remote agents and labels them with the specific failure reason. Configured auto-connect hosts with no cached agents now appear as host-only rows when disconnected, unreachable, or needing update.
 - Remote status/check validate configuration before SSH, including rejecting leading-dash SSH targets.
-- Jafar real-host smoke covered updated remote capability/status commands, isolated `fed-*` status, and host-qualified list/get/read/send/focus/start routing paths, with the known `agent send` composer-submit gap called out above.
+- Jafar real-host smoke covered updated remote capability/status commands, isolated `fed-*` status, and host-qualified list/get/read/send/focus/start routing paths, with `agent send` documented as text injection and `agent submit` providing the composer prompt-submission route added in Phase E.0.
 
 Remaining non-MVP or later polish:
 

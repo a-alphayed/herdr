@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use crate::api::schema::{
     AgentReadParams, AgentRenameParams, AgentSendParams, AgentStartParams, AgentStatus,
-    AgentTarget, EmptyParams, Method, ReadFormat, ReadSource, Request, Subscription,
+    AgentSubmitParams, AgentTarget, EmptyParams, Method, ReadFormat, ReadSource, Request,
+    Subscription,
 };
 
 const AGENT_START_USAGE: &str = "usage: herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--env KEY=VALUE] [--focus|--no-focus] -- <argv...>\n       herdr agent start --host HOST --name NAME [--cwd REMOTE_PATH] [--workspace ID] [--tab ID] [--split right|down] [--env KEY=VALUE] [--focus|--no-focus] -- <argv...>";
@@ -18,6 +19,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "get" => agent_get(&args[1..]),
         "read" => agent_read(&args[1..]),
         "send" => agent_send(&args[1..]),
+        "submit" => agent_submit(&args[1..]),
         "rename" => agent_rename(&args[1..]),
         "focus" => agent_focus(&args[1..]),
         "wait" => agent_wait(&args[1..]),
@@ -673,6 +675,21 @@ fn agent_send(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+fn agent_submit(args: &[String]) -> std::io::Result<i32> {
+    if args.len() < 2 {
+        eprintln!("usage: herdr agent submit <target> <text>");
+        return Ok(2);
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:submit".into(),
+        method: Method::AgentSubmit(AgentSubmitParams {
+            target: args[0].clone(),
+            text: args[1..].join(" "),
+        }),
+    })?)
+}
+
 fn agent_read(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!("usage: herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
@@ -767,6 +784,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send <target> <text>");
+    eprintln!("  herdr agent submit <target> <text>");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> --status <idle|working|blocked|unknown> [--timeout MS]");
@@ -777,8 +795,9 @@ fn print_agent_help() {
     eprintln!("  herdr agent explain --file PATH --agent LABEL [--json]");
     eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");
     eprintln!(
-        "  agent send writes literal text; use pane run when you want command text plus Enter"
+        "  agent send writes literal text; agent submit writes text plus Enter for composer-style prompts"
     );
+    eprintln!("  use pane run when you want command text plus Enter on a plain shell");
 }
 
 #[cfg(test)]
@@ -958,5 +977,12 @@ mod tests {
         let err = configured_remote_start_host_from_config(&config, "jafar").unwrap_err();
 
         assert_eq!(err, "remote agent start requires remote.enabled = true");
+    }
+
+    #[test]
+    fn agent_submit_requires_target_and_text() {
+        // Insufficient args must surface usage before any request is sent.
+        let code = agent_submit(&[]).unwrap();
+        assert_eq!(code, 2);
     }
 }

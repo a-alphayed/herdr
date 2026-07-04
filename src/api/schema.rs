@@ -113,6 +113,8 @@ pub enum Method {
     AgentExplain(AgentTarget),
     #[serde(rename = "agent.send")]
     AgentSend(AgentSendParams),
+    #[serde(rename = "agent.submit")]
+    AgentSubmit(AgentSubmitParams),
     #[serde(rename = "agent.rename")]
     AgentRename(AgentRenameParams),
     #[serde(rename = "agent.focus")]

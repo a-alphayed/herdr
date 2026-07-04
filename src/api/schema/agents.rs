@@ -22,6 +22,16 @@ pub struct AgentSendParams {
     pub text: String,
 }
 
+/// Submit a prompt to a composer-style agent target.
+///
+/// Unlike `AgentSendParams` (literal text injection), submit writes the text
+/// followed by an encoded `enter` key so the target agent processes the prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentSubmitParams {
+    pub target: String,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentRenameParams {
     pub target: String,

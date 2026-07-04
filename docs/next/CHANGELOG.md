@@ -9,6 +9,7 @@
 - Added `herdr api schema` to inspect the bundled socket API schema, with `--json` for the full JSON Schema document and `--output PATH` for file output.
 - Added `herdr terminal session observe` for read-only live ANSI terminal streams that bridge processes can consume as newline-delimited JSON.
 - Added `herdr terminal session control` for bridge processes that need live ANSI frames plus input, resize, scroll, release, and takeover authority.
+- Added `agent.submit` socket API method and `herdr agent submit <target> <text>` CLI command to submit a prompt (text plus Enter) to a composer-style agent target. `agent send` remains literal text injection; `agent submit` is the headless/controller-side way to actually submit a prompt without an interactive attach.
 - Added `ui.hide_tab_bar_when_single_tab` to hide the tab row when a workspace has one tab. (#448)
 
 ### Changed

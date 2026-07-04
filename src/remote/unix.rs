@@ -711,6 +711,9 @@ fn federation_method_for_api_method(method: &crate::api::schema::Method) -> Opti
         crate::api::schema::Method::AgentSend(_) => {
             Some(crate::api::schema::FederationCapabilities::AGENT_SEND)
         }
+        crate::api::schema::Method::AgentSubmit(_) => {
+            Some(crate::api::schema::FederationCapabilities::AGENT_SUBMIT)
+        }
         crate::api::schema::Method::AgentFocus(_) => {
             Some(crate::api::schema::FederationCapabilities::AGENT_FOCUS)
         }
@@ -3097,6 +3100,63 @@ mod tests {
                 crate::api::schema::FederationCapabilities::AGENT_SEND
             ]
         );
+    }
+
+    #[test]
+    fn required_federation_methods_include_remote_agent_submit_method() {
+        let request = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::AgentSubmit(
+                crate::api::schema::AgentSubmitParams {
+                    target: "jafar/codex".to_string(),
+                    text: "continue".to_string(),
+                },
+            ),
+        };
+
+        let methods = required_federation_methods_for_request(&request);
+
+        assert_eq!(
+            methods,
+            vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::AGENT_SUBMIT
+            ]
+        );
+    }
+
+    #[test]
+    fn federation_capabilities_current_advertises_agent_submit() {
+        assert!(crate::api::schema::FederationCapabilities::current()
+            .supports_method(crate::api::schema::FederationCapabilities::AGENT_SUBMIT));
+    }
+
+    #[test]
+    fn validate_federation_capabilities_rejects_missing_agent_submit_without_fallback() {
+        let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true);
+        // An older remote advertises remote_api_bridge and agent_send but not
+        // agent_submit. Submit must fail clearly instead of degrading to send.
+        let capabilities = crate::api::schema::FederationCapabilities {
+            methods: vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE.into(),
+                crate::api::schema::FederationCapabilities::AGENT_SEND.into(),
+            ],
+        };
+
+        let err = validate_federation_capabilities(
+            &host,
+            &capabilities,
+            &[
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::AGENT_SUBMIT,
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("does not advertise federation method agent_submit"));
     }
 
     #[test]

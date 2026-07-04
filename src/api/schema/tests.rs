@@ -197,6 +197,24 @@ fn request_round_trips_for_agent_explain() {
 }
 
 #[test]
+fn request_round_trips_for_agent_submit() {
+    let request = Request {
+        id: "req_agent_submit".into(),
+        method: Method::AgentSubmit(AgentSubmitParams {
+            target: "agent-1".into(),
+            text: "ship it".into(),
+        }),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "agent.submit");
+    assert_eq!(json["params"]["target"], "agent-1");
+    assert_eq!(json["params"]["text"], "ship it");
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+}
+
+#[test]
 fn notification_show_request_parses() {
     let json = r#"{"id":"req_1","method":"notification.show","params":{"title":"build failed","body":"api workspace","position":"top-left","sound":"request"}}"#;
     let request: Request = serde_json::from_str(json).unwrap();
