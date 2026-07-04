@@ -3,7 +3,7 @@
 Status: draft proposal  
 Owner: TBD  
 Created: 2026-05-31  
-Updated: 2026-06-22
+Updated: 2026-07-03
 
 ## Summary
 
@@ -24,6 +24,19 @@ Durability remains per authoritative Herdr server.
 ```
 
 This is **not** a "local server owns a remote PTY" design. Remote panes and agents are owned by the Herdr server on the machine where they run. The local Herdr instance acts as an aggregation/control plane: it displays remote metadata, routes allowed commands, and opens direct attach/proxy views for interaction. The current MVP can show local and remote agents together; the next presentation layer should project one selected source at a time without changing ownership.
+
+## Known limitation: headless prompt submit and teardown
+
+Verified on 2026-07-03 with both the controller and remote host running Herdr 0.7.1 / protocol 15:
+
+- `agent start --host ...` can place a remote lane and the controller can detect it as `<node>/<name>`.
+- `agent read <node>/<target>` can read remote pane content.
+- `agent send <node>/<target> "text"` writes text into a composer-style target, but does not submit the composer prompt; the remote prompt-processing agent remains idle. Readback of text sitting in the composer proves only text injection, not agent processing.
+- No federation-only controller teardown path currently exists for remote panes/workspaces/lane surfaces placed by the controller.
+
+The controller-only headless orchestration target is therefore not satisfied yet. The required path is `place -> submit prompt -> agent reacts -> controller reads reaction`, with no SSH/manual attach step. Until a submit-capable federation command/API exists and is proven for composer-style agents, `agent send` should be treated as text injection, not prompt submission.
+
+A narrow future teardown capability should be host/session-qualified, capability-gated, and explicit about destructive semantics for federation-placed panes/workspaces/lane surfaces. It is not broad remote host/process management.
 
 ## Core Invariants
 
@@ -118,11 +131,11 @@ jafar/codex    working
 
 ```bash
 herdr agent read jafar/codex --lines 80
-herdr agent send jafar/codex "continue"
+herdr agent send jafar/codex "continue"  # text injection only in verified 0.7.1/protocol 15 behavior
 herdr agent wait jafar/codex --status done
 ```
 
-The local Herdr server parses the host-qualified target and proxies the API request to the owning remote node.
+The local Herdr server parses the host-qualified target and proxies the API request to the owning remote node. In the verified 0.7.1/protocol 15 behavior, `agent send` reaches the remote pane and writes text to a composer-style agent, but it does not submit the prompt. A submit-capable command/API remains future work for headless controller-only prompt handoff.
 
 ### 4. Click/focus a remote agent
 
@@ -136,15 +149,15 @@ This is a direct remote terminal attach/proxy, not an embedded local split pane 
 
 ### 5. Agent-to-agent control
 
-An agent running on SteamDeck can control Jafar agents through the local SteamDeck Herdr API:
+An agent running on SteamDeck can inspect Jafar agents and route allowed commands through the local SteamDeck Herdr API:
 
 ```bash
 herdr agent list
 herdr agent read jafar/codex
-herdr agent send jafar/claude "continue"
+herdr agent send jafar/claude "continue"  # text injection only until submit-capable federation is proven
 ```
 
-An agent running on Jafar can control SteamDeck agents only if Jafar's Herdr session also has SteamDeck configured as a remote host. MVP has no transitive routing; each node routes only to local agents and explicitly configured remotes.
+An agent running on Jafar can inspect/control SteamDeck agents only if Jafar's Herdr session also has SteamDeck configured as a remote host. MVP has no transitive routing; each node routes only to local agents and explicitly configured remotes. For composer-style agents, controller-only headless prompt submission is not yet proven by federation alone.
 
 ### 6. Plain SSH is unmanaged
 
@@ -630,6 +643,8 @@ pane.send_input
 events.subscribe for cache/wait state
 ```
 
+Being in the allowlist means the operation may be routed to the authoritative host; it does not prove higher-level composer semantics. In verified Herdr 0.7.1 / protocol 15 behavior, routed `agent.send` writes text into a composer-style agent but does not submit the prompt. The lower-level `pane.send_keys` and `pane.send_input` primitives are listed as routable categories, but a safe federation-only prompt-submit choreography for composer-style agents remains unverified/future work.
+
 Denied by default over federation:
 
 ```text
@@ -641,7 +656,7 @@ integration.uninstall
 broad workspace/tab destructive mutation
 ```
 
-Remote workspace creation is allowed only through explicit capability-gated routes to the owning host, and only when the active source/projection is remote and connected. It must not be confused with adding/provisioning a machine. Broader workspace/tab destructive mutation remains denied by default until confirmations, capabilities, and UX language are settled. Workspace/tab creation or pane placement for agent start may be allowed through explicit remote `agent.start` placement features.
+Remote workspace creation is allowed only through explicit capability-gated routes to the owning host, and only when the active source/projection is remote and connected. It must not be confused with adding/provisioning a machine. Broader workspace/tab destructive mutation remains denied by default until confirmations, capabilities, and UX language are settled. Workspace/tab creation or pane placement for agent start may be allowed through explicit remote `agent.start` placement features. A later teardown route for federation-placed panes/workspaces/lane surfaces must be much narrower than broad host/process management: host/session-qualified, capability-gated, and explicit about destructive semantics.
 
 `agent.wait` is not a routable API method — the API exposes no such op. The CLI's `agent wait` is composed from the long-held wait primitives (`events.wait` / `pane.wait_for_output`). Over federation it is realized by proxying those primitives to the owning node on a dedicated bridge and running the wait/match logic locally, not by forwarding an `agent.wait` call.
 
@@ -803,11 +818,13 @@ Remote agent commands:
 herdr agent list
 herdr agent list --host jafar
 herdr agent read jafar/codex --lines 80
-herdr agent send jafar/codex "continue"
+herdr agent send jafar/codex "continue"  # text injection for composer-style agents; submit is unverified/future
 herdr agent focus jafar/codex
 herdr agent wait jafar/codex --status done
 herdr agent start --host jafar --name codex --cwd /Users/afayed/projects/mentat -- codex
 ```
+
+In verified Herdr 0.7.1 / protocol 15 behavior, `agent send` is a routed text-write primitive for composer-style agents: readback can show the text in the composer, but the target agent may not process it. A submit-capable federation command/API remains a future requirement for controller-only headless orchestration.
 
 Avoid using subcommand `--remote` for this feature because root-level `--remote <ssh-target>` already means remote TUI attach.
 
@@ -1134,15 +1151,13 @@ herdr agent read jafar/codex
 
 Spike limitation: the first implementation performs the one-request SSH bridge synchronously in the App API handler. That proves the routing path, but it can block the local UI/server loop while SSH probes and request execution run. A shipping implementation should move remote request execution off the main loop and reuse supervisor compatibility/preparation state instead of probing the remote binary on every read/send.
 
-Acceptance criteria:
+Acceptance criteria for current Phase 2 routing:
 
-```bash
-herdr agent read jafar/codex --lines 50
-herdr agent send jafar/codex "continue"
-herdr agent wait jafar/codex --status done
-```
+- `herdr agent read jafar/codex --lines 50` returns remote pane content from the local machine and from agents running in local panes.
+- `herdr agent send jafar/codex "continue"` routes to the owning host and the injected text can be observed by subsequent readback, but verified Herdr 0.7.1 / protocol 15 behavior does not submit composer-style prompts.
+- `herdr agent wait jafar/codex --status done` composes the remote wait primitives without introducing a separate routable `agent.wait` method.
 
-work from the local machine and from agents running in local panes.
+Future controller-only headless orchestration acceptance must prove `place -> submit prompt -> agent reacts -> controller reads reaction` with no SSH/manual attach.
 
 Tests:
 
@@ -1237,12 +1252,14 @@ Implemented in this spike:
 - live remote source failure reasons (`disconnected`, `needs update`, `unreachable`) shared between the supervisor, CLI status, and sidebar labels;
 - sidebar host-state rows for configured auto-connect remotes when no cached agents exist;
 - Docker smoke coverage for the configured one-hop path: get/read/send/focus/start, disconnect, and reconnect;
-- real-host Jafar smoke for capability/status commands and isolated `fed-*` host-qualified control after updating the remote binary.
+- real-host Jafar smoke for capability/status commands and isolated `fed-*` host-qualified control after updating the remote binary;
+- verified real-host gap: `agent send` writes text into a composer-style remote agent but does not submit the prompt, and no federation-only controller teardown exists for remote lanes/surfaces placed by the controller.
 
 Still intentionally out of MVP scope:
 
 - embedded remote panes or local-owned remote PTYs;
 - broad destructive remote operations;
+- narrow federation-placed pane/workspace/lane teardown with host/session-qualified, capability-gated destructive semantics;
 - transitive remote-of-remote routing;
 - automatic remote update/setup orchestration for configured hosts;
 - multi-host production soak/chaos validation beyond the Docker and Jafar smoke coverage.
@@ -1261,7 +1278,7 @@ Implemented Phase 5 hardening:
 - Remote failure classification is shared between CLI status/check and the live `RemoteSource` supervisor, including longer retry backoff for missing/incompatible binaries.
 - The sidebar preserves stale remote agents and labels them with the specific failure reason. Configured auto-connect hosts with no cached agents now appear as host-only rows when disconnected, unreachable, or needing update.
 - Remote status/check validate configuration before SSH, including rejecting leading-dash SSH targets.
-- Jafar real-host smoke covered updated remote capability/status commands, isolated `fed-*` status, and host-qualified list/get/read/send/focus/start paths.
+- Jafar real-host smoke covered updated remote capability/status commands, isolated `fed-*` status, and host-qualified list/get/read/send/focus/start routing paths, with the known `agent send` composer-submit gap called out above.
 
 Remaining non-MVP or later polish:
 
