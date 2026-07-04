@@ -32,6 +32,25 @@ pub struct AgentSubmitParams {
     pub text: String,
 }
 
+/// Tear down a federation-placed agent/lane pane.
+///
+/// `agent.teardown` is a narrow, explicitly destructive, capability-gated
+/// close of the pane hosting a detected agent/lane. It is NOT broad remote
+/// pane/workspace/server/process management: the close flows through the
+/// existing authoritative `close_pane` path (preserving events, session save,
+/// runtime cleanup, and the separate worktree-group confirmation guard), and
+/// it must never reach a general raw pane close for non-agent targets.
+///
+/// `confirm` defaults to `false` and must be set explicitly to `true`; the
+/// controller rejects the request before route planning or remote forwarding
+/// when it is absent or false.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentTeardownParams {
+    pub target: String,
+    #[serde(default)]
+    pub confirm: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentRenameParams {
     pub target: String,

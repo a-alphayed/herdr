@@ -1110,6 +1110,22 @@
           ],
           "type": "object"
         },
+        "AgentTeardownParams": {
+          "description": "Tear down a federation-placed agent/lane pane.\n\n`agent.teardown` is a narrow, explicitly destructive, capability-gated\nclose of the pane hosting a detected agent/lane. It is NOT broad remote\npane/workspace/server/process management: the close flows through the\nexisting authoritative `close_pane` path (preserving events, session save,\nruntime cleanup, and the separate worktree-group confirmation guard), and\nit must never reach a general raw pane close for non-agent targets.\n\n`confirm` defaults to `false` and must be set explicitly to `true`; the\ncontroller rejects the request before route planning or remote forwarding\nwhen it is absent or false.",
+          "properties": {
+            "confirm": {
+              "default": false,
+              "type": "boolean"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
         "ClientWindowTitleSetParams": {
           "properties": {
             "title": {
@@ -4173,6 +4189,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/AgentStartParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.teardown",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentTeardownParams"
             }
           },
           "required": [

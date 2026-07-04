@@ -720,6 +720,9 @@ fn federation_method_for_api_method(method: &crate::api::schema::Method) -> Opti
         crate::api::schema::Method::AgentStart(_) => {
             Some(crate::api::schema::FederationCapabilities::AGENT_START)
         }
+        crate::api::schema::Method::AgentTeardown(_) => {
+            Some(crate::api::schema::FederationCapabilities::AGENT_TEARDOWN)
+        }
         crate::api::schema::Method::TabList(_) => {
             Some(crate::api::schema::FederationCapabilities::TAB_LIST)
         }
@@ -3082,6 +3085,23 @@ mod tests {
     }
 
     #[test]
+    fn federation_method_for_api_method_maps_agent_teardown() {
+        // Load-bearing lock-test: AgentTeardown MUST map to AGENT_TEARDOWN. The
+        // catch-all `_ => None` would otherwise only require remote_api_bridge,
+        // letting an older remote silently accept a teardown it cannot perform.
+        let request =
+            crate::api::schema::Method::AgentTeardown(crate::api::schema::AgentTeardownParams {
+                target: "jafar/codex".to_string(),
+                confirm: true,
+            });
+
+        assert_eq!(
+            federation_method_for_api_method(&request),
+            Some(crate::api::schema::FederationCapabilities::AGENT_TEARDOWN)
+        );
+    }
+
+    #[test]
     fn required_federation_methods_include_remote_agent_method() {
         let request = crate::api::schema::Request {
             id: "req".to_string(),
@@ -3132,6 +3152,12 @@ mod tests {
     }
 
     #[test]
+    fn federation_capabilities_current_advertises_agent_teardown() {
+        assert!(crate::api::schema::FederationCapabilities::current()
+            .supports_method(crate::api::schema::FederationCapabilities::AGENT_TEARDOWN,));
+    }
+
+    #[test]
     fn validate_federation_capabilities_rejects_missing_agent_submit_without_fallback() {
         let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true);
         // An older remote advertises remote_api_bridge and agent_send but not
@@ -3157,6 +3183,58 @@ mod tests {
         assert!(err
             .to_string()
             .contains("does not advertise federation method agent_submit"));
+    }
+
+    #[test]
+    fn required_federation_methods_include_remote_agent_teardown_method() {
+        let request = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::AgentTeardown(
+                crate::api::schema::AgentTeardownParams {
+                    target: "jafar/codex".to_string(),
+                    confirm: true,
+                },
+            ),
+        };
+
+        let methods = required_federation_methods_for_request(&request);
+
+        assert_eq!(
+            methods,
+            vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::AGENT_TEARDOWN
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_federation_capabilities_rejects_missing_agent_teardown_without_fallback() {
+        let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true);
+        // An older remote advertises remote_api_bridge and agent_send but not
+        // agent_teardown. Teardown must fail clearly instead of degrading into a
+        // plain bridge-only request the remote cannot service.
+        let capabilities = crate::api::schema::FederationCapabilities {
+            methods: vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE.into(),
+                crate::api::schema::FederationCapabilities::AGENT_SEND.into(),
+            ],
+        };
+
+        let err = validate_federation_capabilities(
+            &host,
+            &capabilities,
+            &[
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::AGENT_TEARDOWN,
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("does not advertise federation method agent_teardown"));
     }
 
     #[test]

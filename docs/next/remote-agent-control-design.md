@@ -67,9 +67,19 @@ Invariants preserved:
 - Projection hit areas take precedence in mouse routing when a projection is selected.
 - Remote source authority, hook relay, and PTY ownership are unchanged.
 
-### Teardown (still future)
+### Teardown (first narrow path)
 
-A narrow future teardown capability should be host/session-qualified, capability-gated, and explicit about destructive semantics for federation-placed panes/workspaces/lane surfaces. It is not broad remote host/process management.
+The first narrow, explicitly destructive, capability-gated controller-side teardown path is now in place for federation-placed agent/lane surfaces. It is deliberately NOT broad remote pane/workspace/server/process management.
+
+- API: `agent.teardown` with `{ target, confirm }`. `confirm` defaults to `false` and the controller rejects the request with `confirmation_required` before route planning or remote forwarding when it is absent or false.
+- CLI: `herdr agent teardown <host>/<target> --confirm`. The CLI rejects a missing `--confirm` before sending; the API enforces `confirm` as well.
+- Capability: the route requires the remote host to advertise `agent_teardown` (in addition to `remote_api_bridge`). A remote that does not advertise it fails with `does not advertise federation method agent_teardown` and does not fall back.
+- Target resolution: host/session-qualified. The controller resolves the projection-derived target against `RemoteSourceCache` and forwards `agent.teardown` to the authoritative host with the resolved `terminal_id` and `confirm: true`. Workspace selectors remain unsupported.
+- Local authoritative close: the close flows through the existing `close_pane` path, preserving `pane.closed` / `workspace.closed` events, session save, and runtime cleanup. The target must carry agent identity (`agent_info_for_target`); non-agent terminal/pane ids fail as an agent-target error and never become a general pane close.
+- The worktree-group `confirmation_required` guard on `close_pane` is NOT bypassed by teardown's `confirm: true`; a teardown that would collapse a worktree group still surfaces `confirmation_required`.
+- No PID kill, process/host/server stop, provisioning, arbitrary SSH shell commands, or local-owned remote PTY behavior is exposed. The operation is non-idempotent and performs no uncertain retry: a remote `close_pane` that happens to close the workspace (last pane) is a consequence of the authoritative close path, not an exposed raw workspace close.
+
+Broad remote pane/workspace/server/process teardown remains out of scope; only this narrow federation-placed agent/lane surface is teardown-capable.
 
 ## Core Invariants
 
@@ -693,7 +703,7 @@ integration.uninstall
 broad workspace/tab destructive mutation
 ```
 
-Remote workspace creation is allowed only through explicit capability-gated routes to the owning host, and only when the active source/projection is remote and connected. It must not be confused with adding/provisioning a machine. Broader workspace/tab destructive mutation remains denied by default until confirmations, capabilities, and UX language are settled. Workspace/tab creation or pane placement for agent start may be allowed through explicit remote `agent.start` placement features. A later teardown route for federation-placed panes/workspaces/lane surfaces must be much narrower than broad host/process management: host/session-qualified, capability-gated, and explicit about destructive semantics.
+Remote workspace creation is allowed only through explicit capability-gated routes to the owning host, and only when the active source/projection is remote and connected. It must not be confused with adding/provisioning a machine. Broader workspace/tab destructive mutation remains denied by default until confirmations, capabilities, and UX language are settled. Workspace/tab creation or pane placement for agent start may be allowed through explicit remote `agent.start` placement features. The narrow federation-placed agent/lane teardown route (`agent.teardown`) is host/session-qualified, capability-gated, and explicit about destructive semantics, and stays much narrower than broad host/process management — broad pane/workspace/server/process teardown remains out of scope.
 
 `agent.wait` is not a routable API method — the API exposes no such op. The CLI's `agent wait` is composed from the long-held wait primitives (`events.wait` / `pane.wait_for_output`). Over federation it is realized by proxying those primitives to the owning node on a dedicated bridge and running the wait/match logic locally, not by forwarding an `agent.wait` call.
 
@@ -1291,13 +1301,12 @@ Implemented in this spike:
 - sidebar host-state rows for configured auto-connect remotes when no cached agents exist;
 - Docker smoke coverage for the configured one-hop path: get/read/send/focus/start, disconnect, and reconnect;
 - real-host Jafar smoke for capability/status commands and isolated `fed-*` host-qualified control after updating the remote binary;
-- verified real-host gap (0.7.1/protocol 15): `agent send` writes text into a composer-style remote agent but does not submit the prompt. Phase E.0 adds the submit-capable `agent.submit` route (`herdr agent submit`), capability-gated by `agent_submit`; full controller-only runtime proof is the E.0 validation step. No federation-only controller teardown exists yet for remote lanes/surfaces placed by the controller.
+- verified real-host gap (0.7.1/protocol 15): `agent send` writes text into a composer-style remote agent but does not submit the prompt. Phase E.0 adds the submit-capable `agent.submit` route (`herdr agent submit`), capability-gated by `agent_submit`; full controller-only runtime proof is the E.0 validation step. Phase F adds the first narrow federation-placed teardown route (`agent.teardown` / `herdr agent teardown <host>/<target> --confirm`), capability-gated by `agent_teardown`; full controller-only runtime proof is the F validation step.
 
 Still intentionally out of MVP scope:
 
 - embedded remote panes or local-owned remote PTYs;
-- broad destructive remote operations;
-- narrow federation-placed pane/workspace/lane teardown with host/session-qualified, capability-gated destructive semantics;
+- broad destructive remote operations (broad pane/workspace/server/process teardown remains out of scope; only the narrow federation-placed agent/lane `agent.teardown` path is supported);
 - transitive remote-of-remote routing;
 - automatic remote update/setup orchestration for configured hosts;
 - multi-host production soak/chaos validation beyond the Docker and Jafar smoke coverage.

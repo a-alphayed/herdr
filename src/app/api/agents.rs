@@ -2,8 +2,8 @@ use bytes::Bytes;
 
 use crate::api::schema::{
     AgentReadParams, AgentRenameParams, AgentSendParams, AgentStartParams, AgentSubmitParams,
-    AgentTarget, ErrorBody, Method, PaneReadResult, ReadFormat, ReadSource, Request,
-    ResponseResult,
+    AgentTarget, AgentTeardownParams, ErrorBody, Method, PaneReadResult, PaneTarget, ReadFormat,
+    ReadSource, Request, ResponseResult,
 };
 use crate::app::App;
 
@@ -113,6 +113,53 @@ impl App {
         };
 
         encode_success(id, ResponseResult::AgentStarted { agent, argv })
+    }
+
+    pub(super) fn handle_agent_teardown(
+        &mut self,
+        id: String,
+        params: AgentTeardownParams,
+    ) -> String {
+        // Confirm gate fires first for BOTH local and remote targets: a missing
+        // confirmation must never reach route planning, local close, or remote
+        // dispatch.
+        if !params.confirm {
+            return encode_error(
+                id,
+                "confirmation_required",
+                "agent.teardown is destructive; pass confirm: true to proceed".to_string(),
+            );
+        }
+
+        match self.plan_agent_api_target(&params.target) {
+            Ok(PlannedTargetRoute::Local { .. }) => {}
+            Ok(PlannedTargetRoute::Remote { host, target }) => {
+                return self.handle_remote_agent_teardown(id, host, target);
+            }
+            Err(err) => return encode_error_body(id, remote_route_plan_error_body(err)),
+        }
+
+        // Prove the target carries agent identity before closing. Non-agent
+        // terminal/pane ids must fail as an agent-target error rather than
+        // degrade into a general pane close path.
+        let agent = match self.agent_info_for_target(&params.target) {
+            Ok(agent) => agent,
+            Err(err) => return encode_error_body(id, self.agent_target_error_body(err)),
+        };
+
+        // Close through the existing authoritative close_pane path so pane.closed
+        // / workspace.closed events, session save, runtime cleanup, and the
+        // separate worktree-group confirmation guard all apply. confirm:true for
+        // teardown is NOT a bypass for that worktree-group guard.
+        match self.close_pane(
+            id.clone(),
+            &PaneTarget {
+                pane_id: agent.pane_id,
+            },
+        ) {
+            Ok(()) => encode_success(id, ResponseResult::Ok {}),
+            Err(response) => response,
+        }
     }
 
     pub(super) fn handle_agent_read(&mut self, id: String, params: AgentReadParams) -> String {
@@ -411,6 +458,30 @@ impl App {
         }
     }
 
+    fn handle_remote_agent_teardown(
+        &self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        selector: RemoteTargetSelector,
+    ) -> String {
+        let resolved =
+            match resolve_remote_agent_target(&self.state.remote_sources, &host, &selector) {
+                Ok(resolved) => resolved,
+                Err(err) => return encode_error_body(id, remote_agent_resolve_error_body(err)),
+            };
+        // Confirmation was already enforced by the local entrypoint; the
+        // forwarded request always carries confirm: true and targets the
+        // resolved authoritative terminal id.
+        let request =
+            remote_agent_teardown_request(id.clone(), resolved.entry.agent.terminal_id.as_str());
+        match crate::remote::send_remote_api_request_to_host_noninteractive(&host, &request)
+            .and_then(|response| rewrite_response_id(&response, &id))
+        {
+            Ok(response) => response,
+            Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
+        }
+    }
+
     fn handle_remote_agent_start(
         &self,
         id: String,
@@ -476,6 +547,16 @@ fn remote_agent_submit_request(
     Request {
         id,
         method: Method::AgentSubmit(params),
+    }
+}
+
+fn remote_agent_teardown_request(id: String, terminal_id: &str) -> Request {
+    Request {
+        id,
+        method: Method::AgentTeardown(AgentTeardownParams {
+            target: terminal_id.to_string(),
+            confirm: true,
+        }),
     }
 }
 
@@ -1128,5 +1209,209 @@ mod tests {
 
         assert_eq!(parsed.id, "missing");
         assert_eq!(parsed.error.code, "agent_not_found");
+    }
+
+    fn agent_teardown_app() -> (App, String) {
+        let mut app = test_app(&crate::config::Config::default());
+        let workspace = crate::workspace::Workspace::test_new("agent-teardown");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("codex".to_string());
+        let target = app.public_pane_id(0, pane_id).unwrap();
+        (app, target)
+    }
+
+    #[test]
+    fn local_agent_teardown_requires_confirm_before_local_close() {
+        let (mut app, target) = agent_teardown_app();
+        let starting_panes = app.state.workspaces[0].tabs[0].layout.pane_count();
+
+        let response = app.handle_agent_teardown(
+            "req".into(),
+            AgentTeardownParams {
+                target: target.clone(),
+                confirm: false,
+            },
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.id, "req");
+        assert_eq!(parsed.error.code, "confirmation_required");
+        // Nothing was closed.
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.pane_count(),
+            starting_panes
+        );
+    }
+
+    #[test]
+    fn local_agent_teardown_omitted_confirm_defaults_to_required() {
+        let (mut app, target) = agent_teardown_app();
+
+        // Omitting confirm entirely (serde default false) must still refuse.
+        let response = app.handle_api_request(Request {
+            id: "req".into(),
+            method: Method::AgentTeardown(AgentTeardownParams {
+                target,
+                confirm: false,
+            }),
+        });
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.error.code, "confirmation_required");
+    }
+
+    #[test]
+    fn local_agent_teardown_rejects_non_agent_target() {
+        // A plain shell pane (no agent name / label / launch argv) is not an
+        // agent terminal and must fail as an agent-target error, never reaching
+        // a general pane close.
+        let mut app = test_app(&crate::config::Config::default());
+        let workspace = crate::workspace::Workspace::test_new("non-agent");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let target = app.public_pane_id(0, pane_id).unwrap();
+        let starting_panes = app.state.workspaces[0].tabs[0].layout.pane_count();
+
+        let response = app.handle_agent_teardown(
+            "req".into(),
+            AgentTeardownParams {
+                target: target.clone(),
+                confirm: true,
+            },
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.error.code, "agent_not_found");
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].layout.pane_count(),
+            starting_panes
+        );
+    }
+
+    #[test]
+    fn local_agent_teardown_closes_agent_pane_and_emits_events() {
+        let (mut app, target) = agent_teardown_app();
+        let sequence_before = app.event_hub.current_sequence();
+
+        let response = app.handle_agent_teardown(
+            "req".into(),
+            AgentTeardownParams {
+                target: target.clone(),
+                confirm: true,
+            },
+        );
+        let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.result, ResponseResult::Ok {});
+        // The single-pane workspace is gone (authoritative close path).
+        assert!(app.state.workspaces.is_empty());
+        // Closed through close_pane, so pane.closed + workspace.closed fired.
+        let events = app.event_hub.events_after(sequence_before);
+        let kinds: Vec<_> = events.into_iter().map(|(_, ev)| ev.event).collect();
+        assert!(kinds
+            .iter()
+            .any(|kind| matches!(kind, crate::api::schema::EventKind::PaneClosed)));
+        assert!(kinds
+            .iter()
+            .any(|kind| matches!(kind, crate::api::schema::EventKind::WorkspaceClosed)));
+    }
+
+    #[test]
+    fn local_agent_teardown_keeps_worktree_group_confirmation_guard() {
+        // confirm:true for teardown does NOT bypass close_pane's separate
+        // worktree-group guard: when the authoritative close would collapse a
+        // worktree group, teardown surfaces confirmation_required too.
+        let mut app = test_app(&crate::config::Config::default());
+        let mut parent = crate::workspace::Workspace::test_new("teardown-parent");
+        parent.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr".into(),
+            is_linked_worktree: false,
+        });
+        let pane_id = parent.tabs[0].root_pane;
+        let terminal_id = parent.terminal_id(pane_id).cloned().unwrap();
+        let mut child = crate::workspace::Workspace::test_new("teardown-child");
+        child.worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr-child".into(),
+            is_linked_worktree: true,
+        });
+        app.state.workspaces = vec![parent, child];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("codex".to_string());
+        let target = app.public_pane_id(0, pane_id).unwrap();
+
+        let response = app.handle_agent_teardown(
+            "req".into(),
+            AgentTeardownParams {
+                target,
+                confirm: true,
+            },
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.error.code, "confirmation_required");
+        // The worktree group is untouched.
+        assert_eq!(app.state.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn remote_agent_teardown_request_uses_resolved_terminal_id_and_confirm_true() {
+        let request = remote_agent_teardown_request("req-1".to_string(), "term-1");
+
+        let Method::AgentTeardown(params) = request.method else {
+            panic!("expected agent.teardown");
+        };
+        assert_eq!(request.id, "req-1");
+        assert_eq!(params.target, "term-1");
+        assert!(params.confirm);
+    }
+
+    #[test]
+    fn remote_agent_teardown_requires_confirm_before_remote_routing() {
+        // confirm:false must refuse before any remote host resolution or
+        // forwarding, even when a remote host is configured and the target is
+        // host-qualified.
+        let mut config = crate::config::Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar", "jafar", "default", true,
+        )];
+        let mut app = test_app(&config);
+        app.state.remote_sources.replace_connected_snapshot(
+            RemoteHostKey::new("jafar", "default"),
+            vec![remote_agent("term-1", "pane-1", "codex")],
+        );
+
+        let response = app.handle_agent_teardown(
+            "req".into(),
+            AgentTeardownParams {
+                target: "jafar/codex".to_string(),
+                confirm: false,
+            },
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.error.code, "confirmation_required");
     }
 }

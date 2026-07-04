@@ -312,6 +312,12 @@ fn agent_command() -> Command {
                 .arg(flag("no-focus")),
         )
         .subcommand(
+            Command::new("teardown")
+                .about("Tear down a federation-placed agent pane (destructive)")
+                .arg(required("target", "TARGET"))
+                .arg(flag("confirm")),
+        )
+        .subcommand(
             Command::new("explain")
                 .about("Explain agent detection state")
                 .arg(Arg::new("target").value_name("TARGET"))
@@ -939,6 +945,17 @@ mod tests {
         assert!(submit
             .get_arguments()
             .any(|arg| arg.get_id() == "text" && arg.is_required_set()));
+    }
+
+    #[test]
+    fn spec_includes_agent_teardown_subcommand() {
+        let cmd = super::command();
+        let teardown = command_path(&cmd, &["agent", "teardown"]);
+        assert!(teardown.get_about().is_some());
+        assert!(teardown
+            .get_arguments()
+            .any(|arg| arg.get_id() == "target" && arg.is_required_set()));
+        assert!(has_option(teardown, "confirm"));
     }
 
     #[test]

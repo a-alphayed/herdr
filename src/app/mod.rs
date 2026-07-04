@@ -3974,6 +3974,15 @@ auto_connect = false
                 amount: Some(0.05),
             }),
         };
+        let agent_teardown = crate::api::schema::Request {
+            id: "req_9".into(),
+            method: crate::api::schema::Method::AgentTeardown(
+                crate::api::schema::AgentTeardownParams {
+                    target: "agent-1".into(),
+                    confirm: true,
+                },
+            ),
+        };
 
         assert!(!crate::api::request_changes_ui(&read_only));
         assert!(!crate::api::request_changes_ui(&worktree_list));
@@ -3983,6 +3992,7 @@ auto_connect = false
         assert!(crate::api::request_changes_ui(&pane_swap));
         assert!(crate::api::request_changes_ui(&pane_focus_direction));
         assert!(crate::api::request_changes_ui(&pane_resize));
+        assert!(crate::api::request_changes_ui(&agent_teardown));
     }
 
     #[test]

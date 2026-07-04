@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use crate::api::schema::{
     AgentReadParams, AgentRenameParams, AgentSendParams, AgentStartParams, AgentStatus,
-    AgentSubmitParams, AgentTarget, EmptyParams, Method, ReadFormat, ReadSource, Request,
-    Subscription,
+    AgentSubmitParams, AgentTarget, AgentTeardownParams, EmptyParams, Method, ReadFormat,
+    ReadSource, Request, Subscription,
 };
 
 const AGENT_START_USAGE: &str = "usage: herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--env KEY=VALUE] [--focus|--no-focus] -- <argv...>\n       herdr agent start --host HOST --name NAME [--cwd REMOTE_PATH] [--workspace ID] [--tab ID] [--split right|down] [--env KEY=VALUE] [--focus|--no-focus] -- <argv...>";
@@ -25,6 +25,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "wait" => agent_wait(&args[1..]),
         "attach" => agent_attach(&args[1..]),
         "start" => agent_start(&args[1..]),
+        "teardown" => agent_teardown(&args[1..]),
         "explain" => agent_explain(&args[1..]),
         "help" | "--help" | "-h" => {
             print_agent_help();
@@ -718,6 +719,60 @@ fn agent_submit(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+fn agent_teardown(args: &[String]) -> std::io::Result<i32> {
+    const USAGE: &str = "usage: herdr agent teardown <target> --confirm";
+    let mut target = None;
+    let mut confirm = false;
+
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--confirm" => {
+                confirm = true;
+                index += 1;
+            }
+            "help" | "--help" | "-h" => {
+                eprintln!("{USAGE}");
+                eprintln!(
+                    "  tears down the federation-placed agent/lane pane (destructive); --confirm is required"
+                );
+                return Ok(0);
+            }
+            value if value.starts_with('-') => {
+                eprintln!("unknown option: {value}");
+                return Ok(2);
+            }
+            value => {
+                if target.is_some() {
+                    eprintln!("{USAGE}");
+                    return Ok(2);
+                }
+                target = Some(value.to_string());
+                index += 1;
+            }
+        }
+    }
+
+    let Some(target) = target else {
+        eprintln!("{USAGE}");
+        return Ok(2);
+    };
+    // Reject before sending: the API enforces confirmation too, but the CLI
+    // fails fast with a usage error so no destructive request is attempted.
+    if !confirm {
+        eprintln!("agent teardown is destructive; pass --confirm to proceed");
+        return Ok(2);
+    }
+
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:teardown".into(),
+        method: Method::AgentTeardown(AgentTeardownParams {
+            target,
+            confirm: true,
+        }),
+    })?)
+}
+
 fn agent_read(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!("usage: herdr agent read <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
@@ -819,6 +874,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent attach <target> [--takeover]");
     eprintln!("  herdr agent start <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--env KEY=VALUE] [--focus|--no-focus] -- <argv...>");
     eprintln!("  herdr agent start --host HOST --name NAME [--cwd REMOTE_PATH] [--workspace ID] [--tab ID] [--split right|down] [--env KEY=VALUE] [--focus|--no-focus] -- <argv...>");
+    eprintln!("  herdr agent teardown <target> --confirm  (destructive; closes the pane hosting a federation-placed agent/lane)");
     eprintln!("  herdr agent explain <target> [--json]");
     eprintln!("  herdr agent explain --file PATH --agent LABEL [--json]");
     eprintln!("  targets accept terminal ids, unique agent names, detected/reported agent labels, and legacy pane ids");

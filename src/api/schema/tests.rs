@@ -215,6 +215,37 @@ fn request_round_trips_for_agent_submit() {
 }
 
 #[test]
+fn request_round_trips_for_agent_teardown() {
+    let request = Request {
+        id: "req_agent_teardown".into(),
+        method: Method::AgentTeardown(AgentTeardownParams {
+            target: "agent-1".into(),
+            confirm: true,
+        }),
+    };
+
+    let json = serde_json::to_value(&request).unwrap();
+    assert_eq!(json["method"], "agent.teardown");
+    assert_eq!(json["params"]["target"], "agent-1");
+    assert_eq!(json["params"]["confirm"], true);
+    let restored: Request = serde_json::from_value(json).unwrap();
+    assert_eq!(restored, request);
+}
+
+#[test]
+fn agent_teardown_confirm_defaults_to_false_when_omitted() {
+    // `confirm` is `#[serde(default)]`; an omitted field must deserialize to
+    // false so a forgetful caller never accidentally authorizes a teardown.
+    let json = r#"{"id":"req_1","method":"agent.teardown","params":{"target":"agent-1"}}"#;
+    let request: Request = serde_json::from_str(json).unwrap();
+    let Method::AgentTeardown(params) = request.method else {
+        panic!("wrong method parsed");
+    };
+    assert_eq!(params.target, "agent-1");
+    assert!(!params.confirm);
+}
+
+#[test]
 fn notification_show_request_parses() {
     let json = r#"{"id":"req_1","method":"notification.show","params":{"title":"build failed","body":"api workspace","position":"top-left","sound":"request"}}"#;
     let request: Request = serde_json::from_str(json).unwrap();
