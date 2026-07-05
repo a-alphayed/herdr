@@ -1,8 +1,8 @@
 use bytes::Bytes;
 
 use crate::api::schema::{
-    EventData, EventEnvelope, EventKind, PaneClearAgentAuthorityParams, PaneCurrentParams,
-    PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
+    ErrorBody, EventData, EventEnvelope, EventKind, Method, PaneClearAgentAuthorityParams,
+    PaneCurrentParams, PaneDirection, PaneEdgesParams, PaneEdgesResult, PaneFocusDirectionParams,
     PaneFocusDirectionReason, PaneFocusDirectionResult, PaneInfo, PaneLayoutPane, PaneLayoutParams,
     PaneLayoutRect, PaneLayoutSnapshot, PaneLayoutSplit, PaneListParams, PaneMoveDestination,
     PaneMoveParams, PaneMoveReason, PaneMoveResult, PaneNeighborParams, PaneNeighborResult,
@@ -11,7 +11,7 @@ use crate::api::schema::{
     PaneReportMetadataParams, PaneResizeParams, PaneResizeReason, PaneResizeResult,
     PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams,
     PaneSwapReason, PaneSwapResult, PaneTarget, PaneZoomMode, PaneZoomParams, PaneZoomReason,
-    PaneZoomResult, ReadFormat, ReadSource, ResponseResult,
+    PaneZoomResult, ReadFormat, ReadSource, Request, ResponseResult,
 };
 use crate::app::actions::{PaneZoomCommand, PaneZoomNoopReason};
 use crate::app::{App, Mode};
@@ -21,14 +21,90 @@ use super::super::api_helpers::{
     detect_state_from_api, encode_api_keys, encode_api_text, normalize_custom_status,
     normalize_reported_agent_label,
 };
-use super::responses::{encode_error, encode_success};
+use super::responses::{encode_error, encode_error_body, encode_success};
+use crate::remote_target::{
+    plan_target_route, resolve_remote_pane_target, PlannedTargetRoute, RemotePaneResolveError,
+    RemoteRoutePlanError, RemoteTargetSelector,
+};
 
 const METADATA_SOURCE_MAX_CHARS: usize = 80;
 const METADATA_TTL_MIN_MS: u64 = 1;
 const METADATA_TTL_MAX_MS: u64 = 86_400_000;
 
+fn remote_pane_split_request(
+    id: String,
+    mut params: PaneSplitParams,
+    workspace_id: &str,
+    pane_id: &str,
+) -> Request {
+    params.workspace_id = Some(workspace_id.to_string());
+    params.target_pane_id = Some(pane_id.to_string());
+    Request {
+        id,
+        method: Method::PaneSplit(params),
+    }
+}
+
+fn rewrite_remote_pane_split_response_id(response: &str, id: &str) -> std::io::Result<String> {
+    let mut value: serde_json::Value = serde_json::from_str(response).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid remote API response JSON: {err}"),
+        )
+    })?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote API response must be a JSON object",
+        ));
+    };
+    if !object.contains_key("result") && !object.contains_key("error") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote API response must contain result or error",
+        ));
+    }
+    object.insert("id".to_string(), serde_json::Value::String(id.to_string()));
+    serde_json::to_string(&value).map_err(std::io::Error::other)
+}
+
+fn remote_route_plan_error_body(err: RemoteRoutePlanError) -> ErrorBody {
+    match err {
+        RemoteRoutePlanError::Parse(err) => ErrorBody {
+            code: "remote_target_error".to_string(),
+            message: err.to_string(),
+        },
+        RemoteRoutePlanError::UnknownHost(host) => ErrorBody {
+            code: "remote_target_error".to_string(),
+            message: format!("unknown remote host: {host}"),
+        },
+    }
+}
+
+fn remote_pane_resolve_error_body(err: RemotePaneResolveError) -> ErrorBody {
+    let code = match &err {
+        RemotePaneResolveError::NotFound { .. } => "remote_pane_not_found",
+        RemotePaneResolveError::ProjectionStale { .. } => "remote_projection_stale",
+        RemotePaneResolveError::NoProjection { .. } => "remote_projection_unavailable",
+        RemotePaneResolveError::HostNotConnected { .. } => "remote_host_not_connected",
+        RemotePaneResolveError::UnsupportedSelector { .. } => "remote_target_error",
+    };
+    ErrorBody {
+        code: code.to_string(),
+        message: err.to_string(),
+    }
+}
+
 impl App {
     pub(super) fn handle_pane_split(&mut self, id: String, params: PaneSplitParams) -> String {
+        match self.plan_pane_split_remote_route(&params) {
+            Ok(Some((host, selector))) => {
+                return self.handle_remote_pane_split(id, host, selector, params);
+            }
+            Ok(None) => {}
+            Err(err) => return encode_error_body(id, remote_route_plan_error_body(err)),
+        }
+
         let target = if let Some(target_pane_id) = params.target_pane_id.as_deref() {
             self.parse_pane_id(target_pane_id)
         } else if let Some(workspace_id) = params.workspace_id.as_deref() {
@@ -119,6 +195,96 @@ impl App {
         });
 
         encode_success(id, ResponseResult::PaneInfo { pane })
+    }
+
+    fn plan_pane_split_remote_route(
+        &self,
+        params: &PaneSplitParams,
+    ) -> Result<
+        Option<(crate::remote_target::RemoteHostConfig, RemoteTargetSelector)>,
+        RemoteRoutePlanError,
+    > {
+        if self.remote_hosts.list().is_empty() {
+            return Ok(None);
+        }
+
+        for target in [
+            params.target_pane_id.as_deref(),
+            params.workspace_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            match plan_target_route(&self.remote_hosts, target)? {
+                PlannedTargetRoute::Local { .. } => {}
+                PlannedTargetRoute::Remote { host, target } => return Ok(Some((host, target))),
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn handle_remote_pane_split(
+        &self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        selector: RemoteTargetSelector,
+        params: PaneSplitParams,
+    ) -> String {
+        self.handle_remote_pane_split_with_sender(
+            id,
+            host,
+            selector,
+            params,
+            crate::remote::send_remote_api_request_to_host_noninteractive,
+        )
+    }
+
+    fn handle_remote_pane_split_with_sender<F>(
+        &self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        selector: RemoteTargetSelector,
+        params: PaneSplitParams,
+        send: F,
+    ) -> String
+    where
+        F: FnOnce(&crate::remote_target::RemoteHostConfig, &Request) -> std::io::Result<String>,
+    {
+        let host_key =
+            crate::remote_source::RemoteHostKey::new(host.name.clone(), host.session.clone());
+        let host_status = self.state.remote_sources.host_status(&host_key);
+        if !host_status.is_some_and(|status| status.is_connected()) {
+            let status = host_status
+                .and_then(|status| status.stale_label())
+                .unwrap_or("disconnected")
+                .to_string();
+            return encode_error_body(
+                id,
+                remote_pane_resolve_error_body(RemotePaneResolveError::HostNotConnected {
+                    host: host.name.clone(),
+                    status,
+                }),
+            );
+        }
+
+        let resolved =
+            match resolve_remote_pane_target(&self.state.remote_sources, &host, &selector) {
+                Ok(resolved) => resolved,
+                Err(err) => return encode_error_body(id, remote_pane_resolve_error_body(err)),
+            };
+        let request = remote_pane_split_request(
+            id.clone(),
+            params,
+            &resolved.workspace_id,
+            &resolved.pane_id,
+        );
+        match send(&resolved.host, &request)
+            .and_then(|response| rewrite_remote_pane_split_response_id(&response, &id))
+        {
+            Ok(response) => response,
+            Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
+        }
     }
 
     pub(super) fn handle_pane_list(&mut self, id: String, params: PaneListParams) -> String {
@@ -1793,8 +1959,14 @@ fn invalid_agent(id: String) -> String {
 mod tests {
     use super::*;
     use crate::{
-        api::schema::{ErrorResponse, SplitDirection, SuccessResponse},
+        api::schema::{
+            ErrorResponse, LayoutDescription, LayoutNode, LayoutPane, Method, SplitDirection,
+            SuccessResponse,
+        },
         config::Config,
+        remote_source::{
+            RemoteConnectionStatus, RemoteHostKey, RemoteProjectionSnapshot, RemoteProjectionStatus,
+        },
         workspace::Workspace,
     };
 
@@ -2011,6 +2183,274 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn config_with_remote_host() -> Config {
+        let mut config = Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar", "jafar", "default", true,
+        )];
+        config
+    }
+
+    fn remote_pane_split_params(target_pane_id: Option<&str>) -> PaneSplitParams {
+        PaneSplitParams {
+            workspace_id: None,
+            target_pane_id: target_pane_id.map(str::to_string),
+            direction: SplitDirection::Right,
+            ratio: Some(0.4),
+            cwd: Some("/remote/project".to_string()),
+            focus: true,
+            env: [("REMOTE_ONLY".to_string(), "$HOME/not-expanded".to_string())]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    fn remote_projection_layout() -> LayoutDescription {
+        LayoutDescription {
+            workspace_id: "remote-ws".to_string(),
+            tab_id: "remote-tab".to_string(),
+            zoomed: false,
+            focused_pane_id: "remote-pane-focused".to_string(),
+            root: LayoutNode::Split {
+                direction: SplitDirection::Right,
+                ratio: 0.5,
+                first: Box::new(LayoutNode::Pane {
+                    pane: LayoutPane {
+                        pane_id: Some("remote-pane-focused".to_string()),
+                        terminal_id: Some("remote-term-focused".to_string()),
+                        ..Default::default()
+                    },
+                }),
+                second: Box::new(LayoutNode::Pane {
+                    pane: LayoutPane {
+                        pane_id: Some("remote-pane-side".to_string()),
+                        terminal_id: Some("remote-term-side".to_string()),
+                        ..Default::default()
+                    },
+                }),
+            },
+        }
+    }
+
+    fn seed_remote_projection(app: &mut App) {
+        let host = RemoteHostKey::new("jafar", "default");
+        app.state
+            .remote_sources
+            .replace_connected_snapshot(host.clone(), Vec::new());
+        app.state.remote_sources.apply_projection_snapshot(
+            &host,
+            vec![RemoteProjectionSnapshot {
+                workspace_id: "remote-ws".to_string(),
+                tab_id: Some("remote-tab".to_string()),
+                tab_label: Some("remote".to_string()),
+                status: RemoteProjectionStatus::Available,
+                layout: Some(remote_projection_layout()),
+            }],
+        );
+    }
+
+    #[test]
+    fn pane_split_without_remote_hosts_keeps_slash_target_local() {
+        let mut app = app_with_linked_worktree();
+
+        let response = app.handle_pane_split(
+            "req".into(),
+            remote_pane_split_params(Some("jafar/terminal:remote-term-side")),
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "pane_not_found");
+    }
+
+    #[test]
+    fn pane_split_host_qualified_target_routes_before_local_resolution() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+
+        let response = app.handle_pane_split(
+            "req".into(),
+            remote_pane_split_params(Some("jafar/terminal:remote-term-side")),
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "remote_host_not_connected");
+        assert!(error
+            .error
+            .message
+            .contains("remote host jafar is disconnected"));
+    }
+
+    #[test]
+    fn pane_split_remote_route_uses_host_qualified_workspace_id() {
+        let app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        let mut params = remote_pane_split_params(None);
+        params.workspace_id = Some("jafar/workspace:remote-ws".to_string());
+
+        let route = app.plan_pane_split_remote_route(&params).unwrap();
+
+        let Some((host, RemoteTargetSelector::Workspace(workspace_id))) = route else {
+            panic!("expected remote workspace route");
+        };
+        assert_eq!(host.name, "jafar");
+        assert_eq!(workspace_id, "remote-ws");
+    }
+
+    #[test]
+    fn pane_split_remote_connection_gate_rejects_disconnected_host_without_send() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        let host_key = RemoteHostKey::new("jafar", "default");
+        app.state
+            .remote_sources
+            .ensure_host(host_key.clone(), RemoteConnectionStatus::Connected);
+        app.state
+            .remote_sources
+            .mark_status(&host_key, RemoteConnectionStatus::Unreachable);
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+
+        let response = app.handle_remote_pane_split_with_sender(
+            "req".into(),
+            host,
+            RemoteTargetSelector::Terminal("remote-term-side".to_string()),
+            remote_pane_split_params(Some("jafar/terminal:remote-term-side")),
+            |_host, _request| panic!("disconnected host must not send a remote request"),
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "remote_host_not_connected");
+        assert!(error.error.message.contains("unreachable"));
+    }
+
+    #[test]
+    fn remote_pane_split_request_uses_resolved_ids_and_passes_remote_fields_through() {
+        let mut params = remote_pane_split_params(Some("jafar/terminal:remote-term-side"));
+        params.direction = SplitDirection::Down;
+        let request =
+            remote_pane_split_request("req".to_string(), params, "remote-ws", "remote-pane-side");
+
+        let Method::PaneSplit(params) = request.method else {
+            panic!("expected pane.split");
+        };
+        assert_eq!(request.id, "req");
+        assert_eq!(params.workspace_id.as_deref(), Some("remote-ws"));
+        assert_eq!(params.target_pane_id.as_deref(), Some("remote-pane-side"));
+        assert_eq!(params.direction, SplitDirection::Down);
+        assert_eq!(params.ratio, Some(0.4));
+        assert_eq!(params.cwd.as_deref(), Some("/remote/project"));
+        assert_eq!(
+            params.env.get("REMOTE_ONLY").map(String::as_str),
+            Some("$HOME/not-expanded")
+        );
+        assert!(params.focus);
+
+        let encoded = serde_json::to_string(&Request {
+            id: "req".to_string(),
+            method: Method::PaneSplit(params),
+        })
+        .unwrap();
+        assert!(!encoded.contains("confirm"));
+    }
+
+    #[test]
+    fn pane_split_remote_resolves_projection_and_rewrites_response_id() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        seed_remote_projection(&mut app);
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+        let captured = std::cell::RefCell::new(None);
+
+        let response = app.handle_remote_pane_split_with_sender(
+            "local-req".into(),
+            host,
+            RemoteTargetSelector::Terminal("remote-term-side".to_string()),
+            remote_pane_split_params(Some("jafar/terminal:remote-term-side")),
+            |sent_host, request| {
+                assert_eq!(sent_host.name, "jafar");
+                *captured.borrow_mut() = Some(request.clone());
+                Ok(r#"{"id":"remote-req","result":{"type":"ok"}}"#.to_string())
+            },
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["id"], "local-req");
+        let request = captured.into_inner().expect("request captured");
+        let Method::PaneSplit(params) = request.method else {
+            panic!("expected pane.split");
+        };
+        assert_eq!(params.workspace_id.as_deref(), Some("remote-ws"));
+        assert_eq!(params.target_pane_id.as_deref(), Some("remote-pane-side"));
+        assert_eq!(
+            params.env.get("REMOTE_ONLY").map(String::as_str),
+            Some("$HOME/not-expanded")
+        );
+    }
+
+    #[test]
+    fn pane_split_remote_agent_selector_is_rejected_clearly() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        seed_remote_projection(&mut app);
+
+        let response =
+            app.handle_pane_split("req".into(), remote_pane_split_params(Some("jafar/codex")));
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "remote_target_error");
+        assert!(error.error.message.contains("pane, terminal, or workspace"));
+    }
+
+    #[test]
+    fn pane_split_remote_request_failure_surfaces_remote_request_failed() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        seed_remote_projection(&mut app);
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+
+        let response = app.handle_remote_pane_split_with_sender(
+            "req".into(),
+            host,
+            RemoteTargetSelector::Pane("remote-pane-side".to_string()),
+            remote_pane_split_params(Some("jafar/pane:remote-pane-side")),
+            |_host, _request| Err(std::io::Error::other("bridge dropped")),
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "remote_request_failed");
+        assert!(error.error.message.contains("bridge dropped"));
     }
 
     #[test]

@@ -628,7 +628,7 @@ fn parse_pane_split_args(
 
     let Some(direction) = direction else {
         return Err(
-            "usage: herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]"
+            "usage: herdr pane split [<pane_id>|<host>/<target>|--pane ID|--current] --direction right|down [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]"
                 .into(),
         );
     };
@@ -1449,7 +1449,7 @@ fn print_pane_help() {
     eprintln!("  herdr pane rename <pane_id> <label>|--clear");
     eprintln!("  herdr pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!(
-        "  herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]"
+        "  herdr pane split [<pane_id>|<host>/<target>|--pane ID|--current] --direction right|down [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]"
     );
     eprintln!("  herdr pane swap --direction left|right|up|down [--pane ID|--current]");
     eprintln!("  herdr pane swap --source-pane ID --target-pane ID");
@@ -1525,6 +1525,30 @@ mod tests {
 
         assert_eq!(params.target_pane_id, Some("issue-2".into()));
         assert_eq!(params.direction, crate::api::schema::SplitDirection::Right);
+    }
+
+    #[test]
+    fn parse_pane_split_args_preserves_host_qualified_positional_target() {
+        let params = parse_pane_split_args(
+            &args(&["jafar/terminal:term-1", "--direction", "right"]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(params.target_pane_id, Some("jafar/terminal:term-1".into()));
+        assert_eq!(params.direction, crate::api::schema::SplitDirection::Right);
+    }
+
+    #[test]
+    fn parse_pane_split_args_preserves_host_qualified_pane_option_target() {
+        let params = parse_pane_split_args(
+            &args(&["--pane", "jafar/pane:remote-pane", "--direction", "down"]),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(params.target_pane_id, Some("jafar/pane:remote-pane".into()));
+        assert_eq!(params.direction, crate::api::schema::SplitDirection::Down);
     }
 
     #[test]

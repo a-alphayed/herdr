@@ -8,7 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
-use crate::remote_source::{RemoteAgentEntry, RemoteAgentKey, RemoteHostKey, RemoteSourceCache};
+use crate::remote_source::{
+    RemoteAgentEntry, RemoteAgentKey, RemoteHostKey, RemoteProjectionEntry, RemoteProjectionStatus,
+    RemoteSourceCache,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteAliasError {
@@ -435,13 +438,332 @@ fn preferred_remote_agent_label(agent: &crate::api::schema::AgentInfo) -> String
         .to_string()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemotePaneResolution {
+    pub(crate) host: RemoteHostConfig,
+    pub(crate) workspace_id: String,
+    pub(crate) pane_id: String,
+    pub(crate) terminal_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemotePaneResolveError {
+    NotFound {
+        target: RemoteTargetSelector,
+        terminal_ids_unavailable: bool,
+    },
+    ProjectionStale {
+        target: RemoteTargetSelector,
+        workspace_id: Option<String>,
+        status: Option<RemoteProjectionStatus>,
+    },
+    NoProjection {
+        target: RemoteTargetSelector,
+    },
+    HostNotConnected {
+        host: String,
+        status: String,
+    },
+    UnsupportedSelector {
+        target: RemoteTargetSelector,
+    },
+}
+
+impl std::fmt::Display for RemotePaneResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound {
+                target,
+                terminal_ids_unavailable,
+            } => {
+                if *terminal_ids_unavailable {
+                    write!(
+                        f,
+                        "remote pane target not found because the cached active-tab projection does not include terminal ids; update the remote Herdr binary: {target:?}"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "remote pane target not found in live active-tab projections: {target:?}"
+                    )
+                }
+            }
+            Self::ProjectionStale {
+                target,
+                workspace_id,
+                status,
+            } => {
+                let status = status
+                    .map(remote_projection_status_label)
+                    .unwrap_or("not available");
+                match workspace_id {
+                    Some(workspace_id) => write!(
+                        f,
+                        "remote projection for workspace {workspace_id} is {status}; wait for a live projection before mutating target {target:?}"
+                    ),
+                    None => write!(
+                        f,
+                        "remote projections are {status}; wait for a live projection before mutating target {target:?}"
+                    ),
+                }
+            }
+            Self::NoProjection { target } => write!(
+                f,
+                "remote pane target has no cached projection to resolve against: {target:?}"
+            ),
+            Self::HostNotConnected { host, status } => write!(
+                f,
+                "remote host {host} is {status}; wait for it to reconnect before splitting a pane"
+            ),
+            Self::UnsupportedSelector { target } => write!(
+                f,
+                "remote pane split target must be a pane, terminal, or workspace selector: {target:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RemotePaneResolveError {}
+
+pub(crate) fn resolve_remote_pane_target(
+    cache: &RemoteSourceCache,
+    host: &RemoteHostConfig,
+    selector: &RemoteTargetSelector,
+) -> Result<RemotePaneResolution, RemotePaneResolveError> {
+    if matches!(selector, RemoteTargetSelector::Agent(_)) {
+        return Err(RemotePaneResolveError::UnsupportedSelector {
+            target: selector.clone(),
+        });
+    }
+
+    let host_key = RemoteHostKey::new(host.name.clone(), host.session.clone());
+    let projections = cache.projections_for_host(&host_key);
+    if projections.is_empty() {
+        return Err(RemotePaneResolveError::NoProjection {
+            target: selector.clone(),
+        });
+    }
+
+    match selector {
+        RemoteTargetSelector::Workspace(workspace_id) => {
+            resolve_remote_workspace_pane(host, selector, &projections, workspace_id)
+        }
+        RemoteTargetSelector::Pane(pane_id) => {
+            resolve_remote_layout_pane(host, selector, &projections, |layout| {
+                find_layout_pane_by_pane_id(&layout.root, pane_id)
+            })
+        }
+        RemoteTargetSelector::Terminal(terminal_id) => {
+            let any_terminal_id_projected = std::cell::Cell::new(false);
+            resolve_remote_layout_pane_with_terminal_tracking(
+                host,
+                selector,
+                &projections,
+                |layout| {
+                    if layout_has_terminal_id(&layout.root) {
+                        any_terminal_id_projected.set(true);
+                    }
+                    find_layout_pane_by_terminal_id(&layout.root, terminal_id)
+                },
+                || !any_terminal_id_projected.get(),
+            )
+        }
+        RemoteTargetSelector::Agent(_) => Err(RemotePaneResolveError::UnsupportedSelector {
+            target: selector.clone(),
+        }),
+    }
+}
+
+fn resolve_remote_workspace_pane(
+    host: &RemoteHostConfig,
+    selector: &RemoteTargetSelector,
+    projections: &[&RemoteProjectionEntry],
+    workspace_id: &str,
+) -> Result<RemotePaneResolution, RemotePaneResolveError> {
+    let Some(projection) = projections
+        .iter()
+        .copied()
+        .find(|projection| projection.workspace_id == workspace_id)
+    else {
+        return Err(RemotePaneResolveError::NoProjection {
+            target: selector.clone(),
+        });
+    };
+    let layout = live_projection_layout(projection, selector)?;
+    let Some(pane) = find_layout_pane_by_pane_id(&layout.root, &layout.focused_pane_id) else {
+        return Err(RemotePaneResolveError::NotFound {
+            target: selector.clone(),
+            terminal_ids_unavailable: false,
+        });
+    };
+    pane_resolution_from_layout_pane(host, layout, pane, selector)
+}
+
+fn resolve_remote_layout_pane<'a, F>(
+    host: &RemoteHostConfig,
+    selector: &RemoteTargetSelector,
+    projections: &[&'a RemoteProjectionEntry],
+    find: F,
+) -> Result<RemotePaneResolution, RemotePaneResolveError>
+where
+    F: FnMut(
+        &'a crate::api::schema::LayoutDescription,
+    ) -> Option<&'a crate::api::schema::LayoutPane>,
+{
+    resolve_remote_layout_pane_with_terminal_tracking(host, selector, projections, find, || false)
+}
+
+fn resolve_remote_layout_pane_with_terminal_tracking<'a, F, U>(
+    host: &RemoteHostConfig,
+    selector: &RemoteTargetSelector,
+    projections: &[&'a RemoteProjectionEntry],
+    mut find: F,
+    terminal_ids_unavailable: U,
+) -> Result<RemotePaneResolution, RemotePaneResolveError>
+where
+    F: FnMut(
+        &'a crate::api::schema::LayoutDescription,
+    ) -> Option<&'a crate::api::schema::LayoutPane>,
+    U: FnOnce() -> bool,
+{
+    let mut saw_live_projection = false;
+    for projection in projections {
+        let Some(layout) = projection.layout.as_ref() else {
+            continue;
+        };
+        if let Some(pane) = find(layout) {
+            if projection.status != RemoteProjectionStatus::Available {
+                return Err(RemotePaneResolveError::ProjectionStale {
+                    target: selector.clone(),
+                    workspace_id: Some(projection.workspace_id.clone()),
+                    status: Some(projection.status),
+                });
+            }
+            return pane_resolution_from_layout_pane(host, layout, pane, selector);
+        }
+        if projection.status == RemoteProjectionStatus::Available {
+            saw_live_projection = true;
+        }
+    }
+
+    if !saw_live_projection {
+        return Err(RemotePaneResolveError::ProjectionStale {
+            target: selector.clone(),
+            workspace_id: None,
+            status: None,
+        });
+    }
+
+    Err(RemotePaneResolveError::NotFound {
+        target: selector.clone(),
+        terminal_ids_unavailable: terminal_ids_unavailable(),
+    })
+}
+
+fn live_projection_layout<'a>(
+    projection: &'a RemoteProjectionEntry,
+    selector: &RemoteTargetSelector,
+) -> Result<&'a crate::api::schema::LayoutDescription, RemotePaneResolveError> {
+    let Some(layout) = projection.layout.as_ref() else {
+        return Err(RemotePaneResolveError::ProjectionStale {
+            target: selector.clone(),
+            workspace_id: Some(projection.workspace_id.clone()),
+            status: Some(projection.status),
+        });
+    };
+    if projection.status != RemoteProjectionStatus::Available {
+        return Err(RemotePaneResolveError::ProjectionStale {
+            target: selector.clone(),
+            workspace_id: Some(projection.workspace_id.clone()),
+            status: Some(projection.status),
+        });
+    }
+    Ok(layout)
+}
+
+fn pane_resolution_from_layout_pane(
+    host: &RemoteHostConfig,
+    layout: &crate::api::schema::LayoutDescription,
+    pane: &crate::api::schema::LayoutPane,
+    selector: &RemoteTargetSelector,
+) -> Result<RemotePaneResolution, RemotePaneResolveError> {
+    let Some(pane_id) = pane.pane_id.clone() else {
+        return Err(RemotePaneResolveError::NotFound {
+            target: selector.clone(),
+            terminal_ids_unavailable: false,
+        });
+    };
+    let Some(terminal_id) = pane.terminal_id.clone() else {
+        return Err(RemotePaneResolveError::NotFound {
+            target: selector.clone(),
+            terminal_ids_unavailable: true,
+        });
+    };
+    Ok(RemotePaneResolution {
+        host: host.clone(),
+        workspace_id: layout.workspace_id.clone(),
+        pane_id,
+        terminal_id,
+    })
+}
+
+fn find_layout_pane_by_pane_id<'a>(
+    node: &'a crate::api::schema::LayoutNode,
+    pane_id: &str,
+) -> Option<&'a crate::api::schema::LayoutPane> {
+    match node {
+        crate::api::schema::LayoutNode::Pane { pane } => {
+            (pane.pane_id.as_deref() == Some(pane_id)).then_some(pane)
+        }
+        crate::api::schema::LayoutNode::Split { first, second, .. } => {
+            find_layout_pane_by_pane_id(first, pane_id)
+                .or_else(|| find_layout_pane_by_pane_id(second, pane_id))
+        }
+    }
+}
+
+fn find_layout_pane_by_terminal_id<'a>(
+    node: &'a crate::api::schema::LayoutNode,
+    terminal_id: &str,
+) -> Option<&'a crate::api::schema::LayoutPane> {
+    match node {
+        crate::api::schema::LayoutNode::Pane { pane } => {
+            (pane.terminal_id.as_deref() == Some(terminal_id)).then_some(pane)
+        }
+        crate::api::schema::LayoutNode::Split { first, second, .. } => {
+            find_layout_pane_by_terminal_id(first, terminal_id)
+                .or_else(|| find_layout_pane_by_terminal_id(second, terminal_id))
+        }
+    }
+}
+
+fn layout_has_terminal_id(node: &crate::api::schema::LayoutNode) -> bool {
+    match node {
+        crate::api::schema::LayoutNode::Pane { pane } => pane.terminal_id.is_some(),
+        crate::api::schema::LayoutNode::Split { first, second, .. } => {
+            layout_has_terminal_id(first) || layout_has_terminal_id(second)
+        }
+    }
+}
+
+fn remote_projection_status_label(status: RemoteProjectionStatus) -> &'static str {
+    match status {
+        RemoteProjectionStatus::Available => "available",
+        RemoteProjectionStatus::Unavailable => "unavailable",
+        RemoteProjectionStatus::StaleLastKnown => "stale",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use crate::api::schema::{AgentInfo, AgentStatus};
+    use crate::api::schema::{
+        AgentInfo, AgentStatus, LayoutDescription, LayoutNode, LayoutPane, SplitDirection,
+    };
     use crate::remote_source::{
-        RemoteAgentKey, RemoteConnectionStatus, RemoteHostKey, RemoteSourceCache,
+        RemoteAgentKey, RemoteConnectionStatus, RemoteHostKey, RemoteProjectionSnapshot,
+        RemoteProjectionStatus, RemoteSourceCache,
     };
 
     use super::*;
@@ -488,6 +810,58 @@ mod tests {
 
     fn host_config(name: &str, session: &str) -> RemoteHostConfig {
         RemoteHostConfig::new(name, name, session, true)
+    }
+
+    fn projected_layout(workspace_id: &str) -> LayoutDescription {
+        LayoutDescription {
+            workspace_id: workspace_id.to_string(),
+            tab_id: format!("{workspace_id}:tab-active"),
+            zoomed: false,
+            focused_pane_id: format!("{workspace_id}:pane-focused"),
+            root: LayoutNode::Split {
+                direction: SplitDirection::Right,
+                ratio: 0.5,
+                first: Box::new(LayoutNode::Pane {
+                    pane: LayoutPane {
+                        pane_id: Some(format!("{workspace_id}:pane-focused")),
+                        label: Some("focused".to_string()),
+                        terminal_id: Some(format!("{workspace_id}:term-focused")),
+                        ..Default::default()
+                    },
+                }),
+                second: Box::new(LayoutNode::Pane {
+                    pane: LayoutPane {
+                        pane_id: Some(format!("{workspace_id}:pane-side")),
+                        label: Some("side".to_string()),
+                        terminal_id: Some(format!("{workspace_id}:term-side")),
+                        ..Default::default()
+                    },
+                }),
+            },
+        }
+    }
+
+    fn projection_snapshot(
+        workspace_id: &str,
+        status: RemoteProjectionStatus,
+        layout: Option<LayoutDescription>,
+    ) -> RemoteProjectionSnapshot {
+        RemoteProjectionSnapshot {
+            workspace_id: workspace_id.to_string(),
+            tab_id: Some(format!("{workspace_id}:tab-active")),
+            tab_label: Some("active".to_string()),
+            status,
+            layout,
+        }
+    }
+
+    fn cache_with_projection(
+        host: &RemoteHostKey,
+        snapshot: RemoteProjectionSnapshot,
+    ) -> RemoteSourceCache {
+        let mut cache = RemoteSourceCache::default();
+        cache.apply_projection_snapshot(host, vec![snapshot]);
+        cache
     }
 
     #[test]
@@ -1022,5 +1396,273 @@ mod tests {
 
         assert!(resolved.entry.stale());
         assert_eq!(resolved.entry.status, RemoteConnectionStatus::Disconnected);
+    }
+
+    #[test]
+    fn remote_pane_target_resolves_terminal_selector_from_projection() {
+        let host = host_config("jafar", "default");
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let cache = cache_with_projection(
+            &host_key,
+            projection_snapshot(
+                "remote-ws",
+                RemoteProjectionStatus::Available,
+                Some(projected_layout("remote-ws")),
+            ),
+        );
+
+        let resolved = resolve_remote_pane_target(
+            &cache,
+            &host,
+            &RemoteTargetSelector::Terminal("remote-ws:term-side".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.host, host);
+        assert_eq!(resolved.workspace_id, "remote-ws");
+        assert_eq!(resolved.pane_id, "remote-ws:pane-side");
+        assert_eq!(resolved.terminal_id, "remote-ws:term-side");
+    }
+
+    #[test]
+    fn remote_pane_target_resolves_pane_selector_from_projection() {
+        let host = host_config("jafar", "default");
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let cache = cache_with_projection(
+            &host_key,
+            projection_snapshot(
+                "remote-ws",
+                RemoteProjectionStatus::Available,
+                Some(projected_layout("remote-ws")),
+            ),
+        );
+
+        let resolved = resolve_remote_pane_target(
+            &cache,
+            &host,
+            &RemoteTargetSelector::Pane("remote-ws:pane-side".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.workspace_id, "remote-ws");
+        assert_eq!(resolved.pane_id, "remote-ws:pane-side");
+        assert_eq!(resolved.terminal_id, "remote-ws:term-side");
+    }
+
+    #[test]
+    fn remote_pane_target_resolves_workspace_selector_to_focused_pane() {
+        let host = host_config("jafar", "default");
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let cache = cache_with_projection(
+            &host_key,
+            projection_snapshot(
+                "remote-ws",
+                RemoteProjectionStatus::Available,
+                Some(projected_layout("remote-ws")),
+            ),
+        );
+
+        let resolved = resolve_remote_pane_target(
+            &cache,
+            &host,
+            &RemoteTargetSelector::Workspace("remote-ws".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.workspace_id, "remote-ws");
+        assert_eq!(resolved.pane_id, "remote-ws:pane-focused");
+        assert_eq!(resolved.terminal_id, "remote-ws:term-focused");
+    }
+
+    #[test]
+    fn remote_pane_target_returns_not_found_for_missing_live_projection_target() {
+        let host = host_config("jafar", "default");
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let cache = cache_with_projection(
+            &host_key,
+            projection_snapshot(
+                "remote-ws",
+                RemoteProjectionStatus::Available,
+                Some(projected_layout("remote-ws")),
+            ),
+        );
+
+        assert_eq!(
+            resolve_remote_pane_target(
+                &cache,
+                &host,
+                &RemoteTargetSelector::Pane("remote-ws:pane-missing".to_string())
+            )
+            .unwrap_err(),
+            RemotePaneResolveError::NotFound {
+                target: RemoteTargetSelector::Pane("remote-ws:pane-missing".to_string()),
+                terminal_ids_unavailable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn remote_pane_target_rejects_stale_projection_for_mutation() {
+        let host = host_config("jafar", "default");
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let mut cache = RemoteSourceCache::default();
+        cache.apply_projection_snapshot(
+            &host_key,
+            vec![projection_snapshot(
+                "remote-ws",
+                RemoteProjectionStatus::Available,
+                Some(projected_layout("remote-ws")),
+            )],
+        );
+        cache.apply_projection_snapshot(
+            &host_key,
+            vec![projection_snapshot(
+                "remote-ws",
+                RemoteProjectionStatus::Unavailable,
+                None,
+            )],
+        );
+
+        assert_eq!(
+            resolve_remote_pane_target(
+                &cache,
+                &host,
+                &RemoteTargetSelector::Pane("remote-ws:pane-focused".to_string())
+            )
+            .unwrap_err(),
+            RemotePaneResolveError::ProjectionStale {
+                target: RemoteTargetSelector::Pane("remote-ws:pane-focused".to_string()),
+                workspace_id: Some("remote-ws".to_string()),
+                status: Some(RemoteProjectionStatus::StaleLastKnown),
+            }
+        );
+    }
+
+    #[test]
+    fn remote_pane_target_returns_no_projection_for_uncached_host_or_workspace() {
+        let host = host_config("jafar", "default");
+        let empty_cache = RemoteSourceCache::default();
+
+        assert_eq!(
+            resolve_remote_pane_target(
+                &empty_cache,
+                &host,
+                &RemoteTargetSelector::Terminal("term-1".to_string())
+            )
+            .unwrap_err(),
+            RemotePaneResolveError::NoProjection {
+                target: RemoteTargetSelector::Terminal("term-1".to_string()),
+            }
+        );
+
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let cache = cache_with_projection(
+            &host_key,
+            projection_snapshot(
+                "remote-ws",
+                RemoteProjectionStatus::Available,
+                Some(projected_layout("remote-ws")),
+            ),
+        );
+
+        assert_eq!(
+            resolve_remote_pane_target(
+                &cache,
+                &host,
+                &RemoteTargetSelector::Workspace("missing-ws".to_string())
+            )
+            .unwrap_err(),
+            RemotePaneResolveError::NoProjection {
+                target: RemoteTargetSelector::Workspace("missing-ws".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn remote_pane_target_rejects_agent_selector() {
+        let host = host_config("jafar", "default");
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let cache = cache_with_projection(
+            &host_key,
+            projection_snapshot(
+                "remote-ws",
+                RemoteProjectionStatus::Available,
+                Some(projected_layout("remote-ws")),
+            ),
+        );
+
+        assert_eq!(
+            resolve_remote_pane_target(
+                &cache,
+                &host,
+                &RemoteTargetSelector::Agent("codex".to_string())
+            )
+            .unwrap_err(),
+            RemotePaneResolveError::UnsupportedSelector {
+                target: RemoteTargetSelector::Agent("codex".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn remote_pane_target_distinguishes_older_projection_without_terminal_ids() {
+        let host = host_config("jafar", "default");
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let mut layout = projected_layout("remote-ws");
+        if let LayoutNode::Split { first, second, .. } = &mut layout.root {
+            if let LayoutNode::Pane { pane } = first.as_mut() {
+                pane.terminal_id = None;
+            }
+            if let LayoutNode::Pane { pane } = second.as_mut() {
+                pane.terminal_id = None;
+            }
+        }
+        let cache = cache_with_projection(
+            &host_key,
+            projection_snapshot("remote-ws", RemoteProjectionStatus::Available, Some(layout)),
+        );
+
+        let err = resolve_remote_pane_target(
+            &cache,
+            &host,
+            &RemoteTargetSelector::Terminal("remote-ws:term-focused".to_string()),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            RemotePaneResolveError::NotFound {
+                target: RemoteTargetSelector::Terminal("remote-ws:term-focused".to_string()),
+                terminal_ids_unavailable: true,
+            }
+        );
+        assert!(err.to_string().contains("does not include terminal ids"));
+    }
+
+    #[test]
+    fn remote_pane_target_background_tab_target_is_not_found() {
+        let host = host_config("jafar", "default");
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let cache = cache_with_projection(
+            &host_key,
+            projection_snapshot(
+                "remote-ws",
+                RemoteProjectionStatus::Available,
+                Some(projected_layout("remote-ws")),
+            ),
+        );
+
+        assert_eq!(
+            resolve_remote_pane_target(
+                &cache,
+                &host,
+                &RemoteTargetSelector::Pane("remote-ws:pane-background-tab".to_string())
+            )
+            .unwrap_err(),
+            RemotePaneResolveError::NotFound {
+                target: RemoteTargetSelector::Pane("remote-ws:pane-background-tab".to_string()),
+                terminal_ids_unavailable: false,
+            }
+        );
     }
 }

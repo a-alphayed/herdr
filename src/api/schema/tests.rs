@@ -569,8 +569,11 @@ fn current_server_capabilities_include_federation_methods() {
     assert!(federation.supports_method(FederationCapabilities::AGENT_GET));
     assert!(federation.supports_method(FederationCapabilities::AGENT_READ));
     assert!(federation.supports_method(FederationCapabilities::AGENT_SEND));
+    assert!(federation.supports_method(FederationCapabilities::AGENT_SUBMIT));
     assert!(federation.supports_method(FederationCapabilities::AGENT_FOCUS));
     assert!(federation.supports_method(FederationCapabilities::AGENT_START));
+    assert!(federation.supports_method(FederationCapabilities::AGENT_TEARDOWN));
+    assert!(federation.supports_method(FederationCapabilities::PANE_SPLIT));
     assert!(federation.supports_method(FederationCapabilities::TAB_LIST));
     assert!(federation.supports_method(FederationCapabilities::LAYOUT_EXPORT));
     assert!(federation.supports_method(FederationCapabilities::TERMINAL_ATTACH));

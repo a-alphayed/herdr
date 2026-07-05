@@ -355,6 +355,13 @@ impl RemoteSourceCache {
             .cloned()
     }
 
+    pub(crate) fn projections_for_host(&self, host: &RemoteHostKey) -> Vec<&RemoteProjectionEntry> {
+        self.hosts
+            .get(host)
+            .map(|host_cache| host_cache.projections.values().collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn ensure_host(&mut self, host: RemoteHostKey, status: RemoteConnectionStatus) {
         self.hosts.entry(host).or_insert_with(|| RemoteHostCache {
             status,
@@ -961,6 +968,51 @@ mod tests {
         assert_eq!(entry.workspace_id, "ws-1");
         assert_eq!(entry.tab_label.as_deref(), Some("dev"));
         assert_eq!(entry.layout.as_ref().unwrap().tab_id, "w1:1");
+    }
+
+    #[test]
+    fn remote_source_projections_for_host_returns_all_cached_projections_for_host_session() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+        let other = RemoteHostKey::new("jafar", "agents");
+
+        cache.apply_projection_snapshot(
+            &host,
+            vec![
+                RemoteProjectionSnapshot {
+                    workspace_id: "ws-b".to_string(),
+                    tab_id: Some("w2:1".to_string()),
+                    tab_label: None,
+                    status: RemoteProjectionStatus::Available,
+                    layout: Some(layout_for("w2:1")),
+                },
+                RemoteProjectionSnapshot {
+                    workspace_id: "ws-a".to_string(),
+                    tab_id: Some("w1:1".to_string()),
+                    tab_label: None,
+                    status: RemoteProjectionStatus::Available,
+                    layout: Some(layout_for("w1:1")),
+                },
+            ],
+        );
+        cache.apply_projection_snapshot(
+            &other,
+            vec![RemoteProjectionSnapshot {
+                workspace_id: "ws-other".to_string(),
+                tab_id: Some("other:1".to_string()),
+                tab_label: None,
+                status: RemoteProjectionStatus::Available,
+                layout: Some(layout_for("other:1")),
+            }],
+        );
+
+        let workspace_ids: Vec<_> = cache
+            .projections_for_host(&host)
+            .into_iter()
+            .map(|entry| entry.workspace_id.as_str())
+            .collect();
+
+        assert_eq!(workspace_ids, vec!["ws-a", "ws-b"]);
     }
 
     #[test]

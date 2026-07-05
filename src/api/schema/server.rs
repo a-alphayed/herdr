@@ -51,6 +51,7 @@ impl FederationCapabilities {
     pub const AGENT_FOCUS: &'static str = "agent_focus";
     pub const AGENT_START: &'static str = "agent_start";
     pub const AGENT_TEARDOWN: &'static str = "agent_teardown";
+    pub const PANE_SPLIT: &'static str = "pane_split";
     pub const TAB_LIST: &'static str = "tab_list";
     pub const LAYOUT_EXPORT: &'static str = "layout_export";
     pub const TERMINAL_ATTACH: &'static str = "terminal_attach";
@@ -70,6 +71,7 @@ impl FederationCapabilities {
                 Self::AGENT_FOCUS,
                 Self::AGENT_START,
                 Self::AGENT_TEARDOWN,
+                Self::PANE_SPLIT,
                 Self::TAB_LIST,
                 Self::LAYOUT_EXPORT,
                 Self::TERMINAL_ATTACH,

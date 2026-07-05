@@ -81,6 +81,17 @@ The first narrow, explicitly destructive, capability-gated controller-side teard
 
 Broad remote pane/workspace/server/process teardown remains out of scope; only this narrow federation-placed agent/lane surface is teardown-capable.
 
+### Remote pane split (Phase F.2)
+
+`pane.split` is federation-routed for host/session-qualified pane targets. It is deliberately narrow: only the existing split-right/down operation is routed, and it creates a pane through the authoritative remote Herdr rather than exposing broad remote layout management.
+
+- API: existing `pane.split` with `{ workspace_id, target_pane_id, direction, ratio, cwd, env, focus }`; no schema change and no protocol bump.
+- CLI: `herdr pane split <host>/<target> --direction right|down`, where `<target>` is `terminal:<id>`, `pane:<id>`, or `workspace:<id>`. Bare/local targets keep the local path.
+- Capability: the route requires the remote host to advertise `pane_split` (in addition to `remote_api_bridge`). A remote that does not advertise it fails with `does not advertise federation method pane_split` and does not fall back.
+- Target resolution: the controller resolves against live active-tab projections from `layout.export`, not against the agent cache. Stale/unavailable projections and older projections without terminal ids are rejected before mutation.
+- Remote authority: the forwarded request carries the resolved remote `workspace_id` and `target_pane_id`; `cwd` and `env` are remote-scoped and pass through without local expansion.
+- The operation is non-destructive but non-idempotent. It has no confirmation gate and no uncertain-delivery retry.
+
 ## Core Invariants
 
 - A host owns the PTYs and child processes it runs.
@@ -684,6 +695,7 @@ agent.start
 pane.list
 pane.get
 pane.read
+pane.split
 pane.send_text
 pane.send_keys
 pane.send_input
@@ -711,7 +723,7 @@ Current spike API shape: aggregated `agent.list` host-qualifies label fields so 
 
 Non-idempotent retry rule:
 
-- `agent.send`, `agent.submit`, `pane.send_text`, `pane.send_keys`, and `pane.send_input` are not idempotent.
+- `agent.send`, `agent.submit`, `pane.split`, `pane.send_text`, `pane.send_keys`, and `pane.send_input` are not idempotent.
 - If the bridge drops after dispatch but before acknowledgement, surface an uncertain-delivery error and do not auto-retry.
 - `agent.list`, `agent.get`, `pane.read`, and status/ping calls are safe to retry within bounded timeout rules.
 
@@ -1301,7 +1313,7 @@ Implemented in this spike:
 - sidebar host-state rows for configured auto-connect remotes when no cached agents exist;
 - Docker smoke coverage for the configured one-hop path: get/read/send/focus/start, disconnect, and reconnect;
 - real-host Jafar smoke for capability/status commands and isolated `fed-*` host-qualified control after updating the remote binary;
-- verified real-host gap (0.7.1/protocol 15): `agent send` writes text into a composer-style remote agent but does not submit the prompt. Phase E.0 adds the submit-capable `agent.submit` route (`herdr agent submit`), capability-gated by `agent_submit`; full controller-only runtime proof is the E.0 validation step. Phase F adds the first narrow federation-placed teardown route (`agent.teardown` / `herdr agent teardown <host>/<target> --confirm`), capability-gated by `agent_teardown`; full controller-only runtime proof is the F validation step.
+- verified real-host gap (0.7.1/protocol 15): `agent send` writes text into a composer-style remote agent but does not submit the prompt. Phase E.0 adds the submit-capable `agent.submit` route (`herdr agent submit`), capability-gated by `agent_submit`; full controller-only runtime proof is the E.0 validation step. Phase F adds the first narrow federation-placed teardown route (`agent.teardown` / `herdr agent teardown <host>/<target> --confirm`), capability-gated by `agent_teardown`; Phase F.2 adds capability-gated remote `pane.split` for projection-resolved pane/terminal/workspace selectors. Full controller-only runtime proof is the F validation step.
 
 Still intentionally out of MVP scope:
 

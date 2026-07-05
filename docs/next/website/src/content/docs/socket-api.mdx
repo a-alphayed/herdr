@@ -123,7 +123,12 @@ worktree discovery remains `worktree.list`.
 
 Pane control methods use public pane ids such as `w1:p1`. Methods whose
 schema makes `pane_id` optional use the server's active focused pane when it is
-omitted. `pane.move` always requires the source `pane_id`.
+omitted. `pane.move` always requires the source `pane_id`. `pane.split` is
+federation-routable for host-qualified `target_pane_id` or `workspace_id`
+selectors (`<host>/terminal:<id>`, `<host>/pane:<id>`, or
+`<host>/workspace:<id>`) when the remote advertises the `pane_split`
+federation capability; the controller resolves live projection ids and forwards
+the existing request to the authoritative remote host.
 
 `pane.send_keys` and `pane.send_input.keys` accept Herdr key-combo strings:
 plain printable keys, special keys like `enter` and `esc`, modifier chords

@@ -411,8 +411,9 @@ fn pane_command() -> Command {
         .subcommand(
             Command::new("split")
                 .about("Split a pane")
-                .arg(Arg::new("pane_id").value_name("PANE_ID"))
-                .args(current_pane_args())
+                .arg(Arg::new("pane_id").value_name("PANE_ID|HOST/TARGET"))
+                .arg(option("pane", "PANE_ID|HOST/TARGET"))
+                .arg(flag("current"))
                 .arg(split_direction_option())
                 .arg(option("ratio", "FLOAT"))
                 .arg(path_option("cwd", "PATH"))
