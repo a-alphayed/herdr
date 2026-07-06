@@ -231,7 +231,12 @@ fn tab_command() -> Command {
                 .arg(required("tab_id", "TAB_ID"))
                 .arg(required("label", "LABEL").num_args(1..)),
         )
-        .subcommand(id_command("close", "tab_id", "Close a tab"))
+        .subcommand(
+            Command::new("close")
+                .about("Close a tab")
+                .arg(required("tab_id", "TAB_ID|HOST/TAB:ID"))
+                .arg(flag("confirm")),
+        )
 }
 
 fn notification_command() -> Command {
@@ -985,6 +990,13 @@ mod tests {
         let cmd = super::command();
         let pane_close = command_path(&cmd, &["pane", "close"]);
         assert!(has_option(pane_close, "confirm"));
+    }
+
+    #[test]
+    fn spec_includes_tab_close_confirm_flag() {
+        let cmd = super::command();
+        let tab_close = command_path(&cmd, &["tab", "close"]);
+        assert!(has_option(tab_close, "confirm"));
     }
 
     #[test]

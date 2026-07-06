@@ -9,7 +9,7 @@ use crate::{
     app::{
         state::{
             AppState, ContextMenuKind, ContextMenuState, MenuListState, Mode, NavigatorStateFilter,
-            RemoteProjectedPaneTarget,
+            RemoteProjectedPaneTarget, RemoteProjectedTabTarget, RemoteProjectedWorkspaceTarget,
         },
         App,
     },
@@ -404,6 +404,35 @@ fn remote_projected_pane_close_method(
 ) -> crate::api::schema::Method {
     crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams {
         pane_id: format!("{}/terminal:{}", target.host, target.terminal_id),
+        confirm: true,
+    })
+}
+
+fn remote_projected_tab_create_method(
+    target: &RemoteProjectedWorkspaceTarget,
+) -> crate::api::schema::Method {
+    crate::api::schema::Method::TabCreate(crate::api::schema::TabCreateParams {
+        workspace_id: Some(format!("{}/workspace:{}", target.host, target.workspace_id)),
+        cwd: None,
+        focus: true,
+        label: None,
+        env: Default::default(),
+    })
+}
+
+fn remote_projected_tab_focus_method(
+    target: &RemoteProjectedTabTarget,
+) -> crate::api::schema::Method {
+    crate::api::schema::Method::TabFocus(crate::api::schema::TabTarget {
+        tab_id: format!("{}/tab:{}", target.host, target.tab_id),
+    })
+}
+
+fn remote_projected_tab_close_method(
+    target: &RemoteProjectedTabTarget,
+) -> crate::api::schema::Method {
+    crate::api::schema::Method::TabClose(crate::api::schema::TabCloseParams {
+        tab_id: format!("{}/tab:{}", target.host, target.tab_id),
         confirm: true,
     })
 }
@@ -1081,6 +1110,57 @@ impl App {
                 self.confirm_remote_projected_pane_close_accept_via_api();
             }
             Some(ModalAction::Cancel) => self.confirm_remote_projected_pane_close_cancel(),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn create_remote_projected_tab_via_api(
+        &mut self,
+        target: RemoteProjectedWorkspaceTarget,
+    ) -> String {
+        self.dispatch_runtime_mutation(
+            "tui.remote_projection.tab.create",
+            remote_projected_tab_create_method(&target),
+        )
+    }
+
+    pub(crate) fn focus_remote_projected_tab_via_api(
+        &mut self,
+        target: RemoteProjectedTabTarget,
+    ) -> String {
+        self.dispatch_runtime_mutation(
+            "tui.remote_projection.tab.focus",
+            remote_projected_tab_focus_method(&target),
+        )
+    }
+
+    fn close_remote_projected_tab_via_api(&mut self, target: RemoteProjectedTabTarget) -> String {
+        self.dispatch_runtime_mutation(
+            "tui.remote_projection.tab.close",
+            remote_projected_tab_close_method(&target),
+        )
+    }
+
+    pub(crate) fn confirm_remote_projected_tab_close_accept_via_api(&mut self) {
+        let Some(target) = self.state.pending_remote_projected_tab_close.take() else {
+            leave_modal(&mut self.state);
+            return;
+        };
+        self.close_remote_projected_tab_via_api(target);
+        leave_modal(&mut self.state);
+    }
+
+    pub(crate) fn confirm_remote_projected_tab_close_cancel(&mut self) {
+        self.state.pending_remote_projected_tab_close = None;
+        leave_modal(&mut self.state);
+    }
+
+    pub(crate) fn handle_confirm_remote_projected_tab_close_key(&mut self, key: KeyEvent) {
+        match modal_action_from_key(&key, CONFIRM_CLOSE_ACTIONS) {
+            Some(ModalAction::Confirm) => {
+                self.confirm_remote_projected_tab_close_accept_via_api();
+            }
+            Some(ModalAction::Cancel) => self.confirm_remote_projected_tab_close_cancel(),
             _ => {}
         }
     }
@@ -2017,6 +2097,24 @@ mod tests {
         }
     }
 
+    fn remote_projected_tab_target() -> RemoteProjectedTabTarget {
+        RemoteProjectedTabTarget {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            workspace_id: "remote-ws".into(),
+            tab_id: "remote-tab-1".into(),
+            label: "remote tab".into(),
+        }
+    }
+
+    fn remote_projected_workspace_target() -> RemoteProjectedWorkspaceTarget {
+        RemoteProjectedWorkspaceTarget {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            workspace_id: "remote-ws".into(),
+        }
+    }
+
     fn app_with_remote_host_for_projected_split() -> App {
         let mut config = crate::config::Config::default();
         config.remote.enabled = true;
@@ -2067,6 +2165,80 @@ mod tests {
 
         assert_eq!(params.pane_id, "jafar/terminal:remote-term-1");
         assert!(params.confirm);
+    }
+
+    #[test]
+    fn remote_projected_tab_methods_use_host_qualified_targets_and_confirm() {
+        let crate::api::schema::Method::TabCreate(create) =
+            remote_projected_tab_create_method(&remote_projected_workspace_target())
+        else {
+            panic!("expected tab.create method");
+        };
+        assert_eq!(
+            create.workspace_id.as_deref(),
+            Some("jafar/workspace:remote-ws")
+        );
+        assert!(create.focus);
+        assert!(create.cwd.is_none());
+        assert!(create.env.is_empty());
+
+        let crate::api::schema::Method::TabFocus(focus) =
+            remote_projected_tab_focus_method(&remote_projected_tab_target())
+        else {
+            panic!("expected tab.focus method");
+        };
+        assert_eq!(focus.tab_id, "jafar/tab:remote-tab-1");
+
+        let crate::api::schema::Method::TabClose(close) =
+            remote_projected_tab_close_method(&remote_projected_tab_target())
+        else {
+            panic!("expected tab.close method");
+        };
+        assert_eq!(close.tab_id, "jafar/tab:remote-tab-1");
+        assert!(close.confirm);
+    }
+
+    #[test]
+    fn remote_projected_tab_close_confirmation_dispatches_and_preserves_selection() {
+        let mut app = app_with_remote_host_for_projected_split();
+        let selected = crate::remote_source::RemoteSpaceKey {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            workspace_id: "remote-ws".into(),
+        };
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("local")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.selected_remote_space = Some(selected.clone());
+        app.state.pending_remote_projected_tab_close = Some(remote_projected_tab_target());
+        app.state.mode = Mode::ConfirmRemoteProjectedTabClose;
+
+        app.handle_confirm_remote_projected_tab_close_key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+        ));
+
+        assert_eq!(app.state.pending_remote_projected_tab_close, None);
+        assert_eq!(app.state.selected_remote_space, Some(selected));
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn remote_projected_tab_close_cancel_preserves_state_without_dispatch() {
+        let mut app = app_with_remote_host_for_projected_split();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("local")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.pending_remote_projected_tab_close = Some(remote_projected_tab_target());
+        app.state.mode = Mode::ConfirmRemoteProjectedTabClose;
+
+        app.handle_confirm_remote_projected_tab_close_key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::empty(),
+        ));
+
+        assert_eq!(app.state.pending_remote_projected_tab_close, None);
+        assert_eq!(app.state.mode, Mode::Terminal);
     }
 
     #[test]

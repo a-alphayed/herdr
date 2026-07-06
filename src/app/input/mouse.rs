@@ -6,8 +6,9 @@ use tracing::warn;
 use crate::{
     app::state::{
         AgentPanelSort, AppState, ContextMenuKind, ContextMenuState, DragState, DragTarget,
-        MenuListState, Mode, RemoteProjectedPaneTarget, RightClickPassthroughGesture,
-        TabPressState, ViewLayout, WorkspacePressState,
+        MenuListState, Mode, RemoteProjectedPaneTarget, RemoteProjectedTabTarget,
+        RemoteProjectedWorkspaceTarget, RightClickPassthroughGesture, TabPressState, ViewLayout,
+        WorkspacePressState,
     },
     layout::{PaneInfo, SplitBorder},
     selection::Selection,
@@ -44,6 +45,12 @@ pub(super) enum MouseAction {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
         selected_remote_agent: crate::remote_source::RemoteAgentKey,
+    },
+    RemoteProjectedTabCreate {
+        target: RemoteProjectedWorkspaceTarget,
+    },
+    RemoteProjectedTabFocus {
+        target: RemoteProjectedTabTarget,
     },
     FocusToastTarget,
     MoveWorkspace {
@@ -695,6 +702,54 @@ impl AppState {
                     // while a remote projection is selected.
                     let col = mouse.column;
                     let row = mouse.row;
+                    if let Some(hit) = self
+                        .view
+                        .remote_projection_tab_hit_areas
+                        .iter()
+                        .find(|h| rect_contains(h.rect, col, row))
+                        .cloned()
+                    {
+                        if hit.live {
+                            match hit.action {
+                                crate::app::state::RemoteProjectionTabAction::New => {
+                                    return Some(MouseAction::RemoteProjectedTabCreate {
+                                        target: RemoteProjectedWorkspaceTarget {
+                                            host: hit.host,
+                                            session: hit.session,
+                                            workspace_id: hit.workspace_id,
+                                        },
+                                    });
+                                }
+                                crate::app::state::RemoteProjectionTabAction::Focus => {
+                                    if let Some(tab_id) = hit.tab_id {
+                                        return Some(MouseAction::RemoteProjectedTabFocus {
+                                            target: RemoteProjectedTabTarget {
+                                                host: hit.host,
+                                                session: hit.session,
+                                                workspace_id: hit.workspace_id,
+                                                tab_id,
+                                                label: hit.label,
+                                            },
+                                        });
+                                    }
+                                }
+                                crate::app::state::RemoteProjectionTabAction::Close => {
+                                    if let Some(tab_id) = hit.tab_id {
+                                        self.pending_remote_projected_tab_close =
+                                            Some(RemoteProjectedTabTarget {
+                                                host: hit.host,
+                                                session: hit.session,
+                                                workspace_id: hit.workspace_id,
+                                                tab_id,
+                                                label: hit.label,
+                                            });
+                                        self.mode = Mode::ConfirmRemoteProjectedTabClose;
+                                    }
+                                }
+                            }
+                        }
+                        return None;
+                    }
                     if let Some(hit) = self
                         .view
                         .remote_projection_hit_areas
@@ -2141,6 +2196,23 @@ mod tests {
         }
     }
 
+    fn remote_projection_tab_hit(
+        rect: Rect,
+        action: crate::app::state::RemoteProjectionTabAction,
+        tab_id: Option<&str>,
+    ) -> crate::app::state::RemoteProjectionTabHitArea {
+        crate::app::state::RemoteProjectionTabHitArea {
+            rect,
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            workspace_id: "remote-ws".into(),
+            tab_id: tab_id.map(str::to_string),
+            label: tab_id.unwrap_or("new tab").to_string(),
+            action,
+            live: true,
+        }
+    }
+
     fn remote_projection_hit(
         rect: Rect,
         live: bool,
@@ -3383,6 +3455,104 @@ mod tests {
 
         assert_eq!(border.pos, 0);
         assert!(app.state.find_border_at(0, row).is_none());
+    }
+
+    #[test]
+    fn left_click_remote_tab_hit_returns_focus_action_without_local_tab_hit() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("local")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.selected_remote_space = Some(remote_space_key());
+        app.state.view.tab_hit_areas = Vec::new();
+        let tab_rect = Rect::new(50, 2, 12, 1);
+        app.state.view.remote_projection_tab_hit_areas = vec![remote_projection_tab_hit(
+            tab_rect,
+            crate::app::state::RemoteProjectionTabAction::Focus,
+            Some("remote-tab-2"),
+        )];
+
+        let action = app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                tab_rect.x + 1,
+                tab_rect.y,
+            ),
+        );
+
+        match action {
+            Some(MouseAction::RemoteProjectedTabFocus { target }) => {
+                assert_eq!(target.host, "jafar");
+                assert_eq!(target.workspace_id, "remote-ws");
+                assert_eq!(target.tab_id, "remote-tab-2");
+            }
+            _ => panic!("expected remote tab focus action"),
+        }
+        assert_eq!(app.state.selected_remote_space, Some(remote_space_key()));
+    }
+
+    #[test]
+    fn left_click_remote_new_tab_hit_returns_create_action() {
+        let mut app = app_for_mouse_test();
+        app.state.mode = Mode::Terminal;
+        app.state.selected_remote_space = Some(remote_space_key());
+        let new_rect = Rect::new(50, 2, 5, 1);
+        app.state.view.remote_projection_tab_hit_areas = vec![remote_projection_tab_hit(
+            new_rect,
+            crate::app::state::RemoteProjectionTabAction::New,
+            None,
+        )];
+
+        let action = app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                new_rect.x + 1,
+                new_rect.y,
+            ),
+        );
+
+        match action {
+            Some(MouseAction::RemoteProjectedTabCreate { target }) => {
+                assert_eq!(target.host, "jafar");
+                assert_eq!(target.workspace_id, "remote-ws");
+            }
+            _ => panic!("expected remote tab create action"),
+        }
+    }
+
+    #[test]
+    fn left_click_remote_tab_close_opens_confirmation() {
+        let mut app = app_for_mouse_test();
+        app.state.mode = Mode::Terminal;
+        app.state.selected_remote_space = Some(remote_space_key());
+        let close_rect = Rect::new(50, 2, 3, 1);
+        app.state.view.remote_projection_tab_hit_areas = vec![remote_projection_tab_hit(
+            close_rect,
+            crate::app::state::RemoteProjectionTabAction::Close,
+            Some("remote-tab-2"),
+        )];
+
+        let action = app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                close_rect.x + 1,
+                close_rect.y,
+            ),
+        );
+
+        assert!(action.is_none());
+        assert_eq!(app.state.mode, Mode::ConfirmRemoteProjectedTabClose);
+        assert_eq!(
+            app.state
+                .pending_remote_projected_tab_close
+                .as_ref()
+                .map(|target| target.tab_id.as_str()),
+            Some("remote-tab-2")
+        );
     }
 
     #[test]

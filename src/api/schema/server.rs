@@ -54,6 +54,9 @@ impl FederationCapabilities {
     pub const PANE_SPLIT: &'static str = "pane_split";
     pub const PANE_CLOSE: &'static str = "pane_close";
     pub const TAB_LIST: &'static str = "tab_list";
+    pub const TAB_CREATE: &'static str = "tab_create";
+    pub const TAB_FOCUS: &'static str = "tab_focus";
+    pub const TAB_CLOSE: &'static str = "tab_close";
     pub const LAYOUT_EXPORT: &'static str = "layout_export";
     pub const TERMINAL_ATTACH: &'static str = "terminal_attach";
 
@@ -75,6 +78,9 @@ impl FederationCapabilities {
                 Self::PANE_SPLIT,
                 Self::PANE_CLOSE,
                 Self::TAB_LIST,
+                Self::TAB_CREATE,
+                Self::TAB_FOCUS,
+                Self::TAB_CLOSE,
                 Self::LAYOUT_EXPORT,
                 Self::TERMINAL_ATTACH,
             ]

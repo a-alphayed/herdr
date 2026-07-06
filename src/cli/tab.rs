@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::api::schema::{
-    Method, Request, TabCreateParams, TabListParams, TabRenameParams, TabTarget,
+    Method, Request, TabCloseParams, TabCreateParams, TabListParams, TabRenameParams, TabTarget,
 };
 
 pub(super) fn run_tab_command(args: &[String]) -> std::io::Result<i32> {
@@ -183,21 +183,76 @@ fn tab_rename(args: &[String]) -> std::io::Result<i32> {
 }
 
 fn tab_close(args: &[String]) -> std::io::Result<i32> {
-    let Some(raw_tab_id) = args.first() else {
-        eprintln!("usage: herdr tab close <tab_id>");
-        return Ok(2);
+    let remote_hosts = cli_remote_host_registry();
+    let params = match parse_tab_close_args(args, remote_hosts.as_ref()) {
+        Ok(params) => params,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(2);
+        }
     };
-    if args.len() != 1 {
-        eprintln!("usage: herdr tab close <tab_id>");
-        return Ok(2);
-    }
 
     super::print_response(&super::send_request(&Request {
         id: "cli:tab:close".into(),
-        method: Method::TabClose(TabTarget {
-            tab_id: super::normalize_tab_id(raw_tab_id),
-        }),
+        method: Method::TabClose(params),
     })?)
+}
+
+fn cli_remote_host_registry() -> Option<crate::remote_target::RemoteHostRegistry> {
+    let config = crate::config::Config::load().config;
+    if !config.remote.enabled {
+        return None;
+    }
+    crate::remote_target::RemoteHostRegistry::from_configs(config.remote.hosts).ok()
+}
+
+fn parse_tab_close_args(
+    args: &[String],
+    remote_hosts: Option<&crate::remote_target::RemoteHostRegistry>,
+) -> Result<TabCloseParams, String> {
+    let mut tab_id = None;
+    let mut confirm = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--confirm" => {
+                confirm = true;
+                index += 1;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown option: {other}")),
+            other if tab_id.is_none() => {
+                tab_id = Some(super::normalize_tab_id(other));
+                index += 1;
+            }
+            _ => return Err("usage: herdr tab close <tab_id>|<host>/tab:<id> [--confirm]".into()),
+        }
+    }
+
+    let Some(tab_id) = tab_id else {
+        return Err("usage: herdr tab close <tab_id>|<host>/tab:<id> [--confirm]".into());
+    };
+
+    if !confirm && tab_close_target_uses_configured_remote_host(&tab_id, remote_hosts) {
+        return Err(format!(
+            "tab.close on remote target {tab_id} is destructive; pass --confirm to proceed"
+        ));
+    }
+
+    Ok(TabCloseParams { tab_id, confirm })
+}
+
+fn tab_close_target_uses_configured_remote_host(
+    tab_id: &str,
+    remote_hosts: Option<&crate::remote_target::RemoteHostRegistry>,
+) -> bool {
+    let Some(remote_hosts) = remote_hosts else {
+        return false;
+    };
+    let Some((host, target)) = tab_id.split_once('/') else {
+        return false;
+    };
+    remote_hosts.get(host).is_some() && target.starts_with("tab:")
 }
 
 fn print_tab_help() {
@@ -209,5 +264,59 @@ fn print_tab_help() {
     eprintln!("  herdr tab get <tab_id>");
     eprintln!("  herdr tab focus <tab_id>");
     eprintln!("  herdr tab rename <tab_id> <label>");
-    eprintln!("  herdr tab close <tab_id>");
+    eprintln!("  herdr tab close <tab_id>|<host>/tab:<id> [--confirm]");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn registry() -> crate::remote_target::RemoteHostRegistry {
+        crate::remote_target::RemoteHostRegistry::from_configs(vec![
+            crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn parse_tab_close_args_preserves_local_target_without_confirm() {
+        let params = parse_tab_close_args(&args(&["local/tab-label"]), None).unwrap();
+        assert_eq!(params.tab_id, "local/tab-label");
+        assert!(!params.confirm);
+    }
+
+    #[test]
+    fn parse_tab_close_args_requires_confirm_for_configured_remote_tab_target() {
+        let registry = registry();
+        let err =
+            parse_tab_close_args(&args(&["jafar/tab:remote-tab"]), Some(&registry)).unwrap_err();
+
+        assert!(err.contains("pass --confirm"));
+    }
+
+    #[test]
+    fn parse_tab_close_args_accepts_confirm_for_configured_remote_tab_target() {
+        let registry = registry();
+        let params = parse_tab_close_args(
+            &args(&["jafar/tab:remote-tab", "--confirm"]),
+            Some(&registry),
+        )
+        .unwrap();
+
+        assert_eq!(params.tab_id, "jafar/tab:remote-tab");
+        assert!(params.confirm);
+    }
+
+    #[test]
+    fn parse_tab_close_args_does_not_require_confirm_for_unknown_slash_label() {
+        let registry = registry();
+        let params = parse_tab_close_args(&args(&["logs/tab"]), Some(&registry)).unwrap();
+
+        assert_eq!(params.tab_id, "logs/tab");
+        assert!(!params.confirm);
+    }
 }

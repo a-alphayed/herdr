@@ -23,7 +23,8 @@ mod widgets;
 
 use self::dialogs::{
     render_confirm_close_overlay, render_confirm_remote_attach_overlay,
-    render_confirm_remote_projected_pane_close_overlay, render_new_linked_worktree_overlay,
+    render_confirm_remote_projected_pane_close_overlay,
+    render_confirm_remote_projected_tab_close_overlay, render_new_linked_worktree_overlay,
     render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
 };
 use self::keybind_help::render_keybind_help_overlay;
@@ -66,7 +67,9 @@ pub(crate) use self::{
     dialogs::{
         confirm_close_button_rects, confirm_close_popup_rect, confirm_remote_attach_button_rects,
         confirm_remote_attach_inner_rect, confirm_remote_projected_pane_close_button_rects,
-        confirm_remote_projected_pane_close_inner_rect, new_linked_worktree_button_rects,
+        confirm_remote_projected_pane_close_inner_rect,
+        confirm_remote_projected_tab_close_button_rects,
+        confirm_remote_projected_tab_close_inner_rect, new_linked_worktree_button_rects,
         new_linked_worktree_inner_rect, open_existing_worktree_button_rects,
         open_existing_worktree_inner_rect, open_existing_worktree_max_visible_rows,
         open_existing_worktree_visible_start, remove_worktree_button_rects,
@@ -318,6 +321,8 @@ fn compute_view_internal(
                 )
             })
             .unwrap_or_default();
+        let remote_projection_tab_hit_areas =
+            compute_remote_projection_tab_hit_areas(app, main_area);
         let remote_projection_hit_areas = compute_remote_projection_hit_areas(app, main_area);
         app.view = crate::app::ViewState {
             layout: ViewLayout::Desktop,
@@ -336,6 +341,7 @@ fn compute_view_internal(
             toast_hit_area,
             pane_infos: Vec::new(),
             split_borders: Vec::new(),
+            remote_projection_tab_hit_areas,
             remote_projection_hit_areas,
         };
         return;
@@ -409,6 +415,7 @@ fn compute_view_internal(
         toast_hit_area,
         pane_infos,
         split_borders,
+        remote_projection_tab_hit_areas: Vec::new(),
         remote_projection_hit_areas: Vec::new(),
     };
 }
@@ -443,6 +450,8 @@ fn compute_mobile_view(
             .as_ref()
             .map(|_| mobile_toast_banner_rect(area, app.config_diagnostic.is_some()))
             .unwrap_or_default();
+        let remote_projection_tab_hit_areas =
+            compute_remote_projection_tab_hit_areas(app, terminal_area);
         let remote_projection_hit_areas = compute_remote_projection_hit_areas(app, terminal_area);
         app.view = crate::app::ViewState {
             layout: ViewLayout::Mobile,
@@ -461,6 +470,7 @@ fn compute_mobile_view(
             toast_hit_area,
             pane_infos: Vec::new(),
             split_borders: Vec::new(),
+            remote_projection_tab_hit_areas,
             remote_projection_hit_areas,
         };
         return;
@@ -513,6 +523,7 @@ fn compute_mobile_view(
         toast_hit_area,
         pane_infos,
         split_borders,
+        remote_projection_tab_hit_areas: Vec::new(),
         remote_projection_hit_areas: Vec::new(),
     };
 }
@@ -572,6 +583,9 @@ pub fn render_with_runtime_registry(
         }
         Mode::ConfirmRemoteProjectedPaneClose => {
             render_confirm_remote_projected_pane_close_overlay(app, frame, terminal_area)
+        }
+        Mode::ConfirmRemoteProjectedTabClose => {
+            render_confirm_remote_projected_tab_close_overlay(app, frame, terminal_area)
         }
         Mode::ContextMenu => {
             render_context_menu(app, frame);
@@ -639,6 +653,133 @@ pub(crate) fn project_layout_rects<'a>(
     }
 }
 
+fn remote_projection_tab_strip(
+    app: &crate::app::AppState,
+) -> Option<(
+    crate::remote_source::RemoteSpaceKey,
+    crate::remote_source::RemoteTabSnapshotEntry,
+    crate::remote_source::RemoteSourceCapabilities,
+)> {
+    use crate::remote_source::{RemoteHostKey, RemoteProjectionStatus};
+
+    let selected = app.selected_remote_space.as_ref()?;
+    let projection = app.remote_sources.projection_for_space(selected)?;
+    if projection.status != RemoteProjectionStatus::Available {
+        return None;
+    }
+    let host = RemoteHostKey::new(selected.host.clone(), selected.session.clone());
+    if !app
+        .remote_sources
+        .host_status(&host)
+        .is_some_and(|status| status.is_connected())
+    {
+        return None;
+    }
+    let tabs = app.remote_sources.tab_snapshot_for_space(selected)?;
+    if tabs.status != RemoteProjectionStatus::Available {
+        return None;
+    }
+    let capabilities = app.remote_sources.host_capabilities(&host);
+    Some((selected.clone(), tabs, capabilities))
+}
+
+fn remote_projection_chrome_rows(app: &crate::app::AppState) -> u16 {
+    if remote_projection_tab_strip(app).is_some() {
+        2
+    } else {
+        1
+    }
+}
+
+fn remote_projection_body_area(app: &crate::app::AppState, area: Rect) -> Option<Rect> {
+    let header_rows = remote_projection_chrome_rows(app);
+    if area.height <= header_rows {
+        return None;
+    }
+    let [_, body] =
+        Layout::vertical([Constraint::Length(header_rows), Constraint::Min(1)]).areas(area);
+    Some(body)
+}
+
+fn compute_remote_projection_tab_hit_areas(
+    app: &crate::app::AppState,
+    area: Rect,
+) -> Vec<crate::app::state::RemoteProjectionTabHitArea> {
+    use crate::app::state::{RemoteProjectionTabAction, RemoteProjectionTabHitArea};
+
+    let Some((selected, tabs, capabilities)) = remote_projection_tab_strip(app) else {
+        return Vec::new();
+    };
+    if area.height <= remote_projection_chrome_rows(app) || area.width == 0 {
+        return Vec::new();
+    }
+
+    let mut hits = Vec::new();
+    let mut x = area
+        .x
+        .saturating_add(5)
+        .min(area.x.saturating_add(area.width));
+    let row = area.y.saturating_add(1);
+    let right = area.x.saturating_add(area.width);
+    for tab in tabs.tabs {
+        if x >= right {
+            break;
+        }
+        let label = if tab.focused {
+            format!("[{}]", tab.label)
+        } else {
+            format!(" {} ", tab.label)
+        };
+        let width = (label.chars().count() as u16)
+            .max(1)
+            .min(right.saturating_sub(x));
+        if capabilities.tab_focus && width > 0 {
+            hits.push(RemoteProjectionTabHitArea {
+                rect: Rect::new(x, row, width, 1),
+                host: selected.host.clone(),
+                session: selected.session.clone(),
+                workspace_id: selected.workspace_id.clone(),
+                tab_id: Some(tab.tab_id.clone()),
+                label: tab.label.clone(),
+                action: RemoteProjectionTabAction::Focus,
+                live: true,
+            });
+        }
+        x = x.saturating_add(width);
+        if capabilities.tab_close && x < right {
+            let close_width = 3u16.min(right.saturating_sub(x));
+            hits.push(RemoteProjectionTabHitArea {
+                rect: Rect::new(x, row, close_width, 1),
+                host: selected.host.clone(),
+                session: selected.session.clone(),
+                workspace_id: selected.workspace_id.clone(),
+                tab_id: Some(tab.tab_id.clone()),
+                label: tab.label.clone(),
+                action: RemoteProjectionTabAction::Close,
+                live: true,
+            });
+            x = x.saturating_add(close_width);
+        }
+        if x < right {
+            x = x.saturating_add(1);
+        }
+    }
+    if capabilities.tab_create && x < right {
+        let width = 5u16.min(right.saturating_sub(x));
+        hits.push(RemoteProjectionTabHitArea {
+            rect: Rect::new(x, row, width, 1),
+            host: selected.host.clone(),
+            session: selected.session.clone(),
+            workspace_id: selected.workspace_id.clone(),
+            tab_id: None,
+            label: "new tab".to_string(),
+            action: RemoteProjectionTabAction::New,
+            live: true,
+        });
+    }
+    hits
+}
+
 /// Build the projection hit-area list for `compute_view`. Called only when
 /// `selected_remote_space` is Some.
 fn compute_remote_projection_hit_areas(
@@ -657,12 +798,8 @@ fn compute_remote_projection_hit_areas(
         return Vec::new();
     };
 
-    // The header row takes 1 line; body starts after it.
-    let actual_body = if body_area.height < 3 {
+    let Some(actual_body) = remote_projection_body_area(app, body_area) else {
         return Vec::new();
-    } else {
-        let [_, b] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(body_area);
-        b
     };
 
     project_layout_rects(&layout.root, actual_body, &layout.focused_pane_id)
@@ -750,7 +887,8 @@ fn render_remote_projection(app: &AppState, frame: &mut Frame, terminal_area: Re
         Span::styled(status_label, status_style),
     ]);
 
-    if terminal_area.height < 3 {
+    let chrome_rows = remote_projection_chrome_rows(app);
+    if terminal_area.height <= chrome_rows {
         frame.render_widget(
             Paragraph::new(vec![header]).alignment(Alignment::Left),
             terminal_area,
@@ -758,12 +896,18 @@ fn render_remote_projection(app: &AppState, frame: &mut Frame, terminal_area: Re
         return;
     }
 
-    let [header_area, body_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(terminal_area);
+    let [chrome_area, body_area] =
+        Layout::vertical([Constraint::Length(chrome_rows), Constraint::Min(1)])
+            .areas(terminal_area);
+    let [header_area, tab_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(chrome_area);
     frame.render_widget(
         Paragraph::new(vec![header]).alignment(Alignment::Left),
         header_area,
     );
+    if chrome_rows > 1 {
+        render_remote_projection_tab_strip(app, frame, tab_area);
+    }
 
     match status {
         Some(RemoteProjectionStatus::Available) | Some(RemoteProjectionStatus::StaleLastKnown)
@@ -785,6 +929,42 @@ fn render_remote_projection(app: &AppState, frame: &mut Frame, terminal_area: Re
             body_area,
         ),
     }
+}
+
+fn render_remote_projection_tab_strip(app: &AppState, frame: &mut Frame, area: Rect) {
+    use ratatui::text::Line;
+    use ratatui::widgets::Paragraph;
+
+    let Some((_selected, tabs, capabilities)) = remote_projection_tab_strip(app) else {
+        return;
+    };
+    let mut spans = vec![Span::raw("tabs ")];
+    for tab in tabs.tabs {
+        let label_style = if tab.focused {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        spans.push(Span::styled(
+            if tab.focused {
+                format!("[{}]", tab.label)
+            } else {
+                format!(" {} ", tab.label)
+            },
+            label_style,
+        ));
+        if capabilities.tab_close {
+            spans.push(Span::raw(" × "));
+        }
+        spans.push(Span::raw(" "));
+    }
+    if capabilities.tab_create {
+        spans.push(Span::styled(
+            " + ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Draw projected remote layout panes using the shared geometry helper.

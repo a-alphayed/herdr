@@ -104,6 +104,20 @@ Broad remote pane/workspace/server/process teardown remains out of scope except 
 - UI: a live projected pane context menu exposes **Close pane**. The confirmation overlay names the host, session, and target label and states that it closes the remote pane/process on that host. Confirm dispatches `tui.remote_projection.pane.close` as `pane.close { pane_id: "<host>/terminal:<terminal_id>", confirm: true }` and returns to the prior local terminal/navigate mode; cancel mutates neither local nor remote panes.
 - Non-goals remain: no agent-label close, no broad workspace/tab destructive mutation, no PID kill, no process/host/server stop, no arbitrary SSH command, no local-owned remote PTY behavior, and no uncertain-delivery retry.
 
+### Remote tab creation, switching, and confirmed close (Phase F.2)
+
+Projected remote tabs are now federation-routed to the authoritative remote Herdr host. The local node renders cached remote tab metadata and forwards only capability-gated tab mutations; it still does not own remote PTYs, tabs, hooks, persistence, or child processes.
+
+- API/schema: `tab.create` may target `workspace_id: "<host>/workspace:<remote-workspace-id>"`; `tab.focus` may target `tab_id: "<host>/tab:<remote-tab-id>"`; `tab.close` uses `{ tab_id, confirm }`, with `confirm` defaulting to `false` and omitted when false. Bare/local tab calls remain backward-compatible.
+- CLI: `herdr tab close <host>/tab:<id> --confirm` is required for configured remote hosts. A configured host-qualified remote tab close without `--confirm` is rejected before sending. Bare/local tab close keeps its prior behavior.
+- Capability: remote tab routes require `tab_create`, `tab_focus`, or `tab_close` respectively, in addition to `remote_api_bridge`; `tab_list` remains the metadata capability for cached remote tab lists.
+- Target/cache resolution: `tab.create` resolves the host-qualified workspace target against a connected direct remote workspace snapshot. `tab.focus` and `tab.close` resolve `tab:<id>` against connected, fresh per-workspace `tab.list` snapshots. Stale, unavailable, disconnected, or missing metadata is rejected before forwarding.
+- Confirmation: remote `tab.close` requires `confirm: true` before host status checks, cache resolution, or remote forwarding. Closing the last remote tab is not special-cased by the controller; the authoritative remote tab close path returns its normal `cannot close the last tab` error.
+- Remote authority: forwarded requests carry raw authoritative remote ids only. `tab.create` rewrites `workspace_id` to the remote workspace id and passes `cwd`, `env`, `focus`, and `label` through unchanged as remote-scoped user input. The local node does not expand local paths, forward local env/secrets, create local-owned remote PTYs, relay hooks, perform transitive routing, or expose broad host/process/server management.
+- Cache/UI freshness: the remote supervisor caches per-workspace `TabInfo` snapshots and uses them for the projected tab strip and active-tab label; `layout.export` remains scoped to the active tab. After successful create/focus/close, the controller patches or refreshes the tab/projection cache promptly instead of waiting for the normal supervisor loop.
+- UI: a live projected remote workspace shows a compact remote tab strip, a new-tab affordance when `tab_create` is advertised, click-to-switch when `tab_focus` is advertised, and a close affordance when `tab_close` is advertised. Confirmed close names the host/session/workspace/tab. Remote tab hit areas are separate from suppressed local tab hit areas, and no remote tab controls are enabled for stale, unavailable, or disconnected projections.
+- Non-goals remain: no remote tab/workspace/pane rename in this slice, no broad remote workspace close, no pane focus movement beyond tab switching, no split dragging/resize expansion, no PID kill, no arbitrary SSH command, no transitive remote-of-remote routing, no local-owned remote PTY behavior, and no uncertain-delivery retry for non-idempotent tab create/close.
+
 ## Core Invariants
 
 - A host owns the PTYs and child processes it runs.

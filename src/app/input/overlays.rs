@@ -50,6 +50,36 @@ impl App {
             return true;
         }
 
+        if self.state.mode == Mode::ConfirmRemoteProjectedTabClose {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let Some(inner) = crate::ui::confirm_remote_projected_tab_close_inner_rect(
+                    self.state.view.terminal_area,
+                ) else {
+                    self.confirm_remote_projected_tab_close_cancel();
+                    return true;
+                };
+                let (confirm, cancel) =
+                    crate::ui::confirm_remote_projected_tab_close_button_rects(inner);
+                match modal_action_from_buttons(
+                    mouse.column,
+                    mouse.row,
+                    &[
+                        (confirm, ModalAction::Confirm),
+                        (cancel, ModalAction::Cancel),
+                    ],
+                ) {
+                    Some(ModalAction::Confirm) => {
+                        self.confirm_remote_projected_tab_close_accept_via_api();
+                    }
+                    Some(ModalAction::Cancel) | None => {
+                        self.confirm_remote_projected_tab_close_cancel();
+                    }
+                    _ => {}
+                }
+            }
+            return true;
+        }
+
         if self.state.mode == Mode::ReleaseNotes {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left)

@@ -90,6 +90,7 @@ pub(crate) enum RemoteTargetSelector {
     Pane(String),
     Terminal(String),
     Workspace(String),
+    Tab(String),
 }
 
 pub(crate) fn parse_target_route(target: &str) -> Result<TargetRoute, TargetRouteParseError> {
@@ -120,6 +121,7 @@ pub(crate) fn parse_remote_target_selector(
         ),
         ("terminal:", RemoteTargetSelector::Terminal),
         ("workspace:", RemoteTargetSelector::Workspace),
+        ("tab:", RemoteTargetSelector::Tab),
     ] {
         if let Some(value) = target.strip_prefix(prefix) {
             if value.is_empty() {
@@ -345,7 +347,10 @@ pub(crate) fn resolve_remote_agent_target(
     host: &RemoteHostConfig,
     selector: &RemoteTargetSelector,
 ) -> Result<RemoteAgentResolution, RemoteAgentResolveError> {
-    if matches!(selector, RemoteTargetSelector::Workspace(_)) {
+    if matches!(
+        selector,
+        RemoteTargetSelector::Workspace(_) | RemoteTargetSelector::Tab(_)
+    ) {
         return Err(RemoteAgentResolveError::UnsupportedSelector {
             target: selector.clone(),
         });
@@ -396,7 +401,7 @@ fn remote_agent_matches_selector(
         RemoteTargetSelector::Agent(label) => {
             remote_agent_identity_labels(&entry.agent).contains(label)
         }
-        RemoteTargetSelector::Workspace(_) => false,
+        RemoteTargetSelector::Workspace(_) | RemoteTargetSelector::Tab(_) => false,
     }
 }
 
@@ -436,6 +441,188 @@ fn preferred_remote_agent_label(agent: &crate::api::schema::AgentInfo) -> String
         .or(agent.title.as_deref())
         .unwrap_or(&agent.terminal_id)
         .to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteWorkspaceResolution {
+    pub(crate) host: RemoteHostConfig,
+    pub(crate) workspace: crate::api::schema::WorkspaceInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteWorkspaceResolveError {
+    NotFound { target: RemoteTargetSelector },
+    MetadataUnavailable { target: RemoteTargetSelector },
+    UnsupportedSelector { target: RemoteTargetSelector },
+}
+
+impl std::fmt::Display for RemoteWorkspaceResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { target } => {
+                write!(f, "remote workspace target not found: {target:?}")
+            }
+            Self::MetadataUnavailable { target } => write!(
+                f,
+                "remote workspace metadata is unavailable; wait for a live workspace snapshot before mutating target {target:?}"
+            ),
+            Self::UnsupportedSelector { target } => write!(
+                f,
+                "remote workspace target must be a workspace selector: {target:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RemoteWorkspaceResolveError {}
+
+pub(crate) fn resolve_remote_workspace_target(
+    cache: &RemoteSourceCache,
+    host: &RemoteHostConfig,
+    selector: &RemoteTargetSelector,
+) -> Result<RemoteWorkspaceResolution, RemoteWorkspaceResolveError> {
+    let RemoteTargetSelector::Workspace(workspace_id) = selector else {
+        return Err(RemoteWorkspaceResolveError::UnsupportedSelector {
+            target: selector.clone(),
+        });
+    };
+
+    let host_key = RemoteHostKey::new(host.name.clone(), host.session.clone());
+    let Some(workspaces) = cache.workspace_entries_for_host(&host_key) else {
+        return Err(RemoteWorkspaceResolveError::MetadataUnavailable {
+            target: selector.clone(),
+        });
+    };
+    let Some(entry) = workspaces
+        .into_iter()
+        .find(|entry| entry.workspace.workspace_id == *workspace_id)
+    else {
+        return Err(RemoteWorkspaceResolveError::NotFound {
+            target: selector.clone(),
+        });
+    };
+
+    Ok(RemoteWorkspaceResolution {
+        host: host.clone(),
+        workspace: entry.workspace,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteTabResolution {
+    pub(crate) host: RemoteHostConfig,
+    pub(crate) workspace_id: String,
+    pub(crate) tab: crate::api::schema::TabInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteTabResolveError {
+    NotFound {
+        target: RemoteTargetSelector,
+    },
+    MetadataUnavailable {
+        target: RemoteTargetSelector,
+    },
+    MetadataStale {
+        target: RemoteTargetSelector,
+        workspace_id: Option<String>,
+        status: Option<RemoteProjectionStatus>,
+    },
+    UnsupportedSelector {
+        target: RemoteTargetSelector,
+    },
+}
+
+impl std::fmt::Display for RemoteTabResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { target } => write!(
+                f,
+                "remote tab target not found in live tab metadata: {target:?}"
+            ),
+            Self::MetadataUnavailable { target } => write!(
+                f,
+                "remote tab metadata is unavailable; wait for a live tab snapshot before mutating target {target:?}"
+            ),
+            Self::MetadataStale {
+                target,
+                workspace_id,
+                status,
+            } => {
+                let status = status
+                    .map(remote_projection_status_label)
+                    .unwrap_or("not available");
+                match workspace_id {
+                    Some(workspace_id) => write!(
+                        f,
+                        "remote tab metadata for workspace {workspace_id} is {status}; wait for live tab metadata before mutating target {target:?}"
+                    ),
+                    None => write!(
+                        f,
+                        "remote tab metadata is {status}; wait for live tab metadata before mutating target {target:?}"
+                    ),
+                }
+            }
+            Self::UnsupportedSelector { target } => {
+                write!(f, "remote tab target must be a tab selector: {target:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RemoteTabResolveError {}
+
+pub(crate) fn resolve_remote_tab_target(
+    cache: &RemoteSourceCache,
+    host: &RemoteHostConfig,
+    selector: &RemoteTargetSelector,
+) -> Result<RemoteTabResolution, RemoteTabResolveError> {
+    let RemoteTargetSelector::Tab(tab_id) = selector else {
+        return Err(RemoteTabResolveError::UnsupportedSelector {
+            target: selector.clone(),
+        });
+    };
+
+    let host_key = RemoteHostKey::new(host.name.clone(), host.session.clone());
+    let snapshots = cache.tab_snapshots_for_host(&host_key);
+    if snapshots.is_empty() {
+        return Err(RemoteTabResolveError::MetadataUnavailable {
+            target: selector.clone(),
+        });
+    }
+
+    let mut saw_live_snapshot = false;
+    for snapshot in snapshots {
+        if let Some(tab) = snapshot.tabs.iter().find(|tab| tab.tab_id == *tab_id) {
+            if snapshot.status != RemoteProjectionStatus::Available {
+                return Err(RemoteTabResolveError::MetadataStale {
+                    target: selector.clone(),
+                    workspace_id: Some(snapshot.workspace_id.clone()),
+                    status: Some(snapshot.status),
+                });
+            }
+            return Ok(RemoteTabResolution {
+                host: host.clone(),
+                workspace_id: snapshot.workspace_id.clone(),
+                tab: tab.clone(),
+            });
+        }
+        if snapshot.status == RemoteProjectionStatus::Available {
+            saw_live_snapshot = true;
+        }
+    }
+
+    if !saw_live_snapshot {
+        return Err(RemoteTabResolveError::MetadataStale {
+            target: selector.clone(),
+            workspace_id: None,
+            status: None,
+        });
+    }
+
+    Err(RemoteTabResolveError::NotFound {
+        target: selector.clone(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -530,7 +717,10 @@ pub(crate) fn resolve_remote_pane_target(
     host: &RemoteHostConfig,
     selector: &RemoteTargetSelector,
 ) -> Result<RemotePaneResolution, RemotePaneResolveError> {
-    if matches!(selector, RemoteTargetSelector::Agent(_)) {
+    if matches!(
+        selector,
+        RemoteTargetSelector::Agent(_) | RemoteTargetSelector::Tab(_)
+    ) {
         return Err(RemotePaneResolveError::UnsupportedSelector {
             target: selector.clone(),
         });
@@ -568,9 +758,11 @@ pub(crate) fn resolve_remote_pane_target(
                 || !any_terminal_id_projected.get(),
             )
         }
-        RemoteTargetSelector::Agent(_) => Err(RemotePaneResolveError::UnsupportedSelector {
-            target: selector.clone(),
-        }),
+        RemoteTargetSelector::Agent(_) | RemoteTargetSelector::Tab(_) => {
+            Err(RemotePaneResolveError::UnsupportedSelector {
+                target: selector.clone(),
+            })
+        }
     }
 }
 
@@ -759,7 +951,8 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::api::schema::{
-        AgentInfo, AgentStatus, LayoutDescription, LayoutNode, LayoutPane, SplitDirection,
+        AgentInfo, AgentStatus, LayoutDescription, LayoutNode, LayoutPane, SplitDirection, TabInfo,
+        WorkspaceInfo,
     };
     use crate::remote_source::{
         RemoteAgentKey, RemoteConnectionStatus, RemoteHostKey, RemoteProjectionSnapshot,
@@ -810,6 +1003,32 @@ mod tests {
 
     fn host_config(name: &str, session: &str) -> RemoteHostConfig {
         RemoteHostConfig::new(name, name, session, true)
+    }
+
+    fn workspace(workspace_id: &str) -> WorkspaceInfo {
+        WorkspaceInfo {
+            workspace_id: workspace_id.to_string(),
+            number: 1,
+            label: workspace_id.to_string(),
+            focused: false,
+            pane_count: 1,
+            tab_count: 1,
+            active_tab_id: format!("{workspace_id}:tab-active"),
+            agent_status: AgentStatus::Unknown,
+            worktree: None,
+        }
+    }
+
+    fn tab(workspace_id: &str, tab_id: &str, focused: bool) -> TabInfo {
+        TabInfo {
+            tab_id: tab_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            number: 1,
+            label: tab_id.to_string(),
+            focused,
+            pane_count: 1,
+            agent_status: AgentStatus::Unknown,
+        }
     }
 
     fn projected_layout(workspace_id: &str) -> LayoutDescription {
@@ -900,7 +1119,7 @@ mod tests {
 
     #[test]
     fn remote_target_bare_typed_handle_lookalikes_are_local_only() {
-        for target in ["pane:1-1", "terminal:term_abc", "workspace:w1"] {
+        for target in ["pane:1-1", "terminal:term_abc", "workspace:w1", "tab:t1"] {
             assert_eq!(
                 parse_target_route(target).unwrap(),
                 TargetRoute::Local {
@@ -971,11 +1190,23 @@ mod tests {
                 target: RemoteTargetSelector::Workspace("w1".to_string()),
             }
         );
+        assert_eq!(
+            parse_target_route("jafar/tab:t1").unwrap(),
+            TargetRoute::Remote {
+                host: "jafar".to_string(),
+                target: RemoteTargetSelector::Tab("t1".to_string()),
+            }
+        );
     }
 
     #[test]
     fn remote_target_rejects_empty_typed_handle_payloads() {
-        for target in ["jafar/pane:", "jafar/terminal:", "jafar/workspace:"] {
+        for target in [
+            "jafar/pane:",
+            "jafar/terminal:",
+            "jafar/workspace:",
+            "jafar/tab:",
+        ] {
             assert_eq!(
                 parse_target_route(target).unwrap_err(),
                 TargetRouteParseError::EmptyRemoteTarget
@@ -1396,6 +1627,130 @@ mod tests {
 
         assert!(resolved.entry.stale());
         assert_eq!(resolved.entry.status, RemoteConnectionStatus::Disconnected);
+    }
+
+    #[test]
+    fn remote_workspace_target_resolves_from_workspace_snapshot() {
+        let host = host_config("jafar", "default");
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let mut cache = RemoteSourceCache::default();
+        cache.replace_workspace_snapshot(host_key, vec![workspace("remote-ws")]);
+
+        let resolved = resolve_remote_workspace_target(
+            &cache,
+            &host,
+            &RemoteTargetSelector::Workspace("remote-ws".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.host, host);
+        assert_eq!(resolved.workspace.workspace_id, "remote-ws");
+    }
+
+    #[test]
+    fn remote_workspace_target_rejects_missing_or_wrong_selector() {
+        let host = host_config("jafar", "default");
+        let cache = RemoteSourceCache::default();
+
+        assert_eq!(
+            resolve_remote_workspace_target(
+                &cache,
+                &host,
+                &RemoteTargetSelector::Workspace("missing".to_string())
+            )
+            .unwrap_err(),
+            RemoteWorkspaceResolveError::MetadataUnavailable {
+                target: RemoteTargetSelector::Workspace("missing".to_string())
+            }
+        );
+        assert_eq!(
+            resolve_remote_workspace_target(
+                &cache,
+                &host,
+                &RemoteTargetSelector::Tab("tab-1".to_string())
+            )
+            .unwrap_err(),
+            RemoteWorkspaceResolveError::UnsupportedSelector {
+                target: RemoteTargetSelector::Tab("tab-1".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn remote_tab_target_resolves_from_live_tab_snapshot() {
+        let host = host_config("jafar", "default");
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let mut cache = RemoteSourceCache::default();
+        cache.replace_tab_snapshot(
+            &host_key,
+            "remote-ws",
+            vec![
+                tab("remote-ws", "tab-1", false),
+                tab("remote-ws", "tab-2", true),
+            ],
+        );
+
+        let resolved = resolve_remote_tab_target(
+            &cache,
+            &host,
+            &RemoteTargetSelector::Tab("tab-2".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.host, host);
+        assert_eq!(resolved.workspace_id, "remote-ws");
+        assert_eq!(resolved.tab.tab_id, "tab-2");
+    }
+
+    #[test]
+    fn remote_tab_target_rejects_stale_missing_and_wrong_selector() {
+        let host = host_config("jafar", "default");
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let mut cache = RemoteSourceCache::default();
+        cache.replace_tab_snapshot(
+            &host_key,
+            "remote-ws",
+            vec![tab("remote-ws", "tab-1", true)],
+        );
+        cache.mark_status(&host_key, RemoteConnectionStatus::Disconnected);
+
+        assert_eq!(
+            resolve_remote_tab_target(
+                &cache,
+                &host,
+                &RemoteTargetSelector::Tab("tab-1".to_string())
+            )
+            .unwrap_err(),
+            RemoteTabResolveError::MetadataStale {
+                target: RemoteTargetSelector::Tab("tab-1".to_string()),
+                workspace_id: Some("remote-ws".to_string()),
+                status: Some(RemoteProjectionStatus::StaleLastKnown),
+            }
+        );
+
+        let empty_cache = RemoteSourceCache::default();
+        assert_eq!(
+            resolve_remote_tab_target(
+                &empty_cache,
+                &host,
+                &RemoteTargetSelector::Tab("missing".to_string())
+            )
+            .unwrap_err(),
+            RemoteTabResolveError::MetadataUnavailable {
+                target: RemoteTargetSelector::Tab("missing".to_string())
+            }
+        );
+        assert_eq!(
+            resolve_remote_tab_target(
+                &empty_cache,
+                &host,
+                &RemoteTargetSelector::Workspace("remote-ws".to_string())
+            )
+            .unwrap_err(),
+            RemoteTabResolveError::UnsupportedSelector {
+                target: RemoteTargetSelector::Workspace("remote-ws".to_string())
+            }
+        );
     }
 
     #[test]

@@ -648,6 +648,7 @@ impl App {
             request_remote_workspace_create: None,
             pending_remote_attach: None,
             pending_remote_projected_pane_close: None,
+            pending_remote_projected_tab_close: None,
             pending_remote_workspace_creates: std::collections::BTreeMap::new(),
             next_remote_workspace_create_token: 1,
             creating_new_tab: false,
@@ -697,6 +698,7 @@ impl App {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                remote_projection_tab_hit_areas: Vec::new(),
                 remote_projection_hit_areas: Vec::new(),
             },
             drag: None,
@@ -1815,6 +1817,9 @@ impl App {
             Mode::ConfirmRemoteProjectedPaneClose => {
                 self.handle_confirm_remote_projected_pane_close_key(key_event);
             }
+            Mode::ConfirmRemoteProjectedTabClose => {
+                self.handle_confirm_remote_projected_tab_close_key(key_event);
+            }
             Mode::ContextMenu => {
                 self.handle_context_menu_key_via_api(key_event);
             }
@@ -2367,6 +2372,7 @@ mod tests {
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
 
         assert!(app.state.remote_sources.list_entries().is_empty());
@@ -2388,6 +2394,7 @@ mod tests {
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
 
         assert!(app.state.remote_sources.list_entries().is_empty());
@@ -2410,6 +2417,7 @@ mod tests {
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
 
         assert_eq!(app.state.remote_sources.list_entries().len(), 1);
@@ -3267,6 +3275,7 @@ auto_connect = false
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
         assert!(app.state.remote_sources.list_host_statuses().is_empty());
         assert!(app.state.remote_sources.list_entries().is_empty());

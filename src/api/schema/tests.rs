@@ -285,6 +285,45 @@ fn pane_close_confirm_true_serializes() {
 }
 
 #[test]
+fn tab_close_confirm_defaults_false_and_skips_false_serialization() {
+    let json = r#"{"id":"req_1","method":"tab.close","params":{"tab_id":"tab-1"}}"#;
+    let request: Request = serde_json::from_str(json).unwrap();
+    let Method::TabClose(params) = request.method else {
+        panic!("wrong method parsed");
+    };
+    assert_eq!(params.tab_id, "tab-1");
+    assert!(!params.confirm);
+
+    let encoded = serde_json::to_value(Request {
+        id: "req_2".into(),
+        method: Method::TabClose(TabCloseParams {
+            tab_id: "tab-2".into(),
+            confirm: false,
+        }),
+    })
+    .unwrap();
+    assert_eq!(encoded["method"], "tab.close");
+    assert_eq!(encoded["params"]["tab_id"], "tab-2");
+    assert!(encoded["params"].get("confirm").is_none());
+}
+
+#[test]
+fn tab_close_confirm_true_serializes() {
+    let encoded = serde_json::to_value(Request {
+        id: "req_1".into(),
+        method: Method::TabClose(TabCloseParams {
+            tab_id: "tab-1".into(),
+            confirm: true,
+        }),
+    })
+    .unwrap();
+
+    assert_eq!(encoded["method"], "tab.close");
+    assert_eq!(encoded["params"]["tab_id"], "tab-1");
+    assert_eq!(encoded["params"]["confirm"], true);
+}
+
+#[test]
 fn notification_show_request_parses() {
     let json = r#"{"id":"req_1","method":"notification.show","params":{"title":"build failed","body":"api workspace","position":"top-left","sound":"request"}}"#;
     let request: Request = serde_json::from_str(json).unwrap();
@@ -615,6 +654,9 @@ fn current_server_capabilities_include_federation_methods() {
     assert!(federation.supports_method(FederationCapabilities::PANE_SPLIT));
     assert!(federation.supports_method(FederationCapabilities::PANE_CLOSE));
     assert!(federation.supports_method(FederationCapabilities::TAB_LIST));
+    assert!(federation.supports_method(FederationCapabilities::TAB_CREATE));
+    assert!(federation.supports_method(FederationCapabilities::TAB_FOCUS));
+    assert!(federation.supports_method(FederationCapabilities::TAB_CLOSE));
     assert!(federation.supports_method(FederationCapabilities::LAYOUT_EXPORT));
     assert!(federation.supports_method(FederationCapabilities::TERMINAL_ATTACH));
 }

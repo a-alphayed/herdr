@@ -98,6 +98,9 @@ impl App {
                 Mode::ConfirmRemoteProjectedPaneClose => {
                     self.handle_confirm_remote_projected_pane_close_key(key_event)
                 }
+                Mode::ConfirmRemoteProjectedTabClose => {
+                    self.handle_confirm_remote_projected_tab_close_key(key_event)
+                }
                 Mode::ContextMenu => {
                     self.handle_context_menu_key_via_api(key_event);
                 }
@@ -333,6 +336,12 @@ impl App {
                         self.focus_pane_internal_via_api(ws_idx, pane_id);
                         self.state.selected_remote_space = None;
                         self.state.selected_remote_agent = Some(selected_remote_agent);
+                    }
+                    MouseAction::RemoteProjectedTabCreate { target } => {
+                        self.create_remote_projected_tab_via_api(target);
+                    }
+                    MouseAction::RemoteProjectedTabFocus { target } => {
+                        self.focus_remote_projected_tab_via_api(target);
                     }
                     MouseAction::FocusToastTarget => self.focus_toast_target_via_api(),
                     MouseAction::MoveWorkspace {

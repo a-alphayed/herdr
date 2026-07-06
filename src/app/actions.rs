@@ -2550,6 +2550,7 @@ impl AppState {
                 workspaces,
                 capabilities,
                 projections,
+                tabs,
             } => {
                 self.remote_sources
                     .replace_connected_snapshot(host.clone(), agents);
@@ -2562,6 +2563,7 @@ impl AppState {
                 }
                 self.remote_sources
                     .apply_projection_snapshot(&host, projections);
+                self.remote_sources.apply_tab_snapshots(&host, tabs);
                 Vec::new()
             }
             AppEvent::RemoteSourceAgentUpdated { host, agent } => {
@@ -2592,6 +2594,15 @@ impl AppState {
                 }
                 if self.request_remote_workspace_create.as_ref() == Some(&host) {
                     self.request_remote_workspace_create = None;
+                }
+                if self
+                    .pending_remote_projected_tab_close
+                    .as_ref()
+                    .is_some_and(|target| {
+                        target.host == host.host && target.session == host.session
+                    })
+                {
+                    self.pending_remote_projected_tab_close = None;
                 }
                 self.pending_remote_workspace_creates.remove(&host);
                 self.remote_sources.remove_host(&host);
@@ -3998,6 +4009,7 @@ mod tests {
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
 
         assert!(updates.is_empty());
@@ -4033,6 +4045,7 @@ mod tests {
             workspaces: Some(vec![remote_workspace("remote-ws", "blank shell")]),
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
 
         assert!(updates.is_empty());
@@ -4062,9 +4075,13 @@ mod tests {
                 workspace_list_local: true,
                 workspace_create: true,
                 tab_list: true,
+                tab_create: true,
+                tab_focus: true,
+                tab_close: true,
                 layout_export: true,
             },
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
 
         assert!(updates.is_empty());
@@ -4075,6 +4092,9 @@ mod tests {
                 workspace_list_local: true,
                 workspace_create: true,
                 tab_list: true,
+                tab_create: true,
+                tab_focus: true,
+                tab_close: true,
                 layout_export: true,
             }
         );
@@ -4092,6 +4112,7 @@ mod tests {
             workspaces: Some(vec![remote_workspace("remote-ws", "metadata label")]),
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
         let mut agent = remote_agent("remote-term", "smoke-agent");
         agent.cwd = Some("/home/amf/tmp".to_string());
@@ -4102,6 +4123,7 @@ mod tests {
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
 
         assert!(updates.is_empty());
@@ -4126,6 +4148,7 @@ mod tests {
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceDisconnected {
@@ -4181,6 +4204,7 @@ mod tests {
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
 
         let old_updates = state.handle_app_event(AppEvent::RemoteSourceAgentUpdated {
@@ -4232,6 +4256,7 @@ mod tests {
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
             host: remove.clone(),
@@ -4239,6 +4264,7 @@ mod tests {
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceAgentRemoved {
@@ -4274,6 +4300,7 @@ mod tests {
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
             host: remove.clone(),
@@ -4281,6 +4308,7 @@ mod tests {
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceRemoved {
@@ -4331,6 +4359,7 @@ mod tests {
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
             host: remove.clone(),
@@ -4338,6 +4367,7 @@ mod tests {
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
+            tabs: Vec::new(),
         });
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceRemoved {

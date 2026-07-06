@@ -136,6 +136,7 @@ pub enum AppEvent {
         workspaces: Option<Vec<WorkspaceInfo>>,
         capabilities: RemoteSourceCapabilities,
         projections: Vec<RemoteProjectionSnapshot>,
+        tabs: Vec<crate::remote_source::RemoteTabSnapshot>,
     },
     /// A connected authoritative remote host/session reported one newer agent entry.
     #[allow(dead_code)]

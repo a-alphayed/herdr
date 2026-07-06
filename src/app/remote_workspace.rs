@@ -444,6 +444,9 @@ mod tests {
                 workspace_list_local: false,
                 workspace_create: true,
                 tab_list: false,
+                tab_create: false,
+                tab_focus: false,
+                tab_close: false,
                 layout_export: false,
             },
         );

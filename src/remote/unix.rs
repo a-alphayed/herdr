@@ -729,8 +729,17 @@ fn federation_method_for_api_method(method: &crate::api::schema::Method) -> Opti
         crate::api::schema::Method::PaneClose(_) => {
             Some(crate::api::schema::FederationCapabilities::PANE_CLOSE)
         }
+        crate::api::schema::Method::TabCreate(_) => {
+            Some(crate::api::schema::FederationCapabilities::TAB_CREATE)
+        }
         crate::api::schema::Method::TabList(_) => {
             Some(crate::api::schema::FederationCapabilities::TAB_LIST)
+        }
+        crate::api::schema::Method::TabFocus(_) => {
+            Some(crate::api::schema::FederationCapabilities::TAB_FOCUS)
+        }
+        crate::api::schema::Method::TabClose(_) => {
+            Some(crate::api::schema::FederationCapabilities::TAB_CLOSE)
         }
         crate::api::schema::Method::LayoutExport(_) => {
             Some(crate::api::schema::FederationCapabilities::LAYOUT_EXPORT)
@@ -3227,6 +3236,39 @@ mod tests {
     }
 
     #[test]
+    fn federation_method_for_api_method_maps_tab_mutations() {
+        assert_eq!(
+            federation_method_for_api_method(&crate::api::schema::Method::TabCreate(
+                crate::api::schema::TabCreateParams {
+                    workspace_id: Some("remote-ws".to_string()),
+                    cwd: None,
+                    focus: true,
+                    label: None,
+                    env: Default::default(),
+                },
+            )),
+            Some(crate::api::schema::FederationCapabilities::TAB_CREATE)
+        );
+        assert_eq!(
+            federation_method_for_api_method(&crate::api::schema::Method::TabFocus(
+                crate::api::schema::TabTarget {
+                    tab_id: "remote-tab".to_string(),
+                },
+            )),
+            Some(crate::api::schema::FederationCapabilities::TAB_FOCUS)
+        );
+        assert_eq!(
+            federation_method_for_api_method(&crate::api::schema::Method::TabClose(
+                crate::api::schema::TabCloseParams {
+                    tab_id: "remote-tab".to_string(),
+                    confirm: true,
+                },
+            )),
+            Some(crate::api::schema::FederationCapabilities::TAB_CLOSE)
+        );
+    }
+
+    #[test]
     fn required_federation_methods_include_remote_pane_close_method() {
         let request = crate::api::schema::Request {
             id: "req".to_string(),
@@ -3448,6 +3490,66 @@ mod tests {
                 crate::api::schema::FederationCapabilities::TAB_LIST
             ]
         );
+    }
+
+    #[test]
+    fn required_federation_methods_include_remote_tab_create_focus_and_close_methods() {
+        let create = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::TabCreate(crate::api::schema::TabCreateParams {
+                workspace_id: Some("remote-ws".to_string()),
+                cwd: Some("/remote".to_string()),
+                focus: true,
+                label: None,
+                env: Default::default(),
+            }),
+        };
+        assert_eq!(
+            required_federation_methods_for_request(&create),
+            vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::TAB_CREATE
+            ]
+        );
+
+        let focus = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::TabFocus(crate::api::schema::TabTarget {
+                tab_id: "remote-tab".to_string(),
+            }),
+        };
+        assert_eq!(
+            required_federation_methods_for_request(&focus),
+            vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::TAB_FOCUS
+            ]
+        );
+
+        let close = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::TabClose(crate::api::schema::TabCloseParams {
+                tab_id: "remote-tab".to_string(),
+                confirm: true,
+            }),
+        };
+        assert_eq!(
+            required_federation_methods_for_request(&close),
+            vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::TAB_CLOSE
+            ]
+        );
+    }
+
+    #[test]
+    fn federation_capabilities_current_advertises_tab_mutations() {
+        let capabilities = crate::api::schema::FederationCapabilities::current();
+        assert!(
+            capabilities.supports_method(crate::api::schema::FederationCapabilities::TAB_CREATE)
+        );
+        assert!(capabilities.supports_method(crate::api::schema::FederationCapabilities::TAB_FOCUS));
+        assert!(capabilities.supports_method(crate::api::schema::FederationCapabilities::TAB_CLOSE));
     }
 
     #[test]

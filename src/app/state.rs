@@ -749,11 +749,36 @@ pub struct ViewState {
     pub toast_hit_area: Rect,
     pub pane_infos: Vec<PaneInfo>,
     pub split_borders: Vec<SplitBorder>,
+    /// Hit areas for projected remote tab controls; non-empty only while a live
+    /// remote projection with fresh tab metadata is selected. These stay
+    /// separate from the local tab hit areas, which are suppressed for remote
+    /// projections.
+    pub remote_projection_tab_hit_areas: Vec<RemoteProjectionTabHitArea>,
     /// Hit areas for projected remote panes; non-empty only while a remote
     /// projection is selected. Computed by `compute_view` so both the mouse
     /// handler and keyboard handler can use them without re-running the
     /// recursive layout math.
     pub remote_projection_hit_areas: Vec<RemoteProjectionHitArea>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteProjectionTabAction {
+    Focus,
+    Close,
+    New,
+}
+
+/// A projected remote tab strip control and routing metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteProjectionTabHitArea {
+    pub rect: Rect,
+    pub host: String,
+    pub session: String,
+    pub workspace_id: String,
+    pub tab_id: Option<String>,
+    pub label: String,
+    pub action: RemoteProjectionTabAction,
+    pub live: bool,
 }
 
 /// A single projected pane's screen rect and attach metadata.
@@ -781,6 +806,24 @@ pub struct RemoteProjectedPaneTarget {
     pub label: String,
 }
 
+/// Projection-derived identity for a remote tab action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteProjectedTabTarget {
+    pub host: String,
+    pub session: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub label: String,
+}
+
+/// Projection-derived identity for creating a remote tab in a workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteProjectedWorkspaceTarget {
+    pub host: String,
+    pub session: String,
+    pub workspace_id: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Onboarding,
@@ -800,6 +843,7 @@ pub enum Mode {
     ConfirmClose,
     ConfirmRemoteAttach,
     ConfirmRemoteProjectedPaneClose,
+    ConfirmRemoteProjectedTabClose,
     ContextMenu,
     Settings,
     GlobalMenu,
@@ -1449,6 +1493,7 @@ pub struct AppState {
     pub(crate) request_remote_workspace_create: Option<crate::remote_source::RemoteHostKey>,
     pub(crate) pending_remote_attach: Option<PendingRemoteAttach>,
     pub(crate) pending_remote_projected_pane_close: Option<RemoteProjectedPaneTarget>,
+    pub(crate) pending_remote_projected_tab_close: Option<RemoteProjectedTabTarget>,
     pub(crate) pending_remote_workspace_creates: std::collections::BTreeMap<
         crate::remote_source::RemoteHostKey,
         PendingRemoteWorkspaceCreate,
@@ -1838,6 +1883,7 @@ impl AppState {
             request_remote_workspace_create: None,
             pending_remote_attach: None,
             pending_remote_projected_pane_close: None,
+            pending_remote_projected_tab_close: None,
             pending_remote_workspace_creates: std::collections::BTreeMap::new(),
             next_remote_workspace_create_token: 1,
             creating_new_tab: false,
@@ -1878,6 +1924,7 @@ impl AppState {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
+                remote_projection_tab_hit_areas: Vec::new(),
                 remote_projection_hit_areas: Vec::new(),
             },
             drag: None,

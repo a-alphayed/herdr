@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::api::schema::{AgentInfo, LayoutDescription, WorkspaceInfo};
+use crate::api::schema::{AgentInfo, LayoutDescription, TabInfo, WorkspaceInfo};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RemoteHostKey {
@@ -121,6 +121,9 @@ pub(crate) struct RemoteSourceCapabilities {
     pub(crate) workspace_list_local: bool,
     pub(crate) workspace_create: bool,
     pub(crate) tab_list: bool,
+    pub(crate) tab_create: bool,
+    pub(crate) tab_focus: bool,
+    pub(crate) tab_close: bool,
     pub(crate) layout_export: bool,
 }
 
@@ -161,6 +164,20 @@ pub(crate) struct RemoteProjectionSnapshot {
     pub(crate) layout: Option<LayoutDescription>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteTabSnapshotEntry {
+    pub(crate) workspace_id: String,
+    pub(crate) status: RemoteProjectionStatus,
+    pub(crate) tabs: Vec<TabInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteTabSnapshot {
+    pub(crate) workspace_id: String,
+    pub(crate) status: RemoteProjectionStatus,
+    pub(crate) tabs: Vec<TabInfo>,
+}
+
 impl RemoteAgentEntry {
     pub(crate) fn stale(&self) -> bool {
         !self.status.is_connected()
@@ -179,6 +196,7 @@ struct RemoteHostCache {
     workspaces: Option<BTreeMap<String, WorkspaceInfo>>,
     capabilities: RemoteSourceCapabilities,
     projections: BTreeMap<String, RemoteProjectionEntry>,
+    tabs: BTreeMap<String, RemoteTabSnapshotEntry>,
 }
 
 impl Default for RemoteHostCache {
@@ -189,6 +207,40 @@ impl Default for RemoteHostCache {
             workspaces: None,
             capabilities: RemoteSourceCapabilities::default(),
             projections: BTreeMap::new(),
+            tabs: BTreeMap::new(),
+        }
+    }
+}
+
+fn projection_entry_from_snapshot(
+    host_cache: &RemoteHostCache,
+    snapshot: &RemoteProjectionSnapshot,
+) -> RemoteProjectionEntry {
+    match snapshot.status {
+        RemoteProjectionStatus::Available => RemoteProjectionEntry {
+            workspace_id: snapshot.workspace_id.clone(),
+            tab_id: snapshot.tab_id.clone(),
+            tab_label: snapshot.tab_label.clone(),
+            status: RemoteProjectionStatus::Available,
+            layout: snapshot.layout.clone(),
+        },
+        RemoteProjectionStatus::Unavailable | RemoteProjectionStatus::StaleLastKnown => {
+            // A fetch failure keeps the last-known layout when present so the
+            // read-only view can still show it (marked stale); otherwise the
+            // projection is simply unavailable for this workspace.
+            let (status, layout) = host_cache
+                .projections
+                .get(&snapshot.workspace_id)
+                .and_then(|existing| existing.layout.clone())
+                .map(|layout| (RemoteProjectionStatus::StaleLastKnown, Some(layout)))
+                .unwrap_or((RemoteProjectionStatus::Unavailable, None));
+            RemoteProjectionEntry {
+                workspace_id: snapshot.workspace_id.clone(),
+                tab_id: snapshot.tab_id.clone(),
+                tab_label: snapshot.tab_label.clone(),
+                status,
+                layout,
+            }
         }
     }
 }
@@ -255,6 +307,141 @@ impl RemoteSourceCache {
         }
     }
 
+    pub(crate) fn replace_tab_snapshot(
+        &mut self,
+        host: &RemoteHostKey,
+        workspace_id: impl Into<String>,
+        tabs: Vec<TabInfo>,
+    ) {
+        let workspace_id = workspace_id.into();
+        let host_cache = self.hosts.entry(host.clone()).or_default();
+        host_cache.tabs.insert(
+            workspace_id.clone(),
+            RemoteTabSnapshotEntry {
+                workspace_id,
+                status: RemoteProjectionStatus::Available,
+                tabs,
+            },
+        );
+    }
+
+    pub(crate) fn mark_tab_snapshot_unavailable(
+        &mut self,
+        host: &RemoteHostKey,
+        workspace_id: impl Into<String>,
+    ) {
+        let workspace_id = workspace_id.into();
+        let host_cache = self.hosts.entry(host.clone()).or_default();
+        match host_cache.tabs.get_mut(&workspace_id) {
+            Some(entry) => {
+                entry.status = if entry.tabs.is_empty() {
+                    RemoteProjectionStatus::Unavailable
+                } else {
+                    RemoteProjectionStatus::StaleLastKnown
+                };
+            }
+            None => {
+                host_cache.tabs.insert(
+                    workspace_id.clone(),
+                    RemoteTabSnapshotEntry {
+                        workspace_id,
+                        status: RemoteProjectionStatus::Unavailable,
+                        tabs: Vec::new(),
+                    },
+                );
+            }
+        }
+    }
+
+    pub(crate) fn apply_tab_snapshots(
+        &mut self,
+        host: &RemoteHostKey,
+        snapshots: Vec<RemoteTabSnapshot>,
+    ) {
+        let host_cache = self.hosts.entry(host.clone()).or_default();
+        let mut next = BTreeMap::new();
+        for snapshot in snapshots {
+            let (status, tabs) = if snapshot.status == RemoteProjectionStatus::Available {
+                (RemoteProjectionStatus::Available, snapshot.tabs)
+            } else {
+                host_cache
+                    .tabs
+                    .get(&snapshot.workspace_id)
+                    .filter(|existing| !existing.tabs.is_empty())
+                    .map(|existing| {
+                        (
+                            RemoteProjectionStatus::StaleLastKnown,
+                            existing.tabs.clone(),
+                        )
+                    })
+                    .unwrap_or((RemoteProjectionStatus::Unavailable, Vec::new()))
+            };
+            next.insert(
+                snapshot.workspace_id.clone(),
+                RemoteTabSnapshotEntry {
+                    workspace_id: snapshot.workspace_id,
+                    status,
+                    tabs,
+                },
+            );
+        }
+        host_cache.tabs = next;
+    }
+
+    pub(crate) fn upsert_tab(&mut self, host: &RemoteHostKey, tab: TabInfo) {
+        let host_cache = self.hosts.entry(host.clone()).or_default();
+        let entry = host_cache
+            .tabs
+            .entry(tab.workspace_id.clone())
+            .or_insert_with(|| RemoteTabSnapshotEntry {
+                workspace_id: tab.workspace_id.clone(),
+                status: RemoteProjectionStatus::Available,
+                tabs: Vec::new(),
+            });
+        entry.status = RemoteProjectionStatus::Available;
+        if let Some(existing) = entry
+            .tabs
+            .iter_mut()
+            .find(|existing| existing.tab_id == tab.tab_id)
+        {
+            *existing = tab;
+        } else {
+            entry.tabs.push(tab);
+            entry.tabs.sort_by_key(|tab| tab.number);
+        }
+    }
+
+    pub(crate) fn remove_tab(&mut self, host: &RemoteHostKey, tab_id: &str) -> Option<TabInfo> {
+        let host_cache = self.hosts.get_mut(host)?;
+        for entry in host_cache.tabs.values_mut() {
+            if let Some(index) = entry.tabs.iter().position(|tab| tab.tab_id == tab_id) {
+                return Some(entry.tabs.remove(index));
+            }
+        }
+        None
+    }
+
+    pub(crate) fn tab_snapshot_for_space(
+        &self,
+        key: &RemoteSpaceKey,
+    ) -> Option<RemoteTabSnapshotEntry> {
+        let host = RemoteHostKey::new(key.host.clone(), key.session.clone());
+        self.hosts
+            .get(&host)
+            .and_then(|host_cache| host_cache.tabs.get(&key.workspace_id))
+            .cloned()
+    }
+
+    pub(crate) fn tab_snapshots_for_host(
+        &self,
+        host: &RemoteHostKey,
+    ) -> Vec<&RemoteTabSnapshotEntry> {
+        self.hosts
+            .get(host)
+            .map(|host_cache| host_cache.tabs.values().collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn set_capabilities(
         &mut self,
         host: &RemoteHostKey,
@@ -295,6 +482,11 @@ impl RemoteSourceCache {
                     projection.status = RemoteProjectionStatus::StaleLastKnown;
                 }
             }
+            for tabs in host_cache.tabs.values_mut() {
+                if tabs.status == RemoteProjectionStatus::Available {
+                    tabs.status = RemoteProjectionStatus::StaleLastKnown;
+                }
+            }
         }
     }
 
@@ -311,36 +503,20 @@ impl RemoteSourceCache {
         let host_cache = self.hosts.entry(host.clone()).or_default();
         let mut next: BTreeMap<String, RemoteProjectionEntry> = BTreeMap::new();
         for snapshot in projections {
-            let entry = match snapshot.status {
-                RemoteProjectionStatus::Available => RemoteProjectionEntry {
-                    workspace_id: snapshot.workspace_id.clone(),
-                    tab_id: snapshot.tab_id.clone(),
-                    tab_label: snapshot.tab_label.clone(),
-                    status: RemoteProjectionStatus::Available,
-                    layout: snapshot.layout.clone(),
-                },
-                RemoteProjectionStatus::Unavailable | RemoteProjectionStatus::StaleLastKnown => {
-                    // A fetch failure keeps the last-known layout when present so the
-                    // read-only view can still show it (marked stale); otherwise the
-                    // projection is simply unavailable for this workspace.
-                    let (status, layout) = host_cache
-                        .projections
-                        .get(&snapshot.workspace_id)
-                        .and_then(|existing| existing.layout.clone())
-                        .map(|layout| (RemoteProjectionStatus::StaleLastKnown, Some(layout)))
-                        .unwrap_or((RemoteProjectionStatus::Unavailable, None));
-                    RemoteProjectionEntry {
-                        workspace_id: snapshot.workspace_id.clone(),
-                        tab_id: snapshot.tab_id.clone(),
-                        tab_label: snapshot.tab_label.clone(),
-                        status,
-                        layout,
-                    }
-                }
-            };
+            let entry = projection_entry_from_snapshot(host_cache, &snapshot);
             next.insert(snapshot.workspace_id, entry);
         }
         host_cache.projections = next;
+    }
+
+    pub(crate) fn upsert_projection_snapshot(
+        &mut self,
+        host: &RemoteHostKey,
+        snapshot: RemoteProjectionSnapshot,
+    ) {
+        let host_cache = self.hosts.entry(host.clone()).or_default();
+        let entry = projection_entry_from_snapshot(host_cache, &snapshot);
+        host_cache.projections.insert(snapshot.workspace_id, entry);
     }
 
     /// Look up the cached projection for a selected remote space.
@@ -369,6 +545,7 @@ impl RemoteSourceCache {
             workspaces: None,
             capabilities: RemoteSourceCapabilities::default(),
             projections: BTreeMap::new(),
+            tabs: BTreeMap::new(),
         });
     }
 
@@ -379,6 +556,7 @@ impl RemoteSourceCache {
             workspaces: None,
             capabilities: RemoteSourceCapabilities::default(),
             projections: BTreeMap::new(),
+            tabs: BTreeMap::new(),
         });
         host_cache.status = RemoteConnectionStatus::Connected;
 
@@ -455,7 +633,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::api::schema::{
-        AgentInfo, AgentStatus, LayoutDescription, LayoutNode, LayoutPane, WorkspaceInfo,
+        AgentInfo, AgentStatus, LayoutDescription, LayoutNode, LayoutPane, TabInfo, WorkspaceInfo,
     };
 
     use super::*;
@@ -493,6 +671,18 @@ mod tests {
             active_tab_id: "t1".to_string(),
             agent_status: AgentStatus::Unknown,
             worktree: None,
+        }
+    }
+
+    fn tab(workspace_id: &str, tab_id: &str, focused: bool) -> TabInfo {
+        TabInfo {
+            tab_id: tab_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            number: if focused { 1 } else { 2 },
+            label: tab_id.to_string(),
+            focused,
+            pane_count: 1,
+            agent_status: AgentStatus::Unknown,
         }
     }
 
@@ -562,6 +752,52 @@ mod tests {
     }
 
     #[test]
+    fn remote_source_tab_snapshot_stores_authoritative_tabs() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+
+        cache.replace_tab_snapshot(
+            &host,
+            "ws-a",
+            vec![tab("ws-a", "tab-2", false), tab("ws-a", "tab-1", true)],
+        );
+
+        let key = RemoteSpaceKey {
+            host: "jafar".to_string(),
+            session: "default".to_string(),
+            workspace_id: "ws-a".to_string(),
+        };
+        let snapshot = cache.tab_snapshot_for_space(&key).expect("tab snapshot");
+        assert_eq!(snapshot.status, RemoteProjectionStatus::Available);
+        assert_eq!(
+            snapshot
+                .tabs
+                .iter()
+                .map(|tab| (tab.tab_id.as_str(), tab.focused))
+                .collect::<Vec<_>>(),
+            vec![("tab-2", false), ("tab-1", true)]
+        );
+    }
+
+    #[test]
+    fn remote_source_disconnect_marks_tab_metadata_stale() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+        cache.replace_tab_snapshot(&host, "ws-a", vec![tab("ws-a", "tab-1", true)]);
+
+        cache.mark_status(&host, RemoteConnectionStatus::Disconnected);
+
+        let key = RemoteSpaceKey {
+            host: "jafar".to_string(),
+            session: "default".to_string(),
+            workspace_id: "ws-a".to_string(),
+        };
+        let snapshot = cache.tab_snapshot_for_space(&key).expect("tab snapshot");
+        assert_eq!(snapshot.status, RemoteProjectionStatus::StaleLastKnown);
+        assert_eq!(snapshot.tabs[0].tab_id, "tab-1");
+    }
+
+    #[test]
     fn remote_source_capabilities_are_host_scoped() {
         let mut cache = RemoteSourceCache::default();
         let capable = RemoteHostKey::new("jafar", "default");
@@ -577,6 +813,9 @@ mod tests {
                 workspace_list_local: true,
                 workspace_create: true,
                 tab_list: true,
+                tab_create: true,
+                tab_focus: true,
+                tab_close: true,
                 layout_export: true,
             },
         );
@@ -588,6 +827,9 @@ mod tests {
                 workspace_list_local: true,
                 workspace_create: true,
                 tab_list: true,
+                tab_create: true,
+                tab_focus: true,
+                tab_close: true,
                 layout_export: true,
             }
         );
