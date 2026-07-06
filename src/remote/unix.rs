@@ -726,6 +726,9 @@ fn federation_method_for_api_method(method: &crate::api::schema::Method) -> Opti
         crate::api::schema::Method::PaneSplit(_) => {
             Some(crate::api::schema::FederationCapabilities::PANE_SPLIT)
         }
+        crate::api::schema::Method::PaneClose(_) => {
+            Some(crate::api::schema::FederationCapabilities::PANE_CLOSE)
+        }
         crate::api::schema::Method::TabList(_) => {
             Some(crate::api::schema::FederationCapabilities::TAB_LIST)
         }
@@ -3179,6 +3182,19 @@ mod tests {
     }
 
     #[test]
+    fn federation_method_for_api_method_maps_pane_close() {
+        let request = crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams {
+            pane_id: "remote-pane".to_string(),
+            confirm: true,
+        });
+
+        assert_eq!(
+            federation_method_for_api_method(&request),
+            Some(crate::api::schema::FederationCapabilities::PANE_CLOSE)
+        );
+    }
+
+    #[test]
     fn required_federation_methods_include_remote_pane_split_method() {
         let request = crate::api::schema::Request {
             id: "req".to_string(),
@@ -3211,6 +3227,33 @@ mod tests {
     }
 
     #[test]
+    fn required_federation_methods_include_remote_pane_close_method() {
+        let request = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams {
+                pane_id: "remote-pane".to_string(),
+                confirm: true,
+            }),
+        };
+
+        let methods = required_federation_methods_for_request(&request);
+
+        assert_eq!(
+            methods,
+            vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::PANE_CLOSE
+            ]
+        );
+    }
+
+    #[test]
+    fn federation_capabilities_current_advertises_pane_close() {
+        assert!(crate::api::schema::FederationCapabilities::current()
+            .supports_method(crate::api::schema::FederationCapabilities::PANE_CLOSE));
+    }
+
+    #[test]
     fn validate_federation_capabilities_rejects_missing_pane_split_without_fallback() {
         let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true);
         let capabilities = crate::api::schema::FederationCapabilities {
@@ -3234,6 +3277,32 @@ mod tests {
         assert!(err
             .to_string()
             .contains("does not advertise federation method pane_split"));
+    }
+
+    #[test]
+    fn validate_federation_capabilities_rejects_missing_pane_close_without_fallback() {
+        let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true);
+        let capabilities = crate::api::schema::FederationCapabilities {
+            methods: vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE.into(),
+                crate::api::schema::FederationCapabilities::PANE_SPLIT.into(),
+            ],
+        };
+
+        let err = validate_federation_capabilities(
+            &host,
+            &capabilities,
+            &[
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::PANE_CLOSE,
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err
+            .to_string()
+            .contains("does not advertise federation method pane_close"));
     }
 
     #[test]

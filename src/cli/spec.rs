@@ -445,7 +445,12 @@ fn pane_command() -> Command {
                 .arg(flag("focus"))
                 .arg(flag("no-focus")),
         )
-        .subcommand(id_command("close", "pane_id", "Close a pane"))
+        .subcommand(
+            Command::new("close")
+                .about("Close a pane")
+                .arg(required("pane_id", "PANE_ID|HOST/TARGET"))
+                .arg(flag("confirm")),
+        )
         .subcommand(
             Command::new("send-text")
                 .about("Send literal text to a pane")
@@ -973,6 +978,13 @@ mod tests {
         assert!(has_option(pane_split, "direction"));
         assert!(!has_option(pane_split, "split"));
         assert_eq!(option_values(pane_split, "direction"), ["right", "down"]);
+    }
+
+    #[test]
+    fn spec_includes_pane_close_confirm_flag() {
+        let cmd = super::command();
+        let pane_close = command_path(&cmd, &["pane", "close"]);
+        assert!(has_option(pane_close, "confirm"));
     }
 
     #[test]

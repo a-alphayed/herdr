@@ -513,11 +513,11 @@ impl std::fmt::Display for RemotePaneResolveError {
             ),
             Self::HostNotConnected { host, status } => write!(
                 f,
-                "remote host {host} is {status}; wait for it to reconnect before splitting a pane"
+                "remote host {host} is {status}; wait for it to reconnect before mutating a remote pane"
             ),
             Self::UnsupportedSelector { target } => write!(
                 f,
-                "remote pane split target must be a pane, terminal, or workspace selector: {target:?}"
+                "remote pane target must be a pane, terminal, or workspace selector: {target:?}"
             ),
         }
     }

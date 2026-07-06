@@ -1843,6 +1843,20 @@
           ],
           "type": "object"
         },
+        "PaneCloseParams": {
+          "properties": {
+            "confirm": {
+              "type": "boolean"
+            },
+            "pane_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id"
+          ],
+          "type": "object"
+        },
         "PaneCurrentParams": {
           "properties": {
             "caller_pane_id": {
@@ -4652,7 +4666,7 @@
               "type": "string"
             },
             "params": {
-              "$ref": "#/schemas/request/$defs/PaneTarget"
+              "$ref": "#/schemas/request/$defs/PaneCloseParams"
             }
           },
           "required": [

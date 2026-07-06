@@ -3425,7 +3425,7 @@ mod tests {
         assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
         assert_eq!(app.state.mode, Mode::ContextMenu);
         let menu = app.state.context_menu.as_ref().expect("remote pane menu");
-        assert_eq!(menu.items(), &["Split right", "Split down"]);
+        assert_eq!(menu.items(), &["Split right", "Split down", "Close pane"]);
         match &menu.kind {
             ContextMenuKind::RemoteProjectedPane { target } => {
                 assert_eq!(target.host, "jafar");

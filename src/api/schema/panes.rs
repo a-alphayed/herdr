@@ -22,6 +22,13 @@ pub struct PaneSplitParams {
     pub env: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneCloseParams {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub confirm: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneDirection {

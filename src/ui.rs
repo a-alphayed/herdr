@@ -23,8 +23,8 @@ mod widgets;
 
 use self::dialogs::{
     render_confirm_close_overlay, render_confirm_remote_attach_overlay,
-    render_new_linked_worktree_overlay, render_open_existing_worktree_overlay,
-    render_remove_worktree_overlay, render_rename_overlay,
+    render_confirm_remote_projected_pane_close_overlay, render_new_linked_worktree_overlay,
+    render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
 };
 use self::keybind_help::render_keybind_help_overlay;
 use self::menus::{
@@ -65,7 +65,8 @@ use self::tabs::render_tab_bar;
 pub(crate) use self::{
     dialogs::{
         confirm_close_button_rects, confirm_close_popup_rect, confirm_remote_attach_button_rects,
-        confirm_remote_attach_inner_rect, new_linked_worktree_button_rects,
+        confirm_remote_attach_inner_rect, confirm_remote_projected_pane_close_button_rects,
+        confirm_remote_projected_pane_close_inner_rect, new_linked_worktree_button_rects,
         new_linked_worktree_inner_rect, open_existing_worktree_button_rects,
         open_existing_worktree_inner_rect, open_existing_worktree_max_visible_rows,
         open_existing_worktree_visible_start, remove_worktree_button_rects,
@@ -568,6 +569,9 @@ pub fn render_with_runtime_registry(
         Mode::ConfirmClose => render_confirm_close_overlay(app, frame, terminal_area),
         Mode::ConfirmRemoteAttach => {
             render_confirm_remote_attach_overlay(app, frame, terminal_area)
+        }
+        Mode::ConfirmRemoteProjectedPaneClose => {
+            render_confirm_remote_projected_pane_close_overlay(app, frame, terminal_area)
         }
         Mode::ContextMenu => {
             render_context_menu(app, frame);

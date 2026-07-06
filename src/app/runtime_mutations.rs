@@ -1,4 +1,4 @@
-use crate::api::schema::{Method, PaneTarget, TabTarget, WorkspaceTarget};
+use crate::api::schema::{Method, PaneCloseParams, PaneTarget, TabTarget, WorkspaceTarget};
 
 use super::App;
 
@@ -44,6 +44,12 @@ impl App {
     }
 
     pub(crate) fn runtime_pane_close(&mut self, id: &'static str, pane_id: String) -> String {
-        self.dispatch_runtime_mutation(id, Method::PaneClose(PaneTarget { pane_id }))
+        self.dispatch_runtime_mutation(
+            id,
+            Method::PaneClose(PaneCloseParams {
+                pane_id,
+                confirm: false,
+            }),
+        )
     }
 }

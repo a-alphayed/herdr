@@ -799,6 +799,7 @@ pub enum Mode {
     Resize,
     ConfirmClose,
     ConfirmRemoteAttach,
+    ConfirmRemoteProjectedPaneClose,
     ContextMenu,
     Settings,
     GlobalMenu,
@@ -1285,7 +1286,9 @@ impl ContextMenuState {
                 "Zoom",
                 "Close pane",
             ],
-            ContextMenuKind::RemoteProjectedPane { .. } => &["Split right", "Split down"],
+            ContextMenuKind::RemoteProjectedPane { .. } => {
+                &["Split right", "Split down", "Close pane"]
+            }
             ContextMenuKind::RemoteAgent {
                 attached_pane: Some(_),
                 ..
@@ -1445,6 +1448,7 @@ pub struct AppState {
     pub(crate) request_remote_detach_view: Option<RemoteAttachPaneTarget>,
     pub(crate) request_remote_workspace_create: Option<crate::remote_source::RemoteHostKey>,
     pub(crate) pending_remote_attach: Option<PendingRemoteAttach>,
+    pub(crate) pending_remote_projected_pane_close: Option<RemoteProjectedPaneTarget>,
     pub(crate) pending_remote_workspace_creates: std::collections::BTreeMap<
         crate::remote_source::RemoteHostKey,
         PendingRemoteWorkspaceCreate,
@@ -1833,6 +1837,7 @@ impl AppState {
             request_remote_detach_view: None,
             request_remote_workspace_create: None,
             pending_remote_attach: None,
+            pending_remote_projected_pane_close: None,
             pending_remote_workspace_creates: std::collections::BTreeMap::new(),
             next_remote_workspace_create_token: 1,
             creating_new_tab: false,

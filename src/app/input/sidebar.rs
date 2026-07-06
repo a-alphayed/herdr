@@ -372,6 +372,7 @@ impl AppState {
                 | Mode::Resize
                 | Mode::ConfirmClose
                 | Mode::ConfirmRemoteAttach
+                | Mode::ConfirmRemoteProjectedPaneClose
                 | Mode::ContextMenu
                 | Mode::Settings
                 | Mode::GlobalMenu

@@ -1,11 +1,11 @@
 use crate::api::schema::{
-    Method, PaneCurrentParams, PaneDirection, PaneEdgesParams, PaneFocusDirectionParams,
-    PaneLayoutParams, PaneListParams, PaneMoveDestination, PaneMoveParams, PaneNeighborParams,
-    PaneProcessInfoParams, PaneReadParams, PaneReleaseAgentParams, PaneRenameParams,
-    PaneReportAgentParams, PaneReportAgentSessionParams, PaneReportMetadataParams,
-    PaneResizeParams, PaneSendInputParams, PaneSendKeysParams, PaneSendTextParams, PaneSplitParams,
-    PaneSwapParams, PaneTarget, PaneZoomMode, PaneZoomParams, ReadFormat, ReadSource, Request,
-    SplitDirection,
+    Method, PaneCloseParams, PaneCurrentParams, PaneDirection, PaneEdgesParams,
+    PaneFocusDirectionParams, PaneLayoutParams, PaneListParams, PaneMoveDestination,
+    PaneMoveParams, PaneNeighborParams, PaneProcessInfoParams, PaneReadParams,
+    PaneReleaseAgentParams, PaneRenameParams, PaneReportAgentParams, PaneReportAgentSessionParams,
+    PaneReportMetadataParams, PaneResizeParams, PaneSendInputParams, PaneSendKeysParams,
+    PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneTarget, PaneZoomMode, PaneZoomParams,
+    ReadFormat, ReadSource, Request, SplitDirection,
 };
 
 pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
@@ -913,21 +913,78 @@ fn parse_pane_direction(value: &str) -> Result<PaneDirection, String> {
 }
 
 fn pane_close(args: &[String]) -> std::io::Result<i32> {
-    let Some(raw_pane_id) = args.first() else {
-        eprintln!("usage: herdr pane close <pane_id>");
-        return Ok(2);
+    let remote_hosts = cli_remote_host_registry();
+    let params = match parse_pane_close_args(args, remote_hosts.as_ref()) {
+        Ok(params) => params,
+        Err(message) => {
+            eprintln!("{message}");
+            return Ok(2);
+        }
     };
-    if args.len() != 1 {
-        eprintln!("usage: herdr pane close <pane_id>");
-        return Ok(2);
-    }
 
     super::print_response(&super::send_request(&Request {
         id: "cli:pane:close".into(),
-        method: Method::PaneClose(PaneTarget {
-            pane_id: super::normalize_pane_id(raw_pane_id),
-        }),
+        method: Method::PaneClose(params),
     })?)
+}
+
+fn cli_remote_host_registry() -> Option<crate::remote_target::RemoteHostRegistry> {
+    let config = crate::config::Config::load().config;
+    if !config.remote.enabled {
+        return None;
+    }
+    crate::remote_target::RemoteHostRegistry::from_configs(config.remote.hosts).ok()
+}
+
+fn parse_pane_close_args(
+    args: &[String],
+    remote_hosts: Option<&crate::remote_target::RemoteHostRegistry>,
+) -> Result<PaneCloseParams, String> {
+    let mut pane_id = None;
+    let mut confirm = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--confirm" => {
+                confirm = true;
+                index += 1;
+            }
+            other if other.starts_with("--") => return Err(format!("unknown option: {other}")),
+            other if pane_id.is_none() => {
+                pane_id = Some(super::normalize_pane_id(other));
+                index += 1;
+            }
+            _ => {
+                return Err("usage: herdr pane close <pane_id>|<host>/<target> [--confirm]".into())
+            }
+        }
+    }
+
+    let Some(pane_id) = pane_id else {
+        return Err("usage: herdr pane close <pane_id>|<host>/<target> [--confirm]".into());
+    };
+
+    if !confirm && pane_close_target_uses_configured_remote_host(&pane_id, remote_hosts) {
+        return Err(format!(
+            "pane.close on remote target {pane_id} is destructive; pass --confirm to proceed"
+        ));
+    }
+
+    Ok(PaneCloseParams { pane_id, confirm })
+}
+
+fn pane_close_target_uses_configured_remote_host(
+    pane_id: &str,
+    remote_hosts: Option<&crate::remote_target::RemoteHostRegistry>,
+) -> bool {
+    let Some(remote_hosts) = remote_hosts else {
+        return false;
+    };
+    let Some((host, _target)) = pane_id.split_once('/') else {
+        return false;
+    };
+    remote_hosts.get(host).is_some()
 }
 
 fn pane_send_text(args: &[String]) -> std::io::Result<i32> {
@@ -1456,7 +1513,7 @@ fn print_pane_help() {
     eprintln!("  herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]");
     eprintln!("  herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]");
     eprintln!("  herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]");
-    eprintln!("  herdr pane close <pane_id>");
+    eprintln!("  herdr pane close <pane_id>|<host>/<target> [--confirm]");
     eprintln!("  herdr pane send-text <pane_id> <text>");
     eprintln!("  herdr pane send-keys <pane_id> <key> [key ...]");
     eprintln!("  herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
@@ -1549,6 +1606,52 @@ mod tests {
 
         assert_eq!(params.target_pane_id, Some("jafar/pane:remote-pane".into()));
         assert_eq!(params.direction, crate::api::schema::SplitDirection::Down);
+    }
+
+    fn remote_registry() -> crate::remote_target::RemoteHostRegistry {
+        crate::remote_target::RemoteHostRegistry::from_configs(vec![
+            crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn parse_pane_close_args_preserves_local_target_without_confirm() {
+        let params = parse_pane_close_args(&args(&["local/pane-label"]), None).unwrap();
+
+        assert_eq!(params.pane_id, "local/pane-label");
+        assert!(!params.confirm);
+    }
+
+    #[test]
+    fn parse_pane_close_args_requires_confirm_for_configured_remote_target() {
+        let registry = remote_registry();
+        let err = parse_pane_close_args(&args(&["jafar/terminal:remote-term"]), Some(&registry))
+            .unwrap_err();
+
+        assert!(err.contains("pass --confirm"));
+    }
+
+    #[test]
+    fn parse_pane_close_args_accepts_confirm_for_configured_remote_target() {
+        let registry = remote_registry();
+        let params = parse_pane_close_args(
+            &args(&["jafar/terminal:remote-term", "--confirm"]),
+            Some(&registry),
+        )
+        .unwrap();
+
+        assert_eq!(params.pane_id, "jafar/terminal:remote-term");
+        assert!(params.confirm);
+    }
+
+    #[test]
+    fn parse_pane_close_args_does_not_require_confirm_for_unknown_slash_label() {
+        let registry = remote_registry();
+        let params = parse_pane_close_args(&args(&["logs/pane"]), Some(&registry)).unwrap();
+
+        assert_eq!(params.pane_id, "logs/pane");
+        assert!(!params.confirm);
     }
 
     #[test]

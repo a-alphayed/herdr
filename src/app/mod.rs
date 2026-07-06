@@ -647,6 +647,7 @@ impl App {
             request_remote_detach_view: None,
             request_remote_workspace_create: None,
             pending_remote_attach: None,
+            pending_remote_projected_pane_close: None,
             pending_remote_workspace_creates: std::collections::BTreeMap::new(),
             next_remote_workspace_create_token: 1,
             creating_new_tab: false,
@@ -1810,6 +1811,9 @@ impl App {
             }
             Mode::ConfirmRemoteAttach => {
                 self.handle_confirm_remote_attach_key(key_event);
+            }
+            Mode::ConfirmRemoteProjectedPaneClose => {
+                self.handle_confirm_remote_projected_pane_close_key(key_event);
             }
             Mode::ContextMenu => {
                 self.handle_context_menu_key_via_api(key_event);
@@ -4644,8 +4648,9 @@ auto_connect = false
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_pane_close".into(),
-            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
+            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams {
                 pane_id: target_pane_id,
+                confirm: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -4670,8 +4675,9 @@ auto_connect = false
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_pane_close_last".into(),
-            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
+            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams {
                 pane_id: target_pane_id,
+                confirm: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -4709,8 +4715,9 @@ auto_connect = false
 
         let response = app.handle_api_request(crate::api::schema::Request {
             id: "req_pane_close_parent_group".into(),
-            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneTarget {
+            method: crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams {
                 pane_id: target_pane_id,
+                confirm: false,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();

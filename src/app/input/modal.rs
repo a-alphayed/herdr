@@ -399,6 +399,15 @@ fn remote_projected_pane_split_method(
     })
 }
 
+fn remote_projected_pane_close_method(
+    target: &RemoteProjectedPaneTarget,
+) -> crate::api::schema::Method {
+    crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams {
+        pane_id: format!("{}/terminal:{}", target.host, target.terminal_id),
+        confirm: true,
+    })
+}
+
 pub(super) const ONBOARDING_WELCOME_ACTIONS: &[ModalActionSpec<ModalAction>] = &[ModalActionSpec {
     action: ModalAction::Continue,
     bindings: &[ModalKeyBinding::Enter],
@@ -1045,6 +1054,37 @@ impl App {
         )
     }
 
+    fn close_remote_projected_pane_via_api(&mut self, target: RemoteProjectedPaneTarget) -> String {
+        self.dispatch_runtime_mutation(
+            "tui.remote_projection.pane.close",
+            remote_projected_pane_close_method(&target),
+        )
+    }
+
+    pub(crate) fn confirm_remote_projected_pane_close_accept_via_api(&mut self) {
+        let Some(target) = self.state.pending_remote_projected_pane_close.take() else {
+            leave_modal(&mut self.state);
+            return;
+        };
+        self.close_remote_projected_pane_via_api(target);
+        leave_modal(&mut self.state);
+    }
+
+    pub(crate) fn confirm_remote_projected_pane_close_cancel(&mut self) {
+        self.state.pending_remote_projected_pane_close = None;
+        leave_modal(&mut self.state);
+    }
+
+    pub(crate) fn handle_confirm_remote_projected_pane_close_key(&mut self, key: KeyEvent) {
+        match modal_action_from_key(&key, CONFIRM_CLOSE_ACTIONS) {
+            Some(ModalAction::Confirm) => {
+                self.confirm_remote_projected_pane_close_accept_via_api();
+            }
+            Some(ModalAction::Cancel) => self.confirm_remote_projected_pane_close_cancel(),
+            _ => {}
+        }
+    }
+
     pub(crate) fn handle_rename_key_via_api(&mut self, key: KeyEvent) {
         if let Some(action) = modal_action_from_key(&key, RENAME_ACTIONS) {
             self.apply_rename_mouse_action_via_api(action);
@@ -1319,6 +1359,10 @@ impl App {
                     crate::api::schema::SplitDirection::Down,
                 );
                 leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::RemoteProjectedPane { target }, Some("Close pane")) => {
+                self.state.pending_remote_projected_pane_close = Some(target);
+                self.state.mode = Mode::ConfirmRemoteProjectedPaneClose;
             }
             (ContextMenuKind::Pane { pane_id, .. }, Some("Rename pane")) => {
                 open_rename_pane(&mut self.state, pane_id);
@@ -2014,6 +2058,18 @@ mod tests {
     }
 
     #[test]
+    fn remote_projected_pane_close_method_uses_host_terminal_target_and_confirm() {
+        let crate::api::schema::Method::PaneClose(params) =
+            remote_projected_pane_close_method(&remote_projected_pane_target())
+        else {
+            panic!("expected pane.close method");
+        };
+
+        assert_eq!(params.pane_id, "jafar/terminal:remote-term-1");
+        assert!(params.confirm);
+    }
+
+    #[test]
     fn remote_projected_pane_split_action_routes_remote_and_preserves_local_state() {
         let mut app = app_with_remote_host_for_projected_split();
         let mut workspace = crate::workspace::Workspace::test_new("local");
@@ -2060,6 +2116,85 @@ mod tests {
             assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
             assert_eq!(app.state.mode, Mode::Terminal);
         }
+    }
+
+    #[test]
+    fn remote_projected_pane_close_context_menu_confirms_dispatch_and_preserves_local_state() {
+        let mut app = app_with_remote_host_for_projected_split();
+        let mut workspace = crate::workspace::Workspace::test_new("local");
+        let focused = workspace.tabs[0].root_pane;
+        workspace.test_split(Direction::Horizontal);
+        workspace.tabs[0].layout.focus_pane(focused);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let selected = crate::remote_source::RemoteSpaceKey {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            workspace_id: "remote-ws".into(),
+        };
+        app.state.selected_remote_space = Some(selected.clone());
+        app.state.mode = Mode::ContextMenu;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::RemoteProjectedPane {
+                target: remote_projected_pane_target(),
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(2),
+        };
+
+        app.apply_context_menu_action_via_api(menu, 2);
+
+        assert_eq!(app.state.mode, Mode::ConfirmRemoteProjectedPaneClose);
+        assert_eq!(
+            app.state.pending_remote_projected_pane_close,
+            Some(remote_projected_pane_target())
+        );
+        assert_eq!(app.state.selected_remote_space, Some(selected.clone()));
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
+
+        app.handle_confirm_remote_projected_pane_close_key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::empty(),
+        ));
+
+        assert_eq!(app.state.pending_remote_projected_pane_close, None);
+        assert_eq!(app.state.selected_remote_space, Some(selected));
+        assert_eq!(app.state.active, Some(0));
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn remote_projected_pane_close_cancel_preserves_state_without_dispatch() {
+        let mut app = app_with_remote_host_for_projected_split();
+        let workspace = crate::workspace::Workspace::test_new("local");
+        let focused = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            workspace_id: "remote-ws".into(),
+        });
+        app.state.pending_remote_projected_pane_close = Some(remote_projected_pane_target());
+        app.state.mode = Mode::ConfirmRemoteProjectedPaneClose;
+
+        app.handle_confirm_remote_projected_pane_close_key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::empty(),
+        ));
+
+        assert_eq!(app.state.pending_remote_projected_pane_close, None);
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 1);
+        assert_eq!(app.state.mode, Mode::Terminal);
     }
 
     #[test]

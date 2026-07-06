@@ -20,6 +20,36 @@ fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
 
 impl App {
     pub(super) fn handle_overlay_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.state.mode == Mode::ConfirmRemoteProjectedPaneClose {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let Some(inner) = crate::ui::confirm_remote_projected_pane_close_inner_rect(
+                    self.state.view.terminal_area,
+                ) else {
+                    self.confirm_remote_projected_pane_close_cancel();
+                    return true;
+                };
+                let (confirm, cancel) =
+                    crate::ui::confirm_remote_projected_pane_close_button_rects(inner);
+                match modal_action_from_buttons(
+                    mouse.column,
+                    mouse.row,
+                    &[
+                        (confirm, ModalAction::Confirm),
+                        (cancel, ModalAction::Cancel),
+                    ],
+                ) {
+                    Some(ModalAction::Confirm) => {
+                        self.confirm_remote_projected_pane_close_accept_via_api();
+                    }
+                    Some(ModalAction::Cancel) | None => {
+                        self.confirm_remote_projected_pane_close_cancel();
+                    }
+                    _ => {}
+                }
+            }
+            return true;
+        }
+
         if self.state.mode == Mode::ReleaseNotes {
             match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left)

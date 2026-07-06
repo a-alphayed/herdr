@@ -95,6 +95,9 @@ impl App {
                 Mode::Resize => self.handle_resize_key_via_api(key),
                 Mode::ConfirmClose => self.handle_confirm_close_key_via_api(key_event),
                 Mode::ConfirmRemoteAttach => self.handle_confirm_remote_attach_key(key_event),
+                Mode::ConfirmRemoteProjectedPaneClose => {
+                    self.handle_confirm_remote_projected_pane_close_key(key_event)
+                }
                 Mode::ContextMenu => {
                     self.handle_context_menu_key_via_api(key_event);
                 }

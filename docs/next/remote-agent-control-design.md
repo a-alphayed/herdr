@@ -3,7 +3,7 @@
 Status: draft proposal  
 Owner: TBD  
 Created: 2026-05-31  
-Updated: 2026-07-03
+Updated: 2026-07-05
 
 ## Summary
 
@@ -32,7 +32,7 @@ Verified on 2026-07-03 with both the controller and remote host running Herdr 0.
 - `agent start --host ...` can place a remote lane and the controller can detect it as `<node>/<name>`.
 - `agent read <node>/<target>` can read remote pane content.
 - `agent send <node>/<target> "text"` writes text into a composer-style target, but does not submit the composer prompt; the remote prompt-processing agent remains idle. Readback of text sitting in the composer proves only text injection, not agent processing. `agent send` remains literal text injection by design.
-- No federation-only controller teardown path currently exists for remote panes/workspaces/lane surfaces placed by the controller.
+- Before Phase F, no federation-only controller teardown path existed for remote panes/workspaces/lane surfaces placed by the controller.
 
 ### Submit-capable route (Phase E.0)
 
@@ -79,7 +79,7 @@ The first narrow, explicitly destructive, capability-gated controller-side teard
 - The worktree-group `confirmation_required` guard on `close_pane` is NOT bypassed by teardown's `confirm: true`; a teardown that would collapse a worktree group still surfaces `confirmation_required`.
 - No PID kill, process/host/server stop, provisioning, arbitrary SSH shell commands, or local-owned remote PTY behavior is exposed. The operation is non-idempotent and performs no uncertain retry: a remote `close_pane` that happens to close the workspace (last pane) is a consequence of the authoritative close path, not an exposed raw workspace close.
 
-Broad remote pane/workspace/server/process teardown remains out of scope; only this narrow federation-placed agent/lane surface is teardown-capable.
+Broad remote pane/workspace/server/process teardown remains out of scope except for this narrow federation-placed agent/lane surface and the separate confirmed projected-pane close described below.
 
 ### Remote pane split (Phase F.2)
 
@@ -91,6 +91,18 @@ Broad remote pane/workspace/server/process teardown remains out of scope; only t
 - Target resolution: the controller resolves against live active-tab projections from `layout.export`, not against the agent cache. Stale/unavailable projections and older projections without terminal ids are rejected before mutation.
 - Remote authority: the forwarded request carries the resolved remote `workspace_id` and `target_pane_id`; `cwd` and `env` are remote-scoped and pass through without local expansion.
 - The operation is non-destructive but non-idempotent. It has no confirmation gate and no uncertain-delivery retry.
+
+### Confirmed projected-pane close (Phase F.2)
+
+`pane.close` now has a narrow federation route for closing one pane from a live source projection. This is the carve-out from the broader remote teardown ban: it is an explicit, confirmed close of the projected pane/process on its authoritative host, not a general remote workspace/tab/server/process management API.
+
+- API/schema: `pane.close` uses `{ pane_id, confirm }`. `confirm` defaults to `false` and is omitted when false. Local `pane.close` remains backward-compatible; the existing worktree-group `confirmation_required` guard on the authoritative close path remains separate and is not bypassed by `confirm: true`.
+- CLI: `herdr pane close <host>/<target> --confirm`, where `<target>` is `terminal:<id>`, `pane:<id>`, or `workspace:<id>`. Bare/local targets keep the local path; a configured host-qualified remote target without `--confirm` is rejected before sending.
+- Capability: the route requires the remote host to advertise `pane_close` (in addition to `remote_api_bridge`). A remote that does not advertise it fails clearly with `does not advertise federation method pane_close` and does not fall back.
+- Target resolution: the controller requires `confirm: true` before host status checks, projection-cache resolution, or bridge send. It resolves host/session-qualified terminal, pane, and workspace selectors against live active-tab projections from `layout.export`; workspace selectors resolve to the focused live projected pane, not to broad workspace close. Stale/unavailable projections and older projections without terminal ids are rejected before mutation.
+- Remote authority: the forwarded request carries the resolved authoritative remote `pane_id` and `confirm: true`. The remote node runs its normal local `close_pane` path, preserving `pane.closed` / `workspace.closed` events, session save, runtime cleanup, and the separate worktree-group confirmation guard. If the closed pane is the last pane, closing the workspace is a consequence of the authoritative local close path, not a separate workspace-close operation.
+- UI: a live projected pane context menu exposes **Close pane**. The confirmation overlay names the host, session, and target label and states that it closes the remote pane/process on that host. Confirm dispatches `tui.remote_projection.pane.close` as `pane.close { pane_id: "<host>/terminal:<terminal_id>", confirm: true }` and returns to the prior local terminal/navigate mode; cancel mutates neither local nor remote panes.
+- Non-goals remain: no agent-label close, no broad workspace/tab destructive mutation, no PID kill, no process/host/server stop, no arbitrary SSH command, no local-owned remote PTY behavior, and no uncertain-delivery retry.
 
 ## Core Invariants
 
@@ -696,6 +708,7 @@ pane.list
 pane.get
 pane.read
 pane.split
+pane.close (confirmed projected-pane close only)
 pane.send_text
 pane.send_keys
 pane.send_input
@@ -715,7 +728,7 @@ integration.uninstall
 broad workspace/tab destructive mutation
 ```
 
-Remote workspace creation is allowed only through explicit capability-gated routes to the owning host, and only when the active source/projection is remote and connected. It must not be confused with adding/provisioning a machine. Broader workspace/tab destructive mutation remains denied by default until confirmations, capabilities, and UX language are settled. Workspace/tab creation or pane placement for agent start may be allowed through explicit remote `agent.start` placement features. The narrow federation-placed agent/lane teardown route (`agent.teardown`) is host/session-qualified, capability-gated, and explicit about destructive semantics, and stays much narrower than broad host/process management — broad pane/workspace/server/process teardown remains out of scope.
+Remote workspace creation is allowed only through explicit capability-gated routes to the owning host, and only when the active source/projection is remote and connected. It must not be confused with adding/provisioning a machine. Broader workspace/tab destructive mutation remains denied by default until confirmations, capabilities, and UX language are settled. Workspace/tab creation or pane placement for agent start may be allowed through explicit remote `agent.start` placement features. The narrow federation-placed agent/lane teardown route (`agent.teardown`) is host/session-qualified, capability-gated, and explicit about destructive semantics, and the confirmed projected-pane `pane.close` route is limited to one projection-resolved pane/process on the authoritative host. Both stay much narrower than broad host/process management — broad pane/workspace/server/process teardown remains out of scope.
 
 `agent.wait` is not a routable API method — the API exposes no such op. The CLI's `agent wait` is composed from the long-held wait primitives (`events.wait` / `pane.wait_for_output`). Over federation it is realized by proxying those primitives to the owning node on a dedicated bridge and running the wait/match logic locally, not by forwarding an `agent.wait` call.
 
@@ -1313,12 +1326,12 @@ Implemented in this spike:
 - sidebar host-state rows for configured auto-connect remotes when no cached agents exist;
 - Docker smoke coverage for the configured one-hop path: get/read/send/focus/start, disconnect, and reconnect;
 - real-host Jafar smoke for capability/status commands and isolated `fed-*` host-qualified control after updating the remote binary;
-- verified real-host gap (0.7.1/protocol 15): `agent send` writes text into a composer-style remote agent but does not submit the prompt. Phase E.0 adds the submit-capable `agent.submit` route (`herdr agent submit`), capability-gated by `agent_submit`; full controller-only runtime proof is the E.0 validation step. Phase F adds the first narrow federation-placed teardown route (`agent.teardown` / `herdr agent teardown <host>/<target> --confirm`), capability-gated by `agent_teardown`; Phase F.2 adds capability-gated remote `pane.split` for projection-resolved pane/terminal/workspace selectors. Full controller-only runtime proof is the F validation step.
+- verified real-host gap (0.7.1/protocol 15): `agent send` writes text into a composer-style remote agent but does not submit the prompt. Phase E.0 adds the submit-capable `agent.submit` route (`herdr agent submit`), capability-gated by `agent_submit`; full controller-only runtime proof is the E.0 validation step. Phase F adds the first narrow federation-placed teardown route (`agent.teardown` / `herdr agent teardown <host>/<target> --confirm`), capability-gated by `agent_teardown`; Phase F.2 adds capability-gated remote `pane.split` and confirmed projected-pane `pane.close` for projection-resolved pane/terminal/workspace selectors. Full controller-only runtime proof is the F validation step.
 
 Still intentionally out of MVP scope:
 
 - embedded remote panes or local-owned remote PTYs;
-- broad destructive remote operations (broad pane/workspace/server/process teardown remains out of scope; only the narrow federation-placed agent/lane `agent.teardown` path is supported);
+- broad destructive remote operations (broad pane/workspace/server/process teardown remains out of scope; only the narrow federation-placed agent/lane `agent.teardown` path and the confirmed projection-resolved single-pane `pane.close` carve-out are supported);
 - transitive remote-of-remote routing;
 - automatic remote update/setup orchestration for configured hosts;
 - multi-host production soak/chaos validation beyond the Docker and Jafar smoke coverage.
