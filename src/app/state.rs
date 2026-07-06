@@ -772,6 +772,15 @@ pub struct RemoteProjectionHitArea {
     pub live: bool,
 }
 
+/// Projection-derived identity for a remote pane context-menu action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteProjectedPaneTarget {
+    pub host: String,
+    pub session: String,
+    pub terminal_id: String,
+    pub label: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Onboarding,
@@ -1114,6 +1123,9 @@ pub enum ContextMenuKind {
         has_manual_label: bool,
         remote_attach_pane: Option<RemoteAttachPaneTarget>,
     },
+    RemoteProjectedPane {
+        target: RemoteProjectedPaneTarget,
+    },
     RemoteAgent {
         target: crate::remote_source::RemoteAttachTarget,
         focused_pane: Option<RemoteAttachPaneTarget>,
@@ -1273,6 +1285,7 @@ impl ContextMenuState {
                 "Zoom",
                 "Close pane",
             ],
+            ContextMenuKind::RemoteProjectedPane { .. } => &["Split right", "Split down"],
             ContextMenuKind::RemoteAgent {
                 attached_pane: Some(_),
                 ..
@@ -2270,6 +2283,7 @@ impl AppState {
                         assert_live_pane(source_pane_id, "context menu source pane");
                     }
                 }
+                ContextMenuKind::RemoteProjectedPane { .. } => {}
                 ContextMenuKind::RemoteAgent {
                     ref focused_pane,
                     ref attached_pane,

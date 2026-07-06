@@ -6,8 +6,8 @@ use tracing::warn;
 use crate::{
     app::state::{
         AgentPanelSort, AppState, ContextMenuKind, ContextMenuState, DragState, DragTarget,
-        MenuListState, Mode, RightClickPassthroughGesture, TabPressState, ViewLayout,
-        WorkspacePressState,
+        MenuListState, Mode, RemoteProjectedPaneTarget, RightClickPassthroughGesture,
+        TabPressState, ViewLayout, WorkspacePressState,
     },
     layout::{PaneInfo, SplitBorder},
     selection::Selection,
@@ -1222,6 +1222,40 @@ impl AppState {
             }
 
             MouseEventKind::Down(MouseButton::Right)
+                if self.selected_remote_space.is_some() && !in_sidebar =>
+            {
+                self.workspace_press = None;
+                self.tab_press = None;
+                self.context_menu = None;
+                let col = mouse.column;
+                let row = mouse.row;
+                if let Some(hit) = self
+                    .view
+                    .remote_projection_hit_areas
+                    .iter()
+                    .find(|hit| rect_contains(hit.rect, col, row))
+                    .cloned()
+                {
+                    if let (true, Some(terminal_id)) = (hit.live, hit.terminal_id) {
+                        self.context_menu = Some(ContextMenuState {
+                            kind: ContextMenuKind::RemoteProjectedPane {
+                                target: RemoteProjectedPaneTarget {
+                                    host: hit.host,
+                                    session: hit.session,
+                                    terminal_id,
+                                    label: hit.label,
+                                },
+                            },
+                            x: mouse.column,
+                            y: mouse.row,
+                            list: MenuListState::new(0),
+                        });
+                        self.mode = Mode::ContextMenu;
+                    }
+                }
+            }
+
+            MouseEventKind::Down(MouseButton::Right)
                 if self.tab_at(mouse.column, mouse.row).is_some() =>
             {
                 if let (Some(ws_idx), Some(tab_idx)) =
@@ -1723,6 +1757,11 @@ impl AppState {
         mouse: MouseEvent,
         in_sidebar: bool,
     ) -> bool {
+        if self.selected_remote_space.is_some() {
+            self.right_click_passthrough = None;
+            return false;
+        }
+
         if let Some(gesture) = self.right_click_passthrough.clone() {
             match mouse.kind {
                 MouseEventKind::Drag(MouseButton::Right)
@@ -2091,6 +2130,31 @@ mod tests {
             session: crate::session::DEFAULT_SESSION_NAME.into(),
             terminal_id: "remote-term".into(),
             label: "jafar/smoke-agent".into(),
+        }
+    }
+
+    fn remote_space_key() -> crate::remote_source::RemoteSpaceKey {
+        crate::remote_source::RemoteSpaceKey {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            workspace_id: "remote-ws".into(),
+        }
+    }
+
+    fn remote_projection_hit(
+        rect: Rect,
+        live: bool,
+        terminal_id: Option<&str>,
+    ) -> crate::app::state::RemoteProjectionHitArea {
+        crate::app::state::RemoteProjectionHitArea {
+            rect,
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            pane_id: Some("remote-pane".into()),
+            terminal_id: terminal_id.map(str::to_string),
+            label: "remote pane".into(),
+            focused: false,
+            live,
         }
     }
 
@@ -3319,6 +3383,113 @@ mod tests {
 
         assert_eq!(border.pos, 0);
         assert!(app.state.find_border_at(0, row).is_none());
+    }
+
+    #[test]
+    fn right_click_live_projected_pane_opens_remote_split_menu() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("local");
+        let focused = ws.tabs[0].root_pane;
+        let target_local = ws.test_split(Direction::Horizontal);
+        ws.tabs[0].layout.focus_pane(focused);
+        app.state.workspaces = vec![ws];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let target_rect = app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == target_local)
+            .expect("target pane info")
+            .inner_rect;
+        let selected = remote_space_key();
+        app.state.selected_remote_space = Some(selected.clone());
+        app.state.view.remote_projection_hit_areas = vec![remote_projection_hit(
+            target_rect,
+            true,
+            Some("remote-term-1"),
+        )];
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            target_rect.x,
+            target_rect.y,
+        ));
+
+        assert_eq!(app.state.selected_remote_space, Some(selected));
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+        let menu = app.state.context_menu.as_ref().expect("remote pane menu");
+        assert_eq!(menu.items(), &["Split right", "Split down"]);
+        match &menu.kind {
+            ContextMenuKind::RemoteProjectedPane { target } => {
+                assert_eq!(target.host, "jafar");
+                assert_eq!(target.session, crate::session::DEFAULT_SESSION_NAME);
+                assert_eq!(target.terminal_id, "remote-term-1");
+                assert_eq!(target.label, "remote pane");
+            }
+            other => panic!("unexpected menu kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn right_click_stale_projected_pane_does_not_open_local_menu() {
+        assert_projected_right_click_is_consumed(Some((false, Some("remote-term-1"))));
+    }
+
+    #[test]
+    fn right_click_projected_pane_without_terminal_id_does_not_open_local_menu() {
+        assert_projected_right_click_is_consumed(Some((false, None)));
+    }
+
+    #[test]
+    fn right_click_missed_projection_does_not_open_local_menu() {
+        assert_projected_right_click_is_consumed(None);
+    }
+
+    fn assert_projected_right_click_is_consumed(hit: Option<(bool, Option<&'static str>)>) {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("local");
+        let focused = ws.tabs[0].root_pane;
+        let target_local = ws.test_split(Direction::Horizontal);
+        ws.tabs[0].layout.focus_pane(focused);
+        app.state.workspaces = vec![ws];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let target_rect = app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == target_local)
+            .expect("target pane info")
+            .inner_rect;
+        let selected = remote_space_key();
+        app.state.selected_remote_space = Some(selected.clone());
+        app.state.view.remote_projection_hit_areas = hit
+            .map(|(live, terminal_id)| remote_projection_hit(target_rect, live, terminal_id))
+            .into_iter()
+            .collect();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            target_rect.x,
+            target_rect.y,
+        ));
+
+        assert_eq!(app.state.selected_remote_space, Some(selected));
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(app.state.context_menu.is_none());
     }
 
     #[test]

@@ -9,6 +9,7 @@ use crate::{
     app::{
         state::{
             AppState, ContextMenuKind, ContextMenuState, MenuListState, Mode, NavigatorStateFilter,
+            RemoteProjectedPaneTarget,
         },
         App,
     },
@@ -381,6 +382,21 @@ pub(super) fn leave_modal(state: &mut AppState) {
     } else {
         state.mode = Mode::Navigate;
     }
+}
+
+fn remote_projected_pane_split_method(
+    target: &RemoteProjectedPaneTarget,
+    direction: crate::api::schema::SplitDirection,
+) -> crate::api::schema::Method {
+    crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
+        workspace_id: None,
+        target_pane_id: Some(format!("{}/terminal:{}", target.host, target.terminal_id)),
+        direction,
+        ratio: None,
+        cwd: None,
+        focus: true,
+        env: Default::default(),
+    })
 }
 
 pub(super) const ONBOARDING_WELCOME_ACTIONS: &[ModalActionSpec<ModalAction>] = &[ModalActionSpec {
@@ -1018,6 +1034,17 @@ pub(crate) fn handle_context_menu_key(
 }
 
 impl App {
+    fn split_remote_projected_pane_via_api(
+        &mut self,
+        target: RemoteProjectedPaneTarget,
+        direction: crate::api::schema::SplitDirection,
+    ) -> String {
+        self.dispatch_runtime_mutation(
+            "tui.remote_projection.pane.split",
+            remote_projected_pane_split_method(&target, direction),
+        )
+    }
+
     pub(crate) fn handle_rename_key_via_api(&mut self, key: KeyEvent) {
         if let Some(action) = modal_action_from_key(&key, RENAME_ACTIONS) {
             self.apply_rename_mouse_action_via_api(action);
@@ -1278,6 +1305,20 @@ impl App {
                 self.focus_workspace_idx_via_api(ws_idx);
                 self.focus_tab_idx_via_api(tab_idx);
                 self.close_active_tab_via_api();
+            }
+            (ContextMenuKind::RemoteProjectedPane { target }, Some("Split right")) => {
+                self.split_remote_projected_pane_via_api(
+                    target,
+                    crate::api::schema::SplitDirection::Right,
+                );
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::RemoteProjectedPane { target }, Some("Split down")) => {
+                self.split_remote_projected_pane_via_api(
+                    target,
+                    crate::api::schema::SplitDirection::Down,
+                );
+                leave_modal(&mut self.state);
             }
             (ContextMenuKind::Pane { pane_id, .. }, Some("Rename pane")) => {
                 open_rename_pane(&mut self.state, pane_id);
@@ -1921,6 +1962,104 @@ mod tests {
 
         assert!(state.workspaces.is_empty());
         assert_eq!(state.mode, Mode::Navigate);
+    }
+
+    fn remote_projected_pane_target() -> RemoteProjectedPaneTarget {
+        RemoteProjectedPaneTarget {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            terminal_id: "remote-term-1".into(),
+            label: "remote pane".into(),
+        }
+    }
+
+    fn app_with_remote_host_for_projected_split() -> App {
+        let mut config = crate::config::Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar", "jafar", "default", true,
+        )];
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(&config, true, None, api_rx, crate::api::EventHub::default())
+    }
+
+    #[test]
+    fn remote_projected_pane_split_method_uses_host_terminal_target_and_safe_defaults() {
+        for (direction, expected_direction) in [
+            (
+                crate::api::schema::SplitDirection::Right,
+                crate::api::schema::SplitDirection::Right,
+            ),
+            (
+                crate::api::schema::SplitDirection::Down,
+                crate::api::schema::SplitDirection::Down,
+            ),
+        ] {
+            let crate::api::schema::Method::PaneSplit(params) =
+                remote_projected_pane_split_method(&remote_projected_pane_target(), direction)
+            else {
+                panic!("expected pane.split method");
+            };
+            assert_eq!(params.workspace_id, None);
+            assert_eq!(
+                params.target_pane_id.as_deref(),
+                Some("jafar/terminal:remote-term-1")
+            );
+            assert_eq!(params.direction, expected_direction);
+            assert_eq!(params.ratio, None);
+            assert_eq!(params.cwd, None);
+            assert!(params.env.is_empty());
+            assert!(params.focus);
+        }
+    }
+
+    #[test]
+    fn remote_projected_pane_split_action_routes_remote_and_preserves_local_state() {
+        let mut app = app_with_remote_host_for_projected_split();
+        let mut workspace = crate::workspace::Workspace::test_new("local");
+        let focused = workspace.tabs[0].root_pane;
+        workspace.test_split(Direction::Horizontal);
+        workspace.tabs[0].layout.focus_pane(focused);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::ContextMenu;
+        let selected = crate::remote_source::RemoteSpaceKey {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            workspace_id: "remote-ws".into(),
+        };
+        app.state.selected_remote_space = Some(selected.clone());
+
+        let response = app.split_remote_projected_pane_via_api(
+            remote_projected_pane_target(),
+            crate::api::schema::SplitDirection::Right,
+        );
+        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.error.code, "remote_host_not_connected");
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
+
+        for idx in [0, 1] {
+            app.state.mode = Mode::ContextMenu;
+            let menu = ContextMenuState {
+                kind: ContextMenuKind::RemoteProjectedPane {
+                    target: remote_projected_pane_target(),
+                },
+                x: 0,
+                y: 0,
+                list: MenuListState::new(idx),
+            };
+
+            app.apply_context_menu_action_via_api(menu, idx);
+
+            assert_eq!(app.state.selected_remote_space, Some(selected.clone()));
+            assert_eq!(app.state.active, Some(0));
+            assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
+            assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
+            assert_eq!(app.state.mode, Mode::Terminal);
+        }
     }
 
     #[test]

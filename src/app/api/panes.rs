@@ -21,6 +21,7 @@ use super::super::api_helpers::{
     detect_state_from_api, encode_api_keys, encode_api_text, normalize_custom_status,
     normalize_reported_agent_label,
 };
+use super::remote_helpers::{remote_route_plan_error_body, rewrite_remote_response_id};
 use super::responses::{encode_error, encode_error_body, encode_success};
 use crate::remote_target::{
     plan_target_route, resolve_remote_pane_target, PlannedTargetRoute, RemotePaneResolveError,
@@ -42,42 +43,6 @@ fn remote_pane_split_request(
     Request {
         id,
         method: Method::PaneSplit(params),
-    }
-}
-
-fn rewrite_remote_pane_split_response_id(response: &str, id: &str) -> std::io::Result<String> {
-    let mut value: serde_json::Value = serde_json::from_str(response).map_err(|err| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid remote API response JSON: {err}"),
-        )
-    })?;
-    let Some(object) = value.as_object_mut() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "remote API response must be a JSON object",
-        ));
-    };
-    if !object.contains_key("result") && !object.contains_key("error") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "remote API response must contain result or error",
-        ));
-    }
-    object.insert("id".to_string(), serde_json::Value::String(id.to_string()));
-    serde_json::to_string(&value).map_err(std::io::Error::other)
-}
-
-fn remote_route_plan_error_body(err: RemoteRoutePlanError) -> ErrorBody {
-    match err {
-        RemoteRoutePlanError::Parse(err) => ErrorBody {
-            code: "remote_target_error".to_string(),
-            message: err.to_string(),
-        },
-        RemoteRoutePlanError::UnknownHost(host) => ErrorBody {
-            code: "remote_target_error".to_string(),
-            message: format!("unknown remote host: {host}"),
-        },
     }
 }
 
@@ -280,7 +245,7 @@ impl App {
             &resolved.pane_id,
         );
         match send(&resolved.host, &request)
-            .and_then(|response| rewrite_remote_pane_split_response_id(&response, &id))
+            .and_then(|response| rewrite_remote_response_id(&response, &id))
         {
             Ok(response) => response,
             Err(err) => encode_error(id, "remote_request_failed", err.to_string()),

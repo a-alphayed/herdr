@@ -7,6 +7,7 @@ mod integrations;
 mod layouts;
 mod panes;
 pub(crate) mod plugins;
+mod remote_helpers;
 mod responses;
 mod session;
 mod tabs;

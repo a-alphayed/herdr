@@ -7,6 +7,9 @@ use crate::api::schema::{
 };
 use crate::app::App;
 
+use super::remote_helpers::{
+    remote_route_plan_error_body, rewrite_remote_response_id, rewrite_remote_response_id_value,
+};
 use super::responses::{encode_error, encode_error_body, encode_success};
 use crate::remote_target::{
     plan_target_route, resolve_remote_agent_target, PlannedTargetRoute, RemoteAgentResolveError,
@@ -376,7 +379,7 @@ impl App {
             resolved.entry.agent.terminal_id.as_str(),
         );
         match crate::remote::send_remote_api_request_to_host_noninteractive(&host, &request)
-            .and_then(|response| rewrite_response_id(&response, &id))
+            .and_then(|response| rewrite_remote_response_id(&response, &id))
         {
             Ok(response) => response,
             Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
@@ -401,7 +404,7 @@ impl App {
             resolved.entry.agent.terminal_id.as_str(),
         );
         match crate::remote::send_remote_api_request_to_host_noninteractive(&host, &request)
-            .and_then(|response| rewrite_response_id(&response, &id))
+            .and_then(|response| rewrite_remote_response_id(&response, &id))
         {
             Ok(response) => response,
             Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
@@ -426,7 +429,7 @@ impl App {
             resolved.entry.agent.terminal_id.as_str(),
         );
         match crate::remote::send_remote_api_request_to_host_noninteractive(&host, &request)
-            .and_then(|response| rewrite_response_id(&response, &id))
+            .and_then(|response| rewrite_remote_response_id(&response, &id))
         {
             Ok(response) => response,
             Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
@@ -451,7 +454,7 @@ impl App {
             resolved.entry.agent.terminal_id.as_str(),
         );
         match crate::remote::send_remote_api_request_to_host_noninteractive(&host, &request)
-            .and_then(|response| rewrite_response_id(&response, &id))
+            .and_then(|response| rewrite_remote_response_id(&response, &id))
         {
             Ok(response) => response,
             Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
@@ -475,7 +478,7 @@ impl App {
         let request =
             remote_agent_teardown_request(id.clone(), resolved.entry.agent.terminal_id.as_str());
         match crate::remote::send_remote_api_request_to_host_noninteractive(&host, &request)
-            .and_then(|response| rewrite_response_id(&response, &id))
+            .and_then(|response| rewrite_remote_response_id(&response, &id))
         {
             Ok(response) => response,
             Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
@@ -569,55 +572,14 @@ pub(crate) fn remote_agent_start_request(id: String, mut params: AgentStartParam
     }
 }
 
-fn rewrite_response_id(response: &str, id: &str) -> std::io::Result<String> {
-    let mut value: serde_json::Value = serde_json::from_str(response).map_err(|err| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid remote API response JSON: {err}"),
-        )
-    })?;
-    let Some(object) = value.as_object_mut() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "remote API response must be a JSON object",
-        ));
-    };
-    if !object.contains_key("result") && !object.contains_key("error") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "remote API response must contain result or error",
-        ));
-    }
-    object.insert("id".to_string(), serde_json::Value::String(id.to_string()));
-    serde_json::to_string(&value).map_err(std::io::Error::other)
-}
-
 pub(crate) fn rewrite_remote_agent_start_response(
     response: &str,
     id: &str,
     host: &str,
 ) -> std::io::Result<String> {
-    let mut value: serde_json::Value = serde_json::from_str(response).map_err(|err| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid remote API response JSON: {err}"),
-        )
-    })?;
-    let Some(object) = value.as_object_mut() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "remote API response must be a JSON object",
-        ));
-    };
-    if !object.contains_key("result") && !object.contains_key("error") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "remote API response must contain result or error",
-        ));
-    }
-    object.insert("id".to_string(), serde_json::Value::String(id.to_string()));
+    let mut value = rewrite_remote_response_id_value(response, id)?;
 
-    if let Some(agent) = object
+    if let Some(agent) = value
         .get_mut("result")
         .and_then(serde_json::Value::as_object_mut)
         .filter(|result| {
@@ -650,19 +612,6 @@ fn prefix_remote_agent_label_field(
         return;
     };
     *value = serde_json::Value::String(format!("{host}/{label}"));
-}
-
-fn remote_route_plan_error_body(err: RemoteRoutePlanError) -> ErrorBody {
-    match err {
-        RemoteRoutePlanError::Parse(err) => ErrorBody {
-            code: "remote_target_error".to_string(),
-            message: err.to_string(),
-        },
-        RemoteRoutePlanError::UnknownHost(host) => ErrorBody {
-            code: "remote_target_error".to_string(),
-            message: format!("unknown remote host: {host}"),
-        },
-    }
 }
 
 fn remote_agent_resolve_error_body(err: RemoteAgentResolveError) -> ErrorBody {
@@ -1098,7 +1047,7 @@ mod tests {
         })
         .unwrap();
 
-        let rewritten = rewrite_response_id(&response, "local-id").unwrap();
+        let rewritten = rewrite_remote_response_id(&response, "local-id").unwrap();
         let parsed: SuccessResponse = serde_json::from_str(&rewritten).unwrap();
 
         assert_eq!(parsed.id, "local-id");
@@ -1116,7 +1065,7 @@ mod tests {
         })
         .unwrap();
 
-        let rewritten = rewrite_response_id(&response, "local-id").unwrap();
+        let rewritten = rewrite_remote_response_id(&response, "local-id").unwrap();
         let parsed: ErrorResponse = serde_json::from_str(&rewritten).unwrap();
 
         assert_eq!(parsed.id, "local-id");
@@ -1126,14 +1075,14 @@ mod tests {
 
     #[test]
     fn rewrite_response_id_rejects_malformed_json() {
-        let err = rewrite_response_id("not json", "local-id").unwrap_err();
+        let err = rewrite_remote_response_id("not json", "local-id").unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
     fn rewrite_response_id_rejects_non_api_json() {
-        let err = rewrite_response_id(r#"{"id":"remote-id"}"#, "local-id").unwrap_err();
+        let err = rewrite_remote_response_id(r#"{"id":"remote-id"}"#, "local-id").unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
