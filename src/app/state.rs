@@ -1330,9 +1330,15 @@ impl ContextMenuState {
                 "Zoom",
                 "Close pane",
             ],
-            ContextMenuKind::RemoteProjectedPane { .. } => {
-                &["Split right", "Split down", "Close pane"]
-            }
+            ContextMenuKind::RemoteProjectedPane { .. } => &[
+                "Attach in new split",
+                "Focus pane",
+                "Rename pane",
+                "Clear pane name",
+                "Split right",
+                "Split down",
+                "Close pane",
+            ],
             ContextMenuKind::RemoteAgent {
                 attached_pane: Some(_),
                 ..
@@ -1502,6 +1508,7 @@ pub struct AppState {
     pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
     pub rename_pane_target: Option<PaneId>,
+    pub(crate) rename_remote_pane_target: Option<RemoteProjectedPaneTarget>,
     pub worktree_create: Option<WorktreeCreateState>,
     pub worktree_open: Option<WorktreeOpenState>,
     pub worktree_remove: Option<WorktreeRemoveState>,
@@ -1889,6 +1896,7 @@ impl AppState {
             creating_new_tab: false,
             requested_new_tab_name: None,
             rename_pane_target: None,
+            rename_remote_pane_target: None,
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,

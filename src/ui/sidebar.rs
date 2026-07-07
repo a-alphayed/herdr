@@ -2239,10 +2239,8 @@ mod tests {
                 workspace_list_local: true,
                 workspace_create: true,
                 tab_list: true,
-                tab_create: false,
-                tab_focus: false,
-                tab_close: false,
                 layout_export: true,
+                ..Default::default()
             },
         );
     }

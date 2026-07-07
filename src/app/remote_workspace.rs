@@ -441,13 +441,8 @@ mod tests {
         app.state.remote_sources.set_capabilities(
             host,
             RemoteSourceCapabilities {
-                workspace_list_local: false,
                 workspace_create: true,
-                tab_list: false,
-                tab_create: false,
-                tab_focus: false,
-                tab_close: false,
-                layout_export: false,
+                ..Default::default()
             },
         );
         assert_eq!(

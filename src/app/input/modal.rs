@@ -384,6 +384,14 @@ pub(super) fn leave_modal(state: &mut AppState) {
     }
 }
 
+fn remote_projected_pane_focus_method(
+    target: &RemoteProjectedPaneTarget,
+) -> crate::api::schema::Method {
+    crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
+        pane_id: format!("{}/terminal:{}", target.host, target.terminal_id),
+    })
+}
+
 fn remote_projected_pane_split_method(
     target: &RemoteProjectedPaneTarget,
     direction: crate::api::schema::SplitDirection,
@@ -559,6 +567,7 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
             }
             state.creating_new_tab = false;
             state.rename_pane_target = None;
+            state.rename_remote_pane_target = None;
             state.name_input.clear();
             state.name_input_replace_on_type = false;
             leave_modal(state);
@@ -571,6 +580,7 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
             state.creating_new_tab = false;
             state.requested_new_tab_name = None;
             state.rename_pane_target = None;
+            state.rename_remote_pane_target = None;
             state.name_input.clear();
             state.name_input_replace_on_type = false;
             leave_modal(state);
@@ -1090,6 +1100,44 @@ impl App {
         )
     }
 
+    pub(crate) fn focus_remote_projected_pane_via_api(
+        &mut self,
+        target: RemoteProjectedPaneTarget,
+    ) -> String {
+        self.dispatch_runtime_mutation(
+            "tui.remote_projection.pane.focus",
+            remote_projected_pane_focus_method(&target),
+        )
+    }
+
+    fn open_rename_remote_projected_pane(
+        state: &mut crate::app::state::AppState,
+        target: RemoteProjectedPaneTarget,
+    ) {
+        let current_label = target.label.clone();
+        state.creating_new_tab = false;
+        state.requested_new_tab_name = None;
+        state.rename_pane_target = None;
+        state.rename_remote_pane_target = Some(target);
+        state.name_input = current_label;
+        state.name_input_replace_on_type = false;
+        state.mode = crate::app::Mode::RenamePane;
+    }
+
+    fn clear_remote_projected_pane_name_via_api(
+        &mut self,
+        target: RemoteProjectedPaneTarget,
+    ) -> String {
+        let pane_id = format!("{}/terminal:{}", target.host, target.terminal_id);
+        self.dispatch_runtime_mutation(
+            "tui.remote_projection.pane.clear_name",
+            crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id,
+                label: None,
+            }),
+        )
+    }
+
     pub(crate) fn confirm_remote_projected_pane_close_accept_via_api(&mut self) {
         let Some(target) = self.state.pending_remote_projected_pane_close.take() else {
             leave_modal(&mut self.state);
@@ -1240,7 +1288,18 @@ impl App {
                 }
             }
             Mode::RenamePane => {
-                if let (Some(ws_idx), Some(pane_id)) =
+                if let Some(target) = self.state.rename_remote_pane_target.clone() {
+                    let pane_id = format!("{}/terminal:{}", target.host, target.terminal_id);
+                    self.dispatch_runtime_mutation(
+                        "tui.remote_projection.pane.rename",
+                        crate::api::schema::Method::PaneRename(
+                            crate::api::schema::PaneRenameParams {
+                                pane_id,
+                                label: Some(new_name),
+                            },
+                        ),
+                    );
+                } else if let (Some(ws_idx), Some(pane_id)) =
                     (self.state.active, self.state.rename_pane_target)
                 {
                     if let Some(pane_id) = self.public_pane_id(ws_idx, pane_id) {
@@ -1426,6 +1485,27 @@ impl App {
                 self.focus_tab_idx_via_api(tab_idx);
                 self.close_active_tab_via_api();
             }
+            (ContextMenuKind::RemoteProjectedPane { target }, Some("Attach in new split")) => {
+                self.state.request_remote_attach_in_new_split =
+                    Some(crate::remote_source::RemoteAttachTarget {
+                        host: target.host,
+                        session: target.session,
+                        terminal_id: target.terminal_id,
+                        label: target.label,
+                    });
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::RemoteProjectedPane { target }, Some("Focus pane")) => {
+                self.focus_remote_projected_pane_via_api(target);
+                leave_modal(&mut self.state);
+            }
+            (ContextMenuKind::RemoteProjectedPane { target }, Some("Rename pane")) => {
+                Self::open_rename_remote_projected_pane(&mut self.state, target);
+            }
+            (ContextMenuKind::RemoteProjectedPane { target }, Some("Clear pane name")) => {
+                self.clear_remote_projected_pane_name_via_api(target);
+                leave_modal(&mut self.state);
+            }
             (ContextMenuKind::RemoteProjectedPane { target }, Some("Split right")) => {
                 self.split_remote_projected_pane_via_api(
                     target,
@@ -1546,6 +1626,7 @@ fn cancel_rename_modal(state: &mut AppState) {
     state.creating_new_tab = false;
     state.requested_new_tab_name = None;
     state.rename_pane_target = None;
+    state.rename_remote_pane_target = None;
     state.name_input.clear();
     state.name_input_replace_on_type = false;
     leave_modal(state);
@@ -2314,10 +2395,19 @@ mod tests {
             },
             x: 0,
             y: 0,
-            list: MenuListState::new(2),
+            list: MenuListState::new(0),
+        };
+        let close_idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Close pane")
+            .expect("close pane item");
+        let menu = ContextMenuState {
+            list: MenuListState::new(close_idx),
+            ..menu
         };
 
-        app.apply_context_menu_action_via_api(menu, 2);
+        app.apply_context_menu_action_via_api(menu, close_idx);
 
         assert_eq!(app.state.mode, Mode::ConfirmRemoteProjectedPaneClose);
         assert_eq!(
@@ -2414,5 +2504,51 @@ mod tests {
         assert_eq!(state.selected, 0);
         assert_eq!(state.mode, Mode::ConfirmClose);
         assert_eq!(state.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn cancel_rename_clears_remote_pane_target() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.mode = Mode::RenamePane;
+        state.rename_remote_pane_target = Some(crate::app::state::RemoteProjectedPaneTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: "term-1".into(),
+            label: "old label".into(),
+        });
+        state.name_input = "old label".into();
+
+        handle_rename_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.mode, Mode::Terminal);
+        assert!(state.rename_remote_pane_target.is_none());
+        assert!(state.name_input.is_empty());
+    }
+
+    #[test]
+    fn open_rename_remote_projected_pane_sets_rename_state() {
+        let mut state = state_with_workspaces(&["test"]);
+        let target = crate::app::state::RemoteProjectedPaneTarget {
+            host: "jafar".into(),
+            session: "default".into(),
+            terminal_id: "term-1".into(),
+            label: "my pane".into(),
+        };
+
+        super::App::open_rename_remote_projected_pane(&mut state, target.clone());
+
+        assert_eq!(state.mode, Mode::RenamePane);
+        assert_eq!(state.name_input, "my pane");
+        assert!(!state.name_input_replace_on_type);
+        assert!(state.rename_pane_target.is_none());
+        let stored = state
+            .rename_remote_pane_target
+            .as_ref()
+            .expect("target set");
+        assert_eq!(stored.host, "jafar");
+        assert_eq!(stored.terminal_id, "term-1");
     }
 }

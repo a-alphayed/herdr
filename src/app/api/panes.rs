@@ -33,6 +33,39 @@ const METADATA_SOURCE_MAX_CHARS: usize = 80;
 const METADATA_TTL_MIN_MS: u64 = 1;
 const METADATA_TTL_MAX_MS: u64 = 86_400_000;
 
+fn remote_pane_rename_request(id: String, pane_id: &str, label: Option<String>) -> Request {
+    Request {
+        id,
+        method: Method::PaneRename(PaneRenameParams {
+            pane_id: pane_id.to_string(),
+            label,
+        }),
+    }
+}
+
+fn remote_pane_focus_request(id: String, pane_id: &str) -> Request {
+    Request {
+        id,
+        method: Method::PaneFocus(PaneTarget {
+            pane_id: pane_id.to_string(),
+        }),
+    }
+}
+
+fn remote_pane_focus_direction_request(
+    id: String,
+    pane_id: &str,
+    direction: PaneDirection,
+) -> Request {
+    Request {
+        id,
+        method: Method::PaneFocusDirection(PaneFocusDirectionParams {
+            pane_id: Some(pane_id.to_string()),
+            direction,
+        }),
+    }
+}
+
 fn remote_pane_split_request(
     id: String,
     mut params: PaneSplitParams,
@@ -341,6 +374,233 @@ impl App {
         }
     }
 
+    fn remote_pane_host_connected_or_error(
+        &self,
+        host: &crate::remote_target::RemoteHostConfig,
+    ) -> Result<crate::remote_source::RemoteHostKey, ErrorBody> {
+        let host_key =
+            crate::remote_source::RemoteHostKey::new(host.name.clone(), host.session.clone());
+        let host_status = self.state.remote_sources.host_status(&host_key);
+        if host_status.is_some_and(|status| status.is_connected()) {
+            Ok(host_key)
+        } else {
+            let status = host_status
+                .and_then(|status| status.stale_label())
+                .unwrap_or("disconnected")
+                .to_string();
+            Err(ErrorBody {
+                code: "remote_host_not_connected".to_string(),
+                message: format!(
+                    "remote host {} is {status}; wait for it to reconnect before mutating a remote pane",
+                    host.name
+                ),
+            })
+        }
+    }
+
+    fn remote_pane_capability_unavailable_body(host: &str, method: &str) -> ErrorBody {
+        ErrorBody {
+            code: "remote_capability_unavailable".to_string(),
+            message: format!("remote host {host} does not advertise federation method {method}"),
+        }
+    }
+
+    fn plan_pane_target_remote_route(
+        &self,
+        pane_id: &str,
+    ) -> Result<
+        Option<(crate::remote_target::RemoteHostConfig, RemoteTargetSelector)>,
+        RemoteRoutePlanError,
+    > {
+        if self.remote_hosts.list().is_empty() {
+            return Ok(None);
+        }
+        let Some((host_alias, _)) = pane_id.split_once('/') else {
+            return Ok(None);
+        };
+        let Some(host) = self.remote_hosts.get(host_alias).cloned() else {
+            return Ok(None);
+        };
+        match crate::remote_target::parse_target_route(pane_id)? {
+            crate::remote_target::TargetRoute::Local { .. } => Ok(None),
+            crate::remote_target::TargetRoute::Remote { target, .. } => Ok(Some((host, target))),
+        }
+    }
+
+    fn handle_remote_pane_rename(
+        &self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        selector: RemoteTargetSelector,
+        label: Option<String>,
+    ) -> String {
+        self.handle_remote_pane_rename_with_sender(
+            id,
+            host,
+            selector,
+            label,
+            crate::remote::send_remote_api_request_to_host_noninteractive,
+        )
+    }
+
+    fn handle_remote_pane_rename_with_sender<F>(
+        &self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        selector: RemoteTargetSelector,
+        label: Option<String>,
+        send: F,
+    ) -> String
+    where
+        F: FnOnce(&crate::remote_target::RemoteHostConfig, &Request) -> std::io::Result<String>,
+    {
+        let host_key = match self.remote_pane_host_connected_or_error(&host) {
+            Ok(host_key) => host_key,
+            Err(err) => return encode_error_body(id, err),
+        };
+        if !self
+            .state
+            .remote_sources
+            .host_capabilities(&host_key)
+            .pane_rename
+        {
+            return encode_error_body(
+                id,
+                Self::remote_pane_capability_unavailable_body(
+                    &host.name,
+                    crate::api::schema::FederationCapabilities::PANE_RENAME,
+                ),
+            );
+        }
+        let resolved =
+            match resolve_remote_pane_target(&self.state.remote_sources, &host, &selector) {
+                Ok(resolved) => resolved,
+                Err(err) => return encode_error_body(id, remote_pane_resolve_error_body(err)),
+            };
+        let request = remote_pane_rename_request(id.clone(), &resolved.pane_id, label);
+        match send(&resolved.host, &request)
+            .and_then(|response| rewrite_remote_response_id(&response, &id))
+        {
+            Ok(response) => response,
+            Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
+        }
+    }
+
+    fn handle_remote_pane_focus(
+        &self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        selector: RemoteTargetSelector,
+    ) -> String {
+        self.handle_remote_pane_focus_with_sender(
+            id,
+            host,
+            selector,
+            crate::remote::send_remote_api_request_to_host_noninteractive,
+        )
+    }
+
+    fn handle_remote_pane_focus_with_sender<F>(
+        &self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        selector: RemoteTargetSelector,
+        send: F,
+    ) -> String
+    where
+        F: FnOnce(&crate::remote_target::RemoteHostConfig, &Request) -> std::io::Result<String>,
+    {
+        let host_key = match self.remote_pane_host_connected_or_error(&host) {
+            Ok(host_key) => host_key,
+            Err(err) => return encode_error_body(id, err),
+        };
+        if !self
+            .state
+            .remote_sources
+            .host_capabilities(&host_key)
+            .pane_focus
+        {
+            return encode_error_body(
+                id,
+                Self::remote_pane_capability_unavailable_body(
+                    &host.name,
+                    crate::api::schema::FederationCapabilities::PANE_FOCUS,
+                ),
+            );
+        }
+        let resolved =
+            match resolve_remote_pane_target(&self.state.remote_sources, &host, &selector) {
+                Ok(resolved) => resolved,
+                Err(err) => return encode_error_body(id, remote_pane_resolve_error_body(err)),
+            };
+        let request = remote_pane_focus_request(id.clone(), &resolved.pane_id);
+        match send(&resolved.host, &request)
+            .and_then(|response| rewrite_remote_response_id(&response, &id))
+        {
+            Ok(response) => response,
+            Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
+        }
+    }
+
+    fn handle_remote_pane_focus_direction(
+        &self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        selector: RemoteTargetSelector,
+        direction: PaneDirection,
+    ) -> String {
+        self.handle_remote_pane_focus_direction_with_sender(
+            id,
+            host,
+            selector,
+            direction,
+            crate::remote::send_remote_api_request_to_host_noninteractive,
+        )
+    }
+
+    fn handle_remote_pane_focus_direction_with_sender<F>(
+        &self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        selector: RemoteTargetSelector,
+        direction: PaneDirection,
+        send: F,
+    ) -> String
+    where
+        F: FnOnce(&crate::remote_target::RemoteHostConfig, &Request) -> std::io::Result<String>,
+    {
+        let host_key = match self.remote_pane_host_connected_or_error(&host) {
+            Ok(host_key) => host_key,
+            Err(err) => return encode_error_body(id, err),
+        };
+        if !self
+            .state
+            .remote_sources
+            .host_capabilities(&host_key)
+            .pane_focus_direction
+        {
+            return encode_error_body(
+                id,
+                Self::remote_pane_capability_unavailable_body(
+                    &host.name,
+                    crate::api::schema::FederationCapabilities::PANE_FOCUS_DIRECTION,
+                ),
+            );
+        }
+        let resolved =
+            match resolve_remote_pane_target(&self.state.remote_sources, &host, &selector) {
+                Ok(resolved) => resolved,
+                Err(err) => return encode_error_body(id, remote_pane_resolve_error_body(err)),
+            };
+        let request = remote_pane_focus_direction_request(id.clone(), &resolved.pane_id, direction);
+        match send(&resolved.host, &request)
+            .and_then(|response| rewrite_remote_response_id(&response, &id))
+        {
+            Ok(response) => response,
+            Err(err) => encode_error(id, "remote_request_failed", err.to_string()),
+        }
+    }
+
     pub(super) fn handle_pane_list(&mut self, id: String, params: PaneListParams) -> String {
         match self.collect_panes_for_workspace(params.workspace_id.as_deref()) {
             Ok(panes) => encode_success(id, ResponseResult::PaneList { panes }),
@@ -375,6 +635,13 @@ impl App {
     }
 
     pub(super) fn handle_pane_focus(&mut self, id: String, target: PaneTarget) -> String {
+        match self.plan_pane_target_remote_route(&target.pane_id) {
+            Ok(Some((host, selector))) => {
+                return self.handle_remote_pane_focus(id, host, selector);
+            }
+            Ok(None) => {}
+            Err(err) => return encode_error_body(id, remote_route_plan_error_body(err)),
+        }
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&target.pane_id) else {
             return pane_not_found(id, &target.pane_id);
         };
@@ -550,6 +817,20 @@ impl App {
         id: String,
         params: PaneFocusDirectionParams,
     ) -> String {
+        if let Some(pane_id) = params.pane_id.as_deref() {
+            match self.plan_pane_target_remote_route(pane_id) {
+                Ok(Some((host, selector))) => {
+                    return self.handle_remote_pane_focus_direction(
+                        id,
+                        host,
+                        selector,
+                        params.direction,
+                    );
+                }
+                Ok(None) => {}
+                Err(err) => return encode_error_body(id, remote_route_plan_error_body(err)),
+            }
+        }
         let Some((ws_idx, source_pane_id)) = self.resolve_optional_pane(params.pane_id.as_deref())
         else {
             return encode_error(id, "pane_not_found", "pane not found");
@@ -1341,6 +1622,13 @@ impl App {
     }
 
     pub(super) fn handle_pane_rename(&mut self, id: String, params: PaneRenameParams) -> String {
+        match self.plan_pane_target_remote_route(&params.pane_id) {
+            Ok(Some((host, selector))) => {
+                return self.handle_remote_pane_rename(id, host, selector, params.label);
+            }
+            Ok(None) => {}
+            Err(err) => return encode_error_body(id, remote_route_plan_error_body(err)),
+        }
         let Some((ws_idx, pane_id)) = self.parse_pane_id(&params.pane_id) else {
             return pane_not_found(id, &params.pane_id);
         };
@@ -4047,5 +4335,323 @@ mod tests {
 
             assert_eq!(metadata_error_code(&response), "invalid_metadata_ttl");
         }
+    }
+
+    fn seed_pane_remote_projection_with_capabilities(
+        app: &mut App,
+        caps: crate::remote_source::RemoteSourceCapabilities,
+    ) -> RemoteHostKey {
+        let host_key = RemoteHostKey::new("jafar", "default");
+        app.state
+            .remote_sources
+            .replace_connected_snapshot(host_key.clone(), Vec::new());
+        app.state.remote_sources.apply_projection_snapshot(
+            &host_key,
+            vec![RemoteProjectionSnapshot {
+                workspace_id: "remote-ws".to_string(),
+                tab_id: Some("remote-tab".to_string()),
+                tab_label: Some("remote".to_string()),
+                status: RemoteProjectionStatus::Available,
+                layout: Some(remote_projection_layout()),
+            }],
+        );
+        app.state.remote_sources.set_capabilities(&host_key, caps);
+        host_key
+    }
+
+    #[test]
+    fn pane_rename_without_remote_hosts_keeps_slash_target_local() {
+        let mut app = app_with_linked_worktree();
+
+        let response = app.handle_pane_rename(
+            "req".into(),
+            PaneRenameParams {
+                pane_id: "jafar/terminal:remote-term-focused".to_string(),
+                label: None,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "pane_not_found");
+    }
+
+    #[test]
+    fn pane_rename_missing_capability_rejects_before_send() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities::default(),
+        );
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+
+        let response = app.handle_remote_pane_rename_with_sender(
+            "req".into(),
+            host,
+            RemoteTargetSelector::Terminal("remote-term-focused".to_string()),
+            None,
+            |_host, _request| panic!("missing capability must not send"),
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "remote_capability_unavailable");
+        assert!(error
+            .error
+            .message
+            .contains(crate::api::schema::FederationCapabilities::PANE_RENAME));
+    }
+
+    #[test]
+    fn pane_rename_disconnected_projection_rejects_before_send() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        let host_key = seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_rename: true,
+                ..Default::default()
+            },
+        );
+        app.state
+            .remote_sources
+            .mark_status(&host_key, RemoteConnectionStatus::Unreachable);
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+
+        let response = app.handle_remote_pane_rename_with_sender(
+            "req".into(),
+            host,
+            RemoteTargetSelector::Terminal("remote-term-focused".to_string()),
+            None,
+            |_host, _request| panic!("disconnected host must not send"),
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "remote_host_not_connected");
+    }
+
+    #[test]
+    fn pane_rename_success_forwards_raw_pane_id() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_rename: true,
+                ..Default::default()
+            },
+        );
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+        let captured = std::cell::RefCell::new(None::<crate::api::schema::Request>);
+
+        let response = app.handle_remote_pane_rename_with_sender(
+            "local-req".into(),
+            host,
+            RemoteTargetSelector::Terminal("remote-term-focused".to_string()),
+            Some("new name".to_string()),
+            |sent_host, request| {
+                assert_eq!(sent_host.name, "jafar");
+                *captured.borrow_mut() = Some(request.clone());
+                Ok(r#"{"id":"remote-req","result":{"type":"ok"}}"#.to_string())
+            },
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["id"], "local-req");
+
+        let request = captured.into_inner().expect("request captured");
+        let Method::PaneRename(rename_params) = request.method else {
+            panic!("expected pane.rename");
+        };
+        assert_eq!(rename_params.pane_id, "remote-pane-focused");
+        assert_eq!(rename_params.label.as_deref(), Some("new name"));
+    }
+
+    #[test]
+    fn pane_focus_without_remote_hosts_keeps_slash_target_local() {
+        let mut app = app_with_linked_worktree();
+
+        let response = app.handle_pane_focus(
+            "req".into(),
+            crate::api::schema::PaneTarget {
+                pane_id: "jafar/terminal:remote-term-focused".to_string(),
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "pane_not_found");
+    }
+
+    #[test]
+    fn pane_focus_missing_capability_rejects_before_send() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities::default(),
+        );
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+
+        let response = app.handle_remote_pane_focus_with_sender(
+            "req".into(),
+            host,
+            RemoteTargetSelector::Terminal("remote-term-focused".to_string()),
+            |_host, _request| panic!("missing capability must not send"),
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "remote_capability_unavailable");
+        assert!(error
+            .error
+            .message
+            .contains(crate::api::schema::FederationCapabilities::PANE_FOCUS));
+    }
+
+    #[test]
+    fn pane_focus_success_forwards_raw_pane_id() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_focus: true,
+                ..Default::default()
+            },
+        );
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+        let captured = std::cell::RefCell::new(None::<crate::api::schema::Request>);
+
+        let response = app.handle_remote_pane_focus_with_sender(
+            "local-req".into(),
+            host,
+            RemoteTargetSelector::Terminal("remote-term-focused".to_string()),
+            |sent_host, request| {
+                assert_eq!(sent_host.name, "jafar");
+                *captured.borrow_mut() = Some(request.clone());
+                Ok(r#"{"id":"remote-req","result":{"type":"ok"}}"#.to_string())
+            },
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["id"], "local-req");
+
+        let request = captured.into_inner().expect("request captured");
+        let Method::PaneFocus(focus_params) = request.method else {
+            panic!("expected pane.focus");
+        };
+        assert_eq!(focus_params.pane_id, "remote-pane-focused");
+    }
+
+    #[test]
+    fn pane_focus_direction_without_remote_hosts_keeps_slash_target_local() {
+        let mut app = app_with_linked_worktree();
+
+        let response = app.handle_pane_focus_direction(
+            "req".into(),
+            PaneFocusDirectionParams {
+                pane_id: Some("jafar/terminal:remote-term-focused".to_string()),
+                direction: PaneDirection::Right,
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "pane_not_found");
+    }
+
+    #[test]
+    fn pane_focus_direction_missing_capability_rejects_before_send() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities::default(),
+        );
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+
+        let response = app.handle_remote_pane_focus_direction_with_sender(
+            "req".into(),
+            host,
+            RemoteTargetSelector::Terminal("remote-term-focused".to_string()),
+            PaneDirection::Right,
+            |_host, _request| panic!("missing capability must not send"),
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "remote_capability_unavailable");
+        assert!(error
+            .error
+            .message
+            .contains(crate::api::schema::FederationCapabilities::PANE_FOCUS_DIRECTION));
+    }
+
+    #[test]
+    fn pane_focus_direction_success_forwards_raw_pane_id_and_direction() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_focus_direction: true,
+                ..Default::default()
+            },
+        );
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+        let captured = std::cell::RefCell::new(None::<crate::api::schema::Request>);
+
+        let response = app.handle_remote_pane_focus_direction_with_sender(
+            "local-req".into(),
+            host,
+            RemoteTargetSelector::Terminal("remote-term-focused".to_string()),
+            PaneDirection::Right,
+            |sent_host, request| {
+                assert_eq!(sent_host.name, "jafar");
+                *captured.borrow_mut() = Some(request.clone());
+                Ok(r#"{"id":"remote-req","result":{"type":"ok"}}"#.to_string())
+            },
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["id"], "local-req");
+
+        let request = captured.into_inner().expect("request captured");
+        let Method::PaneFocusDirection(focus_params) = request.method else {
+            panic!("expected pane.focus_direction");
+        };
+        assert_eq!(focus_params.pane_id.as_deref(), Some("remote-pane-focused"));
+        assert_eq!(focus_params.direction, PaneDirection::Right);
     }
 }

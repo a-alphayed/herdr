@@ -462,6 +462,8 @@ pub(crate) fn parse_ping_response(response: &str) -> io::Result<RemoteSourceCapa
                 ),
                 workspace_create: federation
                     .supports_method(crate::api::schema::FederationCapabilities::WORKSPACE_CREATE),
+                workspace_rename: federation
+                    .supports_method(crate::api::schema::FederationCapabilities::WORKSPACE_RENAME),
                 tab_list: federation
                     .supports_method(crate::api::schema::FederationCapabilities::TAB_LIST),
                 tab_create: federation
@@ -470,6 +472,15 @@ pub(crate) fn parse_ping_response(response: &str) -> io::Result<RemoteSourceCapa
                     .supports_method(crate::api::schema::FederationCapabilities::TAB_FOCUS),
                 tab_close: federation
                     .supports_method(crate::api::schema::FederationCapabilities::TAB_CLOSE),
+                tab_rename: federation
+                    .supports_method(crate::api::schema::FederationCapabilities::TAB_RENAME),
+                pane_rename: federation
+                    .supports_method(crate::api::schema::FederationCapabilities::PANE_RENAME),
+                pane_focus: federation
+                    .supports_method(crate::api::schema::FederationCapabilities::PANE_FOCUS),
+                pane_focus_direction: federation.supports_method(
+                    crate::api::schema::FederationCapabilities::PANE_FOCUS_DIRECTION,
+                ),
                 layout_export: federation
                     .supports_method(crate::api::schema::FederationCapabilities::LAYOUT_EXPORT),
             })

@@ -696,6 +696,9 @@ fn federation_method_for_api_method(method: &crate::api::schema::Method) -> Opti
         crate::api::schema::Method::WorkspaceListLocal(_) => {
             Some(crate::api::schema::FederationCapabilities::WORKSPACE_LIST_LOCAL)
         }
+        crate::api::schema::Method::WorkspaceRename(_) => {
+            Some(crate::api::schema::FederationCapabilities::WORKSPACE_RENAME)
+        }
         crate::api::schema::Method::AgentList(_) => {
             Some(crate::api::schema::FederationCapabilities::AGENT_LIST)
         }
@@ -729,6 +732,15 @@ fn federation_method_for_api_method(method: &crate::api::schema::Method) -> Opti
         crate::api::schema::Method::PaneClose(_) => {
             Some(crate::api::schema::FederationCapabilities::PANE_CLOSE)
         }
+        crate::api::schema::Method::PaneRename(_) => {
+            Some(crate::api::schema::FederationCapabilities::PANE_RENAME)
+        }
+        crate::api::schema::Method::PaneFocus(_) => {
+            Some(crate::api::schema::FederationCapabilities::PANE_FOCUS)
+        }
+        crate::api::schema::Method::PaneFocusDirection(_) => {
+            Some(crate::api::schema::FederationCapabilities::PANE_FOCUS_DIRECTION)
+        }
         crate::api::schema::Method::TabCreate(_) => {
             Some(crate::api::schema::FederationCapabilities::TAB_CREATE)
         }
@@ -740,6 +752,9 @@ fn federation_method_for_api_method(method: &crate::api::schema::Method) -> Opti
         }
         crate::api::schema::Method::TabClose(_) => {
             Some(crate::api::schema::FederationCapabilities::TAB_CLOSE)
+        }
+        crate::api::schema::Method::TabRename(_) => {
+            Some(crate::api::schema::FederationCapabilities::TAB_RENAME)
         }
         crate::api::schema::Method::LayoutExport(_) => {
             Some(crate::api::schema::FederationCapabilities::LAYOUT_EXPORT)
@@ -3572,6 +3587,174 @@ mod tests {
                 crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
                 crate::api::schema::FederationCapabilities::LAYOUT_EXPORT
             ]
+        );
+    }
+
+    #[test]
+    fn federation_method_for_api_method_maps_rename_and_focus_methods() {
+        assert_eq!(
+            federation_method_for_api_method(&crate::api::schema::Method::WorkspaceRename(
+                crate::api::schema::WorkspaceRenameParams {
+                    workspace_id: "ws1".to_string(),
+                    label: "renamed".to_string(),
+                },
+            )),
+            Some(crate::api::schema::FederationCapabilities::WORKSPACE_RENAME)
+        );
+        assert_eq!(
+            federation_method_for_api_method(&crate::api::schema::Method::TabRename(
+                crate::api::schema::TabRenameParams {
+                    tab_id: "tab1".to_string(),
+                    label: "renamed".to_string(),
+                },
+            )),
+            Some(crate::api::schema::FederationCapabilities::TAB_RENAME)
+        );
+        assert_eq!(
+            federation_method_for_api_method(&crate::api::schema::Method::PaneRename(
+                crate::api::schema::PaneRenameParams {
+                    pane_id: "pane1".to_string(),
+                    label: Some("renamed".to_string()),
+                },
+            )),
+            Some(crate::api::schema::FederationCapabilities::PANE_RENAME)
+        );
+        assert_eq!(
+            federation_method_for_api_method(&crate::api::schema::Method::PaneFocus(
+                crate::api::schema::PaneTarget {
+                    pane_id: "pane1".to_string(),
+                },
+            )),
+            Some(crate::api::schema::FederationCapabilities::PANE_FOCUS)
+        );
+        assert_eq!(
+            federation_method_for_api_method(&crate::api::schema::Method::PaneFocusDirection(
+                crate::api::schema::PaneFocusDirectionParams {
+                    pane_id: None,
+                    direction: crate::api::schema::PaneDirection::Right,
+                },
+            )),
+            Some(crate::api::schema::FederationCapabilities::PANE_FOCUS_DIRECTION)
+        );
+    }
+
+    #[test]
+    fn required_federation_methods_include_workspace_rename_method() {
+        let request = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::WorkspaceRename(
+                crate::api::schema::WorkspaceRenameParams {
+                    workspace_id: "ws1".to_string(),
+                    label: "renamed".to_string(),
+                },
+            ),
+        };
+
+        let methods = required_federation_methods_for_request(&request);
+
+        assert_eq!(
+            methods,
+            vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::WORKSPACE_RENAME
+            ]
+        );
+    }
+
+    #[test]
+    fn required_federation_methods_include_tab_rename_method() {
+        let request = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::TabRename(crate::api::schema::TabRenameParams {
+                tab_id: "tab1".to_string(),
+                label: "renamed".to_string(),
+            }),
+        };
+
+        let methods = required_federation_methods_for_request(&request);
+
+        assert_eq!(
+            methods,
+            vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::TAB_RENAME
+            ]
+        );
+    }
+
+    #[test]
+    fn required_federation_methods_include_pane_rename_method() {
+        let request = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
+                pane_id: "pane1".to_string(),
+                label: None,
+            }),
+        };
+
+        let methods = required_federation_methods_for_request(&request);
+
+        assert_eq!(
+            methods,
+            vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::PANE_RENAME
+            ]
+        );
+    }
+
+    #[test]
+    fn required_federation_methods_include_pane_focus_method() {
+        let request = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
+                pane_id: "pane1".to_string(),
+            }),
+        };
+
+        let methods = required_federation_methods_for_request(&request);
+
+        assert_eq!(
+            methods,
+            vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::PANE_FOCUS
+            ]
+        );
+    }
+
+    #[test]
+    fn required_federation_methods_include_pane_focus_direction_method() {
+        let request = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::PaneFocusDirection(
+                crate::api::schema::PaneFocusDirectionParams {
+                    pane_id: None,
+                    direction: crate::api::schema::PaneDirection::Down,
+                },
+            ),
+        };
+
+        let methods = required_federation_methods_for_request(&request);
+
+        assert_eq!(
+            methods,
+            vec![
+                crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE,
+                crate::api::schema::FederationCapabilities::PANE_FOCUS_DIRECTION
+            ]
+        );
+    }
+
+    #[test]
+    fn federation_capabilities_current_advertises_rename_and_focus_methods() {
+        let caps = crate::api::schema::FederationCapabilities::current();
+        assert!(caps.supports_method(crate::api::schema::FederationCapabilities::WORKSPACE_RENAME));
+        assert!(caps.supports_method(crate::api::schema::FederationCapabilities::TAB_RENAME));
+        assert!(caps.supports_method(crate::api::schema::FederationCapabilities::PANE_RENAME));
+        assert!(caps.supports_method(crate::api::schema::FederationCapabilities::PANE_FOCUS));
+        assert!(
+            caps.supports_method(crate::api::schema::FederationCapabilities::PANE_FOCUS_DIRECTION)
         );
     }
 

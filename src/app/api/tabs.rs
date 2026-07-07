@@ -644,7 +644,95 @@ impl App {
         encode_success(id, ResponseResult::TabInfo { tab })
     }
 
+    fn handle_remote_tab_rename(
+        &mut self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        selector: RemoteTargetSelector,
+        params: TabRenameParams,
+    ) -> String {
+        self.handle_remote_tab_rename_with_sender(
+            id,
+            host,
+            selector,
+            params,
+            crate::remote::send_remote_api_request_to_host_noninteractive,
+        )
+    }
+
+    fn handle_remote_tab_rename_with_sender<F>(
+        &mut self,
+        id: String,
+        host: crate::remote_target::RemoteHostConfig,
+        selector: RemoteTargetSelector,
+        params: TabRenameParams,
+        mut send: F,
+    ) -> String
+    where
+        F: FnMut(&crate::remote_target::RemoteHostConfig, &Request) -> std::io::Result<String>,
+    {
+        let host_key = match self.remote_host_connected_or_error(&host, "tab") {
+            Ok(host_key) => host_key,
+            Err(err) => return encode_error_body(id, err),
+        };
+        if !self
+            .state
+            .remote_sources
+            .host_capabilities(&host_key)
+            .tab_rename
+        {
+            return encode_error_body(
+                id,
+                remote_capability_unavailable_body(
+                    &host.name,
+                    crate::api::schema::FederationCapabilities::TAB_RENAME,
+                ),
+            );
+        }
+        let resolved = match resolve_remote_tab_target(&self.state.remote_sources, &host, &selector)
+        {
+            Ok(resolved) => resolved,
+            Err(err) => return encode_error_body(id, remote_tab_resolve_error_body(err)),
+        };
+        let tab_id = resolved.tab.tab_id.clone();
+        let workspace_id = resolved.workspace_id.clone();
+        let request = Request {
+            id: id.clone(),
+            method: Method::TabRename(TabRenameParams {
+                tab_id: tab_id.clone(),
+                label: params.label,
+            }),
+        };
+        let response_value = match send(&resolved.host, &request)
+            .and_then(|response| rewrite_remote_response_id_value(&response, &id))
+        {
+            Ok(value) => value,
+            Err(err) => return encode_error(id, "remote_request_failed", err.to_string()),
+        };
+        if let Some(success) = parse_remote_success_response_value(response_value.clone()) {
+            if let ResponseResult::TabInfo { tab } = success.result {
+                self.state.remote_sources.upsert_tab(&host_key, tab);
+                self.refresh_remote_workspace_tabs_and_projection(
+                    &resolved.host,
+                    &host_key,
+                    &workspace_id,
+                    Some(&tab_id),
+                    &mut send,
+                );
+            }
+        }
+        serde_json::to_string(&response_value)
+            .unwrap_or_else(|err| encode_error(id, "remote_request_failed", err.to_string()))
+    }
+
     pub(super) fn handle_tab_rename(&mut self, id: String, params: TabRenameParams) -> String {
+        match self.plan_tab_target_remote_route(&params.tab_id) {
+            Ok(Some((host, selector))) => {
+                return self.handle_remote_tab_rename(id, host, selector, params);
+            }
+            Ok(None) => {}
+            Err(err) => return encode_error_body(id, remote_route_plan_error_body(err)),
+        }
         let Some((ws_idx, tab_idx)) = self.parse_tab_id(&params.tab_id) else {
             return tab_not_found(id, &params.tab_id);
         };
@@ -989,12 +1077,12 @@ mod tests {
             &host,
             crate::remote_source::RemoteSourceCapabilities {
                 workspace_list_local: true,
-                workspace_create: false,
                 tab_list: true,
                 tab_create: true,
                 tab_focus: true,
                 tab_close: true,
                 layout_export: true,
+                ..Default::default()
             },
         );
         host
@@ -1154,12 +1242,10 @@ mod tests {
             &host_key,
             crate::remote_source::RemoteSourceCapabilities {
                 workspace_list_local: true,
-                workspace_create: false,
-                tab_list: false,
                 tab_create: true,
                 tab_focus: true,
                 tab_close: true,
-                layout_export: false,
+                ..Default::default()
             },
         );
         let host = app.remote_hosts.get("jafar").unwrap().clone();
@@ -1381,5 +1467,138 @@ mod tests {
             crate::worktree::canonical_or_original(&cached_cwd)
         );
         shutdown_test_runtimes(&mut app);
+    }
+
+    fn seed_remote_tab_rename_cache(app: &mut App) -> RemoteHostKey {
+        let host_key = seed_remote_tab_cache(app);
+        app.state.remote_sources.set_capabilities(
+            &host_key,
+            crate::remote_source::RemoteSourceCapabilities {
+                workspace_list_local: true,
+                tab_list: true,
+                tab_create: true,
+                tab_focus: true,
+                tab_close: true,
+                tab_rename: true,
+                layout_export: true,
+                ..Default::default()
+            },
+        );
+        host_key
+    }
+
+    #[test]
+    fn tab_rename_without_remote_hosts_keeps_slash_target_local() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            true,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+
+        let response = app.handle_tab_rename(
+            "req".into(),
+            TabRenameParams {
+                tab_id: "jafar/tab:remote-tab-1".to_string(),
+                label: "new name".to_string(),
+            },
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "tab_not_found");
+    }
+
+    #[test]
+    fn tab_rename_missing_capability_rejects_before_send() {
+        let mut app = app_with_remote_host();
+        // seed cache without tab_rename capability
+        seed_remote_tab_cache(&mut app);
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+
+        let response = app.handle_remote_tab_rename_with_sender(
+            "req".into(),
+            host,
+            RemoteTargetSelector::Tab("remote-tab-1".to_string()),
+            TabRenameParams {
+                tab_id: "jafar/tab:remote-tab-1".to_string(),
+                label: "new name".to_string(),
+            },
+            |_host, _request| panic!("missing capability must not send"),
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "remote_capability_unavailable");
+        assert!(error
+            .error
+            .message
+            .contains(crate::api::schema::FederationCapabilities::TAB_RENAME));
+    }
+
+    #[test]
+    fn tab_rename_stale_metadata_rejects_before_send() {
+        let mut app = app_with_remote_host();
+        let host_key = seed_remote_tab_rename_cache(&mut app);
+        app.state
+            .remote_sources
+            .mark_status(&host_key, RemoteConnectionStatus::Disconnected);
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+
+        let response = app.handle_remote_tab_rename_with_sender(
+            "req".into(),
+            host,
+            RemoteTargetSelector::Tab("remote-tab-1".to_string()),
+            TabRenameParams {
+                tab_id: "jafar/tab:remote-tab-1".to_string(),
+                label: "new name".to_string(),
+            },
+            |_host, _request| panic!("disconnected host must not send"),
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "remote_host_not_connected");
+    }
+
+    #[test]
+    fn tab_rename_success_forwards_raw_tab_id_and_updates_cache() {
+        let mut app = app_with_remote_host();
+        let host_key = seed_remote_tab_rename_cache(&mut app);
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+        let captured = std::cell::RefCell::new(None::<Request>);
+
+        let renamed_tab = remote_tab("remote-tab-1", true);
+        let tab_info_response = remote_tab_info_response("remote-req", renamed_tab.clone());
+
+        let response = app.handle_remote_tab_rename_with_sender(
+            "local-req".into(),
+            host,
+            RemoteTargetSelector::Tab("remote-tab-1".to_string()),
+            TabRenameParams {
+                tab_id: "jafar/tab:remote-tab-1".to_string(),
+                label: "renamed".to_string(),
+            },
+            |sent_host, request| {
+                assert_eq!(sent_host.name, "jafar");
+                if captured.borrow().is_none() {
+                    *captured.borrow_mut() = Some(request.clone());
+                }
+                Ok(tab_info_response.clone())
+            },
+        );
+
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["id"], "local-req");
+
+        let request = captured.into_inner().expect("request captured");
+        let Method::TabRename(rename_params) = request.method else {
+            panic!("expected tab.rename");
+        };
+        assert_eq!(rename_params.tab_id, "remote-tab-1");
+        assert_eq!(rename_params.label, "renamed");
+
+        // Cache was updated (upsert_tab re-inserts the entry)
+        let snapshots = app.state.remote_sources.tab_snapshots_for_host(&host_key);
+        assert!(!snapshots.is_empty());
     }
 }

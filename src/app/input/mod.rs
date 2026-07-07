@@ -343,6 +343,9 @@ impl App {
                     MouseAction::RemoteProjectedTabFocus { target } => {
                         self.focus_remote_projected_tab_via_api(target);
                     }
+                    MouseAction::RemoteProjectedPaneFocus { target } => {
+                        self.focus_remote_projected_pane_via_api(target);
+                    }
                     MouseAction::FocusToastTarget => self.focus_toast_target_via_api(),
                     MouseAction::MoveWorkspace {
                         source_ws_idx,

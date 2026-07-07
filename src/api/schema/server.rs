@@ -51,8 +51,13 @@ impl FederationCapabilities {
     pub const AGENT_FOCUS: &'static str = "agent_focus";
     pub const AGENT_START: &'static str = "agent_start";
     pub const AGENT_TEARDOWN: &'static str = "agent_teardown";
+    pub const WORKSPACE_RENAME: &'static str = "workspace_rename";
+    pub const TAB_RENAME: &'static str = "tab_rename";
     pub const PANE_SPLIT: &'static str = "pane_split";
     pub const PANE_CLOSE: &'static str = "pane_close";
+    pub const PANE_RENAME: &'static str = "pane_rename";
+    pub const PANE_FOCUS: &'static str = "pane_focus";
+    pub const PANE_FOCUS_DIRECTION: &'static str = "pane_focus_direction";
     pub const TAB_LIST: &'static str = "tab_list";
     pub const TAB_CREATE: &'static str = "tab_create";
     pub const TAB_FOCUS: &'static str = "tab_focus";
@@ -66,6 +71,7 @@ impl FederationCapabilities {
                 Self::REMOTE_API_BRIDGE,
                 Self::WORKSPACE_CREATE,
                 Self::WORKSPACE_LIST_LOCAL,
+                Self::WORKSPACE_RENAME,
                 Self::AGENT_LIST,
                 Self::AGENT_LIST_LOCAL,
                 Self::AGENT_GET,
@@ -77,10 +83,14 @@ impl FederationCapabilities {
                 Self::AGENT_TEARDOWN,
                 Self::PANE_SPLIT,
                 Self::PANE_CLOSE,
+                Self::PANE_RENAME,
+                Self::PANE_FOCUS,
+                Self::PANE_FOCUS_DIRECTION,
                 Self::TAB_LIST,
                 Self::TAB_CREATE,
                 Self::TAB_FOCUS,
                 Self::TAB_CLOSE,
+                Self::TAB_RENAME,
                 Self::LAYOUT_EXPORT,
                 Self::TERMINAL_ATTACH,
             ]

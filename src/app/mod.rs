@@ -649,6 +649,7 @@ impl App {
             pending_remote_attach: None,
             pending_remote_projected_pane_close: None,
             pending_remote_projected_tab_close: None,
+            rename_remote_pane_target: None,
             pending_remote_workspace_creates: std::collections::BTreeMap::new(),
             next_remote_workspace_create_token: 1,
             creating_new_tab: false,

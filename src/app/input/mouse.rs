@@ -52,6 +52,9 @@ pub(super) enum MouseAction {
     RemoteProjectedTabFocus {
         target: RemoteProjectedTabTarget,
     },
+    RemoteProjectedPaneFocus {
+        target: RemoteProjectedPaneTarget,
+    },
     FocusToastTarget,
     MoveWorkspace {
         source_ws_idx: usize,
@@ -695,11 +698,12 @@ impl AppState {
                     }
                 } else if self.selected_remote_space.is_some() {
                     // Left-click in the projection body area. Projection hit
-                    // areas take precedence: a click on a live pane schedules
-                    // an attach split and clears the selection; a click on a
-                    // stale/read-only pane is silently consumed; a miss is a
-                    // no-op — the else-if chain disables local pane hit-testing
-                    // while a remote projection is selected.
+                    // areas take precedence: a click on a live pane dispatches
+                    // remote focus and keeps the projection selected (attach is
+                    // Enter or context menu); a click on a stale/read-only pane
+                    // is silently consumed; a miss is a no-op — the else-if
+                    // chain disables local pane hit-testing while a remote
+                    // projection is selected.
                     let col = mouse.column;
                     let row = mouse.row;
                     if let Some(hit) = self
@@ -764,14 +768,14 @@ impl AppState {
                     {
                         if hit.live {
                             if let Some(terminal_id) = hit.terminal_id {
-                                self.request_remote_attach_in_new_split =
-                                    Some(crate::remote_source::RemoteAttachTarget {
+                                return Some(MouseAction::RemoteProjectedPaneFocus {
+                                    target: RemoteProjectedPaneTarget {
                                         host: hit.host,
                                         session: hit.session,
                                         terminal_id,
                                         label: hit.label,
-                                    });
-                                self.selected_remote_space = None;
+                                    },
+                                });
                             }
                         }
                     }
@@ -3595,7 +3599,18 @@ mod tests {
         assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
         assert_eq!(app.state.mode, Mode::ContextMenu);
         let menu = app.state.context_menu.as_ref().expect("remote pane menu");
-        assert_eq!(menu.items(), &["Split right", "Split down", "Close pane"]);
+        assert_eq!(
+            menu.items(),
+            &[
+                "Attach in new split",
+                "Focus pane",
+                "Rename pane",
+                "Clear pane name",
+                "Split right",
+                "Split down",
+                "Close pane",
+            ]
+        );
         match &menu.kind {
             ContextMenuKind::RemoteProjectedPane { target } => {
                 assert_eq!(target.host, "jafar");
@@ -4400,5 +4415,108 @@ mod tests {
         };
 
         assert_eq!(wheel_routing(input_state), WheelRouting::HostScroll);
+    }
+
+    #[test]
+    fn left_click_live_projected_pane_returns_focus_action() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("local");
+        let focused = ws.tabs[0].root_pane;
+        let target_local = ws.test_split(Direction::Horizontal);
+        ws.tabs[0].layout.focus_pane(focused);
+        app.state.workspaces = vec![ws];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let target_rect = app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == target_local)
+            .expect("target pane info")
+            .inner_rect;
+        let selected = remote_space_key();
+        app.state.selected_remote_space = Some(selected.clone());
+        app.state.view.remote_projection_hit_areas = vec![remote_projection_hit(
+            target_rect,
+            true,
+            Some("remote-term-1"),
+        )];
+
+        let action = app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                target_rect.x,
+                target_rect.y,
+            ),
+        );
+
+        assert_eq!(app.state.selected_remote_space, Some(selected));
+        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert!(
+            app.state.request_remote_attach_in_new_split.is_none(),
+            "left-click should not trigger attach"
+        );
+        match action {
+            Some(MouseAction::RemoteProjectedPaneFocus { target }) => {
+                assert_eq!(target.host, "jafar");
+                assert_eq!(target.session, crate::session::DEFAULT_SESSION_NAME);
+                assert_eq!(target.terminal_id, "remote-term-1");
+                assert_eq!(target.label, "remote pane");
+            }
+            _ => panic!("expected RemoteProjectedPaneFocus"),
+        }
+    }
+
+    #[test]
+    fn left_click_stale_projected_pane_does_not_return_focus_action() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("local");
+        let focused = ws.tabs[0].root_pane;
+        let target_local = ws.test_split(Direction::Horizontal);
+        ws.tabs[0].layout.focus_pane(focused);
+        app.state.workspaces = vec![ws];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+        let target_rect = app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == target_local)
+            .expect("target pane info")
+            .inner_rect;
+        let selected = remote_space_key();
+        app.state.selected_remote_space = Some(selected.clone());
+        // stale: live=false
+        app.state.view.remote_projection_hit_areas = vec![remote_projection_hit(
+            target_rect,
+            false,
+            Some("remote-term-1"),
+        )];
+
+        let action = app.state.handle_mouse(
+            &mut app.terminal_runtimes,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                target_rect.x,
+                target_rect.y,
+            ),
+        );
+
+        assert!(
+            !matches!(action, Some(MouseAction::RemoteProjectedPaneFocus { .. })),
+            "stale projected pane should not return focus action"
+        );
+        assert!(app.state.request_remote_attach_in_new_split.is_none());
     }
 }

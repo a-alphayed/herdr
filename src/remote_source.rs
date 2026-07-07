@@ -120,10 +120,15 @@ pub(crate) struct RemoteHostStatusEntry {
 pub(crate) struct RemoteSourceCapabilities {
     pub(crate) workspace_list_local: bool,
     pub(crate) workspace_create: bool,
+    pub(crate) workspace_rename: bool,
     pub(crate) tab_list: bool,
     pub(crate) tab_create: bool,
     pub(crate) tab_focus: bool,
     pub(crate) tab_close: bool,
+    pub(crate) tab_rename: bool,
+    pub(crate) pane_rename: bool,
+    pub(crate) pane_focus: bool,
+    pub(crate) pane_focus_direction: bool,
     pub(crate) layout_export: bool,
 }
 
@@ -817,6 +822,7 @@ mod tests {
                 tab_focus: true,
                 tab_close: true,
                 layout_export: true,
+                ..Default::default()
             },
         );
 
@@ -831,6 +837,7 @@ mod tests {
                 tab_focus: true,
                 tab_close: true,
                 layout_export: true,
+                ..Default::default()
             }
         );
         assert!(!cache.host_supports_workspace_create(&other));

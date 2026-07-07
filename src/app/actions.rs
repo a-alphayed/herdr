@@ -4079,6 +4079,7 @@ mod tests {
                 tab_focus: true,
                 tab_close: true,
                 layout_export: true,
+                ..Default::default()
             },
             projections: Vec::new(),
             tabs: Vec::new(),
@@ -4096,6 +4097,7 @@ mod tests {
                 tab_focus: true,
                 tab_close: true,
                 layout_export: true,
+                ..Default::default()
             }
         );
     }
