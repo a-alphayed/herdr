@@ -119,6 +119,19 @@ manage_ssh_config = true
 
 When enabled, `herdr --remote` writes a private temporary SSH config that includes your `~/.ssh/config` and `/etc/ssh/ssh_config` first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own keepalive settings win. Herdr also uses a private per-attach OpenSSH control socket to reuse the first authenticated connection. Set `manage_ssh_config = false` to run remote attach through plain `ssh` without Herdr's generated config or control socket.
 
+Configured remote hosts define named aliases used by federated/host-qualified remote API controls (remote status/check, agent/pane/tab/workspace routed operations) and configured-host terminal attach. `herdr --remote <target>` at the root still takes a raw SSH target and does not resolve these aliases.
+
+```toml
+[[remote.hosts]]
+name = "jafar"
+target = "jafar"
+session = "default"
+auto_connect = true
+connect_timeout_secs = 10
+```
+
+`connect_timeout_secs` bounds the SSH `ConnectTimeout` (whole seconds) used for connection attempts to this host, for both interactive and noninteractive configured-host SSH invocations. Optional; defaults to 10 seconds. Must be between 1 and 300 seconds inclusive; an out-of-range value fails config validation.
+
 ## Keybindings
 
 For a guided introduction to the prefix and a vetted prefix-free setup, see [Keyboard](/docs/keyboard/).

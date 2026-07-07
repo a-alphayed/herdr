@@ -24,11 +24,11 @@ const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 const SSH_CONTROL_SOCKET_NAME: &str = "ctl";
+// `ConnectTimeout` is parameterized per host (see `RemoteSsh::connect_timeout_secs`);
+// these remaining noninteractive options stay static.
 const NONINTERACTIVE_SSH_OPTIONS: &[&str] = &[
     "-o",
     "BatchMode=yes",
-    "-o",
-    "ConnectTimeout=10",
     "-o",
     "ServerAliveInterval=5",
     "-o",
@@ -190,7 +190,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         .config
         .remote
         .manage_ssh_config;
-    let remote_ssh = RemoteSsh::new(remote.target.clone(), manage_ssh_config);
+    let remote_ssh = RemoteSsh::new_for_target(remote.target.clone(), manage_ssh_config);
     let prepared_remote = prepare_remote_herdr(&remote_ssh, remote.live_handoff)?;
     ensure_remote_server_ready(
         &remote_ssh,
@@ -206,21 +206,22 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         local_socket.clone(),
         session_name,
         remote_ssh.options(),
+        None,
     )?;
 
     run_client_process(&local_socket, &reattach_command, remote.keybindings)
 }
 
 fn remote_ssh_for_host(host: &crate::remote_target::RemoteHostConfig) -> RemoteSsh {
-    remote_ssh_for_target(host.target.clone())
-}
-
-fn remote_ssh_for_target(target: String) -> RemoteSsh {
     let manage_ssh_config = crate::config::Config::load()
         .config
         .remote
         .manage_ssh_config;
-    RemoteSsh::new(target, manage_ssh_config)
+    RemoteSsh::new_for_host(
+        host.target.clone(),
+        manage_ssh_config,
+        host.connect_timeout_secs,
+    )
 }
 
 pub(crate) fn run_remote_terminal_attach(
@@ -252,6 +253,7 @@ pub(crate) fn run_remote_terminal_attach(
         local_socket.clone(),
         host.session.clone(),
         remote_ssh.options(),
+        Some(host.connect_timeout_secs),
     )?;
 
     crate::client::run_terminal_attach_at_socket(&local_socket, terminal_id, takeover)
@@ -1147,10 +1149,20 @@ impl Drop for ManagedSshConfig {
 struct RemoteSsh {
     target: String,
     managed_config: Option<ManagedSshConfig>,
+    /// SSH `ConnectTimeout` override, in seconds. `None` means there is no
+    /// configured-host override: bare-target interactive commands keep the
+    /// prior no-explicit-`ConnectTimeout` behavior, while bare-target
+    /// noninteractive commands (`command_with_mode` with
+    /// `SshInvocationMode::Noninteractive`) fall back to
+    /// `DEFAULT_CONNECT_TIMEOUT_SECS` to preserve the previous hardcoded
+    /// noninteractive timeout. `Some(secs)` is used for configured-host
+    /// connections, which carry a bounded `connect_timeout_secs` and always
+    /// win for both interactive and noninteractive commands.
+    connect_timeout_secs: Option<u32>,
 }
 
 impl RemoteSsh {
-    fn new(target: String, manage_ssh_config: bool) -> Self {
+    fn new(target: String, manage_ssh_config: bool, connect_timeout_secs: Option<u32>) -> Self {
         let managed_config = if manage_ssh_config {
             write_managed_ssh_config()
                 .inspect_err(|err| {
@@ -1164,7 +1176,24 @@ impl RemoteSsh {
         Self {
             target,
             managed_config,
+            connect_timeout_secs,
         }
+    }
+
+    /// Bare target-only helpers (e.g. `herdr --remote <target>`) have no
+    /// `RemoteHostConfig`, so this carries no configured-host override
+    /// (`None`). Interactive commands preserve prior behavior: no explicit
+    /// `ConnectTimeout`. Noninteractive commands (`command_with_mode` with
+    /// `SshInvocationMode::Noninteractive`) still fall back to
+    /// `DEFAULT_CONNECT_TIMEOUT_SECS`, preserving the previous hardcoded
+    /// noninteractive timeout.
+    fn new_for_target(target: String, manage_ssh_config: bool) -> Self {
+        Self::new(target, manage_ssh_config, None)
+    }
+
+    /// Configured-host connections carry a bounded `connect_timeout_secs`.
+    fn new_for_host(target: String, manage_ssh_config: bool, connect_timeout_secs: u32) -> Self {
+        Self::new(target, manage_ssh_config, Some(connect_timeout_secs))
     }
 
     fn target(&self) -> &str {
@@ -1182,6 +1211,25 @@ impl RemoteSsh {
     fn command_with_mode(&self, mode: SshInvocationMode) -> Command {
         let mut command = self.base_command();
         command.arg("-T");
+        // Interactive commands only get an explicit `ConnectTimeout` when a
+        // configured host provides one; bare-target interactive commands
+        // keep the prior no-explicit-timeout behavior. Noninteractive
+        // commands always get an explicit `ConnectTimeout`: a configured
+        // host's bound wins, and bare-target noninteractive commands fall
+        // back to `DEFAULT_CONNECT_TIMEOUT_SECS` to preserve the previous
+        // hardcoded noninteractive timeout.
+        let effective_connect_timeout_secs = match mode {
+            SshInvocationMode::Interactive => self.connect_timeout_secs,
+            SshInvocationMode::Noninteractive => Some(
+                self.connect_timeout_secs
+                    .unwrap_or(crate::remote_target::DEFAULT_CONNECT_TIMEOUT_SECS),
+            ),
+        };
+        if let Some(connect_timeout_secs) = effective_connect_timeout_secs {
+            command
+                .arg("-o")
+                .arg(format!("ConnectTimeout={connect_timeout_secs}"));
+        }
         if mode == SshInvocationMode::Noninteractive {
             command.args(NONINTERACTIVE_SSH_OPTIONS);
         }
@@ -1313,6 +1361,25 @@ fn apply_managed_ssh_options(command: &mut Command, options: Option<&ManagedSshO
         .arg("ControlMaster=auto")
         .arg("-o")
         .arg("ControlPersist=yes");
+}
+
+/// Applies managed ssh config/control-socket options plus an optional bounded
+/// `ConnectTimeout` to a bridge `ssh` command, mirroring
+/// `RemoteSsh::command_with_mode`'s behavior: bare bridges (no
+/// `RemoteHostConfig`) pass `None` and keep the prior no-explicit-timeout
+/// behavior, while configured-host bridges pass `Some(host.connect_timeout_secs)`.
+fn apply_bridge_ssh_options(
+    command: &mut Command,
+    ssh_options: Option<&ManagedSshOptions>,
+    connect_timeout_secs: Option<u32>,
+) {
+    apply_managed_ssh_options(command, ssh_options);
+    command.arg("-T");
+    if let Some(connect_timeout_secs) = connect_timeout_secs {
+        command
+            .arg("-o")
+            .arg(format!("ConnectTimeout={connect_timeout_secs}"));
+    }
 }
 
 impl InstallSource {
@@ -2432,6 +2499,7 @@ impl SshStdioBridge {
         local_socket: PathBuf,
         session_name: String,
         ssh_options: Option<&ManagedSshOptions>,
+        connect_timeout_secs: Option<u32>,
     ) -> io::Result<Self> {
         let _ = std::fs::remove_file(&local_socket);
         let listener = UnixListener::bind(&local_socket)?;
@@ -2457,6 +2525,7 @@ impl SshStdioBridge {
                             &remote_herdr,
                             &session_name,
                             thread_ssh_options.as_ref(),
+                            connect_timeout_secs,
                         ) {
                             eprintln!("herdr: remote bridge failed: {err}");
                         }
@@ -2591,11 +2660,11 @@ fn bridge_connection(
     remote_herdr: &RemoteHerdr,
     session_name: &str,
     ssh_options: Option<&ManagedSshOptions>,
+    connect_timeout_secs: Option<u32>,
 ) -> io::Result<()> {
     let mut command = Command::new("ssh");
-    apply_managed_ssh_options(&mut command, ssh_options);
+    apply_bridge_ssh_options(&mut command, ssh_options, connect_timeout_secs);
     command
-        .arg("-T")
         .arg(target)
         .arg(remote_bridge_command(remote_herdr, session_name));
     command
@@ -2786,6 +2855,7 @@ mod tests {
             socket.clone(),
             "default".to_string(),
             None,
+            None,
         )
         .expect("start bridge listener");
 
@@ -2794,6 +2864,61 @@ mod tests {
 
         drop(bridge);
         let _ = std::fs::remove_file(socket);
+    }
+
+    #[test]
+    fn bare_bridge_ssh_options_do_not_add_connect_timeout() {
+        let mut command = Command::new("ssh");
+        apply_bridge_ssh_options(&mut command, None, None);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(args, vec!["-T"]);
+    }
+
+    #[test]
+    fn configured_host_bridge_ssh_options_add_connect_timeout() {
+        let mut command = Command::new("ssh");
+        apply_bridge_ssh_options(&mut command, None, Some(20));
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(args, vec!["-T", "-o", "ConnectTimeout=20"]);
+    }
+
+    #[test]
+    fn bridge_ssh_options_still_apply_managed_config() {
+        let managed = ManagedSshOptions {
+            config_path: PathBuf::from("/tmp/herdr-bridge-test-config"),
+            control_path: PathBuf::from("/tmp/herdr-bridge-test-control"),
+        };
+        let mut command = Command::new("ssh");
+        apply_bridge_ssh_options(&mut command, Some(&managed), Some(30));
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            args,
+            vec![
+                "-F",
+                "/tmp/herdr-bridge-test-config",
+                "-S",
+                "/tmp/herdr-bridge-test-control",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPersist=yes",
+                "-T",
+                "-o",
+                "ConnectTimeout=30",
+            ]
+        );
     }
 
     #[test]
@@ -3834,6 +3959,7 @@ mod tests {
         let ssh = RemoteSsh {
             target: "example".to_string(),
             managed_config: Some(managed_config),
+            connect_timeout_secs: None,
         };
 
         let command = ssh.command();
@@ -3864,6 +3990,7 @@ mod tests {
         let ssh = RemoteSsh {
             target: "example".to_string(),
             managed_config: None,
+            connect_timeout_secs: None,
         };
 
         let command = ssh.command();
@@ -3880,6 +4007,7 @@ mod tests {
         let ssh = RemoteSsh {
             target: "jafar".to_string(),
             managed_config: None,
+            connect_timeout_secs: Some(crate::remote_target::DEFAULT_CONNECT_TIMEOUT_SECS),
         };
         let command = ssh.command_with_mode(SshInvocationMode::Noninteractive);
         let args: Vec<_> = command
@@ -3892,9 +4020,69 @@ mod tests {
             vec![
                 "-T",
                 "-o",
+                "ConnectTimeout=10",
+                "-o",
                 "BatchMode=yes",
                 "-o",
+                "ServerAliveInterval=5",
+                "-o",
+                "ServerAliveCountMax=2",
+                "jafar",
+            ]
+        );
+    }
+
+    #[test]
+    fn noninteractive_ssh_command_falls_back_to_default_connect_timeout_for_bare_target() {
+        let ssh = RemoteSsh {
+            target: "jafar".to_string(),
+            managed_config: None,
+            connect_timeout_secs: None,
+        };
+        let command = ssh.command_with_mode(SshInvocationMode::Noninteractive);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            args,
+            vec![
+                "-T",
+                "-o",
                 "ConnectTimeout=10",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ServerAliveInterval=5",
+                "-o",
+                "ServerAliveCountMax=2",
+                "jafar",
+            ]
+        );
+    }
+
+    #[test]
+    fn noninteractive_ssh_command_uses_custom_connect_timeout_and_keeps_static_options() {
+        let ssh = RemoteSsh {
+            target: "jafar".to_string(),
+            managed_config: None,
+            connect_timeout_secs: Some(45),
+        };
+        let command = ssh.command_with_mode(SshInvocationMode::Noninteractive);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            args,
+            vec![
+                "-T",
+                "-o",
+                "ConnectTimeout=45",
+                "-o",
+                "BatchMode=yes",
                 "-o",
                 "ServerAliveInterval=5",
                 "-o",
@@ -3909,6 +4097,7 @@ mod tests {
         let ssh = RemoteSsh {
             target: "jafar".to_string(),
             managed_config: None,
+            connect_timeout_secs: None,
         };
         let command = ssh.command_with_mode(SshInvocationMode::Interactive);
         let args: Vec<_> = command
@@ -3917,6 +4106,42 @@ mod tests {
             .collect();
 
         assert_eq!(args, vec!["-T", "jafar"]);
+    }
+
+    #[test]
+    fn interactive_ssh_command_uses_custom_configured_host_connect_timeout() {
+        let ssh = RemoteSsh {
+            target: "jafar".to_string(),
+            managed_config: None,
+            connect_timeout_secs: Some(20),
+        };
+        let command = ssh.command_with_mode(SshInvocationMode::Interactive);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(args, vec!["-T", "-o", "ConnectTimeout=20", "jafar"]);
+    }
+
+    #[test]
+    fn remote_ssh_new_for_target_has_no_connect_timeout_for_bare_target() {
+        let ssh = RemoteSsh::new_for_target("jafar".to_string(), false);
+        assert_eq!(ssh.connect_timeout_secs, None);
+    }
+
+    #[test]
+    fn remote_ssh_new_for_host_uses_configured_connect_timeout() {
+        let ssh = RemoteSsh::new_for_host("jafar".to_string(), false, 42);
+        assert_eq!(ssh.connect_timeout_secs, Some(42));
+    }
+
+    #[test]
+    fn remote_ssh_for_host_uses_host_connect_timeout() {
+        let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true)
+            .with_connect_timeout_secs(37);
+        let ssh = remote_ssh_for_host(&host);
+        assert_eq!(ssh.connect_timeout_secs, Some(37));
     }
 
     #[test]

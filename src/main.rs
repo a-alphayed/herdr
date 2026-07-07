@@ -344,6 +344,19 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # force keepalive or multiplexing off, it only stops herdr from adding its own.
 # manage_ssh_config = true
 
+# Configured remote hosts define aliases used by federated/host-qualified
+# remote API controls and configured-host terminal attach (not
+# `herdr --remote <target>`, which takes a raw SSH target). Each entry needs
+# a unique name and an SSH target; session, auto_connect, and
+# connect_timeout_secs are optional.
+# [[remote.hosts]]
+# name = "jafar"
+# target = "jafar"
+# session = "default"
+# auto_connect = true
+# # SSH ConnectTimeout in whole seconds (1..=300); default 10.
+# connect_timeout_secs = 10
+
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.
 # allow_nested = false

@@ -1064,6 +1064,28 @@ mod tests {
     }
 
     #[test]
+    fn agent_start_remote_host_config_resolves_configured_connect_timeout() {
+        // `agent start --host` dispatches through `send_remote_api_request_to_host`
+        // using this resolved host, so a custom bounded connect timeout must
+        // survive alias resolution (on-demand hosts still dispatch, now bounded).
+        let mut config = crate::config::Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar",
+            "user@jafar:2222",
+            "fed-agents",
+            false,
+        )];
+        config.remote.hosts[0].connect_timeout_secs = 25;
+
+        let host = configured_remote_start_host_from_config(&config, "jafar")
+            .expect("configured start host");
+
+        assert_eq!(host.connect_timeout_secs, 25);
+        assert!(!host.auto_connect);
+    }
+
+    #[test]
     fn agent_submit_requires_target_and_text() {
         // Insufficient args must surface usage before any request is sent.
         let code = agent_submit(&[]).unwrap();

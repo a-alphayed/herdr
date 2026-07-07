@@ -401,6 +401,7 @@ name = "jafar"
 target = "jafar"
 session = "default"
 auto_connect = true
+connect_timeout_secs = 10
 
 [[remote.hosts]]
 name = "work-mini"
@@ -416,6 +417,7 @@ Rules:
 - `session` is the Herdr session name on the remote host, not a workspace/space.
 - Multiple sessions on the same SSH target should be configured with distinct aliases, e.g. `jafar-default` and `jafar-agents`.
 - The remote source key is `(host_alias, session_name)`, not just host.
+- `connect_timeout_secs` bounds the SSH `ConnectTimeout` (whole seconds) used for connection attempts to this host, for both interactive and noninteractive configured-host SSH invocations. Optional; defaults to 10 seconds (matching the previous hardcoded noninteractive default). Must be a non-zero value no greater than 300 seconds; config with an out-of-range value is rejected.
 
 Provisioning split:
 
@@ -1100,6 +1102,8 @@ struct RemoteHostConfig {
     target: String,
     session: String,
     auto_connect: bool,
+    /// SSH `ConnectTimeout` in whole seconds. Default: 10.
+    connect_timeout_secs: u32,
 }
 ```
 

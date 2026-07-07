@@ -1222,6 +1222,87 @@ target = "jafar"
     }
 
     #[test]
+    fn remote_host_defaults_connect_timeout_secs_to_ten() {
+        let config: Config = toml::from_str(
+            r#"
+[remote]
+enabled = true
+
+[[remote.hosts]]
+name = "jafar"
+target = "jafar"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.remote.hosts[0].connect_timeout_secs, 10);
+    }
+
+    #[test]
+    fn remote_host_parses_custom_connect_timeout_secs() {
+        let config: Config = toml::from_str(
+            r#"
+[remote]
+enabled = true
+
+[[remote.hosts]]
+name = "jafar"
+target = "jafar"
+connect_timeout_secs = 30
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.remote.hosts[0].connect_timeout_secs, 30);
+    }
+
+    #[test]
+    fn remote_host_out_of_range_connect_timeout_secs_fails_registry_validation() {
+        let config: Config = toml::from_str(
+            r#"
+[remote]
+enabled = true
+
+[[remote.hosts]]
+name = "jafar"
+target = "jafar"
+connect_timeout_secs = 0
+"#,
+        )
+        .unwrap();
+
+        let err = crate::remote_target::RemoteHostRegistry::from_configs(config.remote.hosts)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            crate::remote_target::RemoteHostConfigError::ConnectTimeoutZero
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+[remote]
+enabled = true
+
+[[remote.hosts]]
+name = "jafar"
+target = "jafar"
+connect_timeout_secs = 301
+"#,
+        )
+        .unwrap();
+
+        let err = crate::remote_target::RemoteHostRegistry::from_configs(config.remote.hosts)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            crate::remote_target::RemoteHostConfigError::ConnectTimeoutTooLarge {
+                value: 301,
+                max: 300,
+            }
+        );
+    }
+
+    #[test]
     fn agent_panel_sort_config_parses_alias_and_defaults() {
         assert_eq!(
             Config::default().ui.agent_panel_sort,

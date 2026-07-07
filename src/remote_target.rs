@@ -142,6 +142,18 @@ fn default_auto_connect() -> bool {
     true
 }
 
+/// Default SSH `ConnectTimeout` (seconds) for a configured remote host, used
+/// when a host config omits `connect_timeout_secs`. Matches the timeout that
+/// was previously hardcoded for noninteractive SSH invocations.
+pub(crate) const DEFAULT_CONNECT_TIMEOUT_SECS: u32 = 10;
+
+/// Conservative upper bound for a configured host's SSH connect timeout.
+pub(crate) const MAX_CONNECT_TIMEOUT_SECS: u32 = 300;
+
+fn default_connect_timeout_secs() -> u32 {
+    DEFAULT_CONNECT_TIMEOUT_SECS
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub(crate) struct RemoteHostConfig {
     pub(crate) name: String,
@@ -150,6 +162,11 @@ pub(crate) struct RemoteHostConfig {
     pub(crate) session: String,
     #[serde(default = "default_auto_connect")]
     pub(crate) auto_connect: bool,
+    /// SSH `ConnectTimeout` in whole seconds for connection attempts to this
+    /// host. Applies to both interactive and noninteractive configured-host
+    /// SSH invocations. Default: 10 seconds.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub(crate) connect_timeout_secs: u32,
 }
 
 impl RemoteHostConfig {
@@ -165,7 +182,14 @@ impl RemoteHostConfig {
             target: target.into(),
             session: session.into(),
             auto_connect,
+            connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_connect_timeout_secs(mut self, connect_timeout_secs: u32) -> Self {
+        self.connect_timeout_secs = connect_timeout_secs;
+        self
     }
 }
 
@@ -176,6 +200,8 @@ pub(crate) enum RemoteHostConfigError {
     SshTargetStartsWithDash,
     EmptySession,
     DuplicateAlias(String),
+    ConnectTimeoutZero,
+    ConnectTimeoutTooLarge { value: u32, max: u32 },
 }
 
 impl std::fmt::Display for RemoteHostConfigError {
@@ -186,6 +212,13 @@ impl std::fmt::Display for RemoteHostConfigError {
             Self::SshTargetStartsWithDash => write!(f, "remote SSH target cannot start with '-'"),
             Self::EmptySession => write!(f, "remote session cannot be empty"),
             Self::DuplicateAlias(alias) => write!(f, "duplicate remote alias: {alias}"),
+            Self::ConnectTimeoutZero => {
+                write!(f, "remote connect_timeout_secs cannot be 0")
+            }
+            Self::ConnectTimeoutTooLarge { value, max } => write!(
+                f,
+                "remote connect_timeout_secs {value} exceeds maximum of {max}"
+            ),
         }
     }
 }
@@ -224,6 +257,15 @@ impl RemoteHostRegistry {
         }
         if config.session.is_empty() {
             return Err(RemoteHostConfigError::EmptySession);
+        }
+        if config.connect_timeout_secs == 0 {
+            return Err(RemoteHostConfigError::ConnectTimeoutZero);
+        }
+        if config.connect_timeout_secs > MAX_CONNECT_TIMEOUT_SECS {
+            return Err(RemoteHostConfigError::ConnectTimeoutTooLarge {
+                value: config.connect_timeout_secs,
+                max: MAX_CONNECT_TIMEOUT_SECS,
+            });
         }
         if self.hosts.contains_key(&config.name) {
             return Err(RemoteHostConfigError::DuplicateAlias(config.name));
@@ -1347,6 +1389,61 @@ mod tests {
 
         assert_eq!(registry.get("work").unwrap().target, "user@host");
         assert_eq!(registry.get("ports").unwrap().target, "host:2222");
+    }
+
+    #[test]
+    fn remote_target_config_new_defaults_connect_timeout_to_ten_seconds() {
+        let config = RemoteHostConfig::new("jafar", "jafar", "default", true);
+        assert_eq!(config.connect_timeout_secs, DEFAULT_CONNECT_TIMEOUT_SECS);
+        assert_eq!(config.connect_timeout_secs, 10);
+    }
+
+    #[test]
+    fn remote_target_config_accepts_custom_connect_timeout() {
+        let config =
+            RemoteHostConfig::new("jafar", "jafar", "default", true).with_connect_timeout_secs(30);
+        assert_eq!(config.connect_timeout_secs, 30);
+    }
+
+    #[test]
+    fn remote_target_registry_rejects_zero_connect_timeout() {
+        let err = RemoteHostRegistry::from_configs(vec![RemoteHostConfig::new(
+            "jafar", "jafar", "default", true,
+        )
+        .with_connect_timeout_secs(0)])
+        .unwrap_err();
+
+        assert_eq!(err, RemoteHostConfigError::ConnectTimeoutZero);
+    }
+
+    #[test]
+    fn remote_target_registry_rejects_excessive_connect_timeout() {
+        let err = RemoteHostRegistry::from_configs(vec![RemoteHostConfig::new(
+            "jafar", "jafar", "default", true,
+        )
+        .with_connect_timeout_secs(MAX_CONNECT_TIMEOUT_SECS + 1)])
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            RemoteHostConfigError::ConnectTimeoutTooLarge {
+                value: MAX_CONNECT_TIMEOUT_SECS + 1,
+                max: MAX_CONNECT_TIMEOUT_SECS,
+            }
+        );
+    }
+
+    #[test]
+    fn remote_target_registry_accepts_custom_connect_timeout_and_preserves_auto_connect() {
+        let registry = RemoteHostRegistry::from_configs(vec![RemoteHostConfig::new(
+            "jafar", "jafar", "default", true,
+        )
+        .with_connect_timeout_secs(45)])
+        .unwrap();
+
+        let host = registry.get("jafar").unwrap();
+        assert_eq!(host.connect_timeout_secs, 45);
+        assert!(host.auto_connect);
     }
 
     #[test]
