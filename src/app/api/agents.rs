@@ -103,6 +103,12 @@ impl App {
                     )),
                 );
             };
+            // Cached non-connected hosts fail fast before dispatch. A missing
+            // cache entry (e.g. auto_connect=false / on-demand hosts) is not a
+            // known-bad status, so it keeps the existing on-demand behavior.
+            if let Err(err) = remote_agent_start_host_precheck(&self.state.remote_sources, &host) {
+                return encode_error_body(id, err);
+            }
             return self.handle_remote_agent_start(id, host, params);
         }
 
@@ -361,6 +367,35 @@ impl App {
         plan_target_route(&self.remote_hosts, target)
     }
 
+    /// Reject a resolved remote agent mutation before any SSH bridge send
+    /// when the resolved cached entry's connection status is non-connected
+    /// (`Disconnected`, `Unreachable`, or `NeedsUpdate`). This runs AFTER
+    /// `resolve_remote_agent_target` so a missing agent/host cache entry
+    /// still surfaces the existing resolve error (`remote_agent_not_found`,
+    /// ambiguous, unsupported selector) instead of this one.
+    /// `agent.get`/`agent.list` must not use this: they show stale cached
+    /// entries rather than fail.
+    fn remote_agent_resolved_connected_or_error(
+        host: &crate::remote_target::RemoteHostConfig,
+        resolved: &crate::remote_target::RemoteAgentResolution,
+    ) -> Result<(), ErrorBody> {
+        if resolved.entry.status.is_connected() {
+            Ok(())
+        } else {
+            let status = resolved
+                .entry
+                .status
+                .stale_label()
+                .unwrap_or("disconnected")
+                .to_string();
+            Err(remote_agent_host_not_connected_body(
+                &host.name,
+                &host.session,
+                status,
+            ))
+        }
+    }
+
     fn handle_remote_agent_focus(
         &self,
         id: String,
@@ -373,6 +408,9 @@ impl App {
                 Ok(resolved) => resolved,
                 Err(err) => return encode_error_body(id, remote_agent_resolve_error_body(err)),
             };
+        if let Err(err) = Self::remote_agent_resolved_connected_or_error(&host, &resolved) {
+            return encode_error_body(id, err);
+        }
         let request = remote_agent_focus_request(
             id.clone(),
             target,
@@ -423,6 +461,9 @@ impl App {
                 Ok(resolved) => resolved,
                 Err(err) => return encode_error_body(id, remote_agent_resolve_error_body(err)),
             };
+        if let Err(err) = Self::remote_agent_resolved_connected_or_error(&host, &resolved) {
+            return encode_error_body(id, err);
+        }
         let request = remote_agent_send_request(
             id.clone(),
             params,
@@ -448,6 +489,9 @@ impl App {
                 Ok(resolved) => resolved,
                 Err(err) => return encode_error_body(id, remote_agent_resolve_error_body(err)),
             };
+        if let Err(err) = Self::remote_agent_resolved_connected_or_error(&host, &resolved) {
+            return encode_error_body(id, err);
+        }
         let request = remote_agent_submit_request(
             id.clone(),
             params,
@@ -472,6 +516,9 @@ impl App {
                 Ok(resolved) => resolved,
                 Err(err) => return encode_error_body(id, remote_agent_resolve_error_body(err)),
             };
+        if let Err(err) = Self::remote_agent_resolved_connected_or_error(&host, &resolved) {
+            return encode_error_body(id, err);
+        }
         // Confirmation was already enforced by the local entrypoint; the
         // forwarded request always carries confirm: true and targets the
         // resolved authoritative terminal id.
@@ -612,6 +659,39 @@ fn prefix_remote_agent_label_field(
         return;
     };
     *value = serde_json::Value::String(format!("{host}/{label}"));
+}
+
+fn remote_agent_host_not_connected_body(host: &str, session: &str, status: String) -> ErrorBody {
+    ErrorBody {
+        code: "remote_host_not_connected".to_string(),
+        message: format!(
+            "remote host {host}/{session} is {status}; wait for it to reconnect before mutating a remote agent"
+        ),
+    }
+}
+
+/// Pure precheck for `agent.start --host`: fail fast when a cached remote host
+/// entry exists and is non-connected. A missing cache entry (e.g.
+/// `auto_connect=false` / an on-demand host with no prior snapshot) is not a
+/// known-bad status and must keep the existing on-demand dispatch behavior,
+/// unlike the pane precheck which rejects `None`.
+fn remote_agent_start_host_precheck(
+    cache: &crate::remote_source::RemoteSourceCache,
+    host: &crate::remote_target::RemoteHostConfig,
+) -> Result<(), ErrorBody> {
+    let host_key =
+        crate::remote_source::RemoteHostKey::new(host.name.clone(), host.session.clone());
+    match cache.host_status(&host_key) {
+        Some(status) if !status.is_connected() => {
+            let status_label = status.stale_label().unwrap_or("disconnected").to_string();
+            Err(remote_agent_host_not_connected_body(
+                &host.name,
+                &host.session,
+                status_label,
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn remote_agent_resolve_error_body(err: RemoteAgentResolveError) -> ErrorBody {
@@ -1362,5 +1442,233 @@ mod tests {
         let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
 
         assert_eq!(parsed.error.code, "confirmation_required");
+    }
+
+    fn app_with_stale_remote_agent(status: crate::remote_source::RemoteConnectionStatus) -> App {
+        let mut config = crate::config::Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar", "jafar", "default", true,
+        )];
+        let mut app = test_app(&config);
+        let host = RemoteHostKey::new("jafar", "default");
+        app.state.remote_sources.replace_connected_snapshot(
+            host.clone(),
+            vec![remote_agent("term-1", "pane-1", "codex")],
+        );
+        app.state.remote_sources.mark_status(&host, status);
+        app
+    }
+
+    #[test]
+    fn remote_agent_focus_fails_fast_for_disconnected_host_without_bridge_send() {
+        // The configured host is "jafar" (target host name); if the
+        // precheck did not fire before the SSH bridge send, this test would
+        // hang/fail trying to actually connect instead of returning
+        // promptly with remote_host_not_connected.
+        let mut app =
+            app_with_stale_remote_agent(crate::remote_source::RemoteConnectionStatus::Disconnected);
+
+        let response = app.handle_agent_focus(
+            "req".into(),
+            AgentTarget {
+                target: "jafar/codex".to_string(),
+            },
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.error.code, "remote_host_not_connected");
+        assert!(parsed.error.message.contains("jafar/default"));
+        assert!(parsed.error.message.contains("disconnected"));
+    }
+
+    #[test]
+    fn remote_agent_send_fails_fast_for_unreachable_host_without_bridge_send() {
+        let mut app =
+            app_with_stale_remote_agent(crate::remote_source::RemoteConnectionStatus::Unreachable);
+
+        let response = app.handle_agent_send(
+            "req".into(),
+            AgentSendParams {
+                target: "jafar/codex".to_string(),
+                text: "hello".to_string(),
+            },
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.error.code, "remote_host_not_connected");
+        assert!(parsed.error.message.contains("jafar/default"));
+        assert!(parsed.error.message.contains("unreachable"));
+    }
+
+    #[test]
+    fn remote_agent_submit_fails_fast_for_needs_update_host_without_bridge_send() {
+        let mut app =
+            app_with_stale_remote_agent(crate::remote_source::RemoteConnectionStatus::NeedsUpdate);
+
+        let response = app.handle_agent_submit(
+            "req".into(),
+            crate::api::schema::AgentSubmitParams {
+                target: "jafar/codex".to_string(),
+                text: "continue".to_string(),
+            },
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.error.code, "remote_host_not_connected");
+        assert!(parsed.error.message.contains("jafar/default"));
+        assert!(parsed.error.message.contains("needs update"));
+    }
+
+    #[test]
+    fn remote_agent_confirmed_teardown_fails_fast_for_disconnected_host_without_bridge_send() {
+        let mut app =
+            app_with_stale_remote_agent(crate::remote_source::RemoteConnectionStatus::Disconnected);
+
+        let response = app.handle_agent_teardown(
+            "req".into(),
+            AgentTeardownParams {
+                target: "jafar/codex".to_string(),
+                confirm: true,
+            },
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.error.code, "remote_host_not_connected");
+    }
+
+    #[test]
+    fn remote_agent_teardown_unconfirmed_still_refuses_on_disconnected_host() {
+        // The confirmation gate must fire before the (also-failing) host
+        // connectivity precheck: an unconfirmed teardown on a disconnected
+        // host still returns confirmation_required, not
+        // remote_host_not_connected.
+        let mut app =
+            app_with_stale_remote_agent(crate::remote_source::RemoteConnectionStatus::Disconnected);
+
+        let response = app.handle_agent_teardown(
+            "req".into(),
+            AgentTeardownParams {
+                target: "jafar/codex".to_string(),
+                confirm: false,
+            },
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.error.code, "confirmation_required");
+    }
+
+    #[test]
+    fn remote_agent_get_still_returns_stale_status_alongside_mutation_prechecks() {
+        // agent.get/list must keep showing stale cached entries even though
+        // mutations now fail fast for the same host status.
+        let mut app =
+            app_with_stale_remote_agent(crate::remote_source::RemoteConnectionStatus::Unreachable);
+
+        let response = app.handle_agent_get(
+            "req".into(),
+            AgentTarget {
+                target: "jafar/codex".to_string(),
+            },
+        );
+        let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::AgentInfo { agent } = parsed.result else {
+            panic!("expected agent info");
+        };
+
+        assert_eq!(agent.custom_status.as_deref(), Some("unreachable"));
+    }
+
+    #[test]
+    fn remote_agent_focus_with_no_cached_agent_returns_not_found_not_host_disconnected() {
+        // A configured host with an empty remote-agent cache (no snapshot ever
+        // replaced in, so no host status and no cached agent entries) must
+        // resolve to remote_agent_not_found: the connectivity precheck only
+        // fires AFTER a resolved cache entry exists, so a missing agent/host
+        // cache entry keeps the existing resolve error instead of being
+        // misread as remote_host_not_connected.
+        let mut config = crate::config::Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar", "jafar", "default", true,
+        )];
+        let mut app = test_app(&config);
+
+        let response = app.handle_agent_focus(
+            "req".into(),
+            AgentTarget {
+                target: "jafar/codex".to_string(),
+            },
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.error.code, "remote_agent_not_found");
+    }
+
+    #[test]
+    fn agent_start_host_fails_fast_for_cached_disconnected_status() {
+        let mut app =
+            app_with_stale_remote_agent(crate::remote_source::RemoteConnectionStatus::Disconnected);
+
+        let response = app.handle_agent_start(
+            "req".into(),
+            AgentStartParams {
+                host: Some("jafar".to_string()),
+                name: "codex".to_string(),
+                cwd: None,
+                workspace_id: None,
+                tab_id: None,
+                split: None,
+                focus: false,
+                new_workspace: false,
+                argv: vec!["codex".to_string()],
+                env: Default::default(),
+            },
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.error.code, "remote_host_not_connected");
+        assert!(parsed.error.message.contains("jafar/default"));
+        assert!(parsed.error.message.contains("disconnected"));
+    }
+
+    #[test]
+    fn agent_start_host_precheck_pure_helper_covers_all_non_connected_statuses() {
+        let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true);
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let mut cache = crate::remote_source::RemoteSourceCache::default();
+
+        for status in [
+            crate::remote_source::RemoteConnectionStatus::Disconnected,
+            crate::remote_source::RemoteConnectionStatus::Unreachable,
+            crate::remote_source::RemoteConnectionStatus::NeedsUpdate,
+        ] {
+            cache.ensure_host(host_key.clone(), status);
+            cache.mark_status(&host_key, status);
+            let err = remote_agent_start_host_precheck(&cache, &host).unwrap_err();
+            assert_eq!(err.code, "remote_host_not_connected");
+        }
+    }
+
+    #[test]
+    fn agent_start_host_precheck_pure_helper_allows_no_cache_entry_on_demand_host() {
+        // A host with no cache entry at all (auto_connect=false / genuinely
+        // on-demand, never yet connected) must NOT be rejected: this keeps
+        // the existing on-demand dispatch behavior, unlike the pane precheck
+        // which rejects None.
+        let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", false);
+        let cache = crate::remote_source::RemoteSourceCache::default();
+
+        assert!(remote_agent_start_host_precheck(&cache, &host).is_ok());
+    }
+
+    #[test]
+    fn agent_start_host_precheck_pure_helper_allows_connected_host() {
+        let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true);
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let mut cache = crate::remote_source::RemoteSourceCache::default();
+        cache.replace_connected_snapshot(host_key, Vec::new());
+
+        assert!(remote_agent_start_host_precheck(&cache, &host).is_ok());
     }
 }

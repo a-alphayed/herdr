@@ -249,6 +249,76 @@ PY
   run_remote_ssh "/usr/local/bin/herdr --session $REMOTE_SESSION pane report-agent $pane_id --source smoke --agent smoke-agent --state working" >/dev/null
 }
 
+AGENT_STATUS_HELPER="$BASE/agent_status_helper.py"
+cat >"$AGENT_STATUS_HELPER" <<'PY'
+import json
+import sys
+
+# Shared non-connected classifier: any custom_status Herdr surfaces for a
+# stale/non-connected cached remote agent entry (see
+# RemoteConnectionStatus::stale_label in src/remote_source.rs). Both the
+# shutdown-phase wait (accept any of these) and the reconnect-phase wait
+# (reject any of these) must use this same set so a status like
+# "unreachable" is never mistaken for connected.
+NON_CONNECTED_STATUSES = {"disconnected", "unreachable", "needs update"}
+
+
+def parse_payload(text):
+    decoder = json.JSONDecoder()
+    idx = 0
+    payload = None
+    while idx < len(text):
+        idx = text.find("{", idx)
+        if idx == -1:
+            break
+        try:
+            payload, idx = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            idx += 1
+            continue
+    return payload
+
+
+def find_agent_custom_status(text, expected_name):
+    # Returns (found, custom_status). "found" is True only when an agent
+    # entry matching expected_name exists; custom_status is whatever value
+    # (including None/absent) that entry carries. Callers must not conflate
+    # "not found" with "found but custom_status is None" -- a truly
+    # connected agent typically has no custom_status at all.
+    payload = parse_payload(text)
+    if payload is None:
+        return False, None
+    for agent in (payload.get("result") or {}).get("agents") or []:
+        labels = {
+            agent.get("agent"),
+            agent.get("display_agent"),
+            agent.get("name"),
+            agent.get("title"),
+        }
+        if expected_name in labels:
+            return True, agent.get("custom_status")
+    return False, None
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1]
+    text = sys.argv[2]
+    expected_name = sys.argv[3]
+    found, status = find_agent_custom_status(text, expected_name)
+    if mode == "non-connected":
+        # Shutdown phase: succeed only once the agent is present AND its
+        # cached status is one of the recognized non-connected statuses.
+        raise SystemExit(0 if found and status in NON_CONNECTED_STATUSES else 1)
+    elif mode == "connected":
+        # Reconnect phase: succeed only once the agent is present AND its
+        # cached status is absent/None or any value NOT in the recognized
+        # non-connected set. Symmetric with "non-connected" above so
+        # "unreachable" is never wrongly accepted as connected.
+        raise SystemExit(0 if found and status not in NON_CONNECTED_STATUSES else 1)
+    else:
+        raise SystemExit(f"unknown agent_status_helper mode: {mode!r}")
+PY
+
 json_has_agent() {
   local payload="$1"
   local expected_name="$2"
@@ -376,45 +446,25 @@ wait_for_local_agent() {
 }
 
 wait_for_local_agent_disconnected() {
+  # Despite the name, this accepts any recognized non-connected custom_status
+  # (disconnected, unreachable, needs update): a forcibly removed container
+  # can surface any of these depending on how the SSH bridge observes the
+  # teardown, and all three are equally valid proof the shutdown phase took
+  # effect.
   local expected_name="$1"
   local timeout_seconds="$2"
   local deadline=$((SECONDS + timeout_seconds))
   while (( SECONDS < deadline )); do
     local list_json
     list_json="$(run_herdr "$LOCAL_SESSION" agent list 2>/dev/null || true)"
-    if [[ -n "$list_json" ]] && python3 - "$list_json" "$expected_name" <<'PY'
-import json
-import sys
-
-text = sys.argv[1]
-expected_name = sys.argv[2]
-decoder = json.JSONDecoder()
-idx = 0
-payload = None
-while idx < len(text):
-    idx = text.find("{", idx)
-    if idx == -1:
-        break
-    try:
-        payload, idx = decoder.raw_decode(text, idx)
-    except json.JSONDecodeError:
-        idx += 1
-        continue
-if payload is None:
-    raise SystemExit(1)
-for agent in (payload.get("result") or {}).get("agents") or []:
-    labels = {agent.get("agent"), agent.get("display_agent"), agent.get("name"), agent.get("title")}
-    if expected_name in labels and agent.get("custom_status") == "disconnected":
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
+    if [[ -n "$list_json" ]] && python3 "$AGENT_STATUS_HELPER" non-connected "$list_json" "$expected_name"
     then
       printf '%s' "$list_json"
       return 0
     fi
     sleep 1
   done
-  echo "error: local agent list did not mark $expected_name disconnected within ${timeout_seconds}s" >&2
+  echo "error: local agent list did not mark $expected_name non-connected (disconnected/unreachable/needs update) within ${timeout_seconds}s" >&2
   return 1
 }
 
@@ -427,32 +477,11 @@ wait_for_single_connected_local_agent() {
     list_json="$(run_herdr "$LOCAL_SESSION" agent list 2>/dev/null || true)"
     if [[ -n "$list_json" ]]; then
       count="$(json_agent_count "$list_json" "$expected_name")"
-      if [[ "$count" == "1" ]] && python3 - "$list_json" "$expected_name" <<'PY'
-import json
-import sys
-
-text = sys.argv[1]
-expected_name = sys.argv[2]
-decoder = json.JSONDecoder()
-idx = 0
-payload = None
-while idx < len(text):
-    idx = text.find("{", idx)
-    if idx == -1:
-        break
-    try:
-        payload, idx = decoder.raw_decode(text, idx)
-    except json.JSONDecodeError:
-        idx += 1
-        continue
-if payload is None:
-    raise SystemExit(1)
-for agent in (payload.get("result") or {}).get("agents") or []:
-    labels = {agent.get("agent"), agent.get("display_agent"), agent.get("name"), agent.get("title")}
-    if expected_name in labels:
-        raise SystemExit(0 if agent.get("custom_status") != "disconnected" else 1)
-raise SystemExit(1)
-PY
+      # Symmetric with wait_for_local_agent_disconnected's non-connected
+      # check above: reject ANY recognized non-connected status here, not
+      # only the literal "disconnected" string, so "unreachable" is never
+      # wrongly accepted as connected.
+      if [[ "$count" == "1" ]] && python3 "$AGENT_STATUS_HELPER" connected "$list_json" "$expected_name"
       then
         printf '%s' "$list_json"
         return 0
