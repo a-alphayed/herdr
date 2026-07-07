@@ -1271,8 +1271,7 @@ impl AppState {
             .into_iter()
             .filter_map(|entry| match entry {
                 crate::ui::WorkspaceListEntry::Workspace { ws_idx, .. } => Some(ws_idx),
-                crate::ui::WorkspaceListEntry::RemoteSpace { .. }
-                | crate::ui::WorkspaceListEntry::RemoteNew { .. } => None,
+                crate::ui::WorkspaceListEntry::RemoteSpace { .. } => None,
             })
             .collect::<Vec<_>>();
         if order.is_empty() {

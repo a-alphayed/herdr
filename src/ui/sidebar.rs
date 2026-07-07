@@ -725,6 +725,27 @@ pub(crate) fn grouped_child_display_label(
         .to_string()
 }
 
+/// UI-only metadata extracted from `WorkspaceInfo` for rendering a remote space row.
+/// Avoids storing the full (large) `WorkspaceInfo` inside the enum variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RemoteSpaceMetadata {
+    focused: bool,
+    agent_status: crate::api::schema::AgentStatus,
+    pane_count: usize,
+    tab_count: usize,
+}
+
+impl RemoteSpaceMetadata {
+    fn from_workspace_info(info: &crate::api::schema::WorkspaceInfo) -> Self {
+        Self {
+            focused: info.focused,
+            agent_status: info.agent_status,
+            pane_count: info.pane_count,
+            tab_count: info.tab_count,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkspaceListEntry {
     Workspace {
@@ -735,9 +756,9 @@ pub(crate) enum WorkspaceListEntry {
         key: crate::remote_source::RemoteSpaceKey,
         label: String,
         status: crate::remote_source::RemoteConnectionStatus,
-    },
-    RemoteNew {
-        host: crate::remote_source::RemoteHostKey,
+        /// UI metadata when available (metadata-backed spaces).
+        /// `None` for agent-derived fallback spaces.
+        metadata: Option<RemoteSpaceMetadata>,
     },
 }
 
@@ -790,7 +811,6 @@ fn workspace_list_entry_content_height(app: &AppState, entry: &WorkspaceListEntr
             }
         }
         WorkspaceListEntry::RemoteSpace { .. } => 1,
-        WorkspaceListEntry::RemoteNew { .. } => 1,
     }
 }
 
@@ -802,7 +822,6 @@ fn workspace_list_entry_gap_after(entries: &[WorkspaceListEntry], idx: usize) ->
         Some(WorkspaceListEntry::RemoteSpace { .. }) => {
             u16::from(!next_entry_is_remote_space(entries, idx))
         }
-        Some(WorkspaceListEntry::RemoteNew { .. }) => 0,
         None => 0,
     }
 }
@@ -957,9 +976,6 @@ fn remote_workspace_list_entries_for_host(
     }
 
     let spaces = agents_by_host.get(host);
-    let status = remote_host_status(app, host, spaces);
-    let can_create_remote_workspace =
-        status.is_connected() && app.remote_sources.host_supports_workspace_create(host);
 
     let mut entries = Vec::new();
     match app.remote_sources.workspace_entries_for_host(host) {
@@ -967,15 +983,17 @@ fn remote_workspace_list_entries_for_host(
         Some(workspaces) => {
             let mut metadata_ids = std::collections::BTreeSet::new();
             for entry in workspaces {
-                metadata_ids.insert(entry.workspace.workspace_id.clone());
+                let ws = entry.workspace;
+                metadata_ids.insert(ws.workspace_id.clone());
                 entries.push(WorkspaceListEntry::RemoteSpace {
                     key: crate::remote_source::RemoteSpaceKey {
                         host: host.host.clone(),
                         session: host.session.clone(),
-                        workspace_id: entry.workspace.workspace_id.clone(),
+                        workspace_id: ws.workspace_id.clone(),
                     },
-                    label: remote_workspace_metadata_label(&entry.workspace),
+                    label: remote_workspace_metadata_label(&ws),
                     status: entry.status,
+                    metadata: Some(RemoteSpaceMetadata::from_workspace_info(&ws)),
                 });
             }
 
@@ -997,30 +1015,7 @@ fn remote_workspace_list_entries_for_host(
         }
     }
 
-    if can_create_remote_workspace {
-        entries.push(WorkspaceListEntry::RemoteNew { host: host.clone() });
-    }
-
     entries
-}
-
-fn remote_host_status(
-    app: &AppState,
-    host: &crate::remote_source::RemoteHostKey,
-    spaces: Option<
-        &std::collections::BTreeMap<String, Vec<crate::remote_source::RemoteAgentEntry>>,
-    >,
-) -> crate::remote_source::RemoteConnectionStatus {
-    app.remote_sources
-        .host_status(host)
-        .or_else(|| {
-            spaces.and_then(|spaces| {
-                spaces
-                    .values()
-                    .find_map(|agents| agents.first().map(|entry| entry.status))
-            })
-        })
-        .unwrap_or(crate::remote_source::RemoteConnectionStatus::Disconnected)
 }
 
 fn remote_agent_derived_space_entry(
@@ -1040,6 +1035,7 @@ fn remote_agent_derived_space_entry(
         },
         label: remote_space_label(agents, workspace_id),
         status,
+        metadata: None,
     }
 }
 
@@ -1061,12 +1057,10 @@ pub(crate) fn workspace_list_body_rect(area: Rect, has_scrollbar: bool) -> Rect 
     workspace_list_body_rect_inner(area, has_scrollbar, true)
 }
 
-fn workspace_list_body_rect_for_source(app: &AppState, area: Rect, has_scrollbar: bool) -> Rect {
-    if matches!(app.effective_sidebar_source(), SidebarSource::Local) {
-        workspace_list_body_rect(area, has_scrollbar)
-    } else {
-        workspace_list_body_rect_inner(area, has_scrollbar, false)
-    }
+fn workspace_list_body_rect_for_source(_app: &AppState, area: Rect, has_scrollbar: bool) -> Rect {
+    // Footer is always reserved for both local and remote sources so that layout
+    // does not flicker on connect/disconnect/capability changes.
+    workspace_list_body_rect(area, has_scrollbar)
 }
 
 fn workspace_list_body_rect_inner(area: Rect, has_scrollbar: bool, reserve_footer: bool) -> Rect {
@@ -1254,38 +1248,46 @@ pub(crate) fn compute_workspace_list_areas(
         return (Vec::new(), Vec::new());
     }
 
-    let metrics = workspace_list_scroll_metrics(app, ws_area);
-    let body = workspace_list_body_rect_for_source(app, ws_area, should_show_scrollbar(metrics));
-    if body.width == 0 || body.height == 0 {
-        return (Vec::new(), Vec::new());
-    }
-
     let mut cards = Vec::new();
     let mut remote_rows = Vec::new();
 
-    for row in workspace_list_row_areas_for_body(app, body, app.workspace_scroll) {
-        match row.entry {
-            WorkspaceListEntry::Workspace { ws_idx, indented } => {
-                cards.push(crate::app::state::WorkspaceCardArea {
-                    ws_idx,
-                    rect: row.rect,
-                    indented,
-                });
-            }
-            WorkspaceListEntry::RemoteSpace { key, .. } => {
-                remote_rows.push(WorkspaceListRemoteRowArea {
-                    target: WorkspaceListRemoteTarget::Space { key },
-                    rect: row.rect,
-                });
-            }
-            WorkspaceListEntry::RemoteNew { host } => {
-                let new_rect = workspace_list_new_button_rect(row.rect);
-                if new_rect != Rect::default() {
-                    remote_rows.push(WorkspaceListRemoteRowArea {
-                        target: WorkspaceListRemoteTarget::New { host },
-                        rect: new_rect,
+    let metrics = workspace_list_scroll_metrics(app, ws_area);
+    let body = workspace_list_body_rect_for_source(app, ws_area, should_show_scrollbar(metrics));
+    if body.width > 0 && body.height > 0 {
+        for row in workspace_list_row_areas_for_body(app, body, app.workspace_scroll) {
+            match row.entry {
+                WorkspaceListEntry::Workspace { ws_idx, indented } => {
+                    cards.push(crate::app::state::WorkspaceCardArea {
+                        ws_idx,
+                        rect: row.rect,
+                        indented,
                     });
                 }
+                WorkspaceListEntry::RemoteSpace { key, .. } => {
+                    remote_rows.push(WorkspaceListRemoteRowArea {
+                        target: WorkspaceListRemoteTarget::Space { key },
+                        rect: row.rect,
+                    });
+                }
+            }
+        }
+    }
+
+    // Fixed footer: emit a New hit target for capable/connected remote sources.
+    if let SidebarSource::Remote(host) = app.effective_sidebar_source() {
+        if app
+            .remote_sources
+            .host_status(&host)
+            .is_some_and(|s| s.is_connected())
+            && app.remote_sources.host_supports_workspace_create(&host)
+        {
+            let footer_rect = workspace_list_footer_rect(ws_area);
+            let new_rect = workspace_list_new_button_rect(footer_rect);
+            if new_rect != Rect::default() {
+                remote_rows.push(WorkspaceListRemoteRowArea {
+                    target: WorkspaceListRemoteTarget::New { host },
+                    rect: new_rect,
+                });
             }
         }
     }
@@ -1648,11 +1650,9 @@ fn render_workspace_list(
         _ => None,
     };
 
-    let list_bottom = if matches!(app.effective_sidebar_source(), SidebarSource::Local) {
-        area.y + area.height.saturating_sub(1)
-    } else {
-        area.y + area.height
-    };
+    // Both local and remote sources reserve a fixed footer row; the body rows
+    // (card and remote-space rendering) must stay above this boundary.
+    let list_bottom = area.y + area.height.saturating_sub(1);
     if area.height > 0 {
         frame.render_widget(
             Paragraph::new(Line::from(vec![Span::styled(
@@ -1799,11 +1799,13 @@ fn render_workspace_list(
     for row in row_areas {
         match row.entry {
             WorkspaceListEntry::Workspace { .. } => {}
-            WorkspaceListEntry::RemoteSpace { key, label, status } => {
-                render_remote_space_row(app, &key, &label, status, frame, row.rect, p);
-            }
-            WorkspaceListEntry::RemoteNew { .. } => {
-                render_remote_new_row(frame, row.rect, p);
+            WorkspaceListEntry::RemoteSpace {
+                key,
+                label,
+                status,
+                metadata,
+            } => {
+                render_remote_space_row(app, &key, &label, status, metadata, frame, row.rect, p);
             }
         }
     }
@@ -1816,6 +1818,20 @@ fn render_workspace_list(
             app.mouse_capture,
             app.global_menu_attention_badge_visible(),
         );
+    } else if let SidebarSource::Remote(ref host) = app.effective_sidebar_source() {
+        // Render the remote `new` button in the fixed footer when the host is
+        // connected and advertises workspace creation. Footer row is always
+        // reserved regardless of capability to avoid layout flicker.
+        let footer_rect = workspace_list_footer_rect(area);
+        if footer_rect != Rect::default()
+            && app
+                .remote_sources
+                .host_status(host)
+                .is_some_and(|s| s.is_connected())
+            && app.remote_sources.host_supports_workspace_create(host)
+        {
+            render_remote_footer_new(frame, footer_rect, p);
+        }
     }
 
     if let Some(y) = insertion_row.filter(|y| *y < list_bottom) {
@@ -2071,7 +2087,7 @@ fn render_local_actions_row(
     );
 }
 
-fn render_remote_new_row(frame: &mut Frame, rect: Rect, p: &Palette) {
+fn render_remote_footer_new(frame: &mut Frame, rect: Rect, p: &Palette) {
     let button_rect = workspace_list_new_button_rect(rect);
     if button_rect == Rect::default() {
         return;
@@ -2083,11 +2099,31 @@ fn render_remote_new_row(frame: &mut Frame, rect: Rect, p: &Palette) {
     );
 }
 
+fn remote_space_metadata_suffix(meta: RemoteSpaceMetadata) -> Option<String> {
+    // Only surface non-trivial counts that give useful context.
+    if meta.tab_count <= 1 && meta.pane_count <= 1 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if meta.tab_count > 1 {
+        parts.push(format!("{} tabs", meta.tab_count));
+    }
+    if meta.pane_count > 1 {
+        parts.push(format!("{} panes", meta.pane_count));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
 fn render_remote_space_row(
     app: &AppState,
     key: &crate::remote_source::RemoteSpaceKey,
     label: &str,
     status: crate::remote_source::RemoteConnectionStatus,
+    metadata: Option<RemoteSpaceMetadata>,
     frame: &mut Frame,
     rect: Rect,
     p: &Palette,
@@ -2096,37 +2132,78 @@ fn render_remote_space_row(
         return;
     }
 
-    let selected = app
-        .selected_remote_space
-        .as_ref()
-        .is_some_and(|selected| selected == key);
-    if selected {
+    let selected = app.selected_remote_space.as_ref().is_some_and(|s| s == key);
+    // Focused active-style only for connected rows — cached `focused==true` on a
+    // stale/disconnected host must not look live.
+    let focused = !selected && status.is_connected() && metadata.is_some_and(|m| m.focused);
+
+    // Full-row background: selected (surface0) wins over focused (surface_dim).
+    // Selection background is kept even for disconnected rows as a projection indicator.
+    if selected || focused {
+        let bg = if selected { p.surface0 } else { p.surface_dim };
         let buf = frame.buffer_mut();
         for x in rect.x..rect.x + rect.width {
-            buf[(x, rect.y)].set_style(Style::default().bg(p.surface_dim));
+            buf[(x, rect.y)].set_style(Style::default().bg(bg));
         }
     }
 
-    let text = if let Some(stale) = status.stale_label() {
-        format!("{label} · {stale}")
+    // State dot: live agent_status only when connected; neutral dim dot for stale rows.
+    let (dot_str, dot_style) = if status.is_connected() {
+        if let Some(meta) = metadata {
+            let (state, seen) = remote_agent_state(meta.agent_status);
+            state_dot(state, seen, p)
+        } else {
+            ("·", Style::default().fg(p.overlay0))
+        }
     } else {
-        label.to_string()
+        (
+            "·",
+            Style::default().fg(p.overlay0).add_modifier(Modifier::DIM),
+        )
     };
-    let text = truncate_text(&text, rect.width.saturating_sub(2) as usize);
-    let style = if selected {
+
+    // Label style: stale/disconnected wins over selected/focused — cached metadata
+    // must not render as live even when selected.
+    let label_style = if !status.is_connected() {
+        Style::default().fg(p.overlay0).add_modifier(Modifier::DIM)
+    } else if selected || focused {
         Style::default().fg(p.text).add_modifier(Modifier::BOLD)
-    } else if status.is_connected() {
-        Style::default().fg(p.subtext0).add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
-            .fg(p.overlay0)
-            .add_modifier(Modifier::BOLD | Modifier::DIM)
+        Style::default().fg(p.subtext0)
+    };
+
+    // Gutter: " " + dot + " " = 3 chars. Remaining width for label+suffix.
+    let gutter_width = 3usize;
+    let available = (rect.width as usize).saturating_sub(gutter_width);
+
+    // Build the text: stale label takes priority over metadata suffix.
+    let row_text = if let Some(stale) = status.stale_label() {
+        let full = format!("{label} · {stale}");
+        truncate_text(&full, available)
+    } else if let Some(meta) = metadata {
+        if let Some(suffix) = remote_space_metadata_suffix(meta) {
+            let separator = " · ";
+            let label_w = display_width(label);
+            let sep_w = display_width(separator);
+            let suffix_w = display_width(&suffix);
+            if label_w + sep_w + suffix_w <= available {
+                format!("{label}{separator}{suffix}")
+            } else {
+                truncate_text(label, available)
+            }
+        } else {
+            truncate_text(label, available)
+        }
+    } else {
+        truncate_text(label, available)
     };
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("  ", Style::default()),
-            Span::styled(text, style),
+            Span::styled(" ", Style::default()),
+            Span::styled(dot_str, dot_style),
+            Span::styled(" ", Style::default()),
+            Span::styled(row_text, label_style),
         ])),
         Rect::new(rect.x, rect.y, rect.width, 1),
     );
@@ -2685,6 +2762,7 @@ mod tests {
                 key,
                 label,
                 status: crate::remote_source::RemoteConnectionStatus::Connected,
+                ..
             } if key.host == "jafar"
                 && key.session == crate::session::DEFAULT_SESSION_NAME
                 && key.workspace_id == "remote-ws"
@@ -2724,7 +2802,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(!rows.iter().any(|row| row.contains("jafar spaces")));
-        assert!(rows.iter().any(|row| row.contains("  tmp")));
+        assert!(rows.iter().any(|row| row.contains("tmp")));
     }
 
     #[test]
@@ -2748,6 +2826,7 @@ mod tests {
                 key,
                 label,
                 status: crate::remote_source::RemoteConnectionStatus::Connected,
+                ..
             }] if key.workspace_id == "remote-ws"
                 && label == "blank shell"
         ));
@@ -2776,47 +2855,37 @@ mod tests {
         select_remote_projection(&mut app, &host);
 
         let entries = workspace_entries(&app);
+        assert_eq!(entries.len(), 0);
 
-        assert_eq!(entries.len(), 1);
-        assert!(matches!(
-            &entries[0],
-            WorkspaceListEntry::RemoteNew { host } if host.host == "jafar"
-        ));
-
-        let (cards, remote_rows) = compute_workspace_list_areas(&app, Rect::new(0, 0, 40, 32));
+        // sidebar_panel_rect equivalent — compute_workspace_list_areas derives ws_area from this
+        let area = Rect::new(0, 0, 40, 12);
+        let ws_area = workspace_list_rect(area, app.sidebar_section_split);
+        let (cards, remote_rows) = compute_workspace_list_areas(&app, area);
         assert!(cards.is_empty());
         assert_eq!(remote_rows.len(), 1);
         let new_row = remote_rows
             .iter()
             .find(|row| matches!(row.target, WorkspaceListRemoteTarget::New { .. }))
-            .expect("remote new action");
+            .expect("remote new action in footer");
         assert_eq!(
-            workspace_list_remote_target_at(
-                &app,
-                Rect::new(0, 0, 40, 32),
-                new_row.rect.x,
-                new_row.rect.y
-            ),
-            Some(WorkspaceListRemoteTarget::New { host })
+            workspace_list_remote_target_at(&app, area, new_row.rect.x, new_row.rect.y),
+            Some(WorkspaceListRemoteTarget::New {
+                host: RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            })
         );
 
-        let backend = ratatui::backend::TestBackend::new(40, 12);
+        // render_workspace_list receives the workspace list area (ws_area), not the full
+        // sidebar panel area; use ws_area for the terminal buffer and render call so the
+        // hit-rect y-coordinate matches the rendered row.
+        let backend = ratatui::backend::TestBackend::new(ws_area.width, ws_area.height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let terminal_runtimes = TerminalRuntimeRegistry::new();
         terminal
-            .draw(|frame| {
-                render_workspace_list(
-                    &app,
-                    &terminal_runtimes,
-                    frame,
-                    Rect::new(0, 0, 40, 12),
-                    false,
-                )
-            })
+            .draw(|frame| render_workspace_list(&app, &terminal_runtimes, frame, ws_area, false))
             .unwrap();
-        let rows = (0..12)
+        let rows = (0..ws_area.height)
             .map(|y| {
-                (0..40)
+                (0..ws_area.width)
                     .map(|x| terminal.backend().buffer()[(x, y)].symbol())
                     .collect::<String>()
             })
@@ -2842,10 +2911,7 @@ mod tests {
         let entries = workspace_entries(&app);
         assert!(matches!(
             &entries[..],
-            [
-                WorkspaceListEntry::RemoteSpace { .. },
-                WorkspaceListEntry::RemoteNew { .. },
-            ]
+            [WorkspaceListEntry::RemoteSpace { .. }]
         ));
 
         let (_, remote_rows) = compute_workspace_list_areas(&app, Rect::new(0, 0, 40, 32));
@@ -2857,6 +2923,7 @@ mod tests {
             .iter()
             .find(|row| matches!(row.target, WorkspaceListRemoteTarget::New { .. }))
             .expect("remote new action");
+        // Space row is in the body; new is in the fixed footer below.
         assert!(space_row.rect.y < new_row.rect.y);
 
         let rows = rendered_workspace_rows(&app, Rect::new(0, 0, 40, 18));
@@ -2873,7 +2940,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_workspace_list_uses_bottom_row_without_local_footer() {
+    fn remote_workspace_list_reserves_fixed_footer_row() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = Vec::new();
         app.active = None;
@@ -2886,16 +2953,22 @@ mod tests {
         enable_remote_workspace_create(&mut app, &host);
         select_remote_projection(&mut app, &host);
 
+        // `area` is the workspace-list area — the same rect passed to
+        // `render_workspace_list` / `rendered_workspace_rows`.
         let area = Rect::new(0, 0, 40, WORKSPACE_SECTION_HEADER_ROWS + 3);
         let bottom_y = area.y + area.height.saturating_sub(1);
         let body = workspace_list_body_rect_for_source(&app, area, false);
-        let row_areas = workspace_list_row_areas_for_body(&app, body, app.workspace_scroll);
-        let new_row = row_areas
-            .iter()
-            .find(|row| matches!(row.entry, WorkspaceListEntry::RemoteNew { .. }))
-            .expect("remote new action");
+        // Footer is always reserved for remote sources; body must not overlap the last row.
+        assert!(body.y + body.height <= bottom_y);
 
-        assert_eq!(new_row.rect.y, bottom_y);
+        // Verify footer geometry using the same helpers render uses (workspace-list
+        // area, not an enclosing panel area). compute_workspace_list_areas takes an
+        // enclosing sidebar panel rect and derives ws_area internally, so it must
+        // not be passed the already-derived workspace-list area here.
+        let footer = workspace_list_footer_rect(area);
+        assert_eq!(footer.y, bottom_y);
+        let new_rect = workspace_list_new_button_rect(footer);
+        assert_ne!(new_rect, Rect::default());
 
         let rows = rendered_workspace_rows(&app, area);
         assert_eq!(rows[bottom_y as usize].trim(), "new");
@@ -3057,7 +3130,7 @@ mod tests {
             .into_iter()
             .filter_map(|entry| match entry {
                 WorkspaceListEntry::RemoteSpace { label, .. } => Some(label),
-                WorkspaceListEntry::Workspace { .. } | WorkspaceListEntry::RemoteNew { .. } => None,
+                WorkspaceListEntry::Workspace { .. } => None,
             })
             .collect::<Vec<_>>();
         let agent_labels = agent_panel_entries(&app)
@@ -3356,6 +3429,7 @@ mod tests {
                 key,
                 label,
                 status: crate::remote_source::RemoteConnectionStatus::Connected,
+                ..
             }) if key.host == "jafar"
                 && key.session == crate::session::DEFAULT_SESSION_NAME
                 && key.workspace_id == "remote-ws"
@@ -3871,6 +3945,225 @@ mod tests {
                 indented: false,
             }]
         );
+    }
+
+    // ── render helper ────────────────────────────────────────────────────────────
+
+    fn render_space_row_buffer(
+        app: &AppState,
+        key: &crate::remote_source::RemoteSpaceKey,
+        label: &str,
+        status: crate::remote_source::RemoteConnectionStatus,
+        metadata: Option<RemoteSpaceMetadata>,
+    ) -> ratatui::buffer::Buffer {
+        let width = 40u16;
+        let area = Rect::new(0, 0, width, 1);
+        let backend = ratatui::backend::TestBackend::new(width, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let p = app.palette.clone();
+        terminal
+            .draw(|frame| {
+                render_remote_space_row(app, key, label, status, metadata, frame, area, &p)
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn test_space_key() -> crate::remote_source::RemoteSpaceKey {
+        crate::remote_source::RemoteSpaceKey {
+            host: "jafar".to_string(),
+            session: crate::session::DEFAULT_SESSION_NAME.to_string(),
+            workspace_id: "remote-ws".to_string(),
+        }
+    }
+
+    // ── remote_space_metadata_suffix unit tests ───────────────────────────────
+
+    #[test]
+    fn remote_space_metadata_suffix_none_for_one_tab_one_pane() {
+        let meta = RemoteSpaceMetadata {
+            focused: false,
+            agent_status: AgentStatus::Unknown,
+            pane_count: 1,
+            tab_count: 1,
+        };
+        assert_eq!(remote_space_metadata_suffix(meta), None);
+    }
+
+    #[test]
+    fn remote_space_metadata_suffix_none_for_zero_counts() {
+        let meta = RemoteSpaceMetadata {
+            focused: false,
+            agent_status: AgentStatus::Unknown,
+            pane_count: 0,
+            tab_count: 0,
+        };
+        assert_eq!(remote_space_metadata_suffix(meta), None);
+    }
+
+    #[test]
+    fn remote_space_metadata_suffix_two_tabs_only() {
+        let meta = RemoteSpaceMetadata {
+            focused: false,
+            agent_status: AgentStatus::Unknown,
+            pane_count: 1,
+            tab_count: 2,
+        };
+        assert_eq!(
+            remote_space_metadata_suffix(meta),
+            Some("2 tabs".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_space_metadata_suffix_two_panes_only() {
+        let meta = RemoteSpaceMetadata {
+            focused: false,
+            agent_status: AgentStatus::Unknown,
+            pane_count: 2,
+            tab_count: 1,
+        };
+        assert_eq!(
+            remote_space_metadata_suffix(meta),
+            Some("2 panes".to_string())
+        );
+    }
+
+    #[test]
+    fn remote_space_metadata_suffix_tabs_and_panes() {
+        let meta = RemoteSpaceMetadata {
+            focused: false,
+            agent_status: AgentStatus::Unknown,
+            pane_count: 3,
+            tab_count: 2,
+        };
+        assert_eq!(
+            remote_space_metadata_suffix(meta),
+            Some("2 tabs · 3 panes".to_string())
+        );
+    }
+
+    // ── render_remote_space_row behavior tests ────────────────────────────────
+
+    #[test]
+    fn connected_metadata_row_renders_live_dot_and_suffix_for_nontrivial_counts() {
+        let app = AppState::test_new();
+        let key = test_space_key();
+        let meta = RemoteSpaceMetadata {
+            focused: false,
+            agent_status: AgentStatus::Working,
+            pane_count: 1,
+            tab_count: 2,
+        };
+        let buf = render_space_row_buffer(
+            &app,
+            &key,
+            "project",
+            crate::remote_source::RemoteConnectionStatus::Connected,
+            Some(meta),
+        );
+        let row: String = (0..40).map(|x| buf[(x, 0)].symbol()).collect();
+
+        // Dot should be live (Working → "●"), not the neutral "·".
+        assert_eq!(buf[(1, 0)].symbol(), "●");
+        assert_eq!(buf[(1, 0)].style().fg, Some(app.palette.yellow));
+        // Suffix "2 tabs" should appear in the rendered text.
+        assert!(row.contains("2 tabs"), "expected '2 tabs' in row: {row:?}");
+    }
+
+    #[test]
+    fn connected_focused_row_gets_active_background_selected_wins() {
+        let app = AppState::test_new();
+        let key = test_space_key();
+        let meta = RemoteSpaceMetadata {
+            focused: true,
+            agent_status: AgentStatus::Idle,
+            pane_count: 1,
+            tab_count: 1,
+        };
+
+        // Focused but not selected → surface_dim background.
+        let buf = render_space_row_buffer(
+            &app,
+            &key,
+            "project",
+            crate::remote_source::RemoteConnectionStatus::Connected,
+            Some(meta),
+        );
+        assert_eq!(
+            buf[(5, 0)].style().bg,
+            Some(app.palette.surface_dim),
+            "connected focused row should get surface_dim background"
+        );
+
+        // Selected → surface0 background wins over focused.
+        let mut app2 = AppState::test_new();
+        app2.selected_remote_space = Some(key.clone());
+        let buf2 = render_space_row_buffer(
+            &app2,
+            &key,
+            "project",
+            crate::remote_source::RemoteConnectionStatus::Connected,
+            Some(meta),
+        );
+        assert_eq!(
+            buf2[(5, 0)].style().bg,
+            Some(app2.palette.surface0),
+            "selected row should get surface0 background, overriding focused"
+        );
+    }
+
+    #[test]
+    fn disconnected_cached_focused_row_renders_dim_not_live() {
+        let app = AppState::test_new();
+        let key = test_space_key();
+        // Cached metadata claims focused=true and Working agent_status, but host is unreachable.
+        let meta = RemoteSpaceMetadata {
+            focused: true,
+            agent_status: AgentStatus::Working,
+            pane_count: 1,
+            tab_count: 1,
+        };
+        let buf = render_space_row_buffer(
+            &app,
+            &key,
+            "project",
+            crate::remote_source::RemoteConnectionStatus::Unreachable,
+            Some(meta),
+        );
+
+        // Background must not be focused/active (no surface_dim set by render).
+        assert_ne!(
+            buf[(5, 0)].style().bg,
+            Some(app.palette.surface_dim),
+            "disconnected cached-focused row must not get active background"
+        );
+
+        // Dot must be neutral "·" with DIM, not the live working "●".
+        assert_eq!(
+            buf[(1, 0)].symbol(),
+            "·",
+            "disconnected row must show neutral dot"
+        );
+        assert!(
+            buf[(1, 0)].style().add_modifier.contains(Modifier::DIM),
+            "disconnected dot must be dim"
+        );
+
+        // Label text must be dim (stale text wins).
+        // For Unreachable, row text contains "unreachable".
+        let row: String = (0..40).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            row.contains("unreachable"),
+            "stale text should appear in row: {row:?}"
+        );
+        // Label style fg is overlay0 + DIM (not text + BOLD).
+        let label_x = 3u16;
+        assert_eq!(buf[(label_x, 0)].style().fg, Some(app.palette.overlay0));
+        assert!(buf[(label_x, 0)]
+            .style()
+            .add_modifier
+            .contains(Modifier::DIM));
     }
 
     #[test]

@@ -123,7 +123,7 @@ fn rendered_mobile_workspace_entries(entries: &[WorkspaceListEntry]) -> Vec<Mobi
                 ws_idx: *ws_idx,
                 indented: *indented,
             }),
-            WorkspaceListEntry::RemoteSpace { .. } | WorkspaceListEntry::RemoteNew { .. } => None,
+            WorkspaceListEntry::RemoteSpace { .. } => None,
         })
         .collect()
 }

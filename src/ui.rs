@@ -561,6 +561,7 @@ pub fn render_with_runtime_registry(
         render_remote_projection(app, frame, terminal_area);
     } else {
         render_panes(app, terminal_runtimes, frame, terminal_area);
+        render_remote_source_banner(app, frame, terminal_area);
     }
 
     // Ambient notifications sit above panes, but below interactive overlays.
@@ -1108,6 +1109,41 @@ fn dim_background(frame: &mut Frame, area: Rect) {
             cell.set_style(cell.style().add_modifier(Modifier::DIM));
         }
     }
+}
+
+/// Dim informational line at the top of the terminal area when a remote source
+/// is selected but no remote space has been projected yet. The local pane
+/// remains fully active in this state; the copy makes that explicit.
+fn render_remote_source_banner(app: &AppState, frame: &mut Frame, area: Rect) {
+    use ratatui::widgets::Paragraph;
+
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let host = match app.effective_sidebar_source() {
+        crate::app::state::SidebarSource::Remote(h) => h,
+        crate::app::state::SidebarSource::Local => return,
+    };
+    let host_label = if host.session == crate::session::DEFAULT_SESSION_NAME {
+        host.host.clone()
+    } else {
+        format!("{}/{}", host.host, host.session)
+    };
+    let p = &app.palette;
+    let text = format!(
+        " {host_label} source selected - choose a remote space to project; local pane remains active"
+    );
+    let width = (text::display_width_u16(&text)).min(area.width);
+    if width == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            text,
+            Style::default().fg(p.overlay0).add_modifier(Modifier::DIM),
+        )),
+        Rect::new(area.x, area.y, width, 1),
+    );
 }
 
 /// Floating overlay for navigate mode — appears at bottom of terminal area.
@@ -2170,5 +2206,78 @@ switch_workspace = "ctrl+1..9"
 
         assert_eq!(switch_tab_key, "prefix+1..9 / alt+1..9");
         assert_eq!(switch_workspace_key, "ctrl+1..9");
+    }
+
+    #[test]
+    fn remote_source_banner_renders_when_source_is_remote_and_no_space_projected() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        let host =
+            crate::remote_source::RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        app.sidebar_source = crate::app::state::SidebarSource::Remote(host);
+        app.selected_remote_space = None;
+
+        // Use a wide screen so the terminal area (total minus sidebar+rail) fits the
+        // full banner text (84 display chars). With a default sidebar of 26 and source
+        // rail of 10 the sidebar takes 36 cols; 140 wide gives a terminal area of 104 cols.
+        compute_view(&mut app, Rect::new(0, 0, 140, 20));
+
+        let backend = TestBackend::new(140, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let top_row = buffer_row_text(buffer, app.view.terminal_area, app.view.terminal_area.y);
+        assert!(
+            top_row.contains("jafar"),
+            "banner not rendered: {top_row:?}"
+        );
+        assert!(
+            top_row.contains("local pane remains active"),
+            "banner missing context: {top_row:?}"
+        );
+    }
+
+    #[test]
+    fn remote_source_banner_hides_when_space_is_projected() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        let host =
+            crate::remote_source::RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        app.sidebar_source = crate::app::state::SidebarSource::Remote(host.clone());
+        app.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
+            host: host.host.clone(),
+            session: host.session.clone(),
+            workspace_id: "remote-ws".to_string(),
+        });
+
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // When a space is projected, the remote projection branch is taken and
+        // the banner is not drawn over the terminal area.
+        let top_row = buffer_row_text(buffer, app.view.terminal_area, app.view.terminal_area.y);
+        assert!(
+            !top_row.contains("local pane remains active"),
+            "banner should be hidden when space is projected: {top_row:?}"
+        );
     }
 }
