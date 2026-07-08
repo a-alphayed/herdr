@@ -266,7 +266,7 @@ fn remote_source_host_keys(
     registry
         .list()
         .into_iter()
-        .filter(|host| host.auto_connect)
+        .filter(|host| host.connection_policy.starts_automatically())
         .map(|host| {
             crate::remote_source::RemoteHostKey::new(host.name.clone(), host.session.clone())
         })
@@ -2311,13 +2311,17 @@ mod tests {
     }
 
     #[test]
-    fn app_seeds_auto_connect_remote_hosts_as_disconnected_sources() {
+    fn app_seeds_only_auto_policy_remote_hosts_as_disconnected_sources() {
+        // Only `Auto` hosts are seeded as disconnected remote sources at startup;
+        // `OnDemand` and `Manual` hosts (sleeping/roaming remotes) are not.
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut config = Config::default();
         config.remote.enabled = true;
         config.remote.hosts = vec![
-            crate::remote_target::RemoteHostConfig::new("manual", "manual", "default", false),
+            crate::remote_target::RemoteHostConfig::new("ondemand", "ondemand", "default", false),
             crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "agents", true),
+            crate::remote_target::RemoteHostConfig::new("manual", "manual", "default", true)
+                .with_connection_policy(crate::remote_target::RemoteConnectionPolicy::Manual),
         ];
 
         let app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
@@ -3262,7 +3266,7 @@ auto_connect = false
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
 
         let host = app.remote_hosts.get("jafar").unwrap();
-        assert!(!host.auto_connect);
+        assert!(!host.connection_policy.starts_automatically());
         assert!(app.state.remote_sources.list_host_statuses().is_empty());
         assert!(app.state.remote_sources.list_entries().is_empty());
 
@@ -3278,6 +3282,60 @@ auto_connect = false
             projections: Vec::new(),
             tabs: Vec::new(),
         });
+        assert!(app.state.remote_sources.list_host_statuses().is_empty());
+        assert!(app.state.remote_sources.list_entries().is_empty());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_removes_remote_source_when_switched_to_manual_policy() {
+        // Switching a host away from `Auto` (here to `connection_policy =
+        // "manual"`) must remove its automatic source row, mirroring the
+        // legacy `auto_connect = false` reload behavior.
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-remote-manual-policy");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        std::fs::write(
+            &path,
+            r#"
+[remote]
+enabled = true
+
+[[remote.hosts]]
+name = "jafar"
+target = "jafar"
+session = "default"
+"#,
+        )
+        .unwrap();
+        let mut app = test_app();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(app.state.remote_sources.list_host_statuses().len(), 1);
+
+        std::fs::write(
+            &path,
+            r#"
+[remote]
+enabled = true
+
+[[remote.hosts]]
+name = "jafar"
+target = "jafar"
+session = "default"
+connection_policy = "manual"
+"#,
+        )
+        .unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+
+        let host = app.remote_hosts.get("jafar").unwrap();
+        assert!(host.connection_policy.is_manual());
         assert!(app.state.remote_sources.list_host_statuses().is_empty());
         assert!(app.state.remote_sources.list_entries().is_empty());
 

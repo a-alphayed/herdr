@@ -108,7 +108,7 @@ pub(crate) fn auto_connect_hosts(registry: &RemoteHostRegistry) -> Vec<RemoteHos
     registry
         .list()
         .into_iter()
-        .filter(|host| host.auto_connect)
+        .filter(|host| host.connection_policy.starts_automatically())
         .cloned()
         .collect()
 }
@@ -907,10 +907,15 @@ mod tests {
     }
 
     #[test]
-    fn remote_supervisor_filters_auto_connect_hosts() {
+    fn remote_supervisor_returns_only_auto_policy_hosts() {
+        // Only `Auto` hosts are started/probed automatically; `OnDemand` and
+        // `Manual` hosts (sleeping/roaming remotes) are excluded.
+        use crate::remote_target::RemoteConnectionPolicy;
         let registry = RemoteHostRegistry::from_configs(vec![
             RemoteHostConfig::new("jafar", "jafar", "default", true),
-            RemoteHostConfig::new("manual", "manual", "default", false),
+            RemoteHostConfig::new("ondemand", "ondemand", "default", false),
+            RemoteHostConfig::new("manual", "manual", "default", true)
+                .with_connection_policy(RemoteConnectionPolicy::Manual),
         ])
         .unwrap();
 

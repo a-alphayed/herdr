@@ -1197,7 +1197,9 @@ auto_connect = false
         assert_eq!(config.remote.hosts[0].name, "jafar");
         assert_eq!(config.remote.hosts[0].target, "jafar");
         assert_eq!(config.remote.hosts[0].session, "default");
-        assert!(!config.remote.hosts[0].auto_connect);
+        assert!(!config.remote.hosts[0]
+            .connection_policy
+            .starts_automatically());
     }
 
     #[test]
@@ -1218,7 +1220,9 @@ target = "jafar"
             config.remote.hosts[0].session,
             crate::session::DEFAULT_SESSION_NAME
         );
-        assert!(config.remote.hosts[0].auto_connect);
+        assert!(config.remote.hosts[0]
+            .connection_policy
+            .starts_automatically());
     }
 
     #[test]

@@ -400,14 +400,25 @@ enabled = true
 name = "jafar"
 target = "jafar"
 session = "default"
-auto_connect = true
+connection_policy = "auto"
 connect_timeout_secs = 10
 
 [[remote.hosts]]
 name = "work-mini"
 target = "work-mini"
 session = "default"
-auto_connect = true
+connection_policy = "auto"
+
+# A sleeping/roaming remote that must not be woken or auto-probed just
+# because it is configured: it is never started automatically, and explicit
+# mutating commands (`agent start --host steamdeck`) fail locally before any
+# SSH/API dispatch. Read-only diagnostics (`herdr remote status steamdeck`)
+# still probe it on demand.
+[[remote.hosts]]
+name = "steamdeck"
+target = "steamdeck"
+session = "default"
+connection_policy = "manual"
 ```
 
 Rules:
@@ -415,6 +426,11 @@ Rules:
 - `name` is the local alias used in targets. It must be unique and must not contain `/` or `:`.
 - `target` is the SSH target.
 - `session` is the Herdr session name on the remote host, not a workspace/space.
+- `connection_policy` controls whether the local aggregator connects to a host automatically:
+  - `auto` (default): the host is probed/connected automatically at startup and on config reload, seeded as a disconnected remote source, and treated as a configured auto source event sender. Explicit mutating commands still fail fast when its cached status is non-connected.
+  - `on_demand`: the host is not probed automatically, but an explicit mutating command such as `agent start --host` may attempt a live bridge dispatch when there is no cached non-connected status; a cached disconnected/unreachable/needs-update status still fails fast before forwarding.
+  - `manual`: the host is never reached implicitly. It is not probed automatically, and an explicit mutating `agent.start --host` fails locally before dispatch with a distinct policy error. Use this for sleeping/roaming remotes (e.g. a laptop or handheld that sleeps, roams between networks, or is often offline) so they are not auto-probed or woken merely because they are configured. Read-only diagnostics (`herdr remote status`/`check`) still probe named hosts regardless of policy.
+  - The legacy `auto_connect` boolean remains a backward-compatible alias. Omitted fields resolve to `auto`; `auto_connect = true` resolves to `auto`; `auto_connect = false` resolves to `on_demand`. An explicit `connection_policy` may be combined with `auto_connect` only when consistent (`true` only with `auto`; `false` only with `on_demand` or `manual`); an inconsistent combination is rejected as a config error. `connection_policy` is the single stored source of truth; `auto_connect` is not retained as a separate stored field.
 - Multiple sessions on the same SSH target should be configured with distinct aliases, e.g. `jafar-default` and `jafar-agents`.
 - The remote source key is `(host_alias, session_name)`, not just host.
 - `connect_timeout_secs` bounds the SSH `ConnectTimeout` (whole seconds) used for connection attempts to this host, for both interactive and noninteractive configured-host SSH invocations. Optional; defaults to 10 seconds (matching the previous hardcoded noninteractive default). Must be a non-zero value no greater than 300 seconds; config with an out-of-range value is rejected.
@@ -808,6 +824,8 @@ herdr agent start --host jafar --tab <remote-tab-id> --split right --name codex 
 
 Placement flags, when present with `--host`, refer to remote workspace/tab/pane IDs on the remote host, not local IDs.
 
+Connection policy gate: `agent.start --host` respects the host's `connection_policy`. A host with `connection_policy = "manual"` (e.g. a sleeping/roaming remote) fails locally before dispatch with a distinct policy error, so it is never woken implicitly. An `on_demand` host with no cached non-connected status may still dispatch on demand; a cached disconnected/unreachable/needs-update status fails fast before forwarding for any host.
+
 ### 11. Cross-node focus / direct remote terminal attach
 
 Click-to-focus is two operations:
@@ -875,9 +893,9 @@ If SteamDeck Herdr restarts:
 
 1. Jafar agents continue running on Jafar if Jafar Herdr remains up.
 2. SteamDeck reloads remote host config.
-3. SteamDeck reconnects remote API bridges non-interactively.
-4. SteamDeck resyncs each host/session using subscribe/buffer/snapshot/replay.
-5. Sidebar remote entries reappear with current state.
+3. SteamDeck reconnects remote API bridges non-interactively — but only for hosts whose `connection_policy = "auto"`. `on_demand` and `manual` hosts (e.g. sleeping/roaming remotes) are not probed or seeded as sources at startup; they are reached only through explicit commands (`manual` refuses implicit mutating dispatch entirely).
+4. SteamDeck resyncs each auto host/session using subscribe/buffer/snapshot/replay.
+5. Sidebar remote entries reappear with current state (auto hosts only).
 6. Any active remote attach/proxy view is not auto-restored in MVP; the user can click the remote agent again.
 
 ### Remote node restart

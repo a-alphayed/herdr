@@ -138,8 +138,127 @@ fn default_remote_session_name() -> String {
     crate::session::DEFAULT_SESSION_NAME.to_string()
 }
 
-fn default_auto_connect() -> bool {
-    true
+/// Per-host connection policy controlling whether the local aggregator probes a
+/// configured remote host automatically and whether explicit on-demand mutating
+/// commands may reach it without a prior live connection.
+///
+/// This enum is the single stored source of truth on [`RemoteHostConfig`]; the
+/// legacy `auto_connect` TOML boolean is accepted only as a backward-compatible
+/// alias (see [`resolve_connection_policy`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RemoteConnectionPolicy {
+    /// The host is probed/connected automatically at startup and on config
+    /// reload by the remote source supervisor, seeded as a disconnected remote
+    /// source, and treated as a configured auto source event sender. Explicit
+    /// mutating commands still fail fast when its cached status is non-connected.
+    /// Equivalent to legacy `auto_connect = true`.
+    #[default]
+    Auto,
+    /// The host is not probed automatically, but an explicit on-demand mutating
+    /// command (e.g. `agent.start --host`) may attempt a live bridge dispatch
+    /// when there is no cached non-connected status; a cached
+    /// disconnected/unreachable/needs-update status still fails fast before
+    /// forwarding. Equivalent to legacy `auto_connect = false`.
+    OnDemand,
+    /// The host is never reached implicitly. It is not probed automatically, and
+    /// an explicit mutating `agent.start --host` fails locally before dispatch
+    /// with a distinct policy error. Use this for sleeping/roaming remotes that
+    /// must not be woken or auto-probed just because they are configured.
+    Manual,
+}
+
+impl RemoteConnectionPolicy {
+    /// Whether this host should be started/probed automatically by the remote
+    /// source supervisor at startup and on config reload, seeded as a
+    /// disconnected remote source, and treated as a configured auto source
+    /// event sender. Only [`RemoteConnectionPolicy::Auto`] qualifies.
+    pub(crate) fn starts_automatically(self) -> bool {
+        matches!(self, RemoteConnectionPolicy::Auto)
+    }
+
+    /// Whether this policy refuses implicit on-demand mutating dispatch
+    /// (e.g. `agent.start --host`). Only [`RemoteConnectionPolicy::Manual`]
+    /// qualifies; `Auto` and `OnDemand` keep the existing explicit-connect
+    /// behavior.
+    pub(crate) fn is_manual(self) -> bool {
+        matches!(self, RemoteConnectionPolicy::Manual)
+    }
+
+    pub(crate) fn as_toml_str(self) -> &'static str {
+        match self {
+            RemoteConnectionPolicy::Auto => "auto",
+            RemoteConnectionPolicy::OnDemand => "on_demand",
+            RemoteConnectionPolicy::Manual => "manual",
+        }
+    }
+
+    /// Whether this policy is consistent with a legacy `auto_connect` boolean.
+    /// `Auto` is consistent with `true`; `OnDemand` and `Manual` with `false`.
+    fn is_consistent_with_legacy(self, auto_connect: bool) -> bool {
+        match self {
+            RemoteConnectionPolicy::Auto => auto_connect,
+            RemoteConnectionPolicy::OnDemand | RemoteConnectionPolicy::Manual => !auto_connect,
+        }
+    }
+}
+
+/// Error raised when an explicit `connection_policy` and a legacy
+/// `auto_connect` boolean are both present but inconsistent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteConnectionPolicyConflict {
+    policy: RemoteConnectionPolicy,
+    auto_connect: bool,
+}
+
+impl std::fmt::Display for RemoteConnectionPolicyConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.policy {
+            RemoteConnectionPolicy::Auto => write!(
+                f,
+                "remote connection_policy = \"auto\" requires auto_connect = true, but auto_connect = {} was set",
+                self.auto_connect
+            ),
+            policy => write!(
+                f,
+                "remote connection_policy = \"{}\" requires auto_connect = false, but auto_connect = {} was set",
+                policy.as_toml_str(),
+                self.auto_connect
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RemoteConnectionPolicyConflict {}
+
+/// Resolve the canonical connection policy from the explicit
+/// `connection_policy` TOML field and the legacy `auto_connect` boolean,
+/// rejecting inconsistent combinations with a clear error.
+///
+/// Presence of each input is detected independently by the caller (the custom
+/// [`Deserialize`] impl on [`RemoteHostConfig`]), so a missing `auto_connect`
+/// never conflicts with the default [`RemoteConnectionPolicy::Auto`] policy and
+/// `auto_connect = false` alone resolves to [`RemoteConnectionPolicy::OnDemand`].
+fn resolve_connection_policy(
+    explicit: Option<RemoteConnectionPolicy>,
+    legacy: Option<bool>,
+) -> Result<RemoteConnectionPolicy, RemoteConnectionPolicyConflict> {
+    match (explicit, legacy) {
+        (Some(policy), Some(auto_connect)) => {
+            if policy.is_consistent_with_legacy(auto_connect) {
+                Ok(policy)
+            } else {
+                Err(RemoteConnectionPolicyConflict {
+                    policy,
+                    auto_connect,
+                })
+            }
+        }
+        (Some(policy), None) => Ok(policy),
+        (None, Some(true)) => Ok(RemoteConnectionPolicy::Auto),
+        (None, Some(false)) => Ok(RemoteConnectionPolicy::OnDemand),
+        (None, None) => Ok(RemoteConnectionPolicy::Auto),
+    }
 }
 
 /// Default SSH `ConnectTimeout` (seconds) for a configured remote host, used
@@ -154,18 +273,19 @@ fn default_connect_timeout_secs() -> u32 {
     DEFAULT_CONNECT_TIMEOUT_SECS
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RemoteHostConfig {
     pub(crate) name: String,
     pub(crate) target: String,
-    #[serde(default = "default_remote_session_name")]
     pub(crate) session: String,
-    #[serde(default = "default_auto_connect")]
-    pub(crate) auto_connect: bool,
+    /// Per-host connection policy. Single stored source of truth; defaults to
+    /// [`RemoteConnectionPolicy::Auto`] when neither `connection_policy` nor
+    /// the legacy `auto_connect` field is set. See [`RemoteConnectionPolicy`]
+    /// and [`resolve_connection_policy`].
+    pub(crate) connection_policy: RemoteConnectionPolicy,
     /// SSH `ConnectTimeout` in whole seconds for connection attempts to this
     /// host. Applies to both interactive and noninteractive configured-host
     /// SSH invocations. Default: 10 seconds.
-    #[serde(default = "default_connect_timeout_secs")]
     pub(crate) connect_timeout_secs: u32,
 }
 
@@ -181,7 +301,15 @@ impl RemoteHostConfig {
             name: name.into(),
             target: target.into(),
             session: session.into(),
-            auto_connect,
+            // The constructor keeps the legacy `auto_connect` boolean shape so
+            // existing call sites keep compiling; `true` maps to `Auto` and
+            // `false` to `OnDemand`. A `Manual` host is built via TOML or via
+            // [`RemoteHostConfig::with_connection_policy`].
+            connection_policy: if auto_connect {
+                RemoteConnectionPolicy::Auto
+            } else {
+                RemoteConnectionPolicy::OnDemand
+            },
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
         }
     }
@@ -190,6 +318,53 @@ impl RemoteHostConfig {
     pub(crate) fn with_connect_timeout_secs(mut self, connect_timeout_secs: u32) -> Self {
         self.connect_timeout_secs = connect_timeout_secs;
         self
+    }
+
+    /// Override the connection policy. Test-only helper for building hosts
+    /// whose policy is not reachable from the legacy bool constructor (e.g.
+    /// [`RemoteConnectionPolicy::Manual`]).
+    #[cfg(test)]
+    pub(crate) fn with_connection_policy(mut self, policy: RemoteConnectionPolicy) -> Self {
+        self.connection_policy = policy;
+        self
+    }
+}
+
+impl<'de> Deserialize<'de> for RemoteHostConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Helper struct so serde can detect presence of `auto_connect` and
+        // `connection_policy` independently via `Option<...>` defaults. A naive
+        // defaulted `bool` would make `auto_connect = false` indistinguishable
+        // from an omitted field and could spuriously conflict with the default
+        // `Auto` policy.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        struct HostConfigToml {
+            name: String,
+            target: String,
+            #[serde(default = "default_remote_session_name")]
+            session: String,
+            #[serde(default)]
+            auto_connect: Option<bool>,
+            #[serde(default)]
+            connection_policy: Option<RemoteConnectionPolicy>,
+            #[serde(default = "default_connect_timeout_secs")]
+            connect_timeout_secs: u32,
+        }
+
+        let raw = HostConfigToml::deserialize(deserializer)?;
+        let connection_policy = resolve_connection_policy(raw.connection_policy, raw.auto_connect)
+            .map_err(serde::de::Error::custom)?;
+        Ok(RemoteHostConfig {
+            name: raw.name,
+            target: raw.target,
+            session: raw.session,
+            connection_policy,
+            connect_timeout_secs: raw.connect_timeout_secs,
+        })
     }
 }
 
@@ -1376,7 +1551,7 @@ mod tests {
         let original = registry.get("jafar").unwrap();
         assert_eq!(original.target, "host-a");
         assert_eq!(original.session, "default");
-        assert!(original.auto_connect);
+        assert!(original.connection_policy.starts_automatically());
     }
 
     #[test]
@@ -1443,7 +1618,7 @@ mod tests {
 
         let host = registry.get("jafar").unwrap();
         assert_eq!(host.connect_timeout_secs, 45);
-        assert!(host.auto_connect);
+        assert!(host.connection_policy.starts_automatically());
     }
 
     #[test]
@@ -2116,5 +2291,159 @@ mod tests {
                 terminal_ids_unavailable: false,
             }
         );
+    }
+
+    #[derive(Deserialize)]
+    struct HostsDoc {
+        hosts: Vec<RemoteHostConfig>,
+    }
+
+    fn parse_hosts(body: &str) -> Result<Vec<RemoteHostConfig>, toml::de::Error> {
+        toml::from_str::<HostsDoc>(&format!("[[hosts]]\n{body}")).map(|doc| doc.hosts)
+    }
+
+    #[test]
+    fn connection_policy_defaults_to_auto_when_neither_field_is_set() {
+        let hosts = parse_hosts(
+            r#"
+name = "jafar"
+target = "jafar"
+session = "default"
+"#,
+        )
+        .expect("parses");
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].connection_policy, RemoteConnectionPolicy::Auto);
+    }
+
+    #[test]
+    fn connection_policy_parses_explicit_auto_on_demand_manual() {
+        for (value, expected) in [
+            ("auto", RemoteConnectionPolicy::Auto),
+            ("on_demand", RemoteConnectionPolicy::OnDemand),
+            ("manual", RemoteConnectionPolicy::Manual),
+        ] {
+            let hosts = parse_hosts(&format!(
+                r#"
+name = "jafar"
+target = "jafar"
+session = "default"
+connection_policy = "{value}"
+"#
+            ))
+            .unwrap_or_else(|err| panic!("parsing {value} failed: {err}"));
+            assert_eq!(hosts[0].connection_policy, expected, "value {value}");
+        }
+    }
+
+    #[test]
+    fn legacy_auto_connect_false_resolves_to_on_demand() {
+        let hosts = parse_hosts(
+            r#"
+name = "jafar"
+target = "jafar"
+session = "default"
+auto_connect = false
+"#,
+        )
+        .expect("parses");
+        assert_eq!(hosts[0].connection_policy, RemoteConnectionPolicy::OnDemand);
+    }
+
+    #[test]
+    fn legacy_auto_connect_true_resolves_to_auto() {
+        let hosts = parse_hosts(
+            r#"
+name = "jafar"
+target = "jafar"
+session = "default"
+auto_connect = true
+"#,
+        )
+        .expect("parses");
+        assert_eq!(hosts[0].connection_policy, RemoteConnectionPolicy::Auto);
+    }
+
+    #[test]
+    fn resolve_connection_policy_accepts_consistent_legacy_boolean() {
+        // auto + auto_connect = true; on_demand / manual + auto_connect = false.
+        assert_eq!(
+            resolve_connection_policy(Some(RemoteConnectionPolicy::Auto), Some(true)),
+            Ok(RemoteConnectionPolicy::Auto)
+        );
+        assert_eq!(
+            resolve_connection_policy(Some(RemoteConnectionPolicy::OnDemand), Some(false)),
+            Ok(RemoteConnectionPolicy::OnDemand)
+        );
+        assert_eq!(
+            resolve_connection_policy(Some(RemoteConnectionPolicy::Manual), Some(false)),
+            Ok(RemoteConnectionPolicy::Manual)
+        );
+        // Explicit policy with no legacy boolean always wins.
+        assert_eq!(
+            resolve_connection_policy(Some(RemoteConnectionPolicy::Manual), None),
+            Ok(RemoteConnectionPolicy::Manual)
+        );
+    }
+
+    #[test]
+    fn resolve_connection_policy_rejects_conflicting_legacy_boolean() {
+        assert_eq!(
+            resolve_connection_policy(Some(RemoteConnectionPolicy::Auto), Some(false)),
+            Err(RemoteConnectionPolicyConflict {
+                policy: RemoteConnectionPolicy::Auto,
+                auto_connect: false
+            })
+        );
+        assert_eq!(
+            resolve_connection_policy(Some(RemoteConnectionPolicy::OnDemand), Some(true)),
+            Err(RemoteConnectionPolicyConflict {
+                policy: RemoteConnectionPolicy::OnDemand,
+                auto_connect: true
+            })
+        );
+        assert_eq!(
+            resolve_connection_policy(Some(RemoteConnectionPolicy::Manual), Some(true)),
+            Err(RemoteConnectionPolicyConflict {
+                policy: RemoteConnectionPolicy::Manual,
+                auto_connect: true
+            })
+        );
+        // Error message names both fields so the conflict is actionable.
+        let message = resolve_connection_policy(Some(RemoteConnectionPolicy::OnDemand), Some(true))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("connection_policy = \"on_demand\""));
+        assert!(message.contains("auto_connect = true"));
+    }
+
+    #[test]
+    fn connection_policy_toml_rejects_conflicting_legacy_boolean() {
+        let err = parse_hosts(
+            r#"
+name = "jafar"
+target = "jafar"
+session = "default"
+connection_policy = "on_demand"
+auto_connect = true
+"#,
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("connection_policy"),
+            "expected conflict message, got: {message}"
+        );
+        assert!(message.contains("auto_connect"));
+    }
+
+    #[test]
+    fn connection_policy_starts_automatically_only_for_auto() {
+        assert!(RemoteConnectionPolicy::Auto.starts_automatically());
+        assert!(!RemoteConnectionPolicy::OnDemand.starts_automatically());
+        assert!(!RemoteConnectionPolicy::Manual.starts_automatically());
+        assert!(!RemoteConnectionPolicy::Auto.is_manual());
+        assert!(!RemoteConnectionPolicy::OnDemand.is_manual());
+        assert!(RemoteConnectionPolicy::Manual.is_manual());
     }
 }

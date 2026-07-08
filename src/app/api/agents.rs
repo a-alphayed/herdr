@@ -103,9 +103,16 @@ impl App {
                     )),
                 );
             };
+            // A Manual host must never be reached implicitly by a mutating
+            // command: fail locally before dispatch with a distinct policy
+            // error, before any connectivity precheck, so the decision is not
+            // confused with a transient connection failure.
+            if let Err(err) = remote_agent_start_host_policy_guard(&host) {
+                return encode_error_body(id, err);
+            }
             // Cached non-connected hosts fail fast before dispatch. A missing
-            // cache entry (e.g. auto_connect=false / on-demand hosts) is not a
-            // known-bad status, so it keeps the existing on-demand behavior.
+            // cache entry (e.g. on-demand hosts with no prior snapshot) is not
+            // a known-bad status, so it keeps the existing on-demand behavior.
             if let Err(err) = remote_agent_start_host_precheck(&self.state.remote_sources, &host) {
                 return encode_error_body(id, err);
             }
@@ -670,11 +677,33 @@ fn remote_agent_host_not_connected_body(host: &str, session: &str, status: Strin
     }
 }
 
+/// Policy precheck for `agent.start --host`: a host whose connection policy
+/// is [`RemoteConnectionPolicy::Manual`] must never be reached implicitly by a
+/// mutating command, so it fails locally before dispatch with a distinct policy
+/// error. This is a policy decision, not a connectivity failure, so it must not
+/// reuse the `remote_host_not_connected` error code.
+///
+/// [`RemoteConnectionPolicy::Manual`]: crate::remote_target::RemoteConnectionPolicy::Manual
+fn remote_agent_start_host_policy_guard(
+    host: &crate::remote_target::RemoteHostConfig,
+) -> Result<(), ErrorBody> {
+    if host.connection_policy.is_manual() {
+        return Err(ErrorBody {
+            code: "remote_host_connection_policy_manual".to_string(),
+            message: format!(
+                "remote host {}/{} has connection_policy = \"manual\"; it must be connected explicitly and will not be reached implicitly by agent.start",
+                host.name, host.session
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Pure precheck for `agent.start --host`: fail fast when a cached remote host
-/// entry exists and is non-connected. A missing cache entry (e.g.
-/// `auto_connect=false` / an on-demand host with no prior snapshot) is not a
-/// known-bad status and must keep the existing on-demand dispatch behavior,
-/// unlike the pane precheck which rejects `None`.
+/// entry exists and is non-connected. A missing cache entry (e.g. an on-demand
+/// host with no prior snapshot) is not a known-bad status and must keep the
+/// existing on-demand dispatch behavior, unlike the pane precheck which rejects
+/// `None`.
 fn remote_agent_start_host_precheck(
     cache: &crate::remote_source::RemoteSourceCache,
     host: &crate::remote_target::RemoteHostConfig,
@@ -1652,10 +1681,10 @@ mod tests {
 
     #[test]
     fn agent_start_host_precheck_pure_helper_allows_no_cache_entry_on_demand_host() {
-        // A host with no cache entry at all (auto_connect=false / genuinely
-        // on-demand, never yet connected) must NOT be rejected: this keeps
-        // the existing on-demand dispatch behavior, unlike the pane precheck
-        // which rejects None.
+        // A host with no cache entry at all (connection_policy = "on_demand" /
+        // genuinely on-demand, never yet connected) must NOT be rejected: this
+        // keeps the existing on-demand dispatch behavior, unlike the pane
+        // precheck which rejects None.
         let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", false);
         let cache = crate::remote_source::RemoteSourceCache::default();
 
@@ -1670,5 +1699,61 @@ mod tests {
         cache.replace_connected_snapshot(host_key, Vec::new());
 
         assert!(remote_agent_start_host_precheck(&cache, &host).is_ok());
+    }
+
+    #[test]
+    fn remote_agent_start_host_policy_guard_rejects_only_manual_policy() {
+        let manual = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true)
+            .with_connection_policy(crate::remote_target::RemoteConnectionPolicy::Manual);
+        let err = remote_agent_start_host_policy_guard(&manual).unwrap_err();
+        assert_eq!(err.code, "remote_host_connection_policy_manual");
+    }
+
+    #[test]
+    fn remote_agent_start_host_policy_guard_allows_auto_and_on_demand() {
+        let auto_host =
+            crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true);
+        let on_demand =
+            crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", false);
+
+        assert!(remote_agent_start_host_policy_guard(&auto_host).is_ok());
+        assert!(remote_agent_start_host_policy_guard(&on_demand).is_ok());
+    }
+
+    #[test]
+    fn agent_start_host_manual_policy_fails_locally_without_dispatch() {
+        // A Manual host must fail locally before any connectivity precheck or
+        // SSH dispatch, with a distinct policy error code (never
+        // remote_host_not_connected). Because the guard fires before dispatch,
+        // this test never reaches the network.
+        let mut config = crate::config::Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts =
+            vec![
+                crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true)
+                    .with_connection_policy(crate::remote_target::RemoteConnectionPolicy::Manual),
+            ];
+        let mut app = test_app(&config);
+
+        let response = app.handle_agent_start(
+            "req".into(),
+            AgentStartParams {
+                host: Some("jafar".to_string()),
+                name: "codex".to_string(),
+                cwd: None,
+                workspace_id: None,
+                tab_id: None,
+                split: None,
+                focus: false,
+                new_workspace: false,
+                argv: vec!["codex".to_string()],
+                env: Default::default(),
+            },
+        );
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(parsed.error.code, "remote_host_connection_policy_manual");
+        assert!(parsed.error.message.contains("manual"));
+        assert!(parsed.error.message.contains("jafar/default"));
     }
 }

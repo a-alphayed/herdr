@@ -146,7 +146,7 @@ impl App {
             );
             return;
         };
-        if config.session != host.session || !config.auto_connect {
+        if config.session != host.session || !config.connection_policy.starts_automatically() {
             show_toast(
                 self,
                 ToastKind::NeedsAttention,

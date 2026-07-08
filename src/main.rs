@@ -347,13 +347,28 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Configured remote hosts define aliases used by federated/host-qualified
 # remote API controls and configured-host terminal attach (not
 # `herdr --remote <target>`, which takes a raw SSH target). Each entry needs
-# a unique name and an SSH target; session, auto_connect, and
+# a unique name and an SSH target; session, connection_policy, and
 # connect_timeout_secs are optional.
 # [[remote.hosts]]
 # name = "jafar"
 # target = "jafar"
 # session = "default"
-# auto_connect = true
+# # connection_policy controls whether herdr probes this host automatically.
+# #   auto      = probed/connected automatically at startup and on reload
+# #               (default; equivalent to legacy auto_connect = true)
+# #   on_demand = not probed automatically, but explicit mutating commands
+# #               such as `agent start --host jafar` may reach it on demand
+# #               (equivalent to legacy auto_connect = false)
+# #   manual    = never reached implicitly; `agent start --host` fails locally
+# #               before dispatch. Use this for sleeping/roaming remotes that
+# #               must not be woken or auto-probed just because they are
+# #               configured. Read-only diagnostics (`herdr remote status`)
+# #               still probe named hosts regardless of policy.
+# # The legacy `auto_connect` boolean remains a backward-compatible alias; it
+# # may be combined with `connection_policy` only when consistent
+# # (true with auto; false with on_demand or manual), otherwise config is
+# # rejected. Omitting both defaults to auto.
+# connection_policy = "auto"
 # # SSH ConnectTimeout in whole seconds (1..=300); default 10.
 # connect_timeout_secs = 10
 

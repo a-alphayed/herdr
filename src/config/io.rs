@@ -627,7 +627,9 @@ target = "jafar"
             loaded.config.remote.hosts[0].session,
             crate::session::DEFAULT_SESSION_NAME
         );
-        assert!(loaded.config.remote.hosts[0].auto_connect);
+        assert!(loaded.config.remote.hosts[0]
+            .connection_policy
+            .starts_automatically());
         assert!(loaded.config.remote.manage_ssh_config);
         assert!(loaded.diagnostics.is_empty());
         assert!(loaded.invalid_sections.is_empty());

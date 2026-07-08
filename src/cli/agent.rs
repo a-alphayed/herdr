@@ -436,10 +436,20 @@ fn configured_remote_start_host_from_config(
     let registry =
         crate::remote_target::RemoteHostRegistry::from_configs(config.remote.hosts.clone())
             .map_err(|err| format!("invalid remote host config: {err}"))?;
-    registry
+    let host = registry
         .get(alias)
-        .cloned()
-        .ok_or_else(|| format!("unknown remote host: {alias}"))
+        .ok_or_else(|| format!("unknown remote host: {alias}"))?;
+    // A Manual host must never be reached implicitly by `agent start --host`:
+    // fail locally before any SSH/API dispatch with a distinct policy error
+    // (never the unknown-host / remote-disabled / connectivity errors). This
+    // mirrors the app API `remote_host_connection_policy_manual` guard.
+    if host.connection_policy.is_manual() {
+        return Err(format!(
+            "remote host {}/{} has connection_policy = \"manual\"; `agent start --host {}` will not reach it implicitly (connect it explicitly first)",
+            host.name, host.session, alias
+        ));
+    }
+    Ok(host.clone())
 }
 
 fn agent_list(args: &[String]) -> std::io::Result<i32> {
@@ -1064,6 +1074,32 @@ mod tests {
     }
 
     #[test]
+    fn agent_start_remote_host_config_errors_for_manual_policy_before_dispatch() {
+        // A Manual host must fail locally before any SSH/API dispatch. Testing
+        // the pure config resolver proves no dispatch path is reached, with a
+        // distinct policy error (never the unknown-host / remote-disabled /
+        // connectivity messages). Mirrors the app API
+        // `remote_host_connection_policy_manual` guard.
+        let mut config = crate::config::Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar",
+            "user@jafar:2222",
+            "fed-agents",
+            true,
+        )
+        .with_connection_policy(crate::remote_target::RemoteConnectionPolicy::Manual)];
+
+        let err = configured_remote_start_host_from_config(&config, "jafar").unwrap_err();
+
+        assert!(err.contains("connection_policy = \"manual\""));
+        assert!(err.contains("jafar/fed-agents"));
+        assert!(err.contains("agent start --host jafar"));
+        assert!(!err.starts_with("unknown remote host"));
+        assert_ne!(err, "remote agent start requires remote.enabled = true");
+    }
+
+    #[test]
     fn agent_start_remote_host_config_resolves_configured_connect_timeout() {
         // `agent start --host` dispatches through `send_remote_api_request_to_host`
         // using this resolved host, so a custom bounded connect timeout must
@@ -1082,7 +1118,7 @@ mod tests {
             .expect("configured start host");
 
         assert_eq!(host.connect_timeout_secs, 25);
-        assert!(!host.auto_connect);
+        assert!(!host.connection_policy.starts_automatically());
     }
 
     #[test]
