@@ -1291,7 +1291,9 @@ herdr agent read jafar/codex
   -> return remote response
 ```
 
-Spike limitation: the first implementation performs the one-request SSH bridge synchronously in the App API handler. That proves the routing path, but it can block the local UI/server loop while SSH probes and request execution run. A shipping implementation should move remote request execution off the main loop and reuse supervisor compatibility/preparation state instead of probing the remote binary on every read/send.
+Phase G.6 status: remote AGENT CONTROL bridge dispatch for host-qualified `agent.read`/`focus`/`send`/`submit`/`teardown` and `agent.start --host` now leaves the App and headless server request loops *after* the existing in-memory route/cache/policy gates pass. A pure planner (`plan_deferred_remote_agent_request`) performs route planning, cached target resolution, the `agent.teardown` confirm gate, the `agent.start --host` connection-policy guard and cached non-connected precheck, and the remote-mutating connected checks without spawning a thread or touching SSH; only when those gates pass does an owned dispatch descriptor run the SSH bridge on a background worker and send the response through a one-shot channel. Slow or sleeping remote hosts therefore can no longer stall unrelated local UI or headless request handling. The guard ordering and semantics are unchanged: `manual` rejects `agent.start --host` before SSH/API dispatch, `on_demand` is not auto-probed/seeded, cached non-connected statuses fail mutating commands before forwarding, and `agent.get`/`agent.list` stay cache-only.
+
+Still future hardening (outside G.6): reusing `remote_supervisor` compatibility/preparation state to avoid per-request remote binary prep/probes; command queueing/retry for mutating commands; and cache-mutating remote tab/workspace/pane layout operations.
 
 Acceptance criteria for current Phase 2 routing:
 

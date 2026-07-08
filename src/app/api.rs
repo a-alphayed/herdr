@@ -2,6 +2,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 mod agents;
+pub(super) mod agents_deferred;
 mod env;
 mod integrations;
 mod layouts;

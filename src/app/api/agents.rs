@@ -362,7 +362,7 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
-    fn plan_agent_api_target(
+    pub(super) fn plan_agent_api_target(
         &self,
         target: &str,
     ) -> Result<PlannedTargetRoute, RemoteRoutePlanError> {
@@ -382,7 +382,7 @@ impl App {
     /// ambiguous, unsupported selector) instead of this one.
     /// `agent.get`/`agent.list` must not use this: they show stale cached
     /// entries rather than fail.
-    fn remote_agent_resolved_connected_or_error(
+    pub(super) fn remote_agent_resolved_connected_or_error(
         host: &crate::remote_target::RemoteHostConfig,
         resolved: &crate::remote_target::RemoteAgentResolution,
     ) -> Result<(), ErrorBody> {
@@ -563,7 +563,11 @@ fn agent_not_found(id: String, target: &str) -> String {
     )
 }
 
-fn remote_agent_focus_request(id: String, mut target: AgentTarget, terminal_id: &str) -> Request {
+pub(super) fn remote_agent_focus_request(
+    id: String,
+    mut target: AgentTarget,
+    terminal_id: &str,
+) -> Request {
     target.target = terminal_id.to_string();
     Request {
         id,
@@ -571,7 +575,7 @@ fn remote_agent_focus_request(id: String, mut target: AgentTarget, terminal_id: 
     }
 }
 
-fn remote_agent_read_request(
+pub(super) fn remote_agent_read_request(
     id: String,
     mut params: AgentReadParams,
     terminal_id: &str,
@@ -583,7 +587,7 @@ fn remote_agent_read_request(
     }
 }
 
-fn remote_agent_send_request(
+pub(super) fn remote_agent_send_request(
     id: String,
     mut params: AgentSendParams,
     terminal_id: &str,
@@ -595,7 +599,7 @@ fn remote_agent_send_request(
     }
 }
 
-fn remote_agent_submit_request(
+pub(super) fn remote_agent_submit_request(
     id: String,
     mut params: AgentSubmitParams,
     terminal_id: &str,
@@ -607,7 +611,7 @@ fn remote_agent_submit_request(
     }
 }
 
-fn remote_agent_teardown_request(id: String, terminal_id: &str) -> Request {
+pub(super) fn remote_agent_teardown_request(id: String, terminal_id: &str) -> Request {
     Request {
         id,
         method: Method::AgentTeardown(AgentTeardownParams {
@@ -668,7 +672,11 @@ fn prefix_remote_agent_label_field(
     *value = serde_json::Value::String(format!("{host}/{label}"));
 }
 
-fn remote_agent_host_not_connected_body(host: &str, session: &str, status: String) -> ErrorBody {
+pub(super) fn remote_agent_host_not_connected_body(
+    host: &str,
+    session: &str,
+    status: String,
+) -> ErrorBody {
     ErrorBody {
         code: "remote_host_not_connected".to_string(),
         message: format!(
@@ -684,7 +692,7 @@ fn remote_agent_host_not_connected_body(host: &str, session: &str, status: Strin
 /// reuse the `remote_host_not_connected` error code.
 ///
 /// [`RemoteConnectionPolicy::Manual`]: crate::remote_target::RemoteConnectionPolicy::Manual
-fn remote_agent_start_host_policy_guard(
+pub(super) fn remote_agent_start_host_policy_guard(
     host: &crate::remote_target::RemoteHostConfig,
 ) -> Result<(), ErrorBody> {
     if host.connection_policy.is_manual() {
@@ -704,7 +712,7 @@ fn remote_agent_start_host_policy_guard(
 /// host with no prior snapshot) is not a known-bad status and must keep the
 /// existing on-demand dispatch behavior, unlike the pane precheck which rejects
 /// `None`.
-fn remote_agent_start_host_precheck(
+pub(super) fn remote_agent_start_host_precheck(
     cache: &crate::remote_source::RemoteSourceCache,
     host: &crate::remote_target::RemoteHostConfig,
 ) -> Result<(), ErrorBody> {
@@ -723,7 +731,7 @@ fn remote_agent_start_host_precheck(
     }
 }
 
-fn remote_agent_resolve_error_body(err: RemoteAgentResolveError) -> ErrorBody {
+pub(super) fn remote_agent_resolve_error_body(err: RemoteAgentResolveError) -> ErrorBody {
     match err {
         RemoteAgentResolveError::NotFound { target } => ErrorBody {
             code: "remote_agent_not_found".to_string(),

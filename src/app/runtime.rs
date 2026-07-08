@@ -82,13 +82,36 @@ impl App {
             self.sync_prefix_input_source(previous_mode);
             return changed | deferred_changed;
         }
-        let response = self.handle_api_request(msg.request);
-        if !skip_default_workspace {
-            changed |= self.ensure_default_workspace();
+        // Drain internal events once so `remote_sources` is as fresh as the
+        // current sync path, then try the deferred remote-agent seam before
+        // the synchronous fallback. Draining once here and dispatching via
+        // `handle_api_request_after_internal_events_drained` on NotHandled
+        // avoids the double drain that `handle_api_request` would perform.
+        self.drain_all_internal_events();
+        match self.handle_deferred_remote_agent_api_request(msg.request, msg.respond_to) {
+            crate::app::DeferredRemoteAgentOutcome::Handled => {
+                // Deferred: a worker was started (or an immediate guard
+                // response was sent) and `respond_to` was consumed. Do not
+                // block; preserve the post-request bookkeeping.
+                if !skip_default_workspace {
+                    changed |= self.ensure_default_workspace();
+                }
+                self.sync_prefix_input_source(previous_mode);
+                changed
+            }
+            crate::app::DeferredRemoteAgentOutcome::NotHandled {
+                request,
+                respond_to,
+            } => {
+                let response = self.handle_api_request_after_internal_events_drained(*request);
+                if !skip_default_workspace {
+                    changed |= self.ensure_default_workspace();
+                }
+                let _ = respond_to.send(response);
+                self.sync_prefix_input_source(previous_mode);
+                changed
+            }
         }
-        let _ = msg.respond_to.send(response);
-        self.sync_prefix_input_source(previous_mode);
-        changed
     }
 
     pub(super) async fn handle_raw_input_batch(

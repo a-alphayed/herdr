@@ -23,6 +23,7 @@ mod terminal_targets;
 mod theme_sync;
 mod worktrees;
 
+pub(crate) use api::agents_deferred::DeferredRemoteAgentOutcome;
 pub(crate) use api::{remote_agent_start_request, rewrite_remote_agent_start_response};
 
 use std::collections::{HashMap, HashSet};
@@ -144,6 +145,12 @@ pub struct App {
     pub(crate) remote_hosts: crate::remote_target::RemoteHostRegistry,
     pub(crate) remote_source_supervisors:
         Vec<crate::remote_supervisor::RemoteSourceSupervisorHandle>,
+    /// Injectable dispatch starter for deferred (off-loop) remote-agent bridge
+    /// dispatch. Defaults to spawning a background thread that runs the bridge;
+    /// tests inject a fake starter to prove the loop continues while the
+    /// worker is blocked.
+    pub(crate) remote_agent_dispatch_starter:
+        crate::app::api::agents_deferred::RemoteAgentDispatchStarter,
     prefix_input_source: Box<dyn crate::platform::PrefixInputSource>,
 }
 
@@ -873,6 +880,8 @@ impl App {
             config_reloaded_from_disk: false,
             remote_hosts,
             remote_source_supervisors,
+            remote_agent_dispatch_starter:
+                crate::app::api::agents_deferred::spawn_remote_agent_dispatch,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
         }
     }

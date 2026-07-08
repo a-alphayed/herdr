@@ -2871,13 +2871,27 @@ impl HeadlessServer {
                 .handle_deferred_worktree_api_request(msg.request, msg.respond_to);
             return changed | deferred_changed;
         }
-        let response = if matches!(
-            &msg.request.method,
-            api::schema::Method::ServerReloadConfig(_)
-        ) {
+        // Deferred remote-agent dispatch: move host-qualified remote agent
+        // control requests off the headless loop after route/cache/policy
+        // gates pass, so a slow/sleeping remote host cannot stall unrelated
+        // headless request handling. The same planner/starter the TUI runtime
+        // uses is invoked here; on NotHandled the request falls through to
+        // the synchronous local path unchanged.
+        let (request, respond_to) = (msg.request, msg.respond_to);
+        let (request, respond_to) = match self
+            .app
+            .handle_deferred_remote_agent_api_request(request, respond_to)
+        {
+            crate::app::DeferredRemoteAgentOutcome::Handled => return changed,
+            crate::app::DeferredRemoteAgentOutcome::NotHandled {
+                request,
+                respond_to,
+            } => (*request, respond_to),
+        };
+        let response = if matches!(&request.method, api::schema::Method::ServerReloadConfig(_)) {
             let report = self.reload_server_config(true);
             serde_json::to_string(&api::schema::SuccessResponse {
-                id: msg.request.id.clone(),
+                id: request.id.clone(),
                 result: api::schema::ResponseResult::ConfigReload {
                     status: report.status,
                     diagnostics: report.diagnostics,
@@ -2895,9 +2909,9 @@ impl HeadlessServer {
             })
         } else {
             self.app
-                .handle_api_request_after_internal_events_drained(msg.request)
+                .handle_api_request_after_internal_events_drained(request)
         };
-        let _ = msg.respond_to.send(response);
+        let _ = respond_to.send(response);
 
         // Forward new toast state only when a client-local delivery mode is selected.
         // Herdr delivery renders the toast in-frame and must not ask clients to
@@ -4239,6 +4253,77 @@ mod tests {
             ServerMessage::ServerShutdown { reason } => reason,
             other => panic!("expected shutdown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn headless_remote_agent_request_uses_deferred_helper_not_sync_fallback() {
+        // Prove the headless server routes host-qualified remote agent
+        // requests through the shared deferred planner/starter instead of
+        // falling through to the synchronous local handler. A fake starter
+        // records invocation and sends a canned success; if the headless path
+        // fell through to sync handling, the starter would never run.
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        STARTED.store(false, Ordering::SeqCst);
+
+        let mut server = test_headless_server();
+        server.app.remote_hosts = crate::remote_target::RemoteHostRegistry::from_configs(vec![
+            crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true),
+        ])
+        .expect("valid remote host config");
+        server.app.state.remote_sources.replace_connected_snapshot(
+            crate::remote_source::RemoteHostKey::new("jafar", "default"),
+            vec![api::schema::AgentInfo {
+                terminal_id: "term-1".into(),
+                name: Some("codex".into()),
+                agent: Some("codex".into()),
+                title: None,
+                display_agent: Some("codex".into()),
+                agent_status: api::schema::AgentStatus::Working,
+                screen_detection_skipped: false,
+                custom_status: None,
+                state_labels: HashMap::new(),
+                agent_session: None,
+                workspace_id: "remote-ws".into(),
+                tab_id: "remote-tab".into(),
+                pane_id: "term-1-pane".into(),
+                focused: false,
+                cwd: None,
+                foreground_cwd: None,
+                revision: 1,
+            }],
+        );
+        server.app.remote_agent_dispatch_starter = |descriptor, respond_to| {
+            STARTED.store(true, Ordering::SeqCst);
+            let response = serde_json::to_string(&api::schema::SuccessResponse {
+                id: descriptor.request.id,
+                result: api::schema::ResponseResult::Ok {},
+            })
+            .unwrap();
+            let _ = respond_to.send(response);
+        };
+
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "headless-remote-agent".into(),
+                method: api::schema::Method::AgentSend(api::schema::AgentSendParams {
+                    target: "jafar/codex".into(),
+                    text: "hi".into(),
+                }),
+            },
+            respond_to,
+        });
+        assert!(
+            STARTED.load(Ordering::SeqCst),
+            "headless loop must route the remote agent request through the deferred helper"
+        );
+        let response = response_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("response must be sent");
+        let parsed: api::schema::SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed.id, "headless-remote-agent");
+
+        shutdown_test_runtimes(&mut server);
     }
 
     #[test]
