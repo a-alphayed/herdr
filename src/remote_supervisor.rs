@@ -32,6 +32,24 @@ const REMOTE_SOURCE_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const REMOTE_SOURCE_STOP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+// Transient (Unreachable/Unknown) failures use bounded exponential backoff on
+// top of the short retry interval. Both the base and the cap are expressed in
+// seconds because the backoff is computed by bit-shifting a `u64` second count.
+/// Base (and first-attempt) transient retry interval. Consecutive transient
+/// failures double this value up to [`REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS`].
+const REMOTE_SOURCE_TRANSIENT_BACKOFF_BASE_SECS: u64 = REMOTE_SOURCE_RETRY_INTERVAL.as_secs();
+/// Ceiling for transient exponential backoff (~5 minutes). This is intentionally
+/// a distinct constant from [`REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL`]: both
+/// happen to be ~5 minutes, but the former is the transient backoff ceiling
+/// while the latter is the fixed long interval for non-transient `NeedsUpdate`
+/// failures and must not be conflated with it.
+const REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS: u64 = 5 * 60;
+/// Largest bit-shift applied to the base before the cap clamps the result.
+/// `2^5 = 32`, so step 5 already yields `15 * 32 = 480s` which exceeds the 300s
+/// cap; any larger consecutive-failure index therefore collapses to the cap.
+/// Clamping the shift also keeps `1u64 << step` from overflowing.
+const TRANSIENT_BACKOFF_MAX_SHIFT: u32 = 5;
+
 pub(crate) struct RemoteSourceSupervisorHandle {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -114,6 +132,7 @@ fn remote_source_supervisor_loop_with<F>(
     let mut next_ping = Instant::now();
     let mut next_snapshot = Instant::now();
     let mut capabilities = RemoteSourceCapabilities::default();
+    let mut transient_backoff = TransientBackoff::default();
 
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
@@ -121,6 +140,9 @@ fn remote_source_supervisor_loop_with<F>(
             match send_ping(&host, &send) {
                 Ok(next_capabilities) => {
                     capabilities = next_capabilities;
+                    // Any successful round-trip proves the host is reachable
+                    // again, so clear any accumulated transient backoff.
+                    transient_backoff.reset();
                     next_ping = now + REMOTE_SOURCE_PING_INTERVAL;
                 }
                 Err(err) => {
@@ -133,8 +155,13 @@ fn remote_source_supervisor_loop_with<F>(
                         host: host_key.clone(),
                         status,
                     });
-                    let retry_interval = ping_failure_retry_interval(&err);
+                    let retry_interval = retry_interval_for_failure(&err, &mut transient_backoff);
                     next_ping = now + retry_interval;
+                    // Defer the next snapshot probe to at least the chosen retry
+                    // interval so an offline host does not immediately run deeper
+                    // snapshot/projection probes in the same iteration, and so a
+                    // single transient failure does not double-escalate the
+                    // shared backoff through both ping and snapshot this tick.
                     next_snapshot = next_snapshot.max(now + retry_interval);
                 }
             }
@@ -155,6 +182,8 @@ fn remote_source_supervisor_loop_with<F>(
                         projections,
                         tabs,
                     });
+                    // A successful snapshot also proves reachability.
+                    transient_backoff.reset();
                     next_snapshot = now + REMOTE_SOURCE_SNAPSHOT_INTERVAL;
                 }
                 Err(err) => {
@@ -167,7 +196,8 @@ fn remote_source_supervisor_loop_with<F>(
                         host: host_key.clone(),
                         status,
                     });
-                    next_snapshot = now + REMOTE_SOURCE_RETRY_INTERVAL;
+                    let retry_interval = retry_interval_for_failure(&err, &mut transient_backoff);
+                    next_snapshot = now + retry_interval;
                 }
             }
         }
@@ -186,11 +216,67 @@ fn sleep_until_next_due(next_due: Instant, stop: &AtomicBool) {
     }
 }
 
-fn ping_failure_retry_interval(err: &io::Error) -> Duration {
+/// Bounded exponential backoff for transient remote-supervisor failures.
+///
+/// Only [`RemoteFailureClass::Unreachable`] and [`RemoteFailureClass::Unknown`]
+/// failures consume this state; [`RemoteFailureClass::NeedsUpdate`] failures
+/// (missing/incompatible binary, invalid data) are not transient, keep the fixed
+/// [`REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL`], and must neither consume nor
+/// reset this counter.
+///
+/// Deterministic jitter is intentionally deferred to a later Phase G slice so
+/// supervisor tests remain deterministic now; the federated remote-agent design
+/// calls for backoff *and* jitter, and jitter will be layered on without
+/// changing this sequence.
+///
+/// [`RemoteFailureClass::Unreachable`]: crate::remote::RemoteFailureClass::Unreachable
+/// [`RemoteFailureClass::Unknown`]: crate::remote::RemoteFailureClass::Unknown
+/// [`RemoteFailureClass::NeedsUpdate`]: crate::remote::RemoteFailureClass::NeedsUpdate
+#[derive(Debug, Default)]
+struct TransientBackoff {
+    consecutive_failures: u32,
+}
+
+impl TransientBackoff {
+    /// Returns the retry interval for the current transient failure, then
+    /// advances the consecutive-failure count so the next failure waits longer.
+    fn record_failure(&mut self) -> Duration {
+        let interval = transient_backoff_interval(self.consecutive_failures);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        interval
+    }
+
+    /// Clears accumulated backoff after any successful ping or snapshot.
+    fn reset(&mut self) {
+        self.consecutive_failures = 0;
+    }
+}
+
+/// Retry interval for the Nth consecutive transient failure (0-indexed).
+///
+/// Sequence: 15s, 30s, 60s, 120s, 240s, then capped at
+/// [`REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS`] (~5 minutes). See
+/// [`TransientBackoff`] for why jitter is not applied here yet.
+fn transient_backoff_interval(failure_index: u32) -> Duration {
+    let step = failure_index.min(TRANSIENT_BACKOFF_MAX_SHIFT);
+    let secs = REMOTE_SOURCE_TRANSIENT_BACKOFF_BASE_SECS
+        .saturating_mul(1u64 << step)
+        .min(REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Retry interval for a remote-supervisor failure.
+///
+/// Transient (`Unreachable`/`Unknown`) failures escalate the shared transient
+/// backoff; `NeedsUpdate` failures keep the fixed long interval and do not touch
+/// the backoff state, so an incompatible-binary host does not burn through the
+/// transient escalation ladder (and a transient flap right after a `NeedsUpdate`
+/// still starts from the base).
+fn retry_interval_for_failure(err: &io::Error, backoff: &mut TransientBackoff) -> Duration {
     match crate::remote::classify_remote_failure(err) {
         crate::remote::RemoteFailureClass::NeedsUpdate => REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL,
         crate::remote::RemoteFailureClass::Unreachable
-        | crate::remote::RemoteFailureClass::Unknown => REMOTE_SOURCE_RETRY_INTERVAL,
+        | crate::remote::RemoteFailureClass::Unknown => backoff.record_failure(),
     }
 }
 
@@ -733,9 +819,12 @@ mod tests {
     #[test]
     fn remote_supervisor_ping_backoff_keeps_transient_failures_short() {
         let err = io::Error::new(io::ErrorKind::TimedOut, "ssh timed out");
+        let mut backoff = TransientBackoff::default();
 
+        // The first transient failure still starts at the short retry interval;
+        // only consecutive transient failures escalate from here.
         assert_eq!(
-            ping_failure_retry_interval(&err),
+            retry_interval_for_failure(&err, &mut backoff),
             REMOTE_SOURCE_RETRY_INTERVAL
         );
     }
@@ -746,12 +835,15 @@ mod tests {
             io::ErrorKind::InvalidData,
             "remote API ping did not advertise federation support",
         );
+        let mut backoff = TransientBackoff::default();
 
         assert_eq!(
-            ping_failure_retry_interval(&err),
+            retry_interval_for_failure(&err, &mut backoff),
             REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL
         );
         assert!(REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL > REMOTE_SOURCE_RETRY_INTERVAL);
+        // NeedsUpdate must not consume the transient backoff counter.
+        assert_eq!(backoff.consecutive_failures, 0);
     }
 
     #[test]
@@ -760,10 +852,79 @@ mod tests {
             io::ErrorKind::NotFound,
             "compatible herdr binary was not found",
         );
+        let mut backoff = TransientBackoff::default();
 
         assert_eq!(
-            ping_failure_retry_interval(&err),
+            retry_interval_for_failure(&err, &mut backoff),
             REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL
+        );
+        // NeedsUpdate must not consume the transient backoff counter.
+        assert_eq!(backoff.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn remote_supervisor_transient_backoff_doubles_then_caps() {
+        let mut backoff = TransientBackoff::default();
+
+        // Bounded exponential sequence: 15s, 30s, 60s, 120s, 240s, then capped.
+        assert_eq!(backoff.record_failure(), Duration::from_secs(15));
+        assert_eq!(backoff.record_failure(), Duration::from_secs(30));
+        assert_eq!(backoff.record_failure(), Duration::from_secs(60));
+        assert_eq!(backoff.record_failure(), Duration::from_secs(120));
+        assert_eq!(backoff.record_failure(), Duration::from_secs(240));
+        // 15 * 2^5 = 480s exceeds the 300s cap, and every further failure holds.
+        assert_eq!(
+            backoff.record_failure(),
+            Duration::from_secs(REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS)
+        );
+        assert_eq!(
+            backoff.record_failure(),
+            Duration::from_secs(REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS)
+        );
+        assert_eq!(REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS, 5 * 60);
+    }
+
+    #[test]
+    fn remote_supervisor_transient_backoff_resets_after_success() {
+        let mut backoff = TransientBackoff::default();
+        backoff.record_failure();
+        backoff.record_failure();
+        backoff.record_failure();
+        assert_eq!(backoff.record_failure(), Duration::from_secs(120));
+
+        // Any successful ping or snapshot clears the ladder: the next transient
+        // failure starts over at the base interval.
+        backoff.reset();
+        assert_eq!(backoff.record_failure(), Duration::from_secs(15));
+        assert_eq!(backoff.record_failure(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn remote_supervisor_needs_update_failure_neither_escalates_nor_resets_backoff() {
+        let mut backoff = TransientBackoff::default();
+        let transient = io::Error::new(io::ErrorKind::TimedOut, "ssh timed out");
+        let needs_update = io::Error::new(
+            io::ErrorKind::NotFound,
+            "compatible herdr binary was not found",
+        );
+
+        // First transient failure escalates once (base interval).
+        assert_eq!(
+            retry_interval_for_failure(&transient, &mut backoff),
+            REMOTE_SOURCE_RETRY_INTERVAL
+        );
+
+        // An intervening NeedsUpdate failure keeps the long interval...
+        assert_eq!(
+            retry_interval_for_failure(&needs_update, &mut backoff),
+            REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL
+        );
+
+        // ...and must NOT consume or reset the transient counter: the next
+        // transient failure is the SECOND attempt (doubled), not the first.
+        assert_eq!(
+            retry_interval_for_failure(&transient, &mut backoff),
+            Duration::from_secs(30)
         );
     }
 
@@ -948,6 +1109,51 @@ mod tests {
         };
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
         assert_eq!(status, RemoteConnectionStatus::Unreachable);
+    }
+
+    #[test]
+    fn remote_supervisor_loop_defers_snapshot_probe_after_failed_ping() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let thread_calls = Arc::clone(&calls);
+        let host = RemoteHostConfig::new("jafar", "jafar", "default", true);
+
+        let handle = thread::spawn(move || {
+            remote_source_supervisor_loop_with(host, tx, thread_stop, move |_host, request| {
+                thread_calls.fetch_add(1, Ordering::Relaxed);
+                match &request.method {
+                    Method::Ping(_) => {
+                        Err(io::Error::new(io::ErrorKind::TimedOut, "ssh timed out"))
+                    }
+                    // A failed ping must defer next_snapshot to the retry
+                    // interval, so none of these deeper probes should run while
+                    // the host is offline. If deferral regresses, the panic
+                    // surfaces through `handle.join()`.
+                    Method::AgentListLocal(_)
+                    | Method::WorkspaceListLocal(_)
+                    | Method::TabList(_)
+                    | Method::LayoutExport(_) => {
+                        panic!("snapshot/projection probe must be deferred while ping fails")
+                    }
+                    _ => unreachable!("unexpected request"),
+                }
+            });
+        });
+
+        let event = rx.blocking_recv().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        let AppEvent::RemoteSourceDisconnected { host, status } = event else {
+            panic!("expected disconnected event, not a snapshot");
+        };
+        assert_eq!(host, RemoteHostKey::new("jafar", "default"));
+        assert_eq!(status, RemoteConnectionStatus::Unreachable);
+        // Only the ping was attempted; the snapshot/projection probes were
+        // deferred to the transient retry interval.
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -1366,4 +1366,163 @@ mod tests {
         assert_eq!(entry.layout.as_ref().unwrap().tab_id, "w1:1");
         assert_eq!(cache.list_entries().len(), 1);
     }
+
+    #[test]
+    fn remote_source_unreachable_status_preserves_cached_state_as_stale_or_unavailable() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+
+        // Seed a fully connected host: agents, workspaces, an available
+        // projection, and an available tab snapshot.
+        cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
+        cache.replace_workspace_snapshot(host.clone(), vec![workspace("ws-1", "tmp")]);
+        cache.apply_projection_snapshot(
+            &host,
+            vec![RemoteProjectionSnapshot {
+                workspace_id: "ws-1".to_string(),
+                tab_id: Some("w1:1".to_string()),
+                tab_label: None,
+                status: RemoteProjectionStatus::Available,
+                layout: Some(layout_for("w1:1")),
+            }],
+        );
+        cache.apply_tab_snapshots(
+            &host,
+            vec![RemoteTabSnapshot {
+                workspace_id: "ws-1".to_string(),
+                status: RemoteProjectionStatus::Available,
+                tabs: vec![tab("ws-1", "w1:1", true)],
+            }],
+        );
+
+        // Going unreachable must NOT drop any cached state: agents/workspaces
+        // keep their data but carry the unreachable status, and available
+        // projections/tabs become stale-last-known with layouts/tabs preserved.
+        cache.mark_status(&host, RemoteConnectionStatus::Unreachable);
+
+        let agents = cache.list_entries();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].status, RemoteConnectionStatus::Unreachable);
+        assert_eq!(agents[0].status.stale_label(), Some("unreachable"));
+        assert!(agents[0].stale());
+
+        let workspaces = cache
+            .workspace_entries_for_host(&host)
+            .expect("workspace snapshot kept");
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].status, RemoteConnectionStatus::Unreachable);
+
+        let projection = cache
+            .projection_for_space(&RemoteSpaceKey {
+                host: "jafar".to_string(),
+                session: "default".to_string(),
+                workspace_id: "ws-1".to_string(),
+            })
+            .expect("projection kept");
+        assert_eq!(projection.status, RemoteProjectionStatus::StaleLastKnown);
+        assert_eq!(projection.layout.as_ref().unwrap().tab_id, "w1:1");
+
+        let tabs = cache
+            .tab_snapshot_for_space(&RemoteSpaceKey {
+                host: "jafar".to_string(),
+                session: "default".to_string(),
+                workspace_id: "ws-1".to_string(),
+            })
+            .expect("tab snapshot kept");
+        assert_eq!(tabs.status, RemoteProjectionStatus::StaleLastKnown);
+        assert_eq!(tabs.tabs.len(), 1);
+        assert_eq!(tabs.tabs[0].tab_id, "w1:1");
+
+        // The host itself stays visible with no fresh data.
+        let statuses = cache.list_host_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].host, host);
+        assert_eq!(statuses[0].status, RemoteConnectionStatus::Unreachable);
+    }
+
+    #[test]
+    fn remote_source_available_snapshot_reconciles_stale_state_back_to_available() {
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+        let space = RemoteSpaceKey {
+            host: "jafar".to_string(),
+            session: "default".to_string(),
+            workspace_id: "ws-1".to_string(),
+        };
+
+        // Connected host with an available projection and tab snapshot.
+        cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
+        cache.apply_projection_snapshot(
+            &host,
+            vec![RemoteProjectionSnapshot {
+                workspace_id: "ws-1".to_string(),
+                tab_id: Some("w1:1".to_string()),
+                tab_label: None,
+                status: RemoteProjectionStatus::Available,
+                layout: Some(layout_for("w1:1")),
+            }],
+        );
+        cache.apply_tab_snapshots(
+            &host,
+            vec![RemoteTabSnapshot {
+                workspace_id: "ws-1".to_string(),
+                status: RemoteProjectionStatus::Available,
+                tabs: vec![tab("ws-1", "w1:1", true)],
+            }],
+        );
+
+        // Disconnect: projection/tab become stale-last-known, agents stale.
+        cache.mark_status(&host, RemoteConnectionStatus::Disconnected);
+        assert_eq!(
+            cache.projection_for_space(&space).unwrap().status,
+            RemoteProjectionStatus::StaleLastKnown
+        );
+        assert_eq!(
+            cache.tab_snapshot_for_space(&space).unwrap().status,
+            RemoteProjectionStatus::StaleLastKnown
+        );
+
+        // A later reconnect delivers a fresh available projection and tab
+        // snapshot: the stale-last-known state reconciles back to available with
+        // the new data, and agents are fresh again.
+        cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 2)]);
+        cache.apply_projection_snapshot(
+            &host,
+            vec![RemoteProjectionSnapshot {
+                workspace_id: "ws-1".to_string(),
+                tab_id: Some("w1:2".to_string()),
+                tab_label: Some("dev".to_string()),
+                status: RemoteProjectionStatus::Available,
+                layout: Some(layout_for("w1:2")),
+            }],
+        );
+        cache.apply_tab_snapshots(
+            &host,
+            vec![RemoteTabSnapshot {
+                workspace_id: "ws-1".to_string(),
+                status: RemoteProjectionStatus::Available,
+                tabs: vec![tab("ws-1", "w1:2", true)],
+            }],
+        );
+
+        let projection = cache
+            .projection_for_space(&space)
+            .expect("projection reconciled");
+        assert_eq!(projection.status, RemoteProjectionStatus::Available);
+        assert_eq!(projection.tab_id.as_deref(), Some("w1:2"));
+        assert_eq!(projection.tab_label.as_deref(), Some("dev"));
+        assert_eq!(projection.layout.as_ref().unwrap().tab_id, "w1:2");
+
+        let tabs = cache
+            .tab_snapshot_for_space(&space)
+            .expect("tab snapshot reconciled");
+        assert_eq!(tabs.status, RemoteProjectionStatus::Available);
+        assert_eq!(tabs.tabs[0].tab_id, "w1:2");
+
+        let agents = cache.list_entries();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].status, RemoteConnectionStatus::Connected);
+        assert!(!agents[0].stale());
+        assert_eq!(agents[0].agent.revision, 2);
+    }
 }
