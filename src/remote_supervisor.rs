@@ -49,6 +49,12 @@ const REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS: u64 = 5 * 60;
 /// cap; any larger consecutive-failure index therefore collapses to the cap.
 /// Clamping the shift also keeps `1u64 << step` from overflowing.
 const TRANSIENT_BACKOFF_MAX_SHIFT: u32 = 5;
+/// Maximum jitter window layered on top of the pure base backoff for transient
+/// failures. Below the cap this bounds an additive window with the base as its
+/// lower bound; at the cap (where the base equals the cap) it bounds a
+/// subtractive de-synchronization window instead, so hosts spread across
+/// `[cap - window, cap]` rather than pinning to exactly the cap.
+const REMOTE_SOURCE_TRANSIENT_JITTER_WINDOW_SECS: u64 = 30;
 
 pub(crate) struct RemoteSourceSupervisorHandle {
     stop: Arc<AtomicBool>,
@@ -155,7 +161,12 @@ fn remote_source_supervisor_loop_with<F>(
                         host: host_key.clone(),
                         status,
                     });
-                    let retry_interval = retry_interval_for_failure(&err, &mut transient_backoff);
+                    let retry_interval = retry_interval_for_failure(
+                        &err,
+                        &mut transient_backoff,
+                        &host_key.host,
+                        &host_key.session,
+                    );
                     next_ping = now + retry_interval;
                     // Defer the next snapshot probe to at least the chosen retry
                     // interval so an offline host does not immediately run deeper
@@ -196,7 +207,12 @@ fn remote_source_supervisor_loop_with<F>(
                         host: host_key.clone(),
                         status,
                     });
-                    let retry_interval = retry_interval_for_failure(&err, &mut transient_backoff);
+                    let retry_interval = retry_interval_for_failure(
+                        &err,
+                        &mut transient_backoff,
+                        &host_key.host,
+                        &host_key.session,
+                    );
                     next_snapshot = now + retry_interval;
                 }
             }
@@ -224,10 +240,13 @@ fn sleep_until_next_due(next_due: Instant, stop: &AtomicBool) {
 /// [`REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL`], and must neither consume nor
 /// reset this counter.
 ///
-/// Deterministic jitter is intentionally deferred to a later Phase G slice so
-/// supervisor tests remain deterministic now; the federated remote-agent design
-/// calls for backoff *and* jitter, and jitter will be layered on without
-/// changing this sequence.
+/// Deterministic jitter is layered on top of the pure base sequence by
+/// [`TransientBackoff::record_failure`] via [`transient_retry_interval`]: it is
+/// keyed on `(host, session, failure_index)` through an in-tree FNV-1a hash so a
+/// given host/session retries on a stable, de-synchronized schedule that is
+/// reproducible across processes and toolchains, without randomness, wall-clock
+/// time, or global state. The pure base sequence itself stays available and
+/// testable via [`transient_backoff_interval`].
 ///
 /// [`RemoteFailureClass::Unreachable`]: crate::remote::RemoteFailureClass::Unreachable
 /// [`RemoteFailureClass::Unknown`]: crate::remote::RemoteFailureClass::Unknown
@@ -238,10 +257,13 @@ struct TransientBackoff {
 }
 
 impl TransientBackoff {
-    /// Returns the retry interval for the current transient failure, then
-    /// advances the consecutive-failure count so the next failure waits longer.
-    fn record_failure(&mut self) -> Duration {
-        let interval = transient_backoff_interval(self.consecutive_failures);
+    /// Returns the jittered retry interval for the current transient failure,
+    /// then advances the consecutive-failure count so the next failure waits
+    /// longer. The jitter is deterministic for `(host, session, failure_index)`
+    /// so a given host/session retries on a stable, de-synchronized schedule
+    /// instead of pinning to the pure base sequence.
+    fn record_failure(&mut self, host: &str, session: &str) -> Duration {
+        let interval = transient_retry_interval(self.consecutive_failures, host, session);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         interval
     }
@@ -252,17 +274,111 @@ impl TransientBackoff {
     }
 }
 
-/// Retry interval for the Nth consecutive transient failure (0-indexed).
+/// Pure (jitter-free) base retry interval for the Nth consecutive transient
+/// failure (0-indexed).
 ///
 /// Sequence: 15s, 30s, 60s, 120s, 240s, then capped at
-/// [`REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS`] (~5 minutes). See
-/// [`TransientBackoff`] for why jitter is not applied here yet.
+/// [`REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS`] (~5 minutes). Below the cap this
+/// is the lower bound of the actual jittered retry interval (see
+/// [`transient_retry_interval`]); at the cap the jitter is subtractive, so the
+/// base is the upper bound there.
 fn transient_backoff_interval(failure_index: u32) -> Duration {
     let step = failure_index.min(TRANSIENT_BACKOFF_MAX_SHIFT);
     let secs = REMOTE_SOURCE_TRANSIENT_BACKOFF_BASE_SECS
         .saturating_mul(1u64 << step)
         .min(REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS);
     Duration::from_secs(secs)
+}
+
+/// Deterministic transient retry interval: the pure base backoff with jitter
+/// layered on top. Only transient ([`Unreachable`] / [`Unknown`]) failures use
+/// this; see [`TransientBackoff`].
+///
+/// Below the cap, the base sequence is the lower bound and a small additive
+/// window `0..=min(JITTER_WINDOW, max(1, base/4))` is layered on top, then
+/// clamped to the cap, so a host's first transient retry can grow past the
+/// fixed 15s base but never shrinks below it. At the cap a subtractive window
+/// keeps hosts from synchronizing forever on exactly 300s: the result lies in
+/// `[cap - JITTER_WINDOW, cap]`.
+///
+/// The offset is deterministic for `(host, session, failure_index)` via
+/// [`transient_jitter_seed`] (an in-tree FNV-1a hash), so a given host/session
+/// retries on a stable, de-synchronized schedule that is reproducible across
+/// processes and toolchains, without randomness, wall-clock time, or global
+/// state.
+///
+/// [`Unreachable`]: crate::remote::RemoteFailureClass::Unreachable
+/// [`Unknown`]: crate::remote::RemoteFailureClass::Unknown
+fn transient_retry_interval(failure_index: u32, host: &str, session: &str) -> Duration {
+    let base = transient_backoff_interval(failure_index);
+    let base_secs = base.as_secs();
+    let seed = transient_jitter_seed(host, session, failure_index);
+    let interval_secs = if base_secs < REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS {
+        // Additive window: base is the lower bound; jitter is bounded by a
+        // quarter of the base, clamped to the max window with a 1s floor.
+        let window = REMOTE_SOURCE_TRANSIENT_JITTER_WINDOW_SECS
+            .min(base_secs / 4)
+            .max(1);
+        let jitter = seed % (window + 1);
+        base_secs
+            .saturating_add(jitter)
+            .min(REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS)
+    } else {
+        // Subtractive window at the cap: de-synchronize without exceeding the
+        // cap or dropping below `cap - JITTER_WINDOW`.
+        let offset = seed % (REMOTE_SOURCE_TRANSIENT_JITTER_WINDOW_SECS + 1);
+        REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS.saturating_sub(offset)
+    };
+    Duration::from_secs(interval_secs)
+}
+
+/// FNV-1a 64-bit offset basis.
+const FNV1A_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+/// FNV-1a 64-bit prime.
+const FNV1A_PRIME: u64 = 0x100000001b3;
+
+/// Small in-tree FNV-1a 64-bit hasher.
+///
+/// Stable across processes and toolchains, and deliberately independent of
+/// `std::collections::hash_map::DefaultHasher`, whose algorithm is unspecified
+/// and may change between Rust releases. This is used only to make transient
+/// retry jitter deterministic per host/session/failure-index; it is not a
+/// cryptographic primitive.
+struct Fnv1aHasher(u64);
+
+impl Default for Fnv1aHasher {
+    fn default() -> Self {
+        Self(FNV1A_OFFSET_BASIS)
+    }
+}
+
+impl Fnv1aHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(FNV1A_PRIME);
+        }
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+/// Stable, unambiguous FNV-1a seed over `(host, session, failure_index)`.
+///
+/// Each field is length-prefixed (and the index written as fixed little-endian
+/// bytes) so two distinct triples cannot fold into the same byte stream, e.g.
+/// host `"ab"` + session `"c"` never collides with host `"a"` + session `"bc"`,
+/// and the fixed-width encoding keeps the seed identical across architectures.
+fn transient_jitter_seed(host: &str, session: &str, failure_index: u32) -> u64 {
+    let mut hasher = Fnv1aHasher::default();
+    hasher.write(&(host.len() as u64).to_le_bytes());
+    hasher.write(host.as_bytes());
+    hasher.write(&(session.len() as u64).to_le_bytes());
+    hasher.write(session.as_bytes());
+    hasher.write(&failure_index.to_le_bytes());
+    hasher.finish()
 }
 
 /// Retry interval for a remote-supervisor failure.
@@ -272,11 +388,16 @@ fn transient_backoff_interval(failure_index: u32) -> Duration {
 /// the backoff state, so an incompatible-binary host does not burn through the
 /// transient escalation ladder (and a transient flap right after a `NeedsUpdate`
 /// still starts from the base).
-fn retry_interval_for_failure(err: &io::Error, backoff: &mut TransientBackoff) -> Duration {
+fn retry_interval_for_failure(
+    err: &io::Error,
+    backoff: &mut TransientBackoff,
+    host: &str,
+    session: &str,
+) -> Duration {
     match crate::remote::classify_remote_failure(err) {
         crate::remote::RemoteFailureClass::NeedsUpdate => REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL,
         crate::remote::RemoteFailureClass::Unreachable
-        | crate::remote::RemoteFailureClass::Unknown => backoff.record_failure(),
+        | crate::remote::RemoteFailureClass::Unknown => backoff.record_failure(host, session),
     }
 }
 
@@ -821,12 +942,13 @@ mod tests {
         let err = io::Error::new(io::ErrorKind::TimedOut, "ssh timed out");
         let mut backoff = TransientBackoff::default();
 
-        // The first transient failure still starts at the short retry interval;
+        // The first transient failure still starts at the short retry interval
+        // with a small additive jitter window (base 15, window 3 -> [15s, 18s]);
         // only consecutive transient failures escalate from here.
-        assert_eq!(
-            retry_interval_for_failure(&err, &mut backoff),
-            REMOTE_SOURCE_RETRY_INTERVAL
-        );
+        let interval = retry_interval_for_failure(&err, &mut backoff, "jafar", "default");
+        assert!(interval >= REMOTE_SOURCE_RETRY_INTERVAL);
+        assert!(interval <= REMOTE_SOURCE_RETRY_INTERVAL + Duration::from_secs(3));
+        assert_eq!(interval, transient_retry_interval(0, "jafar", "default"));
     }
 
     #[test]
@@ -838,7 +960,7 @@ mod tests {
         let mut backoff = TransientBackoff::default();
 
         assert_eq!(
-            retry_interval_for_failure(&err, &mut backoff),
+            retry_interval_for_failure(&err, &mut backoff, "jafar", "default"),
             REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL
         );
         assert!(REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL > REMOTE_SOURCE_RETRY_INTERVAL);
@@ -855,7 +977,7 @@ mod tests {
         let mut backoff = TransientBackoff::default();
 
         assert_eq!(
-            retry_interval_for_failure(&err, &mut backoff),
+            retry_interval_for_failure(&err, &mut backoff, "jafar", "default"),
             REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL
         );
         // NeedsUpdate must not consume the transient backoff counter.
@@ -864,21 +986,21 @@ mod tests {
 
     #[test]
     fn remote_supervisor_transient_backoff_doubles_then_caps() {
-        let mut backoff = TransientBackoff::default();
-
-        // Bounded exponential sequence: 15s, 30s, 60s, 120s, 240s, then capped.
-        assert_eq!(backoff.record_failure(), Duration::from_secs(15));
-        assert_eq!(backoff.record_failure(), Duration::from_secs(30));
-        assert_eq!(backoff.record_failure(), Duration::from_secs(60));
-        assert_eq!(backoff.record_failure(), Duration::from_secs(120));
-        assert_eq!(backoff.record_failure(), Duration::from_secs(240));
-        // 15 * 2^5 = 480s exceeds the 300s cap, and every further failure holds.
+        // Pure (jitter-free) base sequence: 15s, 30s, 60s, 120s, 240s, capped.
+        // Jitter is layered on separately via transient_retry_interval, so the
+        // pure base sequence stays an exact, testable value independent of jitter.
+        assert_eq!(transient_backoff_interval(0), Duration::from_secs(15));
+        assert_eq!(transient_backoff_interval(1), Duration::from_secs(30));
+        assert_eq!(transient_backoff_interval(2), Duration::from_secs(60));
+        assert_eq!(transient_backoff_interval(3), Duration::from_secs(120));
+        assert_eq!(transient_backoff_interval(4), Duration::from_secs(240));
+        // 15 * 2^5 = 480s exceeds the 300s cap; every further index holds at cap.
         assert_eq!(
-            backoff.record_failure(),
+            transient_backoff_interval(5),
             Duration::from_secs(REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS)
         );
         assert_eq!(
-            backoff.record_failure(),
+            transient_backoff_interval(u32::MAX),
             Duration::from_secs(REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS)
         );
         assert_eq!(REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS, 5 * 60);
@@ -887,44 +1009,144 @@ mod tests {
     #[test]
     fn remote_supervisor_transient_backoff_resets_after_success() {
         let mut backoff = TransientBackoff::default();
-        backoff.record_failure();
-        backoff.record_failure();
-        backoff.record_failure();
-        assert_eq!(backoff.record_failure(), Duration::from_secs(120));
+        let host = "jafar";
+        let session = "default";
+
+        // The jittered interval for each failure index is deterministic for this
+        // host/session: record_failure mirrors transient_retry_interval.
+        let first = backoff.record_failure(host, session);
+        assert_eq!(first, transient_retry_interval(0, host, session));
+        let second = backoff.record_failure(host, session);
+        backoff.record_failure(host, session);
+        let fourth = backoff.record_failure(host, session);
+        assert_eq!(fourth, transient_retry_interval(3, host, session));
+        // Base 120 -> additive window min(30, 30) = 30, so the result is [120s, 150s].
+        assert!(fourth >= Duration::from_secs(120));
+        assert!(fourth <= Duration::from_secs(150));
 
         // Any successful ping or snapshot clears the ladder: the next transient
-        // failure starts over at the base interval.
+        // failure restarts the jitter sequence at the first interval.
         backoff.reset();
-        assert_eq!(backoff.record_failure(), Duration::from_secs(15));
-        assert_eq!(backoff.record_failure(), Duration::from_secs(30));
+        assert_eq!(backoff.record_failure(host, session), first);
+        assert_eq!(backoff.record_failure(host, session), second);
     }
 
     #[test]
     fn remote_supervisor_needs_update_failure_neither_escalates_nor_resets_backoff() {
         let mut backoff = TransientBackoff::default();
+        let host = "jafar";
+        let session = "default";
         let transient = io::Error::new(io::ErrorKind::TimedOut, "ssh timed out");
         let needs_update = io::Error::new(
             io::ErrorKind::NotFound,
             "compatible herdr binary was not found",
         );
 
-        // First transient failure escalates once (base interval).
-        assert_eq!(
-            retry_interval_for_failure(&transient, &mut backoff),
-            REMOTE_SOURCE_RETRY_INTERVAL
-        );
+        // First transient failure (index 0): jittered base 15, window 3 -> [15s, 18s].
+        let first_transient = retry_interval_for_failure(&transient, &mut backoff, host, session);
+        assert!(first_transient >= REMOTE_SOURCE_RETRY_INTERVAL);
+        assert!(first_transient <= REMOTE_SOURCE_RETRY_INTERVAL + Duration::from_secs(3));
+        assert_eq!(first_transient, transient_retry_interval(0, host, session));
 
-        // An intervening NeedsUpdate failure keeps the long interval...
+        // An intervening NeedsUpdate failure keeps the fixed long interval...
         assert_eq!(
-            retry_interval_for_failure(&needs_update, &mut backoff),
+            retry_interval_for_failure(&needs_update, &mut backoff, host, session),
             REMOTE_SOURCE_INCOMPATIBLE_RETRY_INTERVAL
         );
 
         // ...and must NOT consume or reset the transient counter: the next
-        // transient failure is the SECOND attempt (doubled), not the first.
+        // transient failure is the SECOND attempt (base 30, window 7), not first.
+        let second_transient = retry_interval_for_failure(&transient, &mut backoff, host, session);
+        assert!(second_transient >= Duration::from_secs(30));
+        assert!(second_transient <= Duration::from_secs(37));
+        assert_eq!(second_transient, transient_retry_interval(1, host, session));
+    }
+
+    #[test]
+    fn remote_supervisor_transient_jitter_is_deterministic_per_host_session_index() {
+        // Same (host, session, index) always returns the same interval, via both
+        // the free helper and the stateful record_failure path.
         assert_eq!(
-            retry_interval_for_failure(&transient, &mut backoff),
-            Duration::from_secs(30)
+            transient_retry_interval(0, "jafar", "default"),
+            transient_retry_interval(0, "jafar", "default")
+        );
+        assert_eq!(
+            transient_retry_interval(3, "jafar", "default"),
+            transient_retry_interval(3, "jafar", "default")
+        );
+        let mut a = TransientBackoff::default();
+        let mut b = TransientBackoff::default();
+        for index in 0..6 {
+            assert_eq!(
+                a.record_failure("jafar", "default"),
+                b.record_failure("jafar", "default"),
+                "index {index} must be stable"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_supervisor_transient_jitter_varies_and_stays_bounded_below_cap() {
+        // Below the cap every interval is within [base, base + window] and never
+        // exceeds the cap, while distinct hosts/sessions de-synchronize.
+        for index in 0u32..5 {
+            let base = transient_backoff_interval(index);
+            let window = (base.as_secs() / 4).clamp(1, REMOTE_SOURCE_TRANSIENT_JITTER_WINDOW_SECS);
+            let values = [
+                transient_retry_interval(index, "jafar", "default"),
+                transient_retry_interval(index, "home-mini", "dev"),
+                transient_retry_interval(index, "steamdeck", "work"),
+            ];
+            for value in values {
+                assert!(
+                    value >= base,
+                    "index {index}: {value:?} below base {base:?}"
+                );
+                assert!(
+                    value <= base + Duration::from_secs(window),
+                    "index {index}: {value:?} above base+window"
+                );
+                assert!(value.as_secs() <= REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS);
+            }
+        }
+        // De-synchronization: at least one host differs from another for some
+        // below-cap index, so they do not all retry on the same wall-clock tick.
+        let de_synchronized = (0u32..5).any(|index| {
+            transient_retry_interval(index, "jafar", "default")
+                != transient_retry_interval(index, "home-mini", "default")
+        });
+        assert!(
+            de_synchronized,
+            "expected hosts to de-synchronize below cap"
+        );
+    }
+
+    #[test]
+    fn remote_supervisor_transient_jitter_at_cap_de_synchronizes_within_window() {
+        // At/above the cap the interval is a subtractive window: [cap - window, cap].
+        let cap = Duration::from_secs(REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS);
+        let floor = Duration::from_secs(
+            REMOTE_SOURCE_TRANSIENT_BACKOFF_CAP_SECS - REMOTE_SOURCE_TRANSIENT_JITTER_WINDOW_SECS,
+        );
+        let mut any_below_cap = false;
+        for index in 5u32..12 {
+            for (host, session) in [
+                ("jafar", "default"),
+                ("home-mini", "dev"),
+                ("steamdeck", "work"),
+            ] {
+                let value = transient_retry_interval(index, host, session);
+                assert!(value <= cap, "index {index}: {value:?} above cap");
+                assert!(value >= floor, "index {index}: {value:?} below floor");
+                if value < cap {
+                    any_below_cap = true;
+                }
+            }
+        }
+        // Hosts must not pin forever to exactly the cap: at least one de-synchronizes.
+        assert!(
+            any_below_cap,
+            "expected cap hosts to de-synchronize below the cap"
         );
     }
 

@@ -526,6 +526,17 @@ NeedsSetup
 
 The SSH supervisor/watchdog tasks live outside pure `AppState`. Cached remote state may live in pure state. Supervisors send updates to the main app loop through existing event patterns; they must not mutate UI state directly off-thread.
 
+#### Probe timing and circuit-breaker / status policy
+
+The supervisor runs two probes per host/session: a lightweight `ping` on a short cadence and a deeper `agent.list_local` / workspace / tab / layout `snapshot`, each with its own next-due timestamp. Each failing probe tick computes a single retry interval that consumes the shared transient counter at most once, so one failure never double-escalates the shared counter in a single tick. On a failed **ping** tick that one interval is reused for both the next ping and the next snapshot deferral (the loop sets `next_ping` and defers `next_snapshot` to at least the same interval, so an offline host does not immediately run the deeper probes in the same tick); on a failed **snapshot** tick one interval is computed for the snapshot only, while ping keeps running on its own cadence. Failure intervals are chosen by failure class:
+
+- **Transient failures** (`Unreachable` / `Unknown`): the cached state for the host/session is preserved as stale, the supervisor emits an `unreachable` (`Unreachable`) or `disconnected` (`Unknown`) status, and the probe retries with bounded exponential backoff **plus deterministic jitter**. The pure base sequence is `15s, 30s, 60s, 120s, 240s`, capped at `300s`; jitter is layered on deterministically per `(host, session, failure-index)` via an in-tree FNV-1a hash so hosts de-synchronize instead of all retrying on the same wall-clock ticks, without randomness, wall-clock time, global state, or new dependencies. Below the cap the base is the lower bound and a small additive window (`0..=min(30, max(1, base/4))`) is added, then clamped to the cap; at the cap a subtractive window keeps hosts in `[270s, 300s]` so they never synchronize forever on exactly `300s`.
+- **Setup / compatibility failures** (`NeedsUpdate`, e.g. missing/incompatible binary or invalid federation data): this is a **circuit-breaker** state, not a transient one. It keeps a fixed long retry interval (matching the backoff cap, currently `300s`), it does **not** consume or reset the transient counter, and a failed ping defers the deeper snapshot/projection probes until a future ping succeeds. A transient flap right after a `NeedsUpdate` therefore still starts the transient ladder from its base.
+- **Circuit-breaker versus transient across ping and snapshot**: if `NeedsUpdate` surfaces during snapshot after a successful ping, ping continues on its normal cadence while only the failing deeper probe (snapshot) is held to the fixed long retry — ping is not stopped. If `NeedsUpdate` surfaces on ping, the deeper probes stay deferred until ping recovers.
+- **Recovery**: any successful ping **or** snapshot clears the accumulated transient backoff, so the next transient failure restarts from the first jittered base interval for that host/session.
+
+Probe timing does not change mutating command behavior. Commands still fail fast through the existing cache/status checks (stale, unavailable, disconnected, or missing-metadata targets are rejected before forwarding); there is no command queuing and no uncertain non-idempotent retry.
+
 ### 5. Cache consistency and resync
 
 Do not use `snapshot -> subscribe` as the reconnect algorithm. It has a race: agent state can change after the snapshot and before the subscription begins.
@@ -1025,7 +1036,7 @@ remote render/terminal attach bridge reuse for focus
 
 - Mark host/session `Disconnected` or `Reconnecting`.
 - Keep last-known entries as stale/disconnected.
-- Retry with bounded exponential backoff and jitter.
+- Retry with bounded exponential backoff and deterministic jitter.
 
 ### Protocol mismatch / remote upgraded mid-session
 
