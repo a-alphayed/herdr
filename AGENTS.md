@@ -15,6 +15,10 @@ Terminal workspace manager for AI coding agents. Rust + ratatui.
 
 Read-only investigation can happen in the shared checkout.
 
+## Local lane closeout policy
+
+This project has no standing opt-in for routine auto-land, automatic task-branch cleanup, live install/deploy, or standing auto-continue. It inherits the global Agent Lane Workflow defaults. Runtime `lane auto-continue on/off` may still be used only through `.local/agent-lanes.md` and the global auto-continue preconditions.
+
 ## Ahmed's production and dev Herdr installs
 
 Ahmed's daily Herdr is this fork, not vanilla/upstream Herdr. Do not reinstall or switch him back to a package-managed vanilla Herdr unless he explicitly asks.
@@ -40,13 +44,13 @@ Do all code edits, tests, and validation inside the task worktree.
 
 Commit on the task branch in that worktree.
 
-When the change is ready, fast-forward the shared checkout at `../herdr` to the task branch commit, then push `origin/master` from `../herdr`. Do not treat the task branch as the final landing branch.
+When Ahmed explicitly approves the specific current landing, or when a future effective project auto-land opt-in exists on the Ahmed-landed base branch and all global checks pass, fast-forward the shared checkout at `../herdr` to the task branch commit, then push `origin/master` from `../herdr`. Otherwise closeout stops at the reviewed local task branch and receipt; do not treat the task branch as the final landing branch.
 
 If the current session is already inside an isolated task worktree, keep using it. Do not create nested worktrees.
 
 Before committing, propose the commit message and get alignment.
 
-After the change is integrated, remove the task worktree and delete the task branch locally and remotely.
+After the change is integrated, remove the clean task worktree and delete the merged task branch locally/remotely only if Ahmed explicitly approves that specific cleanup, or if cleanup is covered by a future effective project opt-in and all global checks pass. Otherwise leave cleanup for Ahmed.
 
 ## Federated remote agents spike workflow
 
