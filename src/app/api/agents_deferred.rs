@@ -236,6 +236,11 @@ impl App {
             // remote: a missing `confirm: true` must return
             // `confirmation_required` immediately, before route planning,
             // target resolution, connected checks, or worker spawn.
+            //
+            // Phase G.8 telemetry intentionally does NOT instrument this arm:
+            // it fires before a configured host/session is known (it wins for
+            // local targets too), so there is no safe remote host identity to
+            // log yet. Do not add a routed-action log call here.
             Method::AgentTeardown(params) if !params.confirm => {
                 DeferredRemoteAgentPlan::Immediate(encode_error(
                     request_id,
@@ -246,6 +251,7 @@ impl App {
 
             Method::AgentFocus(target) => self.plan_remote_agent_method(
                 &request_id,
+                "agent.focus",
                 &target.target,
                 /* require_connected */ true,
                 |host, terminal_id| RemoteAgentDispatchDescriptor {
@@ -266,6 +272,7 @@ impl App {
             // immediate; the slow reachability work still runs off-loop.
             Method::AgentRead(params) => self.plan_remote_agent_method(
                 &request_id,
+                "agent.read",
                 &params.target,
                 /* require_connected */ false,
                 |host, terminal_id| RemoteAgentDispatchDescriptor {
@@ -281,6 +288,7 @@ impl App {
 
             Method::AgentSend(params) => self.plan_remote_agent_method(
                 &request_id,
+                "agent.send",
                 &params.target,
                 /* require_connected */ true,
                 |host, terminal_id| RemoteAgentDispatchDescriptor {
@@ -296,6 +304,7 @@ impl App {
 
             Method::AgentSubmit(params) => self.plan_remote_agent_method(
                 &request_id,
+                "agent.submit",
                 &params.target,
                 /* require_connected */ true,
                 |host, terminal_id| RemoteAgentDispatchDescriptor {
@@ -315,6 +324,7 @@ impl App {
             // builder, which always forwards `confirm: true`.
             Method::AgentTeardown(params) => self.plan_remote_agent_method(
                 &request_id,
+                "agent.teardown",
                 &params.target,
                 /* require_connected */ true,
                 |host, terminal_id| RemoteAgentDispatchDescriptor {
@@ -368,15 +378,18 @@ impl App {
     /// target, then build a dispatch descriptor via `build_descriptor`.
     /// `require_connected` controls whether the remote-mutating connected
     /// precheck runs (`agent.read` is safe/idempotent and may dispatch even for
-    /// stale/non-connected cached entries).
+    /// stale/non-connected cached entries). `method` is the canonical API
+    /// method name used for Phase G.8 routed-action telemetry only; it never
+    /// affects the plan result.
     fn plan_remote_agent_method(
         &self,
         request_id: &str,
+        method: &'static str,
         target: &str,
         require_connected: bool,
         build_descriptor: impl FnOnce(RemoteHostConfig, String) -> RemoteAgentDispatchDescriptor,
     ) -> DeferredRemoteAgentPlan {
-        match self.plan_remote_agent_target_route(request_id, target, require_connected) {
+        match self.plan_remote_agent_target_route(request_id, method, target, require_connected) {
             RemoteAgentTargetRoute::Local => DeferredRemoteAgentPlan::NotHandled,
             RemoteAgentTargetRoute::Immediate(response) => {
                 DeferredRemoteAgentPlan::Immediate(response)
@@ -402,6 +415,8 @@ impl App {
             .as_deref()
             .expect("caller guards params.host.is_some()");
         let Some(host) = self.remote_hosts.get(host_alias).cloned() else {
+            // Unknown host: alias parsed from params but not configured. No
+            // safe host/session identity yet, so intentionally not logged.
             return DeferredRemoteAgentPlan::Immediate(encode_error_body(
                 request_id.to_string(),
                 remote_route_plan_error_body(RemoteRoutePlanError::UnknownHost(
@@ -410,17 +425,41 @@ impl App {
             ));
         };
         if let Err(err) = remote_agent_start_host_policy_guard(&host) {
+            crate::logging::remote_route_planned(
+                request_id,
+                "agent.start",
+                &host.name,
+                &host.session,
+                "fail_fast",
+                Some(&err.code),
+            );
             return DeferredRemoteAgentPlan::Immediate(encode_error_body(
                 request_id.to_string(),
                 err,
             ));
         }
         if let Err(err) = remote_agent_start_host_precheck(&self.state.remote_sources, &host) {
+            crate::logging::remote_route_planned(
+                request_id,
+                "agent.start",
+                &host.name,
+                &host.session,
+                "fail_fast",
+                Some(&err.code),
+            );
             return DeferredRemoteAgentPlan::Immediate(encode_error_body(
                 request_id.to_string(),
                 err,
             ));
         }
+        crate::logging::remote_route_planned(
+            request_id,
+            "agent.start",
+            &host.name,
+            &host.session,
+            "deferred",
+            None,
+        );
         let request = remote_agent_start_request(request_id.to_string(), params);
         DeferredRemoteAgentPlan::Deferred(Box::new(RemoteAgentDispatchDescriptor {
             host,
@@ -434,15 +473,25 @@ impl App {
     /// dispatch, an immediate error response for any guard failure, or `Local`
     /// when the target is not host-qualified remote (caller runs the sync
     /// path).
+    ///
+    /// `method` is for Phase G.8 telemetry only and never affects the result.
+    /// Telemetry is emitted only once a configured host/session is known:
+    /// resolve errors and cached non-connected statuses (guard failures past
+    /// route planning) and the deferred plan result are logged; target parse /
+    /// unknown-host errors that occur before a configured host/session is
+    /// known are intentionally left unlogged in this slice.
     fn plan_remote_agent_target_route(
         &self,
         request_id: &str,
+        method: &'static str,
         target: &str,
         require_connected: bool,
     ) -> RemoteAgentTargetRoute {
         let route = match self.plan_agent_api_target(target) {
             Ok(route) => route,
             Err(err) => {
+                // Target parse / unknown-host error before a configured
+                // host/session is known: intentionally not logged in this slice.
                 return RemoteAgentTargetRoute::Immediate(encode_error_body(
                     request_id.to_string(),
                     remote_route_plan_error_body(err),
@@ -464,20 +513,45 @@ impl App {
         ) {
             Ok(resolved) => resolved,
             Err(err) => {
+                let body = remote_agent_resolve_error_body(err);
+                crate::logging::remote_route_planned(
+                    request_id,
+                    method,
+                    &host.name,
+                    &host.session,
+                    "fail_fast",
+                    Some(&body.code),
+                );
                 return RemoteAgentTargetRoute::Immediate(encode_error_body(
                     request_id.to_string(),
-                    remote_agent_resolve_error_body(err),
+                    body,
                 ));
             }
         };
         if require_connected {
             if let Err(err) = Self::remote_agent_resolved_connected_or_error(&host, &resolved) {
+                crate::logging::remote_route_planned(
+                    request_id,
+                    method,
+                    &host.name,
+                    &host.session,
+                    "fail_fast",
+                    Some(&err.code),
+                );
                 return RemoteAgentTargetRoute::Immediate(encode_error_body(
                     request_id.to_string(),
                     err,
                 ));
             }
         }
+        crate::logging::remote_route_planned(
+            request_id,
+            method,
+            &host.name,
+            &host.session,
+            "deferred",
+            None,
+        );
         RemoteAgentTargetRoute::Ready {
             host,
             terminal_id: resolved.entry.agent.terminal_id.clone(),
@@ -492,6 +566,35 @@ pub(crate) fn real_remote_agent_bridge(
     request: &Request,
 ) -> std::io::Result<String> {
     crate::remote::send_remote_api_request_to_host_noninteractive(host, request)
+}
+
+/// Canonical dot method name for a routed remote-agent method, used for Phase
+/// G.8 telemetry only. Limited to the routed agent methods handled by this
+/// seam; never records params or values. Returns a stable fallback for any
+/// other method so the helper stays total.
+fn remote_agent_method_name(method: &Method) -> &'static str {
+    match method {
+        Method::AgentRead(_) => "agent.read",
+        Method::AgentFocus(_) => "agent.focus",
+        Method::AgentSend(_) => "agent.send",
+        Method::AgentSubmit(_) => "agent.submit",
+        Method::AgentTeardown(_) => "agent.teardown",
+        Method::AgentStart(_) => "agent.start",
+        _ => "agent",
+    }
+}
+
+/// Extract the controlled `error.code` scalar from a rewritten remote API
+/// response when it is an authoritative remote-side error. Returns `None` for
+/// success responses and malformed JSON. Telemetry-only: the returned code is
+/// a controlled scalar label, never the raw `message`, body, or payload.
+fn remote_response_error_code(response: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(response).ok()?;
+    value
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(|code| code.as_str())
+        .map(str::to_string)
 }
 
 /// Process-global limiter bound to [`REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT`].
@@ -553,6 +656,13 @@ fn spawn_remote_agent_dispatch_with_limiter(
     else {
         return;
     };
+    // Permit acquired: log dispatch start before spawning the worker.
+    crate::logging::remote_route_dispatch_started(
+        &descriptor.request.id,
+        remote_agent_method_name(&descriptor.request.method),
+        &descriptor.host.name,
+        &descriptor.host.session,
+    );
     std::thread::spawn(move || {
         // RAII guard: releases the per-(host, session) slot on normal return
         // (bridge success, bridge error mapped to `remote_request_failed`,
@@ -581,6 +691,15 @@ pub(crate) fn acquire_remote_agent_bridge_permit_or_busy<'a>(
     match limiter.try_acquire(&key) {
         Some(permit) => Some(permit),
         None => {
+            // Phase G.7 limiter saturation: one immediate `remote_bridge_busy`
+            // outcome, no worker spawned, nothing queued.
+            crate::logging::remote_route_busy(
+                &descriptor.request.id,
+                remote_agent_method_name(&descriptor.request.method),
+                &descriptor.host.name,
+                &descriptor.host.session,
+                limiter.limit(),
+            );
             let _ = respond_to.send(remote_bridge_busy_response(
                 &descriptor.request.id,
                 &key,
@@ -618,19 +737,33 @@ pub(crate) fn run_remote_agent_dispatch_with_bridge(
     bridge: RemoteAgentBridge,
 ) {
     let local_id = descriptor.request.id.clone();
+    let method = remote_agent_method_name(&descriptor.request.method);
     let host_name = descriptor.host.name.clone();
     let rewrite = descriptor.rewrite;
-    let response =
+    let bridged =
         bridge(&descriptor.host, &descriptor.request).and_then(|response| match rewrite {
             RemoteAgentResponseRewrite::Id => rewrite_remote_response_id(&response, &local_id),
             RemoteAgentResponseRewrite::AgentStart => {
                 rewrite_remote_agent_start_response(&response, &local_id, &host_name)
             }
         });
-    let response = match response {
+    let response = match bridged {
         Ok(response) => response,
         Err(err) => encode_error(local_id, "remote_request_failed", err.to_string()),
     };
+    // Observability only: completion outcome derived from the controlled
+    // `error.code` scalar on the final response. A bridge/rewrite failure was
+    // mapped above to the fixed `remote_request_failed` code; an authoritative
+    // remote API error surfaces its own controlled `error.code`. Never logs
+    // raw messages, payloads, response bodies, or request bodies.
+    let remote_error = remote_response_error_code(&response);
+    crate::logging::remote_route_completed(
+        &descriptor.request.id,
+        method,
+        &descriptor.host.name,
+        &descriptor.host.session,
+        remote_error.as_deref(),
+    );
     let _ = respond_to.send(response);
 }
 
@@ -1320,5 +1453,72 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert!(limiter.try_acquire(&key).is_some());
+    }
+
+    #[test]
+    fn remote_agent_method_name_classifies_routed_methods() {
+        // Telemetry name only: never records params/values. The canonical dot
+        // names must match what each planner call site passes.
+        assert_eq!(
+            remote_agent_method_name(&Method::AgentRead(read_params("t"))),
+            "agent.read"
+        );
+        assert_eq!(
+            remote_agent_method_name(&Method::AgentFocus(AgentTarget {
+                target: "t".to_string(),
+            })),
+            "agent.focus"
+        );
+        assert_eq!(
+            remote_agent_method_name(&Method::AgentSend(AgentSendParams {
+                target: "t".to_string(),
+                text: "secret-text".to_string(),
+            })),
+            "agent.send"
+        );
+        assert_eq!(
+            remote_agent_method_name(&Method::AgentSubmit(AgentSubmitParams {
+                target: "t".to_string(),
+                text: "secret-text".to_string(),
+            })),
+            "agent.submit"
+        );
+        assert_eq!(
+            remote_agent_method_name(&Method::AgentTeardown(AgentTeardownParams {
+                target: "t".to_string(),
+                confirm: true,
+            })),
+            "agent.teardown"
+        );
+        assert_eq!(
+            remote_agent_method_name(&Method::AgentStart(base_start_params(Some("jafar")))),
+            "agent.start"
+        );
+    }
+
+    #[test]
+    fn remote_response_error_code_extracts_controlled_code_only() {
+        // Success response: no error code.
+        assert!(remote_response_error_code(r#"{"id":"r","result":{"type":"ok"}}"#).is_none());
+        // Authoritative remote API error: controlled `error.code` scalar only.
+        assert_eq!(
+            remote_response_error_code(
+                r#"{"id":"r","error":{"code":"agent_not_found","message":"leaky detail"}}"#
+            )
+            .as_deref(),
+            Some("agent_not_found")
+        );
+        // Local bridge/rewrite failure mapped by the worker: fixed label.
+        assert_eq!(
+            remote_response_error_code(
+                r#"{"id":"r","error":{"code":"remote_request_failed","message":"x"}}"#
+            )
+            .as_deref(),
+            Some("remote_request_failed")
+        );
+        // Malformed JSON is not a remote error.
+        assert!(remote_response_error_code("not json").is_none());
+        // Missing `error.code` is not a remote error.
+        assert!(remote_response_error_code(r#"{"id":"r","error":{}}"#).is_none());
     }
 }

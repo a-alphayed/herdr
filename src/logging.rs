@@ -409,6 +409,183 @@ pub(crate) fn integration_action(
     );
 }
 
+/// Whether a remote routed agent method is non-mutating and therefore logged
+/// at `debug` on success instead of `info`. Only `agent.read` is routine;
+/// every other routed agent method (`agent.focus`/`send`/`submit`/`teardown`,
+/// `agent.start --host`) is mutating. Naming only -- never values.
+fn remote_method_is_routine(method: &str) -> bool {
+    method == "agent.read"
+}
+
+/// Structured telemetry for a configured remote routed agent action plan
+/// result, emitted once a configured host alias/session is known.
+///
+/// `outcome` is `deferred` (route/cache/policy guards passed; the action is
+/// scheduled for off-loop dispatch) or `fail_fast` (a pre-dispatch guard
+/// fired: manual connection policy, cached non-connected status, resolve
+/// error, or unsupported selector).
+///
+/// Safety: only controlled routing scalars are logged. `host`/`session` come
+/// from the configured alias + session, never the SSH target. `error_code` is
+/// the controlled error code on `fail_fast`; never raw messages, payloads,
+/// targets, terminal ids, pane ids, config values, or bridge command lines.
+pub(crate) fn remote_route_planned(
+    request_id: &str,
+    method: &'static str,
+    host: &str,
+    session: &str,
+    outcome: &'static str,
+    error_code: Option<&str>,
+) {
+    if outcome == "deferred" && remote_method_is_routine(method) {
+        tracing::debug!(
+            event = "remote.route.plan",
+            subsystem = "remote",
+            outcome,
+            request_id,
+            method,
+            host,
+            session,
+            "remote routed agent action planned for off-loop dispatch"
+        );
+    } else if outcome == "deferred" {
+        tracing::info!(
+            event = "remote.route.plan",
+            subsystem = "remote",
+            outcome,
+            request_id,
+            method,
+            host,
+            session,
+            "remote routed agent action planned for off-loop dispatch"
+        );
+    } else {
+        tracing::warn!(
+            event = "remote.route.plan",
+            subsystem = "remote",
+            outcome,
+            request_id,
+            method,
+            host,
+            session,
+            error_code,
+            "remote routed agent action failed fast before dispatch"
+        );
+    }
+}
+
+/// Structured telemetry for the per-(host, session) bridge dispatch cap being
+/// saturated (Phase G.7): one immediate `remote_bridge_busy` response is sent,
+/// no worker is spawned, and nothing is queued. `limit` is the configured cap.
+/// Safety: host/session are the configured alias + session, never the target.
+pub(crate) fn remote_route_busy(
+    request_id: &str,
+    method: &'static str,
+    host: &str,
+    session: &str,
+    limit: usize,
+) {
+    tracing::warn!(
+        event = "remote.route.busy",
+        subsystem = "remote",
+        outcome = "busy",
+        request_id,
+        method,
+        host,
+        session,
+        limit,
+        "remote bridge dispatch cap saturated; no worker spawned"
+    );
+}
+
+/// Structured telemetry emitted after a per-(host, session) bridge dispatch
+/// permit is acquired and a background worker is about to run the bridge.
+pub(crate) fn remote_route_dispatch_started(
+    request_id: &str,
+    method: &'static str,
+    host: &str,
+    session: &str,
+) {
+    if remote_method_is_routine(method) {
+        tracing::debug!(
+            event = "remote.route.dispatch",
+            subsystem = "remote",
+            outcome = "started",
+            request_id,
+            method,
+            host,
+            session,
+            "remote bridge worker dispatch started"
+        );
+    } else {
+        tracing::info!(
+            event = "remote.route.dispatch",
+            subsystem = "remote",
+            outcome = "started",
+            request_id,
+            method,
+            host,
+            session,
+            "remote bridge worker dispatch started"
+        );
+    }
+}
+
+/// Structured telemetry for a remote bridge worker completion.
+///
+/// `remote_error` is `None` on success, the controlled authoritative remote
+/// API `error.code` on a remote-side error, or the fixed `remote_request_failed`
+/// label on a local bridge/rewrite failure. Only the controlled code scalar is
+/// logged; never raw messages, payloads, response bodies, or request bodies.
+pub(crate) fn remote_route_completed(
+    request_id: &str,
+    method: &'static str,
+    host: &str,
+    session: &str,
+    remote_error: Option<&str>,
+) {
+    match remote_error {
+        None => {
+            if remote_method_is_routine(method) {
+                tracing::debug!(
+                    event = "remote.route.complete",
+                    subsystem = "remote",
+                    outcome = "ok",
+                    request_id,
+                    method,
+                    host,
+                    session,
+                    "remote routed agent action completed"
+                );
+            } else {
+                tracing::info!(
+                    event = "remote.route.complete",
+                    subsystem = "remote",
+                    outcome = "ok",
+                    request_id,
+                    method,
+                    host,
+                    session,
+                    "remote routed agent action completed"
+                );
+            }
+        }
+        Some(code) => {
+            tracing::warn!(
+                event = "remote.route.complete",
+                subsystem = "remote",
+                outcome = "error",
+                request_id,
+                method,
+                host,
+                session,
+                remote_error = code,
+                "remote routed agent action failed"
+            );
+        }
+    }
+}
+
 struct RotatingFileMakeWriter {
     state: Arc<Mutex<RotatingFileState>>,
 }
