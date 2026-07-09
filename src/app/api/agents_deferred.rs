@@ -36,6 +36,7 @@
 
 use crate::api::schema::{AgentStartParams, Method, Request};
 use crate::app::App;
+use crate::remote_source::RemoteHostKey;
 use crate::remote_target::{PlannedTargetRoute, RemoteHostConfig, RemoteRoutePlanError};
 
 use super::agents::{
@@ -117,6 +118,92 @@ pub(crate) type RemoteAgentBridge = fn(&RemoteHostConfig, &Request) -> std::io::
 /// worker is blocked/not completed.
 pub(crate) type RemoteAgentDispatchStarter =
     fn(RemoteAgentDispatchDescriptor, std::sync::mpsc::Sender<String>);
+
+/// Per-(host alias, session) in-flight cap for deferred remote-agent bridge
+/// dispatch. Bounds how many concurrent SSH request bridge workers one
+/// configured host/session may run when many host-qualified remote-agent
+/// requests clear the existing route/cache/policy gates. Keyed by configured
+/// remote alias + session, not by method, agent target, display label, or
+/// global process count.
+pub(crate) const REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT: usize = 4;
+
+/// Small independently testable limiter with RAII permits. Production reads a
+/// process-global instance via [`remote_agent_bridge_limiter`]; unit tests use
+/// local instances so they never mutate or saturate the production global.
+pub(crate) struct RemoteAgentBridgeLimiter {
+    limit: usize,
+    in_flight: std::sync::Mutex<std::collections::BTreeMap<RemoteHostKey, usize>>,
+}
+
+impl RemoteAgentBridgeLimiter {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            in_flight: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    /// Configured per-(host, session) cap.
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Active in-flight dispatch count for one (host, session). Inspection /
+    /// test only.
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self, key: &RemoteHostKey) -> usize {
+        self.lock().get(key).copied().unwrap_or(0)
+    }
+
+    /// Try to acquire an in-flight permit for `(host, session)`. Returns
+    /// `None` if the cap is saturated; the caller must respond with
+    /// `remote_bridge_busy` and must not spawn a worker.
+    pub(crate) fn try_acquire(&self, key: &RemoteHostKey) -> Option<RemoteAgentBridgePermit<'_>> {
+        let mut map = self.lock();
+        let count = map.get(key).copied().unwrap_or(0);
+        if count >= self.limit {
+            None
+        } else {
+            map.insert(key.clone(), count + 1);
+            Some(RemoteAgentBridgePermit {
+                limiter: self,
+                key: key.clone(),
+            })
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<RemoteHostKey, usize>> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn release(&self, key: &RemoteHostKey) {
+        let mut map = self.lock();
+        if let Some(count) = map.get_mut(key) {
+            if *count > 0 {
+                *count -= 1;
+            }
+            if *count == 0 {
+                map.remove(key);
+            }
+        }
+    }
+}
+
+/// RAII permit for one in-flight remote-agent bridge dispatch. Releases the
+/// per-(host, session) slot on drop, including through panic unwind, so a
+/// worker that succeeds, errors, or panics always frees its slot.
+pub(crate) struct RemoteAgentBridgePermit<'a> {
+    limiter: &'a RemoteAgentBridgeLimiter,
+    key: RemoteHostKey,
+}
+
+impl Drop for RemoteAgentBridgePermit<'_> {
+    fn drop(&mut self) {
+        self.limiter.release(&self.key);
+    }
+}
 
 /// Intermediate route/resolve result used by the planner before building a
 /// dispatch descriptor.
@@ -407,30 +494,124 @@ pub(crate) fn real_remote_agent_bridge(
     crate::remote::send_remote_api_request_to_host_noninteractive(host, request)
 }
 
-/// Default dispatch starter: spawn a background thread that runs the bridge
-/// and sends a response through the one-shot channel. Always attempts to send a
-/// response so a client never hangs on a worker/bridge/rewrite error.
+/// Process-global limiter bound to [`REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT`].
+/// `RemoteAgentDispatchStarter` is a `fn` pointer with no extra state, so the
+/// default starter reads this global. Tests exercise the limiter through local
+/// instances ([`acquire_remote_agent_bridge_permit_or_busy`]) instead of
+/// mutating or saturating this global.
+static REMOTE_AGENT_BRIDGE_LIMITER: std::sync::OnceLock<RemoteAgentBridgeLimiter> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn remote_agent_bridge_limiter() -> &'static RemoteAgentBridgeLimiter {
+    REMOTE_AGENT_BRIDGE_LIMITER
+        .get_or_init(|| RemoteAgentBridgeLimiter::new(REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT))
+}
+
+/// Default dispatch starter: delegate to the testable
+/// [`spawn_remote_agent_dispatch_with_limiter`] core with the process-global
+/// limiter and the real SSH bridge. Acquire a per-(host, session) in-flight
+/// permit, then spawn a background thread that runs the bridge and sends a
+/// response through the one-shot channel. If the cap is saturated, an
+/// immediate `remote_bridge_busy` response is sent without spawning a worker.
+/// Always attempts to send a response so a client never hangs on a
+/// worker/bridge/rewrite error or a saturated cap.
 pub(crate) fn spawn_remote_agent_dispatch(
     descriptor: RemoteAgentDispatchDescriptor,
     respond_to: std::sync::mpsc::Sender<String>,
 ) {
-    std::thread::spawn(move || run_remote_agent_dispatch(descriptor, respond_to));
+    spawn_remote_agent_dispatch_with_limiter(
+        descriptor,
+        respond_to,
+        remote_agent_bridge_limiter(),
+        real_remote_agent_bridge,
+    );
 }
 
-/// Run one remote-agent bridge dispatch to completion using the real bridge and
-/// send the response. Maps any bridge/rewrite error to the existing
-/// `remote_request_failed` error shape so the client always receives a
-/// response.
-pub(crate) fn run_remote_agent_dispatch(
+/// Testable core of the default dispatch starter: acquire a per-(host,
+/// session) in-flight permit from the supplied limiter, then spawn a
+/// background thread that runs the injectable bridge and sends a response
+/// through the one-shot channel. If the cap is saturated, an immediate
+/// `remote_bridge_busy` response is sent without spawning a worker. Always
+/// attempts to send a response so a client never hangs on a
+/// worker/bridge/rewrite error or a saturated cap.
+///
+/// `limiter` is `&'static` so the RAII permit (which borrows it) is `Send` and
+/// may move into the worker thread. Production passes the process-global
+/// limiter ([`remote_agent_bridge_limiter`]); tests pass a leaked local
+/// limiter (`Box::leak`) so they never touch or saturate the production
+/// global. The worker runs `bridge` (the real bridge in production, an
+/// injectable fake in tests) instead of the real-bridge wrapper, preserving
+/// the existing acquire/spawn/release behavior.
+fn spawn_remote_agent_dispatch_with_limiter(
     descriptor: RemoteAgentDispatchDescriptor,
     respond_to: std::sync::mpsc::Sender<String>,
+    limiter: &'static RemoteAgentBridgeLimiter,
+    bridge: RemoteAgentBridge,
 ) {
-    run_remote_agent_dispatch_with_bridge(descriptor, respond_to, real_remote_agent_bridge);
+    let Some(permit) =
+        acquire_remote_agent_bridge_permit_or_busy(limiter, &descriptor, &respond_to)
+    else {
+        return;
+    };
+    std::thread::spawn(move || {
+        // RAII guard: releases the per-(host, session) slot on normal return
+        // (bridge success, bridge error mapped to `remote_request_failed`,
+        // rewrite error) and on panic unwind. `permit` borrows the limiter for
+        // `'static`, so it is `Send` and may move into the worker thread.
+        let _permit = permit;
+        run_remote_agent_dispatch_with_bridge(descriptor, respond_to, bridge);
+    });
+}
+
+/// Acquire a per-(host, session) in-flight permit for `descriptor`'s configured
+/// host/session. On saturation send an immediate `remote_bridge_busy` response
+/// on `respond_to` and return `None` (the caller must not spawn a worker). On
+/// success return the RAII permit; the caller moves it into the worker closure
+/// so the slot releases on bridge success, bridge error, rewrite error, and
+/// panic unwind. Takes the limiter by shared reference so unit tests can use
+/// local limiter instances without touching the production global; the returned
+/// permit borrows only the limiter, leaving `descriptor`/`respond_to` free to
+/// move into the worker closure.
+pub(crate) fn acquire_remote_agent_bridge_permit_or_busy<'a>(
+    limiter: &'a RemoteAgentBridgeLimiter,
+    descriptor: &RemoteAgentDispatchDescriptor,
+    respond_to: &std::sync::mpsc::Sender<String>,
+) -> Option<RemoteAgentBridgePermit<'a>> {
+    let key = RemoteHostKey::new(&descriptor.host.name, &descriptor.host.session);
+    match limiter.try_acquire(&key) {
+        Some(permit) => Some(permit),
+        None => {
+            let _ = respond_to.send(remote_bridge_busy_response(
+                &descriptor.request.id,
+                &key,
+                limiter.limit(),
+            ));
+            None
+        }
+    }
+}
+
+/// Build the `remote_bridge_busy` error response sent when the per-(host,
+/// session) in-flight cap is saturated. Preserves the local request id and
+/// names the host/session and active limit.
+pub(crate) fn remote_bridge_busy_response(id: &str, key: &RemoteHostKey, limit: usize) -> String {
+    encode_error(
+        id.to_string(),
+        "remote_bridge_busy",
+        format!(
+            "remote agent bridge dispatch limit reached for {host}/{session}: \
+             {limit} in-flight dispatches already in progress",
+            host = key.host,
+            session = key.session,
+        ),
+    )
 }
 
 /// Testable core: run one dispatch with an injectable bridge. A bridge or
 /// rewrite error still sends a `remote_request_failed` response through the
-/// channel so the client never hangs.
+/// channel so the client never hangs. Production dispatches through
+/// [`spawn_remote_agent_dispatch_with_limiter`] with [`real_remote_agent_bridge`];
+/// tests inject a fake bridge.
 pub(crate) fn run_remote_agent_dispatch_with_bridge(
     descriptor: RemoteAgentDispatchDescriptor,
     respond_to: std::sync::mpsc::Sender<String>,
@@ -876,5 +1057,268 @@ mod tests {
             .expect("local request must be handled while worker is blocked");
         let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(parsed.id, "local");
+    }
+
+    #[test]
+    fn limiter_rejects_nth_plus_one_acquire_for_one_host_session() {
+        let limiter = RemoteAgentBridgeLimiter::new(REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT);
+        let key = RemoteHostKey::new("jafar", "default");
+
+        // Hold every acquired permit so the slots stay saturated; a dropped
+        // permit would release its slot immediately.
+        let held: Vec<_> = (0..REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT)
+            .map(|_| limiter.try_acquire(&key).expect("acquire within limit"))
+            .collect();
+        // N+1 is rejected: the cap is saturated and no slot is handed out.
+        assert!(limiter.try_acquire(&key).is_none());
+        assert_eq!(limiter.in_flight(&key), REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT);
+        drop(held);
+    }
+
+    #[test]
+    fn limiter_permits_are_per_host_session() {
+        let limiter = RemoteAgentBridgeLimiter::new(REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT);
+        let key_a = RemoteHostKey::new("jafar", "default");
+        let key_b = RemoteHostKey::new("work-mini", "default");
+
+        // Saturate host A.
+        let held_a: Vec<_> = (0..REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT)
+            .map(|_| limiter.try_acquire(&key_a).unwrap())
+            .collect();
+        assert!(limiter.try_acquire(&key_a).is_none());
+
+        // Host B is independent: saturating A does not block B. Hold the permit
+        // so the slot stays occupied for the in-flight assertion.
+        let permit_b = limiter.try_acquire(&key_b).expect("host B independent");
+        assert_eq!(
+            limiter.in_flight(&key_a),
+            REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT
+        );
+        assert_eq!(limiter.in_flight(&key_b), 1);
+
+        drop(permit_b);
+        drop(held_a);
+    }
+
+    #[test]
+    fn limiter_permit_releases_on_drop() {
+        let limiter = RemoteAgentBridgeLimiter::new(1);
+        let key = RemoteHostKey::new("jafar", "default");
+
+        let permit = limiter.try_acquire(&key).unwrap();
+        assert!(limiter.try_acquire(&key).is_none());
+        drop(permit);
+        // The slot is freed; a new acquire succeeds.
+        assert!(limiter.try_acquire(&key).is_some());
+    }
+
+    #[test]
+    fn limiter_permit_releases_on_worker_completion() {
+        let limiter = RemoteAgentBridgeLimiter::new(REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT);
+        let key = RemoteHostKey::new("jafar", "default");
+
+        // Saturate the cap.
+        let mut held: Vec<_> = (0..REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT)
+            .map(|_| limiter.try_acquire(&key).unwrap())
+            .collect();
+        assert!(limiter.try_acquire(&key).is_none());
+
+        // Move one permit into a worker closure. `thread::scope` keeps the
+        // borrow valid until the worker completes; the permit releases when the
+        // closure returns, modeling a worker that finished (success or error).
+        let permit = held.pop().expect("held permits non-empty");
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let _permit = permit;
+            });
+        });
+
+        // The worker released its slot; the cap is no longer saturated.
+        assert!(limiter.try_acquire(&key).is_some());
+        drop(held);
+    }
+
+    #[test]
+    fn saturated_cap_returns_remote_bridge_busy_without_permit() {
+        let limiter = RemoteAgentBridgeLimiter::new(REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT);
+        let key = RemoteHostKey::new("jafar", "default");
+
+        // Saturate the (host, session) cap with locally-held permits. Tests
+        // never touch the production global limiter.
+        let held: Vec<_> = (0..REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT)
+            .map(|_| limiter.try_acquire(&key).unwrap())
+            .collect();
+        assert_eq!(limiter.in_flight(&key), REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT);
+
+        let descriptor = RemoteAgentDispatchDescriptor {
+            host: RemoteHostConfig::new("jafar", "jafar", "default", true),
+            request: Request {
+                id: "req".to_string(),
+                method: Method::AgentRead(read_params("term-1")),
+            },
+            rewrite: RemoteAgentResponseRewrite::Id,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        // This is the exact acquire step the default dispatch starter runs
+        // before spawning a worker. With the cap saturated it must hand out no
+        // permit (so no worker is spawned) and send `remote_bridge_busy`.
+        let permit = acquire_remote_agent_bridge_permit_or_busy(&limiter, &descriptor, &tx);
+        assert!(permit.is_none(), "saturated cap must not hand out a permit");
+        // No permit was acquired: the in-flight count is unchanged at the cap.
+        assert_eq!(limiter.in_flight(&key), REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT);
+
+        let response = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("busy response must be sent immediately");
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed.id, "req");
+        assert_eq!(parsed.error.code, "remote_bridge_busy");
+        assert!(parsed.error.message.contains("jafar"));
+        assert!(parsed.error.message.contains("default"));
+        assert!(parsed
+            .error
+            .message
+            .contains(&REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT.to_string()));
+
+        drop(held);
+    }
+
+    #[test]
+    fn permit_releases_after_worker_bridge_error_and_mapping_stays_remote_request_failed() {
+        // Prove that holding a permit across a worker that actually runs does
+        // not change the existing `remote_request_failed` mapping, and that the
+        // permit releases on the bridge-error completion path. This mirrors the
+        // `spawn_remote_agent_dispatch_with_limiter` worker closure body
+        // without touching real SSH or the production global limiter.
+        fn failing_bridge(_host: &RemoteHostConfig, _request: &Request) -> std::io::Result<String> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulated bridge timeout",
+            ))
+        }
+
+        let limiter = RemoteAgentBridgeLimiter::new(1);
+        let key = RemoteHostKey::new("jafar", "default");
+        let permit = limiter.try_acquire(&key).unwrap();
+        assert!(limiter.try_acquire(&key).is_none());
+
+        let descriptor = RemoteAgentDispatchDescriptor {
+            host: RemoteHostConfig::new("jafar", "jafar", "default", true),
+            request: Request {
+                id: "req".to_string(),
+                method: Method::AgentRead(read_params("term-1")),
+            },
+            rewrite: RemoteAgentResponseRewrite::Id,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // Worker closure body, inline (no real thread/SSH): the permit is held
+        // while the bridge runs and drops when the block ends.
+        {
+            let _permit_guard = permit;
+            run_remote_agent_dispatch_with_bridge(descriptor, tx, failing_bridge);
+        }
+        // The worker completed with a bridge error; its slot is freed.
+        assert!(limiter.try_acquire(&key).is_some());
+
+        let response = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker must send a response");
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed.id, "req");
+        assert_eq!(parsed.error.code, "remote_request_failed");
+        assert!(parsed.error.message.contains("simulated bridge timeout"));
+    }
+
+    #[test]
+    fn with_limiter_saturated_sends_busy_and_does_not_invoke_bridge() {
+        // Directly exercise the extracted starter core with a local (leaked)
+        // test limiter so the production global is never touched. A saturated
+        // cap must send `remote_bridge_busy` immediately and must not spawn a
+        // worker, so the injectable bridge is never invoked.
+        static BRIDGE_INVOKED: AtomicBool = AtomicBool::new(false);
+        fn tracking_bridge(
+            _host: &RemoteHostConfig,
+            _request: &Request,
+        ) -> std::io::Result<String> {
+            BRIDGE_INVOKED.store(true, Ordering::SeqCst);
+            Ok(r#"{"id":"ignored","result":{"type":"ok"}}"#.to_string())
+        }
+
+        let limiter: &'static RemoteAgentBridgeLimiter =
+            Box::leak(Box::new(RemoteAgentBridgeLimiter::new(1)));
+        let key = RemoteHostKey::new("jafar", "default");
+
+        // Saturate the single-slot cap with a locally-held permit.
+        let _held = limiter.try_acquire(&key).expect("acquire within limit");
+
+        let descriptor = RemoteAgentDispatchDescriptor {
+            host: RemoteHostConfig::new("jafar", "jafar", "default", true),
+            request: Request {
+                id: "req".to_string(),
+                method: Method::AgentRead(read_params("term-1")),
+            },
+            rewrite: RemoteAgentResponseRewrite::Id,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_remote_agent_dispatch_with_limiter(descriptor, tx, limiter, tracking_bridge);
+
+        let response = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("busy response must be sent immediately");
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed.id, "req");
+        assert_eq!(parsed.error.code, "remote_bridge_busy");
+        // No worker was spawned, so the bridge was never invoked.
+        assert!(!BRIDGE_INVOKED.load(Ordering::SeqCst));
+        // The in-flight count is unchanged at the cap.
+        assert_eq!(limiter.in_flight(&key), 1);
+    }
+
+    #[test]
+    fn with_limiter_success_runs_injectable_bridge_and_releases_permit() {
+        // Directly exercise the extracted starter core with a local (leaked)
+        // test limiter: a successful acquire spawns a worker that runs the
+        // injectable fake bridge, sends a rewritten success response, and
+        // releases the permit on completion.
+        static BRIDGE_INVOKED: AtomicBool = AtomicBool::new(false);
+        fn fake_bridge(_host: &RemoteHostConfig, _request: &Request) -> std::io::Result<String> {
+            BRIDGE_INVOKED.store(true, Ordering::SeqCst);
+            Ok(r#"{"id":"ignored","result":{"type":"ok"}}"#.to_string())
+        }
+
+        let limiter: &'static RemoteAgentBridgeLimiter =
+            Box::leak(Box::new(RemoteAgentBridgeLimiter::new(1)));
+        let key = RemoteHostKey::new("jafar", "default");
+
+        let descriptor = RemoteAgentDispatchDescriptor {
+            host: RemoteHostConfig::new("jafar", "jafar", "default", true),
+            request: Request {
+                id: "req".to_string(),
+                method: Method::AgentRead(read_params("term-1")),
+            },
+            rewrite: RemoteAgentResponseRewrite::Id,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_remote_agent_dispatch_with_limiter(descriptor, tx, limiter, fake_bridge);
+
+        let response = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker must send a response");
+        let parsed: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed.id, "req");
+        assert!(BRIDGE_INVOKED.load(Ordering::SeqCst));
+
+        // The worker spawned in a background thread; after it sends the
+        // response it drops the permit on closure return. Poll until the slot
+        // frees, then prove a new acquire succeeds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while limiter.in_flight(&key) != 0 {
+            if std::time::Instant::now() >= deadline {
+                panic!("permit was not released after worker completion");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(limiter.try_acquire(&key).is_some());
     }
 }
