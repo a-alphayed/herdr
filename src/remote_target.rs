@@ -169,20 +169,33 @@ pub(crate) enum RemoteConnectionPolicy {
 }
 
 impl RemoteConnectionPolicy {
-    /// Whether this host should be started/probed automatically by the remote
-    /// source supervisor at startup and on config reload, seeded as a
-    /// disconnected remote source, and treated as a configured auto source
-    /// event sender. Only [`RemoteConnectionPolicy::Auto`] qualifies.
+    /// Whether this host is eligible for automatic scheduler/orchestrator
+    /// consideration: started/probed automatically by the remote source
+    /// supervisor at startup and on config reload, seeded as a disconnected
+    /// remote source, and treated as a configured auto source event sender.
+    /// Only [`RemoteConnectionPolicy::Auto`] qualifies; `OnDemand` and
+    /// `Manual` hosts are excluded so sleeping/roaming remotes are never
+    /// probed or woken by background scheduling.
     pub(crate) fn starts_automatically(self) -> bool {
         matches!(self, RemoteConnectionPolicy::Auto)
     }
 
-    /// Whether this policy refuses implicit on-demand mutating dispatch
+    /// Whether this policy refuses explicit mutating dispatch
     /// (e.g. `agent.start --host`). Only [`RemoteConnectionPolicy::Manual`]
-    /// qualifies; `Auto` and `OnDemand` keep the existing explicit-connect
-    /// behavior.
+    /// qualifies; `Auto` and `OnDemand` allow explicit start. The positive
+    /// counterpart is [`Self::allows_explicit_start`].
     pub(crate) fn is_manual(self) -> bool {
         matches!(self, RemoteConnectionPolicy::Manual)
+    }
+
+    /// Whether an explicit mutating start command (e.g. `agent.start --host`)
+    /// may proceed for this policy. `Auto` and `OnDemand` return `true`;
+    /// `Manual` returns `false`. This is the positive counterpart to
+    /// [`Self::is_manual`] and is the intended guard for dispatch sites so the
+    /// intent — "is explicit start allowed?" — reads forward rather than as a
+    /// negated `is_manual` check.
+    pub(crate) fn allows_explicit_start(self) -> bool {
+        !self.is_manual()
     }
 
     pub(crate) fn as_toml_str(self) -> &'static str {
@@ -2442,6 +2455,22 @@ auto_connect = true
         assert!(RemoteConnectionPolicy::Auto.starts_automatically());
         assert!(!RemoteConnectionPolicy::OnDemand.starts_automatically());
         assert!(!RemoteConnectionPolicy::Manual.starts_automatically());
+        assert!(!RemoteConnectionPolicy::Auto.is_manual());
+        assert!(!RemoteConnectionPolicy::OnDemand.is_manual());
+        assert!(RemoteConnectionPolicy::Manual.is_manual());
+    }
+
+    #[test]
+    fn remote_connection_policy_allows_explicit_start_for_auto_and_on_demand_not_manual() {
+        // Automatic orchestration eligibility: Auto only.
+        assert!(RemoteConnectionPolicy::Auto.starts_automatically());
+        assert!(!RemoteConnectionPolicy::OnDemand.starts_automatically());
+        assert!(!RemoteConnectionPolicy::Manual.starts_automatically());
+        // Explicit mutating start dispatch: Auto and OnDemand allowed, Manual rejected.
+        assert!(RemoteConnectionPolicy::Auto.allows_explicit_start());
+        assert!(RemoteConnectionPolicy::OnDemand.allows_explicit_start());
+        assert!(!RemoteConnectionPolicy::Manual.allows_explicit_start());
+        // allows_explicit_start and is_manual are strict inverses.
         assert!(!RemoteConnectionPolicy::Auto.is_manual());
         assert!(!RemoteConnectionPolicy::OnDemand.is_manual());
         assert!(RemoteConnectionPolicy::Manual.is_manual());

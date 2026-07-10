@@ -436,6 +436,12 @@ Rules:
 - The remote source key is `(host_alias, session_name)`, not just host.
 - `connect_timeout_secs` bounds the SSH `ConnectTimeout` (whole seconds) used for connection attempts to this host, for both interactive and noninteractive configured-host SSH invocations. Optional; defaults to 10 seconds (matching the previous hardcoded noninteractive default). Must be a non-zero value no greater than 300 seconds; config with an out-of-range value is rejected.
 
+Scheduler/orchestrator availability policy:
+
+Automatic scheduler/orchestrator work may only consider hosts that are both `connection_policy = "auto"` and have a cached remote-source status of `Connected`. An `on_demand` or `manual` host is never a candidate for background scheduling regardless of its cached status, so sleeping, roaming, or offline machines are never probed or woken by automatic scheduling. An `auto` host that is seeded `Disconnected` at startup (before its first supervisor ping) is also excluded — the scheduler only acts on already-connected `auto` hosts with fresh cached state.
+
+Explicit user-directed commands (`agent start --host`, `remote status`, `remote check`) keep their existing policy gates and are not affected by automatic orchestration eligibility: `manual` hosts reject explicit `agent.start --host` locally before dispatch; `on_demand` hosts allow explicit dispatch when there is no cached non-connected status; read-only diagnostics probe named hosts regardless of policy. No command queue, retry, wake-on-LAN, or deferred execution semantics are introduced by this policy.
+
 Provisioning split:
 
 - `remote add` / `remote connect` may be interactive and may prompt to install/bootstrap a compatible Herdr binary.

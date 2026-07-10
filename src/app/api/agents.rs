@@ -695,7 +695,7 @@ pub(super) fn remote_agent_host_not_connected_body(
 pub(super) fn remote_agent_start_host_policy_guard(
     host: &crate::remote_target::RemoteHostConfig,
 ) -> Result<(), ErrorBody> {
-    if host.connection_policy.is_manual() {
+    if !host.connection_policy.allows_explicit_start() {
         return Err(ErrorBody {
             code: "remote_host_connection_policy_manual".to_string(),
             message: format!(
@@ -1726,6 +1726,42 @@ mod tests {
 
         assert!(remote_agent_start_host_policy_guard(&auto_host).is_ok());
         assert!(remote_agent_start_host_policy_guard(&on_demand).is_ok());
+    }
+
+    #[test]
+    fn remote_agent_start_host_precheck_no_cache_on_demand_passes_but_automatic_orchestration_unavailable(
+    ) {
+        // A missing cache entry for an on_demand host passes the precheck (on-demand
+        // no-cache dispatch is preserved), but does NOT satisfy
+        // available_for_automatic_orchestration() — the two predicates are distinct.
+        let host = crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", false)
+            .with_connection_policy(crate::remote_target::RemoteConnectionPolicy::OnDemand);
+        let cache = crate::remote_source::RemoteSourceCache::default();
+
+        // No cache entry: precheck must pass (on-demand first-contact is OK).
+        assert!(
+            remote_agent_start_host_precheck(&cache, &host).is_ok(),
+            "missing cache entry must not block on_demand precheck"
+        );
+        // A missing cache entry is not Connected, so automatic orchestration
+        // eligibility returns false.
+        let host_key = RemoteHostKey::new("jafar", "default");
+        let status_from_cache = cache.host_status(&host_key);
+        assert!(
+            status_from_cache.is_none(),
+            "cache should have no entry for an on_demand host that has never connected"
+        );
+        // Absent status means available_for_automatic_orchestration() is false:
+        // None is not Connected.
+        let auto_orchestration_available = status_from_cache
+            .map(|s| s.available_for_automatic_orchestration())
+            .unwrap_or(false);
+        assert!(
+            !auto_orchestration_available,
+            "missing cache entry must not satisfy automatic orchestration eligibility"
+        );
+        // OnDemand policy itself does not allow automatic scheduling.
+        assert!(!host.connection_policy.starts_automatically());
     }
 
     #[test]

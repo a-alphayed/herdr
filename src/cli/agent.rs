@@ -443,7 +443,7 @@ fn configured_remote_start_host_from_config(
     // fail locally before any SSH/API dispatch with a distinct policy error
     // (never the unknown-host / remote-disabled / connectivity errors). This
     // mirrors the app API `remote_host_connection_policy_manual` guard.
-    if host.connection_policy.is_manual() {
+    if !host.connection_policy.allows_explicit_start() {
         return Err(format!(
             "remote host {}/{} has connection_policy = \"manual\"; `agent start --host {}` will not reach it implicitly (connect it explicitly first)",
             host.name, host.session, alias

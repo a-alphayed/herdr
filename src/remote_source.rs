@@ -93,6 +93,22 @@ impl RemoteConnectionStatus {
             Self::Unreachable => Some("unreachable"),
         }
     }
+
+    /// Whether this host is available for automatic scheduler/orchestrator
+    /// consideration: the cached remote-source status must be `Connected`.
+    ///
+    /// Only [`RemoteConnectionStatus::Connected`] qualifies. `Disconnected`,
+    /// `NeedsUpdate`, and `Unreachable` all return `false`, so sleeping or
+    /// roaming hosts are never included in automatic scheduling decisions
+    /// even if they are `connection_policy = "auto"`.
+    ///
+    /// This predicate is for automatic-eligibility and safe prepared-state reuse
+    /// only. It is **not** a replacement for `remote_agent_start_host_precheck`,
+    /// which intentionally treats a missing cache entry as OK so explicit
+    /// `on_demand` no-cache dispatch can proceed.
+    pub(crate) fn available_for_automatic_orchestration(self) -> bool {
+        matches!(self, Self::Connected)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -544,7 +560,7 @@ impl RemoteSourceCache {
         host: &RemoteHostKey,
     ) -> Option<crate::remote::RemoteApiBridgeState> {
         let host_cache = self.hosts.get(host)?;
-        if host_cache.status.is_connected() {
+        if host_cache.status.available_for_automatic_orchestration() {
             host_cache.bridge_state.clone()
         } else {
             None
@@ -1588,6 +1604,28 @@ mod tests {
         crate::remote::RemoteApiBridgeState {
             shell_path: "\"$HOME/.local/bin/herdr\"".to_string(),
             capabilities: crate::api::schema::FederationCapabilities::current(),
+        }
+    }
+
+    #[test]
+    fn remote_connection_status_available_for_automatic_orchestration_only_when_connected() {
+        // Automatic scheduler/orchestrator eligibility requires Connected only.
+        assert!(RemoteConnectionStatus::Connected.available_for_automatic_orchestration());
+        assert!(!RemoteConnectionStatus::Disconnected.available_for_automatic_orchestration());
+        assert!(!RemoteConnectionStatus::NeedsUpdate.available_for_automatic_orchestration());
+        assert!(!RemoteConnectionStatus::Unreachable.available_for_automatic_orchestration());
+        // is_connected and available_for_automatic_orchestration agree exactly.
+        for status in [
+            RemoteConnectionStatus::Connected,
+            RemoteConnectionStatus::Disconnected,
+            RemoteConnectionStatus::NeedsUpdate,
+            RemoteConnectionStatus::Unreachable,
+        ] {
+            assert_eq!(
+                status.is_connected(),
+                status.available_for_automatic_orchestration(),
+                "is_connected and available_for_automatic_orchestration must agree for {status:?}"
+            );
         }
     }
 
