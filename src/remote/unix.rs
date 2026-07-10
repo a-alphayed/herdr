@@ -399,13 +399,14 @@ pub(crate) fn send_remote_api_request_to_host(
         false,
     )?;
 
-    send_remote_api_request_to_host_with_mode(
+    let (response, _capabilities) = send_remote_api_request_to_host_with_mode(
         host,
         &remote_ssh,
         &prepared_remote.remote_herdr,
         request,
         SshInvocationMode::Interactive,
-    )
+    )?;
+    Ok(response)
 }
 
 pub(crate) fn send_remote_api_request_to_host_noninteractive(
@@ -414,10 +415,76 @@ pub(crate) fn send_remote_api_request_to_host_noninteractive(
 ) -> io::Result<String> {
     let remote_ssh = remote_ssh_for_host(host);
     let remote_herdr = prepare_remote_herdr_noninteractive(&remote_ssh)?;
-    send_remote_api_request_to_host_with_mode(
+    let (response, _capabilities) = send_remote_api_request_to_host_with_mode(
         host,
         &remote_ssh,
         &remote_herdr,
+        request,
+        SshInvocationMode::Noninteractive,
+    )?;
+    Ok(response)
+}
+
+/// Like [`send_remote_api_request_to_host_noninteractive`] but also returns the
+/// prepared [`RemoteApiBridgeState`] captured on the successful round-trip
+/// (prepared remote Herdr shell path plus advertised federation capabilities).
+/// A connected remote-source supervisor publishes this state so routed agent
+/// dispatch can reuse it instead of redoing per-request binary preparation and
+/// capability/ping probes. This reuses already-prepared data; it is not
+/// connection pooling and does not persist an SSH bridge between requests.
+pub(crate) fn send_remote_api_request_to_host_noninteractive_with_state(
+    host: &crate::remote_target::RemoteHostConfig,
+    request: &crate::api::schema::Request,
+) -> io::Result<(String, RemoteApiBridgeState)> {
+    let remote_ssh = remote_ssh_for_host(host);
+    let remote_herdr = prepare_remote_herdr_noninteractive(&remote_ssh)?;
+    let (response, capabilities) = send_remote_api_request_to_host_with_mode(
+        host,
+        &remote_ssh,
+        &remote_herdr,
+        request,
+        SshInvocationMode::Noninteractive,
+    )?;
+    Ok((
+        response,
+        RemoteApiBridgeState {
+            shell_path: remote_herdr.shell_path.clone(),
+            capabilities,
+        },
+    ))
+}
+
+/// Send a remote API request reusing cached supervisor-prepared bridge state.
+///
+/// Validates the cached full federation capabilities against the request's
+/// required method locally (using the same method mapping as the current
+/// bridge path), then builds the `remote-api-bridge` command from the cached
+/// prepared shell path and sends the actual request without re-running remote
+/// binary preparation, the `remote-federation-capabilities` probe, or the API
+/// ping probe. A fresh SSH process is still spawned for the request itself, so
+/// this reuses prepared *data*, not a persistent connection. The actual remote
+/// API request still fails authoritatively on drift, mapped through the existing
+/// remote error handling by the caller.
+pub(crate) fn send_remote_api_request_with_prepared_state(
+    host: &crate::remote_target::RemoteHostConfig,
+    state: &RemoteApiBridgeState,
+    request: &crate::api::schema::Request,
+) -> io::Result<String> {
+    let required_methods = required_federation_methods_for_request(request);
+    // Local cached-capability check first: preserves today's early clean error
+    // before any SSH work, using the same required-method mapping as the full
+    // bridge path.
+    validate_federation_capabilities(host, &state.capabilities, &required_methods)?;
+
+    let remote_ssh = remote_ssh_for_host(host);
+    let bridge_command = remote_bridge_command_for_shell_path(
+        &state.shell_path,
+        &host.session,
+        REMOTE_API_BRIDGE_SUBCOMMAND,
+    );
+    send_remote_api_request_with_mode(
+        &remote_ssh,
+        &bridge_command,
         request,
         SshInvocationMode::Noninteractive,
     )
@@ -546,15 +613,19 @@ fn send_remote_api_request_to_host_with_mode(
     remote_herdr: &RemoteHerdr,
     request: &crate::api::schema::Request,
     mode: SshInvocationMode,
-) -> io::Result<String> {
+) -> io::Result<(String, crate::api::schema::FederationCapabilities)> {
     let required_methods = required_federation_methods_for_request(request);
-    ensure_remote_federation_methods(host, ssh, remote_herdr, mode, &required_methods)?;
+    // The advertised capabilities from the successful federation probe are the
+    // prepared bridge state a connected supervisor cache may reuse to skip
+    // per-request probes, so capture them here alongside the response.
+    let capabilities =
+        ensure_remote_federation_methods(host, ssh, remote_herdr, mode, &required_methods)?;
 
     let bridge_command = remote_api_bridge_command_for_host(remote_herdr, host);
     if matches!(request.method, crate::api::schema::Method::Ping(_)) {
         let response = send_remote_api_request_with_mode(ssh, &bridge_command, request, mode)?;
         validate_remote_api_ping_capabilities(host, &response, &required_methods)?;
-        return Ok(response);
+        return Ok((response, capabilities));
     }
 
     validate_remote_api_capabilities_with_mode(
@@ -564,7 +635,8 @@ fn send_remote_api_request_to_host_with_mode(
         mode,
         &required_methods,
     )?;
-    send_remote_api_request_with_mode(ssh, &bridge_command, request, mode)
+    let response = send_remote_api_request_with_mode(ssh, &bridge_command, request, mode)?;
+    Ok((response, capabilities))
 }
 
 fn ensure_remote_federation_methods(
@@ -573,9 +645,10 @@ fn ensure_remote_federation_methods(
     remote_herdr: &RemoteHerdr,
     mode: SshInvocationMode,
     required_methods: &[&'static str],
-) -> io::Result<()> {
+) -> io::Result<crate::api::schema::FederationCapabilities> {
     let capabilities = fetch_remote_federation_capabilities(host, ssh, remote_herdr, mode)?;
-    validate_federation_capabilities(host, &capabilities, required_methods)
+    validate_federation_capabilities(host, &capabilities, required_methods)?;
+    Ok(capabilities)
 }
 
 fn fetch_remote_federation_capabilities(
@@ -975,6 +1048,25 @@ pub(crate) struct RemoteHerdr {
     install_suffix: String,
     shell_path: String,
     platform: RemotePlatform,
+}
+
+/// Reusable, cloneable prepared bridge state for a remote host: the prepared
+/// remote Herdr shell path plus the full advertised [`FederationCapabilities`]
+/// captured from a successful supervisor compatibility/ping round-trip.
+///
+/// This is rebuildable soft data (no live handles, sockets, or threads): a
+/// connected remote-source supervisor publishes it through an `AppEvent`, and
+/// routed agent dispatch may reuse it to skip per-request remote binary
+/// preparation and capability/ping probes while the host stays `Connected`. It
+/// is invalidated when the host becomes non-connected. Storing the shell path
+/// string keeps `AppState`/`RemoteSourceCache` free of platform-specific
+/// `RemoteHerdr`.
+///
+/// [`FederationCapabilities`]: crate::api::schema::FederationCapabilities
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteApiBridgeState {
+    pub(crate) shell_path: String,
+    pub(crate) capabilities: crate::api::schema::FederationCapabilities,
 }
 
 impl RemoteHerdr {
@@ -2420,7 +2512,19 @@ fn remote_bridge_command_for(
     session_name: &str,
     bridge_subcommand: &str,
 ) -> String {
-    let mut command = format!("exec {}", remote_herdr.shell_path);
+    remote_bridge_command_for_shell_path(&remote_herdr.shell_path, session_name, bridge_subcommand)
+}
+
+/// Build a remote bridge subcommand from a prepared shell path string rather
+/// than a full platform-specific [`RemoteHerdr`]. Used by the prepared-state
+/// dispatch path, which only has the cached shell path plus advertised
+/// capabilities and must not re-run remote binary preparation.
+fn remote_bridge_command_for_shell_path(
+    shell_path: &str,
+    session_name: &str,
+    bridge_subcommand: &str,
+) -> String {
+    let mut command = format!("exec {}", shell_path);
     if session_name != crate::session::DEFAULT_SESSION_NAME {
         command.push_str(" --session ");
         command.push_str(&shell_quote(session_name));
@@ -5134,5 +5238,114 @@ mod tests {
         InstallSource::temporary(path, dir.clone()).cleanup();
 
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn prepared_state_helper_rejects_missing_required_federation_method() {
+        // C5/test 1: the prepared-state helper validates cached full federation
+        // capabilities locally using the same method mapping as the current
+        // bridge path. A request whose required method is missing must be
+        // rejected before any SSH work, so this test never spawns ssh.
+        let host = crate::remote_target::RemoteHostConfig::new(
+            "jafar",
+            "user@jafar:2222",
+            crate::session::DEFAULT_SESSION_NAME,
+            true,
+        );
+        // Capabilities advertise remote_api_bridge but NOT agent_read.
+        let state = RemoteApiBridgeState {
+            shell_path: "\"$HOME/.local/bin/herdr\"".to_string(),
+            capabilities: crate::api::schema::FederationCapabilities {
+                methods: vec![
+                    crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE.to_string(),
+                ],
+            },
+        };
+        let request = crate::api::schema::Request {
+            id: "req".to_string(),
+            method: crate::api::schema::Method::AgentRead(crate::api::schema::AgentReadParams {
+                target: "term-1".to_string(),
+                source: crate::api::schema::ReadSource::Recent,
+                lines: None,
+                format: crate::api::schema::ReadFormat::Text,
+                strip_ansi: true,
+            }),
+        };
+
+        let err = send_remote_api_request_with_prepared_state(&host, &state, &request).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("agent_read"));
+        assert!(err.to_string().contains("jafar"));
+    }
+
+    #[test]
+    fn prepared_state_helper_accepts_cached_required_methods_via_same_mapping() {
+        // The prepared-state path reuses the exact required-method mapping of
+        // the full bridge path. With full capabilities advertised, every routed
+        // agent method's required methods validate locally (no SSH). This proves
+        // acceptance mirrors the current bridge path without spawning ssh.
+        let host = crate::remote_target::RemoteHostConfig::new(
+            "jafar",
+            "user@jafar:2222",
+            crate::session::DEFAULT_SESSION_NAME,
+            true,
+        );
+        let capabilities = crate::api::schema::FederationCapabilities::current();
+
+        let methods = [
+            crate::api::schema::Method::AgentRead(crate::api::schema::AgentReadParams {
+                target: "t".to_string(),
+                source: crate::api::schema::ReadSource::Recent,
+                lines: None,
+                format: crate::api::schema::ReadFormat::Text,
+                strip_ansi: true,
+            }),
+            crate::api::schema::Method::AgentFocus(crate::api::schema::AgentTarget {
+                target: "t".to_string(),
+            }),
+            crate::api::schema::Method::AgentStart(crate::api::schema::AgentStartParams {
+                host: None,
+                name: "codex".to_string(),
+                cwd: None,
+                workspace_id: None,
+                tab_id: None,
+                split: None,
+                focus: false,
+                new_workspace: false,
+                argv: vec!["codex".to_string()],
+                env: Default::default(),
+            }),
+        ];
+        for method in methods {
+            let request = crate::api::schema::Request {
+                id: "req".to_string(),
+                method,
+            };
+            let required = required_federation_methods_for_request(&request);
+            validate_federation_capabilities(&host, &capabilities, &required)
+                .unwrap_or_else(|err| panic!("expected local validation to pass: {err}"));
+        }
+    }
+
+    #[test]
+    fn remote_bridge_command_for_shell_path_matches_host_shape() {
+        // The prepared-state path builds the bridge command from a cached shell
+        // path string only; it must match the shape the full path produces.
+        assert_eq!(
+            remote_bridge_command_for_shell_path(
+                "\"$HOME/.local/bin/herdr\"",
+                crate::session::DEFAULT_SESSION_NAME,
+                REMOTE_API_BRIDGE_SUBCOMMAND,
+            ),
+            "exec \"$HOME/.local/bin/herdr\" remote-api-bridge"
+        );
+        assert_eq!(
+            remote_bridge_command_for_shell_path(
+                "/usr/bin/herdr",
+                "fed api",
+                REMOTE_API_BRIDGE_SUBCOMMAND,
+            ),
+            "exec /usr/bin/herdr --session 'fed api' remote-api-bridge"
+        );
     }
 }

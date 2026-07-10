@@ -122,8 +122,55 @@ fn remote_source_supervisor_loop(
         host,
         event_tx,
         stop,
-        crate::remote::send_remote_api_request_to_host_noninteractive,
+        send_remote_api_request_with_send_result,
     );
+}
+
+/// Result of one supervisor bridge round-trip: the JSON response plus any
+/// prepared bridge state captured on a successful round-trip (prepared remote
+/// Herdr shell path + advertised federation capabilities).
+///
+/// The real supervisor sender ([`send_remote_api_request_with_send_result`])
+/// calls the remote helper that returns both the response and prepared state,
+/// so a successful ping can publish that state for routed agent dispatch reuse.
+/// Test send closures return response-only results ([`Self::response_only`] /
+/// `From<String>`) with `bridge_state: None`.
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteSourceSendResult {
+    pub(crate) response: String,
+    pub(crate) bridge_state: Option<crate::remote::RemoteApiBridgeState>,
+}
+
+impl RemoteSourceSendResult {
+    /// Response-only send result with no prepared bridge state. Used by test
+    /// send closures that do not exercise the prepared-state capture path.
+    pub(crate) fn response_only(response: String) -> Self {
+        Self {
+            response,
+            bridge_state: None,
+        }
+    }
+}
+
+impl From<String> for RemoteSourceSendResult {
+    fn from(response: String) -> Self {
+        Self::response_only(response)
+    }
+}
+
+/// Production supervisor sender: runs the real non-interactive remote API
+/// request and captures the prepared bridge state on success so a connected
+/// supervisor ping can publish it for routed agent dispatch reuse.
+fn send_remote_api_request_with_send_result(
+    host: &RemoteHostConfig,
+    request: &Request,
+) -> io::Result<RemoteSourceSendResult> {
+    let (response, bridge_state) =
+        crate::remote::send_remote_api_request_to_host_noninteractive_with_state(host, request)?;
+    Ok(RemoteSourceSendResult {
+        response,
+        bridge_state: Some(bridge_state),
+    })
 }
 
 fn remote_source_supervisor_loop_with<F>(
@@ -132,7 +179,7 @@ fn remote_source_supervisor_loop_with<F>(
     stop: Arc<AtomicBool>,
     send: F,
 ) where
-    F: Fn(&RemoteHostConfig, &Request) -> io::Result<String>,
+    F: Fn(&RemoteHostConfig, &Request) -> io::Result<RemoteSourceSendResult>,
 {
     let host_key = RemoteHostKey::new(host.name.clone(), host.session.clone());
     let mut next_ping = Instant::now();
@@ -144,12 +191,25 @@ fn remote_source_supervisor_loop_with<F>(
         let now = Instant::now();
         if now >= next_ping {
             match send_ping(&host, &send) {
-                Ok(next_capabilities) => {
+                Ok((next_capabilities, bridge_state)) => {
                     capabilities = next_capabilities;
                     // Any successful round-trip proves the host is reachable
                     // again, so clear any accumulated transient backoff.
                     transient_backoff.reset();
                     next_ping = now + REMOTE_SOURCE_PING_INTERVAL;
+                    // C3: capture prepared bridge state on the ping path so a
+                    // connected supervisor cache is paired with prepared state
+                    // promptly. Published through the AppEvent/reducer path only;
+                    // the supervisor thread never mutates AppState/RemoteSourceCache
+                    // directly. A later non-connected ping/snapshot clears it.
+                    if let Some(bridge_state) = bridge_state {
+                        if !stop.load(Ordering::Relaxed) {
+                            let _ = event_tx.blocking_send(AppEvent::RemoteSourceBridgeState {
+                                host: host_key.clone(),
+                                bridge_state,
+                            });
+                        }
+                    }
                 }
                 Err(err) => {
                     if stop.load(Ordering::Relaxed) {
@@ -409,12 +469,19 @@ fn remote_source_failure_status(err: &io::Error) -> RemoteConnectionStatus {
     }
 }
 
-fn send_ping<F>(host: &RemoteHostConfig, send: &F) -> io::Result<RemoteSourceCapabilities>
+fn send_ping<F>(
+    host: &RemoteHostConfig,
+    send: &F,
+) -> io::Result<(
+    RemoteSourceCapabilities,
+    Option<crate::remote::RemoteApiBridgeState>,
+)>
 where
-    F: Fn(&RemoteHostConfig, &Request) -> io::Result<String>,
+    F: Fn(&RemoteHostConfig, &Request) -> io::Result<RemoteSourceSendResult>,
 {
-    let response = send(host, &ping_request())?;
-    parse_ping_response(&response)
+    let result = send(host, &ping_request())?;
+    let capabilities = parse_ping_response(&result.response)?;
+    Ok((capabilities, result.bridge_state))
 }
 
 /// Core snapshot + projected layouts produced by [`send_remote_source_snapshot`].
@@ -431,7 +498,7 @@ fn send_remote_source_snapshot<F>(
     capabilities: RemoteSourceCapabilities,
 ) -> io::Result<RemoteSourceSnapshotParts>
 where
-    F: Fn(&RemoteHostConfig, &Request) -> io::Result<String>,
+    F: Fn(&RemoteHostConfig, &Request) -> io::Result<RemoteSourceSendResult>,
 {
     let agents = send_agent_list(host, send)?;
     let workspaces = if capabilities.workspace_list_local {
@@ -454,7 +521,7 @@ fn build_projections<F>(
     workspaces: Option<&[WorkspaceInfo]>,
 ) -> (Vec<RemoteProjectionSnapshot>, Vec<RemoteTabSnapshot>)
 where
-    F: Fn(&RemoteHostConfig, &Request) -> io::Result<String>,
+    F: Fn(&RemoteHostConfig, &Request) -> io::Result<RemoteSourceSendResult>,
 {
     let Some(workspaces) = workspaces else {
         return (Vec::new(), Vec::new());
@@ -558,10 +625,10 @@ fn send_tab_list<F>(
     workspace_id: &str,
 ) -> io::Result<Vec<TabInfo>>
 where
-    F: Fn(&RemoteHostConfig, &Request) -> io::Result<String>,
+    F: Fn(&RemoteHostConfig, &Request) -> io::Result<RemoteSourceSendResult>,
 {
-    let response = send(host, &tab_list_request(workspace_id))?;
-    parse_tab_list_response(&response)
+    let result = send(host, &tab_list_request(workspace_id))?;
+    parse_tab_list_response(&result.response)
 }
 
 fn send_layout_export<F>(
@@ -570,10 +637,10 @@ fn send_layout_export<F>(
     tab_id: &str,
 ) -> io::Result<LayoutDescription>
 where
-    F: Fn(&RemoteHostConfig, &Request) -> io::Result<String>,
+    F: Fn(&RemoteHostConfig, &Request) -> io::Result<RemoteSourceSendResult>,
 {
-    let response = send(host, &layout_export_request(tab_id))?;
-    parse_layout_export_response(&response)
+    let result = send(host, &layout_export_request(tab_id))?;
+    parse_layout_export_response(&result.response)
 }
 
 fn parse_layout_export_response(response: &str) -> io::Result<LayoutDescription> {
@@ -588,18 +655,18 @@ fn parse_layout_export_response(response: &str) -> io::Result<LayoutDescription>
 
 fn send_agent_list<F>(host: &RemoteHostConfig, send: &F) -> io::Result<Vec<AgentInfo>>
 where
-    F: Fn(&RemoteHostConfig, &Request) -> io::Result<String>,
+    F: Fn(&RemoteHostConfig, &Request) -> io::Result<RemoteSourceSendResult>,
 {
-    let response = send(host, &agent_list_request())?;
-    parse_agent_list_response(&response)
+    let result = send(host, &agent_list_request())?;
+    parse_agent_list_response(&result.response)
 }
 
 fn send_workspace_list<F>(host: &RemoteHostConfig, send: &F) -> io::Result<Vec<WorkspaceInfo>>
 where
-    F: Fn(&RemoteHostConfig, &Request) -> io::Result<String>,
+    F: Fn(&RemoteHostConfig, &Request) -> io::Result<RemoteSourceSendResult>,
 {
-    let response = send(host, &workspace_list_request())?;
-    parse_workspace_list_response(&response)
+    let result = send(host, &workspace_list_request())?;
+    parse_workspace_list_response(&result.response)
 }
 
 pub(crate) fn ping_request() -> Request {
@@ -1214,13 +1281,15 @@ mod tests {
             remote_source_supervisor_loop_with(host, tx, thread_stop, move |_host, request| {
                 thread_calls.fetch_add(1, Ordering::Relaxed);
                 match &request.method {
-                    Method::Ping(_) => Ok(pong_response()),
-                    Method::AgentListLocal(_) => Ok(agent_list_response(vec![agent("term-1")])),
-                    Method::WorkspaceListLocal(_) => {
-                        Ok(workspace_list_response(vec![workspace("ws-1", "tmp")]))
+                    Method::Ping(_) => Ok(pong_response().into()),
+                    Method::AgentListLocal(_) => {
+                        Ok(agent_list_response(vec![agent("term-1")]).into())
                     }
-                    Method::TabList(_) => Ok(tab_list_response(vec![tab("tab-1", true)])),
-                    Method::LayoutExport(_) => Ok(layout_export_response("ws-1", "tab-1")),
+                    Method::WorkspaceListLocal(_) => {
+                        Ok(workspace_list_response(vec![workspace("ws-1", "tmp")]).into())
+                    }
+                    Method::TabList(_) => Ok(tab_list_response(vec![tab("tab-1", true)]).into()),
+                    Method::LayoutExport(_) => Ok(layout_export_response("ws-1", "tab-1").into()),
                     _ => unreachable!("unexpected request"),
                 }
             });
@@ -1264,6 +1333,95 @@ mod tests {
     }
 
     #[test]
+    fn remote_supervisor_loop_publishes_prepared_bridge_state_on_ping() {
+        // C5/test 2: a successful supervisor ping publishes the prepared bridge
+        // state captured on the ping path through the AppEvent/reducer path
+        // only. The supervisor thread never mutates AppState/RemoteSourceCache
+        // directly; it sends an event, which the reducer applies.
+        let (tx, mut rx) = mpsc::channel(8);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let host = RemoteHostConfig::new("jafar", "jafar", "default", true);
+        let published_state = crate::remote::RemoteApiBridgeState {
+            shell_path: "\"$HOME/.local/bin/herdr\"".to_string(),
+            capabilities: crate::api::schema::FederationCapabilities::current(),
+        };
+        let expected_state = published_state.clone();
+
+        let handle = thread::spawn(move || {
+            remote_source_supervisor_loop_with(host, tx, thread_stop, move |_host, request| {
+                match &request.method {
+                    Method::Ping(_) => Ok(RemoteSourceSendResult {
+                        response: pong_response(),
+                        bridge_state: Some(published_state.clone()),
+                    }),
+                    Method::AgentListLocal(_) => {
+                        Ok(agent_list_response(vec![agent("term-1")]).into())
+                    }
+                    Method::WorkspaceListLocal(_) => {
+                        Ok(workspace_list_response(vec![workspace("ws-1", "tmp")]).into())
+                    }
+                    Method::TabList(_) => Ok(tab_list_response(vec![tab("tab-1", true)]).into()),
+                    Method::LayoutExport(_) => Ok(layout_export_response("ws-1", "tab-1").into()),
+                    _ => unreachable!("unexpected request"),
+                }
+            });
+        });
+
+        // The ping runs first and must publish the prepared bridge state event
+        // before the snapshot event is published.
+        let first = rx.blocking_recv().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        let AppEvent::RemoteSourceBridgeState { host, bridge_state } = first else {
+            panic!("expected RemoteSourceBridgeState event first, got {first:?}");
+        };
+        assert_eq!(host, RemoteHostKey::new("jafar", "default"));
+        assert_eq!(bridge_state.shell_path, expected_state.shell_path);
+        assert_eq!(bridge_state.capabilities, expected_state.capabilities);
+    }
+
+    #[test]
+    fn remote_supervisor_loop_does_not_publish_bridge_state_when_ping_omits_it() {
+        // A response-only ping (no prepared state, e.g. an older/test sender)
+        // must not publish a bridge-state event; the snapshot event is still
+        // delivered. This proves the publish is gated on captured state.
+        let (tx, mut rx) = mpsc::channel(8);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let host = RemoteHostConfig::new("jafar", "jafar", "default", true);
+
+        let handle = thread::spawn(move || {
+            remote_source_supervisor_loop_with(host, tx, thread_stop, move |_host, request| {
+                match &request.method {
+                    Method::Ping(_) => Ok(pong_response().into()),
+                    Method::AgentListLocal(_) => {
+                        Ok(agent_list_response(vec![agent("term-1")]).into())
+                    }
+                    Method::WorkspaceListLocal(_) => {
+                        Ok(workspace_list_response(vec![workspace("ws-1", "tmp")]).into())
+                    }
+                    Method::TabList(_) => Ok(tab_list_response(vec![tab("tab-1", true)]).into()),
+                    Method::LayoutExport(_) => Ok(layout_export_response("ws-1", "tab-1").into()),
+                    _ => unreachable!("unexpected request"),
+                }
+            });
+        });
+
+        let first = rx.blocking_recv().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        // No prepared state captured -> first event is the snapshot, not a
+        // bridge-state event.
+        assert!(
+            matches!(first, AppEvent::RemoteSourceSnapshot { .. }),
+            "expected snapshot event first, got {first:?}"
+        );
+    }
+
+    #[test]
     fn remote_supervisor_loop_skips_workspace_poll_when_capability_missing() {
         let (tx, mut rx) = mpsc::channel(4);
         let stop = Arc::new(AtomicBool::new(false));
@@ -1276,8 +1434,10 @@ mod tests {
             remote_source_supervisor_loop_with(host, tx, thread_stop, move |_host, request| {
                 thread_calls.fetch_add(1, Ordering::Relaxed);
                 match &request.method {
-                    Method::Ping(_) => Ok(pong_response_without_workspace_list_local()),
-                    Method::AgentListLocal(_) => Ok(agent_list_response(vec![agent("term-1")])),
+                    Method::Ping(_) => Ok(pong_response_without_workspace_list_local().into()),
+                    Method::AgentListLocal(_) => {
+                        Ok(agent_list_response(vec![agent("term-1")]).into())
+                    }
                     Method::WorkspaceListLocal(_) => panic!("workspace poll should be skipped"),
                     _ => unreachable!("unexpected request"),
                 }
@@ -1396,7 +1556,7 @@ mod tests {
             remote_source_supervisor_loop_with(host, tx, thread_stop, move |_host, request| {
                 thread_calls.fetch_add(1, Ordering::Relaxed);
                 match &request.method {
-                    Method::Ping(_) => Ok(old_pong_response_without_federation()),
+                    Method::Ping(_) => Ok(old_pong_response_without_federation().into()),
                     Method::AgentListLocal(_) => panic!("snapshot should not be requested"),
                     Method::WorkspaceListLocal(_) => panic!("workspace should not be requested"),
                     _ => unreachable!("unexpected request"),
@@ -1429,7 +1589,7 @@ mod tests {
             remote_source_supervisor_loop_with(host, tx, thread_stop, move |_host, request| {
                 thread_calls.fetch_add(1, Ordering::Relaxed);
                 match &request.method {
-                    Method::Ping(_) => Ok(pong_response()),
+                    Method::Ping(_) => Ok(pong_response().into()),
                     Method::AgentListLocal(_) => Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "remote API ping did not advertise federation method agent.list",
@@ -1465,9 +1625,11 @@ mod tests {
             remote_source_supervisor_loop_with(host, tx, thread_stop, move |_host, request| {
                 thread_calls.fetch_add(1, Ordering::Relaxed);
                 match &request.method {
-                    Method::Ping(_) => Ok(pong_response()),
-                    Method::AgentListLocal(_) => Ok(agent_list_response(vec![agent("term-1")])),
-                    Method::WorkspaceListLocal(_) => Ok("not json".to_string()),
+                    Method::Ping(_) => Ok(pong_response().into()),
+                    Method::AgentListLocal(_) => {
+                        Ok(agent_list_response(vec![agent("term-1")]).into())
+                    }
+                    Method::WorkspaceListLocal(_) => Ok("not json".to_string().into()),
                     _ => unreachable!("unexpected request"),
                 }
             });
@@ -1606,13 +1768,15 @@ mod tests {
         let handle = thread::spawn(move || {
             remote_source_supervisor_loop_with(host, tx, thread_stop, move |_host, request| {
                 match &request.method {
-                    Method::Ping(_) => Ok(pong_response()),
-                    Method::AgentListLocal(_) => Ok(agent_list_response(vec![agent("term-1")])),
+                    Method::Ping(_) => Ok(pong_response().into()),
+                    Method::AgentListLocal(_) => {
+                        Ok(agent_list_response(vec![agent("term-1")]).into())
+                    }
                     Method::WorkspaceListLocal(_) => {
-                        Ok(workspace_list_response(vec![workspace("ws-1", "tmp")]))
+                        Ok(workspace_list_response(vec![workspace("ws-1", "tmp")]).into())
                     }
                     Method::TabList(_) => Err(io::Error::other("tab list denied")),
-                    Method::LayoutExport(_) => Ok(layout_export_response("ws-1", "tab-1")),
+                    Method::LayoutExport(_) => Ok(layout_export_response("ws-1", "tab-1").into()),
                     _ => unreachable!("unexpected request"),
                 }
             });
@@ -1649,12 +1813,14 @@ mod tests {
         let handle = thread::spawn(move || {
             remote_source_supervisor_loop_with(host, tx, thread_stop, move |_host, request| {
                 match &request.method {
-                    Method::Ping(_) => Ok(pong_response()),
-                    Method::AgentListLocal(_) => Ok(agent_list_response(vec![agent("term-1")])),
-                    Method::WorkspaceListLocal(_) => {
-                        Ok(workspace_list_response(vec![workspace("ws-1", "tmp")]))
+                    Method::Ping(_) => Ok(pong_response().into()),
+                    Method::AgentListLocal(_) => {
+                        Ok(agent_list_response(vec![agent("term-1")]).into())
                     }
-                    Method::TabList(_) => Ok(tab_list_response(vec![tab("tab-1", true)])),
+                    Method::WorkspaceListLocal(_) => {
+                        Ok(workspace_list_response(vec![workspace("ws-1", "tmp")]).into())
+                    }
+                    Method::TabList(_) => Ok(tab_list_response(vec![tab("tab-1", true)]).into()),
                     Method::LayoutExport(_) => Err(io::Error::other("layout export denied")),
                     _ => unreachable!("unexpected request"),
                 }

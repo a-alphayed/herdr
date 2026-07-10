@@ -202,6 +202,11 @@ struct RemoteHostCache {
     capabilities: RemoteSourceCapabilities,
     projections: BTreeMap<String, RemoteProjectionEntry>,
     tabs: BTreeMap<String, RemoteTabSnapshotEntry>,
+    /// Supervisor-prepared bridge state (prepared shell path + advertised
+    /// federation capabilities) for reuse by routed agent dispatch while the
+    /// host stays `Connected`. Rebuildable soft state: dropped when the host
+    /// becomes non-connected ([`Self::mark_status`]).
+    bridge_state: Option<crate::remote::RemoteApiBridgeState>,
 }
 
 impl Default for RemoteHostCache {
@@ -213,6 +218,7 @@ impl Default for RemoteHostCache {
             capabilities: RemoteSourceCapabilities::default(),
             projections: BTreeMap::new(),
             tabs: BTreeMap::new(),
+            bridge_state: None,
         }
     }
 }
@@ -482,6 +488,11 @@ impl RemoteSourceCache {
         // A non-connected host keeps its cached projections for read-only display
         // but they are no longer fresh, so available projections become stale.
         if !status.is_connected() {
+            // Prepared bridge state is safety-relevant for mutating dispatch:
+            // a stale prepared binary/capabilities must never be reused to skip
+            // probes after a disconnect/incompatibility. Drop it while keeping
+            // display caches (agents/workspaces/projections/tabs) stale as today.
+            host_cache.bridge_state = None;
             for projection in host_cache.projections.values_mut() {
                 if projection.status == RemoteProjectionStatus::Available {
                     projection.status = RemoteProjectionStatus::StaleLastKnown;
@@ -492,6 +503,44 @@ impl RemoteSourceCache {
                     tabs.status = RemoteProjectionStatus::StaleLastKnown;
                 }
             }
+        }
+    }
+
+    /// Mark `host` `Connected` and store supervisor-prepared bridge state
+    /// captured from a successful supervisor ping.
+    ///
+    /// C3 alignment: a successful ping proves the host is reachable, so the
+    /// cached status is flipped to `Connected` (a snapshot may not have arrived
+    /// yet, in which case the host is connected with no agents) and the prepared
+    /// state is stored so routed agent dispatch can reuse it. This is the
+    /// reducer-side handler for [`AppEvent::RemoteSourceBridgeState`].
+    /// `Connected` here means the prepared state stays; a later non-connected
+    /// [`Self::mark_status`] still invalidates it.
+    ///
+    /// [`AppEvent::RemoteSourceBridgeState`]: crate::events::AppEvent::RemoteSourceBridgeState
+    pub(crate) fn set_connected_bridge_state(
+        &mut self,
+        host: &RemoteHostKey,
+        bridge_state: crate::remote::RemoteApiBridgeState,
+    ) {
+        let host_cache = self.hosts.entry(host.clone()).or_default();
+        host_cache.status = RemoteConnectionStatus::Connected;
+        host_cache.bridge_state = Some(bridge_state);
+    }
+
+    /// Prepared bridge state for routed agent dispatch, available only while the
+    /// host is `Connected` and has cached state. Returns `None` for stale /
+    /// non-connected hosts (so dispatch falls back to the full non-interactive
+    /// bridge path) and for hosts with no cached prepared state.
+    pub(crate) fn connected_bridge_state(
+        &self,
+        host: &RemoteHostKey,
+    ) -> Option<crate::remote::RemoteApiBridgeState> {
+        let host_cache = self.hosts.get(host)?;
+        if host_cache.status.is_connected() {
+            host_cache.bridge_state.clone()
+        } else {
+            None
         }
     }
 
@@ -551,6 +600,7 @@ impl RemoteSourceCache {
             capabilities: RemoteSourceCapabilities::default(),
             projections: BTreeMap::new(),
             tabs: BTreeMap::new(),
+            bridge_state: None,
         });
     }
 
@@ -562,6 +612,7 @@ impl RemoteSourceCache {
             capabilities: RemoteSourceCapabilities::default(),
             projections: BTreeMap::new(),
             tabs: BTreeMap::new(),
+            bridge_state: None,
         });
         host_cache.status = RemoteConnectionStatus::Connected;
 
@@ -1524,5 +1575,125 @@ mod tests {
         assert_eq!(agents[0].status, RemoteConnectionStatus::Connected);
         assert!(!agents[0].stale());
         assert_eq!(agents[0].agent.revision, 2);
+    }
+
+    fn full_bridge_state() -> crate::remote::RemoteApiBridgeState {
+        crate::remote::RemoteApiBridgeState {
+            shell_path: "\"$HOME/.local/bin/herdr\"".to_string(),
+            capabilities: crate::api::schema::FederationCapabilities::current(),
+        }
+    }
+
+    #[test]
+    fn remote_source_connected_bridge_state_available_only_when_connected() {
+        // C5/test 4 gating: connected_bridge_state returns the cached prepared
+        // state only while the host is Connected, and None otherwise (so stale
+        // agent.read and non-connected dispatch fall back to the full path).
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+        let state = full_bridge_state();
+
+        cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
+        cache.set_connected_bridge_state(&host, state.clone());
+        assert_eq!(cache.connected_bridge_state(&host).as_ref(), Some(&state));
+
+        // Non-connected marks must hide the prepared state for dispatch.
+        for status in [
+            RemoteConnectionStatus::Disconnected,
+            RemoteConnectionStatus::Unreachable,
+            RemoteConnectionStatus::NeedsUpdate,
+        ] {
+            cache.mark_status(&host, status);
+            assert_eq!(
+                cache.connected_bridge_state(&host),
+                None,
+                "prepared state must be hidden for {status:?}"
+            );
+            // Reconnect to re-test the next status variant from Connected.
+            cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
+            cache.set_connected_bridge_state(&host, state.clone());
+        }
+    }
+
+    #[test]
+    fn remote_source_mark_status_invalidates_prepared_state_but_preserves_display() {
+        // C5/test 3: mark_status(Disconnected|Unreachable|NeedsUpdate) drops the
+        // prepared bridge state (safety-relevant for mutating dispatch) while
+        // keeping display caches (agents/workspaces/projections) stale as today.
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+        cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
+        cache.replace_workspace_snapshot(host.clone(), vec![workspace("ws-1", "tmp")]);
+        cache.set_connected_bridge_state(&host, full_bridge_state());
+        assert!(cache.connected_bridge_state(&host).is_some());
+
+        cache.mark_status(&host, RemoteConnectionStatus::Unreachable);
+
+        // Prepared state is gone: mutating dispatch cannot reuse stale prep.
+        assert!(cache.connected_bridge_state(&host).is_none());
+        // Display caches remain (stale) for read-only views.
+        let agents = cache.list_entries();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].status, RemoteConnectionStatus::Unreachable);
+        assert!(agents[0].stale());
+        let workspaces = cache
+            .workspace_entries_for_host(&host)
+            .expect("snapshot kept");
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].status, RemoteConnectionStatus::Unreachable);
+    }
+
+    #[test]
+    fn remote_source_reconnect_keeps_connected_bridge_state_until_marked() {
+        // Replacing the connected snapshot does not drop prepared state on its
+        // own; only a non-connected mark_status hides it.
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+        let state = full_bridge_state();
+        cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
+        cache.set_connected_bridge_state(&host, state.clone());
+        assert_eq!(cache.connected_bridge_state(&host).as_ref(), Some(&state));
+
+        cache.replace_connected_snapshot(host.clone(), vec![agent("term-2", "claude", 1)]);
+        // Still connected and still prepared.
+        assert_eq!(cache.connected_bridge_state(&host).as_ref(), Some(&state));
+    }
+
+    #[test]
+    fn remote_source_set_connected_bridge_state_marks_connected_and_stores_state() {
+        // C3: the reducer-side handler for `AppEvent::RemoteSourceBridgeState`
+        // (a successful supervisor ping) must mark the host `Connected` and
+        // store the prepared state together. This is what lets a host seeded
+        // `Disconnected` (no snapshot/agents yet) hold prepared state and clear
+        // the `agent.start --host` connected precheck. A later non-connected
+        // mark still invalidates it.
+        let mut cache = RemoteSourceCache::default();
+        let host = RemoteHostKey::new("jafar", "default");
+        let state = full_bridge_state();
+
+        // Seed the host `Disconnected` (mirrors startup seeding), with no agents.
+        cache.ensure_host(host.clone(), RemoteConnectionStatus::Disconnected);
+        assert_eq!(
+            cache.host_status(&host),
+            Some(RemoteConnectionStatus::Disconnected)
+        );
+        assert!(cache.connected_bridge_state(&host).is_none());
+
+        cache.set_connected_bridge_state(&host, state.clone());
+        assert_eq!(
+            cache.host_status(&host),
+            Some(RemoteConnectionStatus::Connected)
+        );
+        assert_eq!(cache.connected_bridge_state(&host).as_ref(), Some(&state));
+        // No snapshot arrived yet: connected host with prepared state, no agents.
+        assert!(cache.list_entries().is_empty());
+
+        // A later non-connected mark still invalidates the prepared state.
+        cache.mark_status(&host, RemoteConnectionStatus::Unreachable);
+        assert_eq!(
+            cache.host_status(&host),
+            Some(RemoteConnectionStatus::Unreachable)
+        );
+        assert!(cache.connected_bridge_state(&host).is_none());
     }
 }

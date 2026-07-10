@@ -105,12 +105,25 @@ pub(crate) struct RemoteAgentDispatchDescriptor {
     pub(crate) host: RemoteHostConfig,
     pub(crate) request: Request,
     pub(crate) rewrite: RemoteAgentResponseRewrite,
+    /// Optional supervisor-prepared bridge state reused to skip per-request
+    /// remote binary preparation and capability/ping probes. Populated only
+    /// when the host is `Connected` with cached prepared state; `None` means
+    /// the worker uses the existing full non-interactive bridge path. This is
+    /// data reuse, not connection pooling: a fresh SSH process still runs per
+    /// request, and the actual remote API request still fails authoritatively
+    /// on drift.
+    pub(crate) bridge_state: Option<crate::remote::RemoteApiBridgeState>,
 }
 
 /// Signature of the bridge call the worker makes to the remote host. Defaults
 /// to [`real_remote_agent_bridge`]; tests inject a fake to exercise the worker
-/// error/response path deterministically without real SSH.
-pub(crate) type RemoteAgentBridge = fn(&RemoteHostConfig, &Request) -> std::io::Result<String>;
+/// error/response path deterministically without real SSH. The optional cached
+/// prepared bridge state is forwarded so the real bridge can reuse it.
+pub(crate) type RemoteAgentBridge = fn(
+    &RemoteHostConfig,
+    &Request,
+    Option<&crate::remote::RemoteApiBridgeState>,
+) -> std::io::Result<String>;
 
 /// Signature of the dispatch starter. The default implementation
 /// ([`spawn_remote_agent_dispatch`]) spawns a background thread that runs the
@@ -217,6 +230,10 @@ enum RemoteAgentTargetRoute {
     Ready {
         host: RemoteHostConfig,
         terminal_id: String,
+        /// Cached prepared bridge state, present only when the host is
+        /// `Connected` with cached state; the descriptor carries it through to
+        /// the worker so it can skip per-request preparation/probes.
+        bridge_state: Option<crate::remote::RemoteApiBridgeState>,
     },
 }
 
@@ -254,7 +271,7 @@ impl App {
                 "agent.focus",
                 &target.target,
                 /* require_connected */ true,
-                |host, terminal_id| RemoteAgentDispatchDescriptor {
+                |host, terminal_id, bridge_state| RemoteAgentDispatchDescriptor {
                     host,
                     request: remote_agent_focus_request(
                         request_id.clone(),
@@ -262,6 +279,7 @@ impl App {
                         &terminal_id,
                     ),
                     rewrite: RemoteAgentResponseRewrite::Id,
+                    bridge_state,
                 },
             ),
 
@@ -275,7 +293,7 @@ impl App {
                 "agent.read",
                 &params.target,
                 /* require_connected */ false,
-                |host, terminal_id| RemoteAgentDispatchDescriptor {
+                |host, terminal_id, bridge_state| RemoteAgentDispatchDescriptor {
                     host,
                     request: remote_agent_read_request(
                         request_id.clone(),
@@ -283,6 +301,7 @@ impl App {
                         &terminal_id,
                     ),
                     rewrite: RemoteAgentResponseRewrite::Id,
+                    bridge_state,
                 },
             ),
 
@@ -291,7 +310,7 @@ impl App {
                 "agent.send",
                 &params.target,
                 /* require_connected */ true,
-                |host, terminal_id| RemoteAgentDispatchDescriptor {
+                |host, terminal_id, bridge_state| RemoteAgentDispatchDescriptor {
                     host,
                     request: remote_agent_send_request(
                         request_id.clone(),
@@ -299,6 +318,7 @@ impl App {
                         &terminal_id,
                     ),
                     rewrite: RemoteAgentResponseRewrite::Id,
+                    bridge_state,
                 },
             ),
 
@@ -307,7 +327,7 @@ impl App {
                 "agent.submit",
                 &params.target,
                 /* require_connected */ true,
-                |host, terminal_id| RemoteAgentDispatchDescriptor {
+                |host, terminal_id, bridge_state| RemoteAgentDispatchDescriptor {
                     host,
                     request: remote_agent_submit_request(
                         request_id.clone(),
@@ -315,6 +335,7 @@ impl App {
                         &terminal_id,
                     ),
                     rewrite: RemoteAgentResponseRewrite::Id,
+                    bridge_state,
                 },
             ),
 
@@ -327,10 +348,11 @@ impl App {
                 "agent.teardown",
                 &params.target,
                 /* require_connected */ true,
-                |host, terminal_id| RemoteAgentDispatchDescriptor {
+                |host, terminal_id, bridge_state| RemoteAgentDispatchDescriptor {
                     host,
                     request: remote_agent_teardown_request(request_id.clone(), &terminal_id),
                     rewrite: RemoteAgentResponseRewrite::Id,
+                    bridge_state,
                 },
             ),
 
@@ -387,16 +409,26 @@ impl App {
         method: &'static str,
         target: &str,
         require_connected: bool,
-        build_descriptor: impl FnOnce(RemoteHostConfig, String) -> RemoteAgentDispatchDescriptor,
+        build_descriptor: impl FnOnce(
+            RemoteHostConfig,
+            String,
+            Option<crate::remote::RemoteApiBridgeState>,
+        ) -> RemoteAgentDispatchDescriptor,
     ) -> DeferredRemoteAgentPlan {
         match self.plan_remote_agent_target_route(request_id, method, target, require_connected) {
             RemoteAgentTargetRoute::Local => DeferredRemoteAgentPlan::NotHandled,
             RemoteAgentTargetRoute::Immediate(response) => {
                 DeferredRemoteAgentPlan::Immediate(response)
             }
-            RemoteAgentTargetRoute::Ready { host, terminal_id } => {
-                DeferredRemoteAgentPlan::Deferred(Box::new(build_descriptor(host, terminal_id)))
-            }
+            RemoteAgentTargetRoute::Ready {
+                host,
+                terminal_id,
+                bridge_state,
+            } => DeferredRemoteAgentPlan::Deferred(Box::new(build_descriptor(
+                host,
+                terminal_id,
+                bridge_state,
+            ))),
         }
     }
 
@@ -461,10 +493,18 @@ impl App {
             None,
         );
         let request = remote_agent_start_request(request_id.to_string(), params);
+        // Prepared state is included only when the host is `Connected` with
+        // cached state. For on-demand/no-cache `agent.start --host` this returns
+        // `None`, so the worker falls back to the full non-interactive bridge path.
+        let bridge_state = self
+            .state
+            .remote_sources
+            .connected_bridge_state(&RemoteHostKey::new(host.name.clone(), host.session.clone()));
         DeferredRemoteAgentPlan::Deferred(Box::new(RemoteAgentDispatchDescriptor {
             host,
             request,
             rewrite: RemoteAgentResponseRewrite::AgentStart,
+            bridge_state,
         }))
     }
 
@@ -552,20 +592,39 @@ impl App {
             "deferred",
             None,
         );
+        // Prepared state is included only when the host is `Connected` with
+        // cached state. For stale/non-connected `agent.read` (and any
+        // non-connected resolved target) this returns `None`, so the worker
+        // falls back to the full non-interactive bridge path.
+        let bridge_state = self
+            .state
+            .remote_sources
+            .connected_bridge_state(&RemoteHostKey::new(host.name.clone(), host.session.clone()));
         RemoteAgentTargetRoute::Ready {
             host,
             terminal_id: resolved.entry.agent.terminal_id.clone(),
+            bridge_state,
         }
     }
 }
 
 /// Production bridge: runs the real SSH-bridged JSON API request to the remote
-/// host non-interactively.
+/// host non-interactively. When cached supervisor-prepared bridge state is
+/// available it reuses that prepared data to skip per-request remote binary
+/// preparation and capability/ping probes; otherwise it uses the existing full
+/// non-interactive bridge path. A fresh SSH process still runs per request in
+/// both paths; this reuses prepared data, not a persistent connection.
 pub(crate) fn real_remote_agent_bridge(
     host: &RemoteHostConfig,
     request: &Request,
+    bridge_state: Option<&crate::remote::RemoteApiBridgeState>,
 ) -> std::io::Result<String> {
-    crate::remote::send_remote_api_request_to_host_noninteractive(host, request)
+    match bridge_state {
+        Some(state) => {
+            crate::remote::send_remote_api_request_with_prepared_state(host, state, request)
+        }
+        None => crate::remote::send_remote_api_request_to_host_noninteractive(host, request),
+    }
 }
 
 /// Canonical dot method name for a routed remote-agent method, used for Phase
@@ -740,11 +799,14 @@ pub(crate) fn run_remote_agent_dispatch_with_bridge(
     let method = remote_agent_method_name(&descriptor.request.method);
     let host_name = descriptor.host.name.clone();
     let rewrite = descriptor.rewrite;
+    let bridge_state = descriptor.bridge_state.as_ref();
     let bridged =
-        bridge(&descriptor.host, &descriptor.request).and_then(|response| match rewrite {
-            RemoteAgentResponseRewrite::Id => rewrite_remote_response_id(&response, &local_id),
-            RemoteAgentResponseRewrite::AgentStart => {
-                rewrite_remote_agent_start_response(&response, &local_id, &host_name)
+        bridge(&descriptor.host, &descriptor.request, bridge_state).and_then(|response| {
+            match rewrite {
+                RemoteAgentResponseRewrite::Id => rewrite_remote_response_id(&response, &local_id),
+                RemoteAgentResponseRewrite::AgentStart => {
+                    rewrite_remote_agent_start_response(&response, &local_id, &host_name)
+                }
             }
         });
     let response = match bridged {
@@ -1045,6 +1107,174 @@ mod tests {
         assert_eq!(parsed.error.code, "remote_host_not_connected");
     }
 
+    fn seeded_bridge_state() -> crate::remote::RemoteApiBridgeState {
+        crate::remote::RemoteApiBridgeState {
+            shell_path: "\"$HOME/.local/bin/herdr\"".to_string(),
+            capabilities: crate::api::schema::FederationCapabilities::current(),
+        }
+    }
+
+    fn seed_connected_agent_with_bridge_state(app: &mut App, terminal_id: &str, name: &str) {
+        let host = RemoteHostKey::new("jafar", "default");
+        app.state.remote_sources.replace_connected_snapshot(
+            host.clone(),
+            vec![standalone_remote_agent(terminal_id, name)],
+        );
+        app.state
+            .remote_sources
+            .set_connected_bridge_state(&host, seeded_bridge_state());
+    }
+
+    #[test]
+    fn routed_descriptor_includes_prepared_state_for_connected_host() {
+        // C5/test 4: connected routed actions (agent.read here) include the
+        // cached prepared bridge state so the worker can skip per-request prep.
+        let mut app = remote_enabled_app();
+        seed_connected_agent_with_bridge_state(&mut app, "term-1", "codex");
+
+        let plan = app.plan_deferred_remote_agent_request(&Request {
+            id: "req".to_string(),
+            method: Method::AgentRead(read_params("jafar/codex")),
+        });
+        let descriptor = match plan {
+            DeferredRemoteAgentPlan::Deferred(descriptor) => descriptor,
+            other => panic!("expected Deferred, got {other:?}"),
+        };
+        let bridge_state = descriptor
+            .bridge_state
+            .as_ref()
+            .expect("connected routed action must carry prepared state");
+        assert_eq!(bridge_state.shell_path, seeded_bridge_state().shell_path);
+        assert_eq!(
+            bridge_state.capabilities,
+            seeded_bridge_state().capabilities
+        );
+    }
+
+    #[test]
+    fn routed_descriptor_omits_prepared_state_for_stale_agent_read() {
+        // C5/test 4: stale/non-connected agent.read must NOT carry prepared
+        // state; the worker falls back to the full non-interactive bridge path.
+        let mut app = remote_enabled_app();
+        seed_stale_agent(&mut app, RemoteConnectionStatus::Disconnected);
+
+        let plan = app.plan_deferred_remote_agent_request(&Request {
+            id: "req".to_string(),
+            method: Method::AgentRead(read_params("jafar/codex")),
+        });
+        let descriptor = match plan {
+            DeferredRemoteAgentPlan::Deferred(descriptor) => descriptor,
+            other => panic!("expected Deferred, got {other:?}"),
+        };
+        assert!(
+            descriptor.bridge_state.is_none(),
+            "stale agent.read must not carry prepared state"
+        );
+    }
+
+    #[test]
+    fn agent_start_host_connected_with_cache_includes_prepared_state() {
+        // C5/test 4: connected agent.start --host with cached prepared state
+        // includes it. On-demand/no-cache omits it (next test).
+        //
+        // The host is connected with prepared state but no agent snapshot yet:
+        // this mirrors a successful supervisor ping that published bridge state
+        // before the first agent snapshot arrived. `set_connected_bridge_state`
+        // is the reducer path for `AppEvent::RemoteSourceBridgeState` and marks
+        // the host `Connected` while storing the prepared state, so the
+        // `agent.start --host` connected precheck clears.
+        let mut config = crate::config::Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar", "jafar", "default", true,
+        )];
+        let mut app = test_app(&config);
+        let host = RemoteHostKey::new("jafar", "default");
+        app.state
+            .remote_sources
+            .set_connected_bridge_state(&host, seeded_bridge_state());
+
+        let plan = app.plan_deferred_remote_agent_request(&Request {
+            id: "req".to_string(),
+            method: Method::AgentStart(base_start_params(Some("jafar"))),
+        });
+        let descriptor = match plan {
+            DeferredRemoteAgentPlan::Deferred(descriptor) => descriptor,
+            other => panic!("expected Deferred, got {other:?}"),
+        };
+        assert!(
+            descriptor.bridge_state.is_some(),
+            "connected agent.start --host with cache must carry prepared state"
+        );
+    }
+
+    #[test]
+    fn agent_start_host_on_demand_without_cache_omits_prepared_state() {
+        // C5/test 4: on-demand/no-cache agent.start --host omits prepared
+        // state; the worker uses the full non-interactive bridge path.
+        let mut config = crate::config::Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar", "jafar", "default", false,
+        )];
+        let app = test_app(&config);
+
+        let plan = app.plan_deferred_remote_agent_request(&Request {
+            id: "req".to_string(),
+            method: Method::AgentStart(base_start_params(Some("jafar"))),
+        });
+        let descriptor = match plan {
+            DeferredRemoteAgentPlan::Deferred(descriptor) => descriptor,
+            other => panic!("expected Deferred, got {other:?}"),
+        };
+        assert!(
+            descriptor.bridge_state.is_none(),
+            "on-demand/no-cache agent.start --host must not carry prepared state"
+        );
+    }
+
+    #[test]
+    fn worker_with_cached_prepared_state_preserves_rewrite_error_and_telemetry_semantics() {
+        // C5/test 5: a descriptor carrying cached prepared state still maps a
+        // bridge error to remote_request_failed and rewrites the id. The fake
+        // bridge asserts the prepared state was forwarded to the bridge seam.
+        static BRIDGE_SAW_STATE: AtomicBool = AtomicBool::new(false);
+        fn state_aware_bridge(
+            _host: &RemoteHostConfig,
+            _request: &Request,
+            state: Option<&crate::remote::RemoteApiBridgeState>,
+        ) -> std::io::Result<String> {
+            if state.is_some() {
+                BRIDGE_SAW_STATE.store(true, Ordering::SeqCst);
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "simulated bridge timeout",
+            ))
+        }
+
+        let descriptor = RemoteAgentDispatchDescriptor {
+            host: RemoteHostConfig::new("jafar", "jafar", "default", true),
+            request: Request {
+                id: "req".to_string(),
+                method: Method::AgentRead(read_params("term-1")),
+            },
+            rewrite: RemoteAgentResponseRewrite::Id,
+            bridge_state: Some(seeded_bridge_state()),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        run_remote_agent_dispatch_with_bridge(descriptor, tx, state_aware_bridge);
+
+        let response = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let parsed: ErrorResponse = serde_json::from_str(&response).unwrap();
+        // Response id rewrite + remote_request_failed mapping preserved.
+        assert_eq!(parsed.id, "req");
+        assert_eq!(parsed.error.code, "remote_request_failed");
+        assert!(parsed.error.message.contains("simulated bridge timeout"));
+        // The prepared state was forwarded through the bridge seam.
+        assert!(BRIDGE_SAW_STATE.load(Ordering::SeqCst));
+    }
+
     #[test]
     fn local_and_bare_targets_return_not_handled() {
         let mut app = remote_enabled_app();
@@ -1081,7 +1311,11 @@ mod tests {
     fn worker_bridge_error_returns_remote_request_failed_through_channel() {
         // Deterministic: a fake bridge that always errors. The worker must map
         // it to remote_request_failed and still send a response.
-        fn failing_bridge(_host: &RemoteHostConfig, _request: &Request) -> std::io::Result<String> {
+        fn failing_bridge(
+            _host: &RemoteHostConfig,
+            _request: &Request,
+            _state: Option<&crate::remote::RemoteApiBridgeState>,
+        ) -> std::io::Result<String> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "simulated bridge timeout",
@@ -1095,6 +1329,7 @@ mod tests {
                 method: Method::AgentRead(read_params("term-1")),
             },
             rewrite: RemoteAgentResponseRewrite::Id,
+            bridge_state: None,
         };
         let (tx, rx) = std::sync::mpsc::channel();
         run_remote_agent_dispatch_with_bridge(descriptor, tx, failing_bridge);
@@ -1113,6 +1348,7 @@ mod tests {
         fn malformed_bridge(
             _host: &RemoteHostConfig,
             _request: &Request,
+            _state: Option<&crate::remote::RemoteApiBridgeState>,
         ) -> std::io::Result<String> {
             Ok("not json".to_string())
         }
@@ -1124,6 +1360,7 @@ mod tests {
                 method: Method::AgentRead(read_params("term-1")),
             },
             rewrite: RemoteAgentResponseRewrite::Id,
+            bridge_state: None,
         };
         let (tx, rx) = std::sync::mpsc::channel();
         run_remote_agent_dispatch_with_bridge(descriptor, tx, malformed_bridge);
@@ -1290,6 +1527,7 @@ mod tests {
                 method: Method::AgentRead(read_params("term-1")),
             },
             rewrite: RemoteAgentResponseRewrite::Id,
+            bridge_state: None,
         };
         let (tx, rx) = std::sync::mpsc::channel();
         // This is the exact acquire step the default dispatch starter runs
@@ -1323,7 +1561,11 @@ mod tests {
         // permit releases on the bridge-error completion path. This mirrors the
         // `spawn_remote_agent_dispatch_with_limiter` worker closure body
         // without touching real SSH or the production global limiter.
-        fn failing_bridge(_host: &RemoteHostConfig, _request: &Request) -> std::io::Result<String> {
+        fn failing_bridge(
+            _host: &RemoteHostConfig,
+            _request: &Request,
+            _state: Option<&crate::remote::RemoteApiBridgeState>,
+        ) -> std::io::Result<String> {
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "simulated bridge timeout",
@@ -1342,6 +1584,7 @@ mod tests {
                 method: Method::AgentRead(read_params("term-1")),
             },
             rewrite: RemoteAgentResponseRewrite::Id,
+            bridge_state: None,
         };
         let (tx, rx) = std::sync::mpsc::channel();
 
@@ -1373,6 +1616,7 @@ mod tests {
         fn tracking_bridge(
             _host: &RemoteHostConfig,
             _request: &Request,
+            _state: Option<&crate::remote::RemoteApiBridgeState>,
         ) -> std::io::Result<String> {
             BRIDGE_INVOKED.store(true, Ordering::SeqCst);
             Ok(r#"{"id":"ignored","result":{"type":"ok"}}"#.to_string())
@@ -1392,6 +1636,7 @@ mod tests {
                 method: Method::AgentRead(read_params("term-1")),
             },
             rewrite: RemoteAgentResponseRewrite::Id,
+            bridge_state: None,
         };
         let (tx, rx) = std::sync::mpsc::channel();
         spawn_remote_agent_dispatch_with_limiter(descriptor, tx, limiter, tracking_bridge);
@@ -1415,7 +1660,11 @@ mod tests {
         // injectable fake bridge, sends a rewritten success response, and
         // releases the permit on completion.
         static BRIDGE_INVOKED: AtomicBool = AtomicBool::new(false);
-        fn fake_bridge(_host: &RemoteHostConfig, _request: &Request) -> std::io::Result<String> {
+        fn fake_bridge(
+            _host: &RemoteHostConfig,
+            _request: &Request,
+            _state: Option<&crate::remote::RemoteApiBridgeState>,
+        ) -> std::io::Result<String> {
             BRIDGE_INVOKED.store(true, Ordering::SeqCst);
             Ok(r#"{"id":"ignored","result":{"type":"ok"}}"#.to_string())
         }
@@ -1431,6 +1680,7 @@ mod tests {
                 method: Method::AgentRead(read_params("term-1")),
             },
             rewrite: RemoteAgentResponseRewrite::Id,
+            bridge_state: None,
         };
         let (tx, rx) = std::sync::mpsc::channel();
         spawn_remote_agent_dispatch_with_limiter(descriptor, tx, limiter, fake_bridge);

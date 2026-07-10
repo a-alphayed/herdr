@@ -154,6 +154,17 @@ pub enum AppEvent {
         host: RemoteHostKey,
         status: RemoteConnectionStatus,
     },
+    /// A connected authoritative remote host/session published prepared bridge
+    /// state (prepared remote Herdr shell path plus advertised federation
+    /// capabilities) captured from a successful supervisor ping. Routed agent
+    /// dispatch may reuse this state to skip per-request remote binary
+    /// preparation and capability/ping probes while the host stays `Connected`;
+    /// it is invalidated when the host becomes non-connected. This is data reuse,
+    /// not connection pooling.
+    RemoteSourceBridgeState {
+        host: RemoteHostKey,
+        bridge_state: crate::remote::RemoteApiBridgeState,
+    },
     /// A remote host/session was removed from aggregation state.
     RemoteSourceRemoved { host: RemoteHostKey },
     /// A remote workspace create request succeeded on the authoritative host.

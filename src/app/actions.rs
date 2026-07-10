@@ -2577,6 +2577,19 @@ impl AppState {
                 self.remote_sources.mark_status(&host, status);
                 Vec::new()
             }
+            AppEvent::RemoteSourceBridgeState { host, bridge_state } => {
+                // C3: a bridge-state event is published only from a successful
+                // supervisor ping, so it proves the host is reachable. Mark the
+                // host `Connected` (a snapshot may not have arrived yet -> no
+                // agents) and store the prepared state together, so a host seeded
+                // `Disconnected` that received prepared state still clears the
+                // `agent.start --host` connected precheck. The supervisor thread
+                // never mutates AppState/RemoteSourceCache directly; this is the
+                // sole reducer path.
+                self.remote_sources
+                    .set_connected_bridge_state(&host, bridge_state);
+                Vec::new()
+            }
             AppEvent::RemoteSourceRemoved { host } => {
                 if self.sidebar_source == crate::app::state::SidebarSource::Remote(host.clone()) {
                     self.select_sidebar_source(crate::app::state::SidebarSource::Local);

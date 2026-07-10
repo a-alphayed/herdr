@@ -256,6 +256,30 @@ pub(crate) fn send_remote_api_request_to_host_noninteractive(
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteApiBridgeState {
+    pub(crate) shell_path: String,
+    pub(crate) capabilities: crate::api::schema::FederationCapabilities,
+}
+
+#[cfg(windows)]
+pub(crate) fn send_remote_api_request_to_host_noninteractive_with_state(
+    _host: &crate::remote_target::RemoteHostConfig,
+    _request: &crate::api::schema::Request,
+) -> std::io::Result<(String, RemoteApiBridgeState)> {
+    Err(unsupported_remote_error("remote API request"))
+}
+
+#[cfg(windows)]
+pub(crate) fn send_remote_api_request_with_prepared_state(
+    _host: &crate::remote_target::RemoteHostConfig,
+    _state: &RemoteApiBridgeState,
+    _request: &crate::api::schema::Request,
+) -> std::io::Result<String> {
+    Err(unsupported_remote_error("remote API request"))
+}
+
+#[cfg(windows)]
 pub(crate) fn prepare_remote_binary_to_host_noninteractive(
     _host: &crate::remote_target::RemoteHostConfig,
 ) -> std::io::Result<RemoteHerdr> {

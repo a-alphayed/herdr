@@ -314,7 +314,8 @@ impl App {
         match ev {
             AppEvent::RemoteSourceSnapshot { host, .. }
             | AppEvent::RemoteSourceAgentUpdated { host, .. }
-            | AppEvent::RemoteSourceDisconnected { host, .. } => {
+            | AppEvent::RemoteSourceDisconnected { host, .. }
+            | AppEvent::RemoteSourceBridgeState { host, .. } => {
                 !self.remote_host_is_configured(host)
             }
             _ => false,
