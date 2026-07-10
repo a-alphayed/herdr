@@ -372,7 +372,7 @@ impl App {
             .unwrap_or_else(|err| encode_error(id, "remote_request_failed", err.to_string()))
     }
 
-    fn refresh_remote_workspace_tabs_and_projection<F>(
+    pub(super) fn refresh_remote_workspace_tabs_and_projection<F>(
         &mut self,
         host: &crate::remote_target::RemoteHostConfig,
         host_key: &crate::remote_source::RemoteHostKey,
