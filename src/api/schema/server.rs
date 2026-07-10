@@ -40,6 +40,13 @@ pub struct FederationCapabilities {
 
 impl FederationCapabilities {
     pub const REMOTE_API_BRIDGE: &'static str = "remote_api_bridge";
+    /// Optional persistent remote-API bridge (`remote-api-bridge --persistent`):
+    /// the remote host runs a long-lived stdio loop that opens one fresh API
+    /// socket per request. Advertised alongside [`Self::REMOTE_API_BRIDGE`]; a
+    /// local node may use a bounded idle bridge pool only when both this and
+    /// the request's required method are advertised. Older remotes that do not
+    /// advertise it keep using the one-shot prepared bridge path unchanged.
+    pub const REMOTE_API_BRIDGE_PERSISTENT: &'static str = "remote_api_bridge_persistent";
     pub const WORKSPACE_CREATE: &'static str = "workspace_create";
     pub const WORKSPACE_LIST_LOCAL: &'static str = "workspace_list_local";
     pub const AGENT_LIST: &'static str = "agent_list";
@@ -69,6 +76,7 @@ impl FederationCapabilities {
         Self {
             methods: [
                 Self::REMOTE_API_BRIDGE,
+                Self::REMOTE_API_BRIDGE_PERSISTENT,
                 Self::WORKSPACE_CREATE,
                 Self::WORKSPACE_LIST_LOCAL,
                 Self::WORKSPACE_RENAME,

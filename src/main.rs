@@ -478,7 +478,7 @@ fn main() -> io::Result<()> {
     }
 
     if args.get(1).map(|s| s.as_str()) == Some(remote::REMOTE_API_BRIDGE_SUBCOMMAND) {
-        return remote::run_remote_api_bridge();
+        return remote::run_remote_api_bridge(&args[2..]);
     }
 
     if args.get(1).map(|s| s.as_str()) == Some(remote::REMOTE_FEDERATION_CAPABILITIES_SUBCOMMAND) {
@@ -842,6 +842,14 @@ fn main() -> io::Result<()> {
 
         result
     });
+
+    // Phase G.10: explicitly drain the process-global persistent-bridge pool at
+    // app exit so idle `SshPersistentBridge` entries are reaped (child stdin
+    // close + `RemoteSsh::Drop` `ssh -O exit` control-master cleanup) instead
+    // of relying on OS pipe-close cascade + ControlPersist timeout. Safe no-op
+    // when no pooled bridge was ever started. Runs after the app has dropped (no
+    // more dispatch) and before the runtime shuts down.
+    crate::remote::drain_remote_bridge_pool();
 
     // Shut down runtime immediately — kills lingering PTY reader/writer tasks
     rt.shutdown_timeout(std::time::Duration::from_millis(100));

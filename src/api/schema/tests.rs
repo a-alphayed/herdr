@@ -640,6 +640,7 @@ fn current_server_capabilities_include_federation_methods() {
     let federation = capabilities.federation.expect("federation");
 
     assert!(federation.supports_method(FederationCapabilities::REMOTE_API_BRIDGE));
+    assert!(federation.supports_method(FederationCapabilities::REMOTE_API_BRIDGE_PERSISTENT));
     assert!(federation.supports_method(FederationCapabilities::WORKSPACE_CREATE));
     assert!(federation.supports_method(FederationCapabilities::WORKSPACE_LIST_LOCAL));
     assert!(federation.supports_method(FederationCapabilities::AGENT_LIST));

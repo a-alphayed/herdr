@@ -493,6 +493,11 @@ impl RemoteSourceCache {
             // probes after a disconnect/incompatibility. Drop it while keeping
             // display caches (agents/workspaces/projections/tabs) stale as today.
             host_cache.bridge_state = None;
+            // Phase G.10: also retire idle persistent bridges for this host so
+            // they are not reused after a disconnect. Mark-only and cheap; the
+            // actual child reap happens lazily on the next checkout/return, so
+            // this never stalls the reducer loop on process cleanup.
+            crate::remote::invalidate_remote_bridge_pool_host(host);
             for projection in host_cache.projections.values_mut() {
                 if projection.status == RemoteProjectionStatus::Available {
                     projection.status = RemoteProjectionStatus::StaleLastKnown;

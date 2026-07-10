@@ -3989,6 +3989,14 @@ pub fn run_server() -> io::Result<()> {
         server.run().await
     });
 
+    // Phase G.10: explicitly drain the process-global persistent-bridge pool at
+    // server shutdown so idle `SshPersistentBridge` entries are reaped (child
+    // stdin close + `RemoteSsh::Drop` `ssh -O exit` control-master cleanup)
+    // instead of lingering on OS pipe-close cascade + ControlPersist timeout.
+    // Safe no-op when no pooled bridge was ever started. Runs after the server
+    // has dropped (no more dispatch) and before the runtime shuts down.
+    crate::remote::drain_remote_bridge_pool();
+
     rt.shutdown_timeout(Duration::from_millis(100));
     crate::logging::shutdown("server");
     result
@@ -4088,6 +4096,10 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         print_ready_message(&api::socket_path(), &client_socket_path());
         server.run().await
     });
+
+    // Phase G.10: drain the process-global persistent-bridge pool at shutdown
+    // (see `run_server`). Safe no-op when no pooled bridge was ever started.
+    crate::remote::drain_remote_bridge_pool();
 
     rt.shutdown_timeout(Duration::from_millis(100));
     crate::logging::shutdown("server");

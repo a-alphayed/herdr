@@ -5,12 +5,12 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, IsTerminal, Write as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -37,6 +37,11 @@ const NONINTERACTIVE_SSH_OPTIONS: &[&str] = &[
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 pub(crate) const REMOTE_CLIENT_BRIDGE_SUBCOMMAND: &str = "remote-client-bridge";
 pub(crate) const REMOTE_API_BRIDGE_SUBCOMMAND: &str = "remote-api-bridge";
+/// CLI flag that selects the persistent remote-API bridge loop
+/// ([`run_remote_api_bridge`]). Bare `remote-api-bridge` (no flag) keeps the
+/// one-shot stdio socket bridge behavior; `remote-api-bridge --persistent`
+/// runs the one-request-per-API-socket loop reused by the local bridge pool.
+pub(crate) const REMOTE_API_BRIDGE_PERSISTENT_FLAG: &str = "--persistent";
 pub(crate) const REMOTE_FEDERATION_CAPABILITIES_SUBCOMMAND: &str = "remote-federation-capabilities";
 pub(crate) const REMOTE_API_STATUS_SUBCOMMAND: &str = "remote-api-status";
 pub(crate) const REMOTE_API_PING_SUBCOMMAND: &str = "remote-api-ping";
@@ -926,11 +931,191 @@ pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
     run_stdio_socket_bridge(&socket_path, description)
 }
 
-pub(crate) fn run_remote_api_bridge() -> io::Result<()> {
+/// Which `remote-api-bridge` mode a CLI invocation selects. Bare
+/// `remote-api-bridge` (no flag, or any unrecognized arg) stays on the existing
+/// one-shot stdio socket bridge; `remote-api-bridge --persistent` runs the
+/// Phase G.10 one-request-per-API-socket loop reused by the local bridge pool.
+/// Factored out so the routing decision is pinnable by tests without a running
+/// Herdr server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteApiBridgeMode {
+    OneShot,
+    Persistent,
+}
+
+fn remote_api_bridge_mode(args: &[String]) -> RemoteApiBridgeMode {
+    if args
+        .iter()
+        .any(|arg| arg == REMOTE_API_BRIDGE_PERSISTENT_FLAG)
+    {
+        RemoteApiBridgeMode::Persistent
+    } else {
+        RemoteApiBridgeMode::OneShot
+    }
+}
+
+pub(crate) fn run_remote_api_bridge(args: &[String]) -> io::Result<()> {
+    match remote_api_bridge_mode(args) {
+        RemoteApiBridgeMode::Persistent => run_remote_api_bridge_persistent(),
+        RemoteApiBridgeMode::OneShot => {
+            ensure_remote_server_running()?;
+
+            let (socket_path, description) =
+                remote_bridge_socket_target(RemoteBridgeSocketKind::Api);
+            run_stdio_socket_bridge(&socket_path, description)
+        }
+    }
+}
+
+/// Persistent remote-API bridge loop (Phase G.10). Runs on the authoritative
+/// remote host. For each newline-terminated JSON request line read from stdin it
+/// opens one fresh Herdr API Unix-socket connection, forwards exactly that one
+/// request line, reads exactly one response line, writes that response line to
+/// stdout, flushes, closes that API socket, and loops for the next request.
+///
+/// Contract:
+/// - Exits cleanly on stdin EOF.
+/// - One active request at a time; no multiplexing and no request queue.
+/// - Never streams or holds a subscription: only the single-response routed
+///   methods are gated into this path locally.
+/// - A per-request API-socket connect/IO failure (the request never reached the
+///   API socket) emits one structured `remote_request_failed` response line for
+///   that request and keeps the loop alive, rather than killing the bridge.
+fn run_remote_api_bridge_persistent() -> io::Result<()> {
     ensure_remote_server_running()?;
 
     let (socket_path, description) = remote_bridge_socket_target(RemoteBridgeSocketKind::Api);
-    run_stdio_socket_bridge(&socket_path, description)
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    let stdout = io::stdout();
+    let stdout = io::BufWriter::new(stdout.lock());
+    run_persistent_api_bridge_loop_io(&mut stdin, stdout, &socket_path, description)
+}
+
+/// Core of the persistent remote-API bridge loop, factored out so tests can
+/// drive it against a local `UnixListener` (a fake remote API socket) with piped
+/// stdin/stdout, without spawning a real Herdr server. The production entry
+/// point ([`run_remote_api_bridge_persistent`]) locks the process stdin/stdout
+/// and calls this. See the loop contract on [`run_remote_api_bridge_persistent`].
+fn run_persistent_api_bridge_loop_io<R: BufRead, W: io::Write>(
+    stdin: &mut R,
+    mut stdout: W,
+    socket_path: &Path,
+    description: &str,
+) -> io::Result<()> {
+    let mut request_line = String::new();
+    loop {
+        request_line.clear();
+        let bytes_read = stdin.read_line(&mut request_line)?;
+        if bytes_read == 0 {
+            // Clean stdin EOF: exit the loop. No partial request is in flight
+            // because a request only begins once a full line has been read.
+            return Ok(());
+        }
+        let request = request_line.trim_matches(['\r', '\n']);
+        if request.is_empty() {
+            // Skip blank lines without consuming an API socket connection.
+            continue;
+        }
+
+        // Open one fresh API socket connection per request. The remote API
+        // remains one-request-per-socket; this bridge only forwards.
+        let mut stream = match UnixStream::connect(socket_path) {
+            Ok(stream) => stream,
+            Err(err) => {
+                // The request never reached the API socket: emit a structured
+                // error response line for this request and keep looping. This
+                // is an idempotency-safe failure (no delivery happened), so the
+                // local pool never needs to retry it.
+                write_persistent_bridge_error_response(
+                    &mut stdout,
+                    request,
+                    format!(
+                        "failed to connect to {description} {}: {err}",
+                        socket_path.display()
+                    ),
+                )?;
+                continue;
+            }
+        };
+
+        // Forward exactly this one request line.
+        if let Err(err) = stream
+            .write_all(request.as_bytes())
+            .and_then(|()| stream.write_all(b"\n"))
+            .and_then(|()| stream.flush())
+        {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            write_persistent_bridge_error_response(
+                &mut stdout,
+                request,
+                format!("failed to forward request to {description}: {err}"),
+            )?;
+            continue;
+        }
+
+        // Read exactly one response line.
+        let mut reader = io::BufReader::new(&stream);
+        let mut response_line = String::new();
+        let read_result = reader.read_line(&mut response_line).and_then(|n| {
+            if n == 0 || response_line.trim().is_empty() {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "remote API returned an empty response",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        // Close this per-request socket before looping regardless of outcome.
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        drop(reader);
+
+        match read_result {
+            Ok(()) => {
+                stdout.write_all(response_line.trim_end_matches(['\r', '\n']).as_bytes())?;
+                stdout.write_all(b"\n")?;
+                stdout.flush()?;
+            }
+            Err(err) => {
+                write_persistent_bridge_error_response(
+                    &mut stdout,
+                    request,
+                    format!("failed to read response from {description}: {err}"),
+                )?;
+            }
+        }
+    }
+}
+
+/// Build a structured `remote_request_failed` JSON response line for one
+/// persistent-bridge request whose per-request API-socket IO failed before the
+/// request reached the API. The `id` is echoed back leniently from the request
+/// line when it parses as JSON with an `id` field, so the local dispatcher can
+/// still correlate the failure; otherwise the response carries a null id. Only
+/// the controlled `remote_request_failed` code and the id are emitted; the
+/// message is the bridge-local IO detail.
+fn write_persistent_bridge_error_response<W: io::Write>(
+    stdout: &mut W,
+    request_line: &str,
+    message: String,
+) -> io::Result<()> {
+    let id = serde_json::from_str::<serde_json::Value>(request_line.trim())
+        .ok()
+        .and_then(|value| value.get("id").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    let payload = serde_json::json!({
+        "id": id,
+        "error": {
+            "code": "remote_request_failed",
+            "message": message,
+        }
+    });
+    // `to_string` cannot fail for this shape.
+    let encoded = serde_json::to_string(&payload).map_err(io::Error::other)?;
+    stdout.write_all(encoded.as_bytes())?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1067,6 +1252,720 @@ pub(crate) struct RemoteHerdr {
 pub(crate) struct RemoteApiBridgeState {
     pub(crate) shell_path: String,
     pub(crate) capabilities: crate::api::schema::FederationCapabilities,
+}
+
+/// One live persistent remote-API bridge connection: a remote
+/// `ssh ... remote-api-bridge --persistent` child speaking the one-request
+/// stdio loop. The local bridge pool owns these and moves one out of the pool
+/// during an active request, so a checked-out connection is never shared
+/// between two requesters (one active request per bridge, no multiplexing).
+///
+/// This is a transport object only: `write_request`/`read_response` forward
+/// exactly one JSON line each way. Production is [`SshPersistentBridge`]; tests
+/// inject a fake via [`dispatch_via_remote_bridge_pool`]'s starter parameter.
+pub(crate) trait PersistentRemoteBridgeConnection: Send {
+    /// Write exactly one newline-terminated JSON request line to the remote
+    /// persistent loop. A failure here (including a partial write or broken
+    /// pipe on a silently-dead idle bridge) means the request may or may not
+    /// have been delivered; callers must treat it as delivered-and-failed and
+    /// must not retry or fall back.
+    fn write_request(&mut self, request: &crate::api::schema::Request) -> io::Result<()>;
+    /// Read exactly one JSON response line from the remote persistent loop.
+    fn read_response(&mut self) -> io::Result<String>;
+    /// Cheap pre-write liveness probe. Returns `false` only when the underlying
+    /// transport has definitively exited (e.g. the ssh child has died). A
+    /// `true` result is not a guarantee the next write/read succeeds; a
+    /// half-dead connection still fails on write/read and is discarded then.
+    fn is_alive(&mut self) -> bool;
+}
+
+/// Signature of a starter that opens one persistent remote-API bridge
+/// connection. Production uses [`start_persistent_remote_api_bridge`]; pool
+/// tests inject a fake so the checkout/start/return/prune/invalidation logic
+/// is exercised without real SSH.
+pub(crate) type PersistentRemoteBridgeStarter =
+    fn(
+        &crate::remote_target::RemoteHostConfig,
+        &RemoteApiBridgeState,
+    ) -> io::Result<Box<dyn PersistentRemoteBridgeConnection>>;
+
+/// Real persistent remote-API bridge connection: one non-interactive `ssh`
+/// child running `remote-api-bridge --persistent`, plus the [`RemoteSsh`] whose
+/// `Drop` tears the SSH control master down. One active request at a time; the
+/// pool never hands the same connection to two requesters.
+pub(crate) struct SshPersistentBridge {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+    /// Held so its `Drop` runs `ssh -O exit` control-master cleanup when this
+    /// connection is torn down. Kept alive for exactly the bridge's lifetime.
+    _ssh: RemoteSsh,
+}
+
+impl SshPersistentBridge {
+    /// Take a stdin handle for writing request lines. Returns `None` if the
+    /// child's stdin was already taken (should not happen for a pooled entry).
+    fn stdin(&mut self) -> io::Result<&mut ChildStdin> {
+        self.stdin.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "persistent bridge stdin closed")
+        })
+    }
+}
+
+impl PersistentRemoteBridgeConnection for SshPersistentBridge {
+    fn write_request(&mut self, request: &crate::api::schema::Request) -> io::Result<()> {
+        write_remote_api_request(self.stdin()?, request)
+    }
+
+    fn read_response(&mut self) -> io::Result<String> {
+        read_remote_api_response_line(&mut self.stdout)
+    }
+
+    fn is_alive(&mut self) -> bool {
+        // `try_wait` returning `Ok(None)` means the child is still running.
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+impl Drop for SshPersistentBridge {
+    fn drop(&mut self) {
+        // Teardown ordering (Phase G.10): close the child's stdin first so the
+        // remote persistent loop observes EOF and exits cleanly, then reap the
+        // child, then drop the `RemoteSsh` so control-master cleanup (`ssh -O
+        // exit`) still happens. Closing stdin before drop matters: without it
+        // the remote loop would block on the next read and the ssh child would
+        // not exit promptly.
+        drop(self.stdin.take());
+        // Reap with a short grace window; kill only if it refuses to exit so a
+        // wedged remote loop cannot leak an ssh process indefinitely.
+        let _ = reap_child(&mut self.child);
+    }
+}
+
+/// Reap a child process: wait briefly for it to exit on its own, then escalate
+/// to `kill` + wait so teardown never leaks a process. Best-effort: errors are
+/// swallowed because this runs on `Drop` paths where there is no caller to
+/// surface them.
+fn reap_child(child: &mut Child) -> io::Result<()> {
+    let deadline = Instant::now() + PERSISTENT_BRIDGE_REAP_GRACE;
+    loop {
+        match child.try_wait()? {
+            Some(_status) => return Ok(()),
+            None if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Start one real persistent remote-API bridge connection to `host`, reusing
+/// cached supervisor-prepared bridge state (shell path + capabilities) so the
+/// bridge command is built without redoing remote binary preparation. Returns
+/// a connection backed by a non-interactive `ssh` child running
+/// `remote-api-bridge --persistent`. A fresh child is started per call; pooling
+/// is the caller's responsibility.
+pub(crate) fn start_persistent_remote_api_bridge(
+    host: &crate::remote_target::RemoteHostConfig,
+    state: &RemoteApiBridgeState,
+) -> io::Result<Box<dyn PersistentRemoteBridgeConnection>> {
+    let remote_ssh = remote_ssh_for_host(host);
+    let bridge_command =
+        remote_persistent_api_bridge_command_for_shell_path(&state.shell_path, &host.session);
+    let mut command = remote_ssh.command_with_mode(SshInvocationMode::Noninteractive);
+    command
+        .arg(&bridge_command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    let mut child = command.spawn().map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("failed to start persistent ssh bridge: {err}"),
+        )
+    })?;
+    let stdin = child.stdin.take().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "persistent ssh bridge stdin missing",
+        )
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "persistent ssh bridge stdout missing",
+        )
+    })?;
+
+    Ok(Box::new(SshPersistentBridge {
+        child,
+        stdin: Some(stdin),
+        stdout: BufReader::new(stdout),
+        _ssh: remote_ssh,
+    }))
+}
+
+/// Idle TTL for pooled persistent bridges. A pooled entry older than this since
+/// its last use is pruned at checkout/return. Named constant per the plan: a
+/// bridge idle longer than this is closed and reaped rather than reused.
+const PERSISTENT_BRIDGE_IDLE_TTL: Duration = Duration::from_secs(30);
+/// Grace window before a persistent bridge child is force-killed on teardown.
+/// The remote loop exits on stdin EOF within milliseconds under normal
+/// conditions; this only bounds the worst case.
+const PERSISTENT_BRIDGE_REAP_GRACE: Duration = Duration::from_secs(2);
+
+/// Identity captured for a pooled persistent bridge so stale children are never
+/// reused across config reload, SSH target change, prepared-state change, or
+/// capability change. The cached prepared state is already `Eq`, so comparing it
+/// is the primary lazy invalidation path (no separate generation counter); the
+/// SSH target/session/config fields additionally catch a config reload that
+/// keeps the same alias/session but changes the underlying SSH target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistentBridgeIdentity {
+    shell_path: String,
+    capabilities: crate::api::schema::FederationCapabilities,
+    ssh_target: String,
+    session: String,
+    manage_ssh_config: bool,
+    connect_timeout_secs: u32,
+}
+
+impl PersistentBridgeIdentity {
+    fn from_host_state(
+        host: &crate::remote_target::RemoteHostConfig,
+        state: &RemoteApiBridgeState,
+    ) -> Self {
+        Self {
+            shell_path: state.shell_path.clone(),
+            capabilities: state.capabilities.clone(),
+            ssh_target: host.target.clone(),
+            session: host.session.clone(),
+            manage_ssh_config: crate::config::Config::load()
+                .config
+                .remote
+                .manage_ssh_config,
+            connect_timeout_secs: host.connect_timeout_secs,
+        }
+    }
+}
+
+/// One pooled idle persistent bridge entry.
+struct PooledBridgeEntry {
+    identity: PersistentBridgeIdentity,
+    connection: Box<dyn PersistentRemoteBridgeConnection>,
+    last_used: Instant,
+    /// `false` once the entry is retired (idle-pruned, invalidated by a
+    /// non-connected transition, or superseded). Retired entries are reaped at
+    /// the next checkout/return/shutdown rather than in a hot loop.
+    reusable: bool,
+}
+
+/// Per-`RemoteHostKey` pool state. `active` counts connections currently
+/// checked out (held by worker threads, not stored here); `idle` holds parked
+/// reusable connections. The invariant `active + idle.len() <= max_per_key` is
+/// enforced at start-new time (see [`RemoteAgentBridgePool::reserve_new`]).
+///
+/// `generation` is the per-host invalidation epoch (Phase G.10): a checked-out
+/// or reserved connection captures the generation at checkout/reserve time, and
+/// `return_connection` parks it only when that captured generation still equals
+/// the current one. `invalidate_host` and `drain` advance the generation, so an
+/// active bridge returning after a disconnect/shutdown is reaped instead of
+/// parked even though the worker still passes `reusable: true`. Idle entries are
+/// also marked non-reusable at invalidate time (they have no captured
+/// generation, so the `reusable` flag catches entries parked before the
+/// invalidation).
+#[derive(Default)]
+struct HostBridgePool {
+    idle: Vec<PooledBridgeEntry>,
+    active: usize,
+    generation: u64,
+}
+
+impl HostBridgePool {
+    fn total(&self) -> usize {
+        self.idle.len() + self.active
+    }
+}
+
+/// Local per-`RemoteHostKey` bounded idle persistent-bridge pool (Phase G.10).
+/// Used only when a dispatch descriptor carries G.9 [`RemoteApiBridgeState`] and
+/// the cached capabilities advertise [`FederationCapabilities::REMOTE_API_BRIDGE_PERSISTENT`].
+/// The per-(host alias, session) in-flight limiter (`REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT`)
+/// is acquired *before* this pool is consulted, so saturating that limiter
+/// returns `remote_bridge_busy` without any pool checkout/start.
+///
+/// Invariants:
+/// - `active + idle.len() <= max_per_key` (enforced at start-new; reuse/return
+///   never grow the total).
+/// - A checked-out connection is owned by one worker; the pool never hands the
+///   same connection to two requesters (one active request per bridge).
+/// - Idle entries hold no limiter permit; only active dispatch holds the RAII
+///   permit (acquired by the starter before this pool runs).
+///
+/// [`FederationCapabilities`]: crate::api::schema::FederationCapabilities
+/// [`FederationCapabilities::REMOTE_API_BRIDGE_PERSISTENT`]: crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE_PERSISTENT
+pub(crate) struct RemoteAgentBridgePool {
+    inner: Mutex<RemoteAgentBridgePoolInner>,
+    max_per_key: usize,
+    idle_ttl: Duration,
+}
+
+struct RemoteAgentBridgePoolInner {
+    hosts: BTreeMap<crate::remote_source::RemoteHostKey, HostBridgePool>,
+}
+
+impl RemoteAgentBridgePool {
+    /// Construct a pool with an explicit per-key cap and idle TTL. Production
+    /// uses [`remote_agent_bridge_pool`]; tests construct local instances so
+    /// they never touch or saturate the process-global pool.
+    pub(crate) fn new(max_per_key: usize, idle_ttl: Duration) -> Self {
+        Self {
+            inner: Mutex::new(RemoteAgentBridgePoolInner {
+                hosts: BTreeMap::new(),
+            }),
+            max_per_key,
+            idle_ttl,
+        }
+    }
+
+    /// Per-key cap. Test only: the equality test pins it against the app-layer
+    /// limiter `REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT`.
+    #[cfg(test)]
+    pub(crate) fn max_per_key(&self) -> usize {
+        self.max_per_key
+    }
+}
+
+/// Maximum number of live persistent bridges (active + idle) the local pool
+/// will keep per configured (host alias, session). Mirrors the per-(host,
+/// session) in-flight dispatch limiter
+/// `REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT` (app layer): the limiter is acquired
+/// before this pool is consulted, and the pool cap stays no greater than it so
+/// `active + idle` never exceeds the limiter. Kept local to the remote layer so
+/// it does not depend on the app layer; `pub(crate)` so the app-layer test can
+/// pin the two consts equal.
+pub(crate) const REMOTE_AGENT_BRIDGE_POOL_MAX_PER_HOST: usize = 4;
+
+impl RemoteAgentBridgePool {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RemoteAgentBridgePoolInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Idle connection count for one (host, session). Test only.
+    #[cfg(test)]
+    pub(crate) fn idle_for(&self, key: &crate::remote_source::RemoteHostKey) -> usize {
+        self.lock()
+            .hosts
+            .get(key)
+            .map(|h| h.idle.len())
+            .unwrap_or(0)
+    }
+
+    /// Active (checked-out) connection count for one (host, session). Test only.
+    #[cfg(test)]
+    pub(crate) fn active_for(&self, key: &crate::remote_source::RemoteHostKey) -> usize {
+        self.lock().hosts.get(key).map(|h| h.active).unwrap_or(0)
+    }
+
+    /// Try to check out a reusable idle connection matching `identity`. On
+    /// success the connection is moved out of the pool, `active` is incremented
+    /// (the worker now owns it exclusively — one active request per bridge), and
+    /// the host generation captured at checkout is returned alongside it so the
+    /// later [`Self::return_connection`] call can refuse to park the connection
+    /// if the host was invalidated while it was active. Expired, retired, dead,
+    /// or identity-mismatched idle entries are pruned during the scan and reaped
+    /// outside the pool lock.
+    fn checkout_reusable(
+        &self,
+        key: &crate::remote_source::RemoteHostKey,
+        identity: &PersistentBridgeIdentity,
+    ) -> Option<(Box<dyn PersistentRemoteBridgeConnection>, u64)> {
+        let mut pruned = Vec::new();
+        let checked_out = {
+            let mut inner = self.lock();
+            let now = Instant::now();
+            let host_pool = inner.hosts.entry(key.clone()).or_default();
+            let mut keep = Vec::with_capacity(host_pool.idle.len());
+            let mut checked_out: Option<Box<dyn PersistentRemoteBridgeConnection>> = None;
+            for mut entry in host_pool.idle.drain(..) {
+                // Cheap pre-write liveness probe: a dead ssh child is pruned
+                // rather than handed to a requester. Identity mismatch and TTL
+                // expiry are also pruned here (lazy invalidation).
+                let alive = entry.connection.is_alive();
+                let fresh = now.duration_since(entry.last_used) < self.idle_ttl;
+                if checked_out.is_none()
+                    && entry.reusable
+                    && alive
+                    && fresh
+                    && entry.identity == *identity
+                {
+                    checked_out = Some(entry.connection);
+                } else if entry.reusable && alive && fresh && entry.identity == *identity {
+                    // Keep additional matching fresh idle entries after one has
+                    // been checked out; mismatched-but-fresh entries are pruned
+                    // here so they cannot temporarily fill the pool with stale
+                    // identities (matching the doc comment above).
+                    keep.push(entry);
+                } else {
+                    pruned.push(entry.connection);
+                }
+            }
+            host_pool.idle = keep;
+            let generation = host_pool.generation;
+            if checked_out.is_some() {
+                host_pool.active += 1;
+            }
+            checked_out.map(|connection| (connection, generation))
+        };
+        drop(pruned);
+        checked_out
+    }
+
+    /// Reserve an active slot for starting a new connection. Returns
+    /// `Some(generation)` if `total < max_per_key` after pruning (incrementing
+    /// `active`), or `None` if the pool is full — in which case the caller falls
+    /// back to the one-shot prepared path (pre-write, safe). The returned
+    /// generation is captured for the active connection so the later
+    /// [`Self::return_connection`] call can refuse to park it if the host was
+    /// invalidated between reserve and return. Reaping happens outside the lock.
+    fn reserve_new(&self, key: &crate::remote_source::RemoteHostKey) -> Option<u64> {
+        let mut pruned = Vec::new();
+        let reserved = {
+            let mut inner = self.lock();
+            let now = Instant::now();
+            let host_pool = inner.hosts.entry(key.clone()).or_default();
+            prune_host_idle_collect(host_pool, self.idle_ttl, now, &mut pruned);
+            if host_pool.total() < self.max_per_key {
+                host_pool.active += 1;
+                Some(host_pool.generation)
+            } else {
+                None
+            }
+        };
+        drop(pruned);
+        reserved
+    }
+
+    /// Release an active slot reserved by [`Self::reserve_new`] when the
+    /// connection start failed before any byte was written. Pre-write, so the
+    /// caller is still allowed to fall back to the one-shot prepared path. Also
+    /// used to release the slot of a connection discarded after a post-write
+    /// failure (the connection itself is reaped by the caller).
+    fn release_active(&self, key: &crate::remote_source::RemoteHostKey) {
+        let mut inner = self.lock();
+        if let Some(host_pool) = inner.hosts.get_mut(key) {
+            if host_pool.active > 0 {
+                host_pool.active -= 1;
+            }
+        }
+    }
+
+    /// Return a connection that was checked out or started: decrement `active`,
+    /// prune expired idle entries, then park the connection for reuse when there
+    /// is room, it is `reusable`, AND its `checked_out_generation` still equals
+    /// the host's current generation; otherwise reap it. The generation check is
+    /// the active-connection invalidation boundary: a bridge checked out during
+    /// a disconnect/non-connected transition (or before a shutdown drain) has a
+    /// stale captured generation by the time it returns, so it is reaped outside
+    /// the pool lock rather than parked with an old identity. `active` is always
+    /// released exactly once here regardless of whether the connection is
+    /// parked. Pruning and the returned connection's teardown both happen
+    /// outside the pool lock so a slow child reap cannot block other workers.
+    fn return_connection(
+        &self,
+        key: &crate::remote_source::RemoteHostKey,
+        identity: PersistentBridgeIdentity,
+        connection: Box<dyn PersistentRemoteBridgeConnection>,
+        reusable: bool,
+        checked_out_generation: u64,
+    ) {
+        let mut pruned = Vec::new();
+        let not_parked = {
+            let mut inner = self.lock();
+            let now = Instant::now();
+            let host_pool = inner.hosts.entry(key.clone()).or_default();
+            if host_pool.active > 0 {
+                host_pool.active -= 1;
+            }
+            prune_host_idle_collect(host_pool, self.idle_ttl, now, &mut pruned);
+            // Park only when reusable, the generation is still current (the host
+            // was not invalidated/drained while this connection was active), and
+            // there is room. A stale generation reaps the connection below.
+            let park = reusable
+                && host_pool.generation == checked_out_generation
+                && host_pool.idle.len() < self.max_per_key;
+            if park {
+                host_pool.idle.push(PooledBridgeEntry {
+                    identity,
+                    connection,
+                    last_used: now,
+                    reusable: true,
+                });
+                None
+            } else {
+                Some(connection)
+            }
+        };
+        drop(not_parked);
+        drop(pruned);
+    }
+
+    /// Invalidate every pooled bridge for `key` on a non-connected transition
+    /// (disconnect, config reload, prepared-state loss). Advances the per-host
+    /// invalidation generation so an ACTIVE bridge checked out during the
+    /// transition is not parked when it later returns (its captured generation
+    /// will be stale), and marks idle entries non-reusable so entries parked
+    /// before the transition are pruned at the next checkout. Mark-only and
+    /// lock-bounded: it never reaps a child, so the App/headless reducer loop
+    /// that calls it on a non-connected transition never stalls on process
+    /// cleanup. Idle entries and active bridges returning with a stale
+    /// generation are reaped lazily on the next checkout/return.
+    pub(crate) fn invalidate_host(&self, key: &crate::remote_source::RemoteHostKey) {
+        let mut inner = self.lock();
+        if let Some(host_pool) = inner.hosts.get_mut(key) {
+            host_pool.generation = host_pool.generation.wrapping_add(1);
+            for entry in host_pool.idle.iter_mut() {
+                entry.reusable = false;
+            }
+        }
+    }
+
+    /// Drain every idle bridge for every host and advance every host generation
+    /// so an active bridge returning after this drain is not parked. Idle
+    /// connections are collected under the lock and reaped (child stdin close +
+    /// reap) outside it so a slow child reap cannot block another worker or the
+    /// shutdown path. Intended for process shutdown only; safe to call on a
+    /// never-used or empty pool, and idempotent. `active` counts are left as-is
+    /// (in-flight dispatches release their own active slot on return, where the
+    /// advanced generation prevents parking).
+    pub(crate) fn drain(&self) {
+        let mut drained = Vec::new();
+        {
+            let mut inner = self.lock();
+            for host_pool in inner.hosts.values_mut() {
+                host_pool.generation = host_pool.generation.wrapping_add(1);
+                drained.extend(host_pool.idle.drain(..).map(|entry| entry.connection));
+            }
+        }
+        // Reap outside the lock: each drop closes stdin + reaps the ssh child
+        // (ControlPersist cleanup via `RemoteSsh::Drop`).
+        drop(drained);
+    }
+}
+
+/// Move expired/retired idle entries out of a host pool into `pruned` (to be
+/// reaped by the caller outside the pool lock). Keeps only entries that are
+/// still `reusable` and within the idle TTL. It does not probe liveness (that
+/// is done per-entry at checkout); a dead-but-not-expired entry is kept here
+/// and pruned lazily on its next checkout attempt.
+fn prune_host_idle_collect(
+    host_pool: &mut HostBridgePool,
+    ttl: Duration,
+    now: Instant,
+    pruned: &mut Vec<Box<dyn PersistentRemoteBridgeConnection>>,
+) {
+    let mut keep = Vec::with_capacity(host_pool.idle.len());
+    for entry in host_pool.idle.drain(..) {
+        if entry.reusable && now.duration_since(entry.last_used) < ttl {
+            keep.push(entry);
+        } else {
+            pruned.push(entry.connection);
+        }
+    }
+    host_pool.idle = keep;
+}
+
+/// Process-global persistent-bridge pool bound to
+/// [`REMOTE_AGENT_BRIDGE_POOL_MAX_PER_HOST`] and [`PERSISTENT_BRIDGE_IDLE_TTL`].
+/// Consulted only inside [`try_pooled_remote_api_request`] when a dispatch
+/// descriptor carries G.9 prepared state and the cached capabilities advertise
+/// the persistent-bridge capability. Dormant otherwise.
+static REMOTE_AGENT_BRIDGE_POOL: OnceLock<RemoteAgentBridgePool> = OnceLock::new();
+
+pub(crate) fn remote_agent_bridge_pool() -> &'static RemoteAgentBridgePool {
+    REMOTE_AGENT_BRIDGE_POOL.get_or_init(|| {
+        RemoteAgentBridgePool::new(
+            REMOTE_AGENT_BRIDGE_POOL_MAX_PER_HOST,
+            PERSISTENT_BRIDGE_IDLE_TTL,
+        )
+    })
+}
+
+/// Mark every idle persistent bridge for `key` non-reusable. Called from the
+/// remote-source reducer on a non-connected transition so idle bridges are not
+/// reused after a disconnect; they are reaped lazily at the next checkout.
+/// Also advances the per-host generation so an active bridge returning after
+/// the transition is not parked.
+pub(crate) fn invalidate_remote_bridge_pool_host(key: &crate::remote_source::RemoteHostKey) {
+    remote_agent_bridge_pool().invalidate_host(key);
+}
+
+/// Drain the process-global persistent-bridge pool at process shutdown: reap
+/// every idle bridge (closing stdin + reaping the ssh child so `RemoteSsh::Drop`
+/// runs `ssh -O exit` control-master cleanup) and advance every host generation
+/// so an active bridge returning after this drain is not parked. Safe to call
+/// when the pool was never used (it stays uninitialized) and idempotent. Called
+/// from the headless server and TUI run exit paths; it never runs on the
+/// reducer/AppState hot mutation paths.
+pub(crate) fn drain_remote_bridge_pool() {
+    if let Some(pool) = REMOTE_AGENT_BRIDGE_POOL.get() {
+        pool.drain();
+    }
+}
+
+/// Run one routed remote-agent request against the persistent-bridge pool.
+///
+/// Returns:
+/// - `Ok(Some(response))` when a pooled bridge served the request.
+/// - `Ok(None)` when pool checkout/start failed *before any byte of the
+///   request was written* (no reusable idle entry, pool full, or start
+///   failed). The caller must fall back to the one-shot prepared path.
+/// - `Err(_)` once a write attempt has begun (partial write, broken pipe, EOF,
+///   IO, or parse failure). The bridge is discarded; the caller must map this
+///   to `remote_request_failed` and must NOT retry or fall back. This uniform
+///   rule applies to every routed method, idempotent or not.
+///
+/// The per-(host, session) limiter (`REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT`) is
+/// acquired by the dispatch starter *before* this runs, so a saturated limiter
+/// returns `remote_bridge_busy` without any pool checkout/start.
+pub(crate) fn dispatch_via_remote_bridge_pool(
+    pool: &RemoteAgentBridgePool,
+    host: &crate::remote_target::RemoteHostConfig,
+    state: &RemoteApiBridgeState,
+    request: &crate::api::schema::Request,
+    starter: PersistentRemoteBridgeStarter,
+) -> io::Result<Option<String>> {
+    let key = crate::remote_source::RemoteHostKey::new(&host.name, &host.session);
+    let identity = PersistentBridgeIdentity::from_host_state(host, state);
+
+    // Capability validation (pre-write, safe): the normal required methods plus
+    // the persistent capability. Failure surfaces exactly like the one-shot
+    // prepared path (it becomes `remote_request_failed` at the worker).
+    let mut required = required_federation_methods_for_request(request);
+    required.push(crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE_PERSISTENT);
+    validate_federation_capabilities(host, &state.capabilities, &required)?;
+
+    // 1. Reuse an idle bridge if one matches; otherwise reserve room to start.
+    //    `checked_out_generation` captures the host generation at checkout/reserve
+    //    so a non-connected transition (or shutdown drain) that advances it
+    //    while this connection is active prevents it from being parked on return.
+    let (mut connection, checked_out_generation) = match pool.checkout_reusable(&key, &identity) {
+        Some((connection, generation)) => {
+            tracing::debug!(
+                event = "remote.route.bridge_pool",
+                subsystem = "remote",
+                outcome = "hit",
+                host = %host.name,
+                session = %host.session,
+                "reused idle persistent remote bridge"
+            );
+            (connection, generation)
+        }
+        None => {
+            let generation = match pool.reserve_new(&key) {
+                Some(generation) => generation,
+                None => {
+                    tracing::debug!(
+                        event = "remote.route.bridge_pool",
+                        subsystem = "remote",
+                        outcome = "disabled_pool_full",
+                        host = %host.name,
+                        session = %host.session,
+                        "persistent bridge pool full; falling back to one-shot"
+                    );
+                    return Ok(None);
+                }
+            };
+            // Start a fresh persistent connection. This is still pre-write: a
+            // failure here releases the reservation and the caller falls back.
+            match starter(host, state) {
+                Ok(connection) => {
+                    tracing::debug!(
+                        event = "remote.route.bridge_pool",
+                        subsystem = "remote",
+                        outcome = "miss",
+                        host = %host.name,
+                        session = %host.session,
+                        "started new persistent remote bridge"
+                    );
+                    (connection, generation)
+                }
+                Err(err) => {
+                    pool.release_active(&key);
+                    tracing::debug!(
+                        err = %err,
+                        event = "remote.route.bridge_pool",
+                        subsystem = "remote",
+                        outcome = "start_failed",
+                        host = %host.name,
+                        session = %host.session,
+                        "persistent bridge start failed; falling back to one-shot"
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+    };
+
+    // 2. WRITE BOUNDARY: a connection is now exclusively held. Any failure from
+    //    here (partial write, broken pipe on a silently-dead bridge, EOF/IO/parse
+    //    on read) maps to `remote_request_failed`: discard the bridge, no retry,
+    //    no one-shot fallback. Uniform for every routed method.
+    let result = connection
+        .write_request(request)
+        .and_then(|()| connection.read_response());
+    match result {
+        Ok(response) => {
+            pool.return_connection(
+                &key,
+                identity,
+                connection,
+                /* reusable */ true,
+                checked_out_generation,
+            );
+            Ok(Some(response))
+        }
+        Err(err) => {
+            pool.release_active(&key);
+            // Reap the discarded bridge outside the pool lock.
+            drop(connection);
+            tracing::debug!(
+                err = %err,
+                event = "remote.route.bridge_pool",
+                subsystem = "remote",
+                outcome = "discarded",
+                host = %host.name,
+                session = %host.session,
+                "persistent remote bridge failed after write; discarded"
+            );
+            Err(err)
+        }
+    }
+}
+
+/// Production entry point for pooled persistent-bridge dispatch. Consults the
+/// process-global pool with the real SSH starter. Returns `Ok(None)` when the
+/// caller should fall back to the one-shot prepared path, and `Err(_)` once a
+/// write has begun (see [`dispatch_via_remote_bridge_pool`]).
+pub(crate) fn try_pooled_remote_api_request(
+    host: &crate::remote_target::RemoteHostConfig,
+    state: &RemoteApiBridgeState,
+    request: &crate::api::schema::Request,
+) -> io::Result<Option<String>> {
+    dispatch_via_remote_bridge_pool(
+        remote_agent_bridge_pool(),
+        host,
+        state,
+        request,
+        start_persistent_remote_api_bridge,
+    )
 }
 
 impl RemoteHerdr {
@@ -2539,6 +3438,25 @@ fn remote_api_bridge_command_for_host(
     host: &crate::remote_target::RemoteHostConfig,
 ) -> String {
     remote_bridge_command_for(remote_herdr, &host.session, REMOTE_API_BRIDGE_SUBCOMMAND)
+}
+
+/// Build the persistent remote-API bridge command from a prepared shell path
+/// string plus optional session, used by the local bridge pool to start a
+/// `remote-api-bridge --persistent` SSH child. Reuses the one-shot builder so
+/// the `exec <shell> [--session X] remote-api-bridge` shape stays identical,
+/// then appends the persistent flag.
+fn remote_persistent_api_bridge_command_for_shell_path(
+    shell_path: &str,
+    session_name: &str,
+) -> String {
+    let mut command = remote_bridge_command_for_shell_path(
+        shell_path,
+        session_name,
+        REMOTE_API_BRIDGE_SUBCOMMAND,
+    );
+    command.push(' ');
+    command.push_str(REMOTE_API_BRIDGE_PERSISTENT_FLAG);
+    command
 }
 
 fn reattach_command(
@@ -5347,5 +6265,866 @@ mod tests {
             ),
             "exec /usr/bin/herdr --session 'fed api' remote-api-bridge"
         );
+    }
+
+    // ===============================
+    // Phase G.10 persistent bridge pool
+    // ===============================
+
+    use std::cell::RefCell;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Unique temp directory per test so concurrent socket paths never collide.
+    fn persistent_bridge_test_dir(label: &str) -> PathBuf {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-g10-{}-{}-{}",
+            label,
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    fn sample_host() -> crate::remote_target::RemoteHostConfig {
+        crate::remote_target::RemoteHostConfig::new(
+            "jafar",
+            "user@jafar:2222",
+            crate::session::DEFAULT_SESSION_NAME,
+            true,
+        )
+    }
+
+    fn sample_state(shell_path: &str) -> RemoteApiBridgeState {
+        RemoteApiBridgeState {
+            shell_path: shell_path.to_string(),
+            capabilities: crate::api::schema::FederationCapabilities::current(),
+        }
+    }
+
+    fn sample_read_request(id: &str) -> crate::api::schema::Request {
+        crate::api::schema::Request {
+            id: id.to_string(),
+            method: crate::api::schema::Method::AgentRead(crate::api::schema::AgentReadParams {
+                target: "term-1".to_string(),
+                source: crate::api::schema::ReadSource::Recent,
+                lines: None,
+                format: crate::api::schema::ReadFormat::Text,
+                strip_ansi: true,
+            }),
+        }
+    }
+
+    // ---- Fake persistent bridge connection + starter (no real SSH) ----
+    // `dispatch_via_remote_bridge_pool` runs synchronously on the calling
+    // thread, so a thread-local fixture is deterministic and parallel-safe:
+    // each test thread owns its own fake state, and each worker thread in a
+    // concurrency test owns its own. The `PersistentRemoteBridgeStarter` is a
+    // bare `fn` pointer (no captured state), so per-thread behavior is wired
+    // through this thread-local.
+    struct FakeBridgeState {
+        response: String,
+        fail_write: bool,
+        fail_read: bool,
+        starts: usize,
+        writes: usize,
+    }
+    impl Default for FakeBridgeState {
+        fn default() -> Self {
+            Self {
+                response: String::from("ok"),
+                fail_write: false,
+                fail_read: false,
+                starts: 0,
+                writes: 0,
+            }
+        }
+    }
+    thread_local! {
+        static FAKE_BRIDGE: RefCell<FakeBridgeState> = RefCell::new(FakeBridgeState::default());
+    }
+    fn reset_fake_bridge(response: &str) {
+        FAKE_BRIDGE.with(|f| {
+            let mut f = f.borrow_mut();
+            f.response = response.to_string();
+            f.fail_write = false;
+            f.fail_read = false;
+            f.starts = 0;
+            f.writes = 0;
+        });
+    }
+    fn set_fake_bridge_failure(fail_write: bool, fail_read: bool) {
+        FAKE_BRIDGE.with(|f| {
+            let mut f = f.borrow_mut();
+            f.fail_write = fail_write;
+            f.fail_read = fail_read;
+        });
+    }
+    fn fake_bridge_starts() -> usize {
+        FAKE_BRIDGE.with(|f| f.borrow().starts)
+    }
+    fn fake_bridge_writes() -> usize {
+        FAKE_BRIDGE.with(|f| f.borrow().writes)
+    }
+
+    struct FakePersistentBridge;
+    impl PersistentRemoteBridgeConnection for FakePersistentBridge {
+        fn write_request(&mut self, request: &crate::api::schema::Request) -> io::Result<()> {
+            let mut buf = Vec::new();
+            write_remote_api_request(&mut buf, request)?;
+            let fail = FAKE_BRIDGE.with(|f| {
+                let mut f = f.borrow_mut();
+                f.writes += 1;
+                f.fail_write
+            });
+            if fail {
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fake bridge write failure",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        fn read_response(&mut self) -> io::Result<String> {
+            FAKE_BRIDGE.with(|f| {
+                let f = f.borrow();
+                if f.fail_read {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "fake bridge read EOF",
+                    ))
+                } else {
+                    Ok(f.response.clone())
+                }
+            })
+        }
+        fn is_alive(&mut self) -> bool {
+            true
+        }
+    }
+
+    fn fake_bridge_starter(
+        _host: &crate::remote_target::RemoteHostConfig,
+        _state: &RemoteApiBridgeState,
+    ) -> io::Result<Box<dyn PersistentRemoteBridgeConnection>> {
+        FAKE_BRIDGE.with(|f| f.borrow_mut().starts += 1);
+        Ok(Box::new(FakePersistentBridge))
+    }
+
+    fn failing_bridge_starter(
+        _host: &crate::remote_target::RemoteHostConfig,
+        _state: &RemoteApiBridgeState,
+    ) -> io::Result<Box<dyn PersistentRemoteBridgeConnection>> {
+        FAKE_BRIDGE.with(|f| f.borrow_mut().starts += 1);
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "fake bridge start failure",
+        ))
+    }
+
+    /// Spawn a nonblocking fake Herdr API server on `socket_path`: for each
+    /// accepted connection it reads one request line and writes one response
+    /// line. Returns an accept counter plus a `running` flag; clear the flag and
+    /// join the handle to stop the server.
+    fn spawn_fake_api_server(
+        socket_path: &Path,
+        response: String,
+    ) -> (
+        Arc<AtomicUsize>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = UnixListener::bind(socket_path).expect("bind fake api socket");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let running = Arc::new(AtomicBool::new(true));
+        let (accepts_c, running_c) = (accepts.clone(), running.clone());
+        let handle = thread::spawn(move || {
+            while running_c.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        accepts_c.fetch_add(1, Ordering::SeqCst);
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                        let mut line = String::new();
+                        let mut reader = io::BufReader::new(&stream);
+                        let _ = reader.read_line(&mut line);
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(b"\n");
+                        let _ = stream.flush();
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (accepts, running, handle)
+    }
+
+    #[test]
+    fn g10_pool_max_matches_app_layer_limiter() {
+        // The remote-layer pool cap must stay no greater than the app-layer
+        // per-(host, session) in-flight limiter so `active + idle` never exceeds
+        // the limiter that gates dispatch before the pool is consulted. The
+        // cross-layer equality is pinned in `agents_deferred`'s test module
+        // (it can reach both consts); here we pin the pool's own cap and that
+        // the process-global pool is constructed from it.
+        assert_eq!(REMOTE_AGENT_BRIDGE_POOL_MAX_PER_HOST, 4);
+        assert_eq! {
+            remote_agent_bridge_pool().max_per_key(),
+            REMOTE_AGENT_BRIDGE_POOL_MAX_PER_HOST
+        }
+    }
+
+    #[test]
+    fn g10_persistent_bridge_mode_routes_on_persistent_flag() {
+        // Bare `remote-api-bridge` (no flag, or any unrecognized arg) stays on
+        // the one-shot path; only `--persistent` selects the long-lived loop.
+        assert_eq!(remote_api_bridge_mode(&[]), RemoteApiBridgeMode::OneShot);
+        assert_eq! {
+            remote_api_bridge_mode(&["--persistent".to_string()]),
+            RemoteApiBridgeMode::Persistent
+        }
+        assert_eq! {
+            remote_api_bridge_mode(&["--weird".to_string()]),
+            RemoteApiBridgeMode::OneShot
+        }
+        assert_eq! {
+            remote_api_bridge_mode(&[
+                "remote".to_string(),
+                "--persistent".to_string()
+            ]),
+            RemoteApiBridgeMode::Persistent
+        }
+    }
+
+    #[test]
+    fn g10_persistent_bridge_command_appends_persistent_flag() {
+        // The pooled bridge command is the one-shot shape plus the persistent
+        // flag; nothing else about the prepared-state command shape changes.
+        assert_eq! {
+            remote_persistent_api_bridge_command_for_shell_path(
+                "\"$HOME/.local/bin/herdr\"",
+                crate::session::DEFAULT_SESSION_NAME,
+            ),
+            "exec \"$HOME/.local/bin/herdr\" remote-api-bridge --persistent"
+        }
+        assert_eq! {
+            remote_persistent_api_bridge_command_for_shell_path("/usr/bin/herdr", "fed api"),
+            "exec /usr/bin/herdr --session 'fed api' remote-api-bridge --persistent"
+        }
+    }
+
+    #[test]
+    fn g10_persistent_bridge_loop_serves_multiple_requests_with_fresh_socket_each() {
+        // Drives the real persistent-loop core against a fake Herdr API socket.
+        // Two request lines must produce two response lines and open TWO
+        // separate API socket connections (one fresh socket per request, no
+        // multiplexing), then exit cleanly on stdin EOF.
+        let dir = persistent_bridge_test_dir("loop-multi");
+        let socket_path = dir.join("api.sock");
+        let (accepts, running, server) =
+            spawn_fake_api_server(&socket_path, "{\"id\":\"req\",\"result\":{}}".to_string());
+
+        let mut input: &[u8] =
+            b"{\"id\":\"req\",\"method\":\"agent.read\"}\n{\"id\":\"req\",\"method\":\"agent.read\"}\n";
+        let mut stdout = Vec::new();
+        run_persistent_api_bridge_loop_io(&mut input, &mut stdout, &socket_path, "test api")
+            .expect("persistent loop exits cleanly on EOF");
+
+        running.store(false, Ordering::SeqCst);
+        server.join().expect("fake api server thread");
+
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "one fresh socket per request"
+        );
+        let out = String::from_utf8(stdout).expect("utf8");
+        let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "one response line per request");
+        assert!(lines.iter().all(|l| l.contains("\"result\"")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn g10_persistent_bridge_loop_survives_api_socket_connect_failure() {
+        // A per-request API-socket connect failure (the request never reached
+        // the API socket) must emit one structured `remote_request_failed`
+        // response line for that request and keep the loop alive for the next
+        // one, instead of killing the bridge.
+        let dir = persistent_bridge_test_dir("loop-connfail");
+        let missing_socket = dir.join("does-not-exist.sock");
+
+        let mut input: &[u8] = b"{\"id\":\"req-1\",\"method\":\"agent.read\"}\n{\"id\":\"req-2\",\"method\":\"agent.read\"}\n";
+        let mut stdout = Vec::new();
+        run_persistent_api_bridge_loop_io(&mut input, &mut stdout, &missing_socket, "test api")
+            .expect("loop survives per-request connect failure");
+
+        let out = String::from_utf8(stdout).expect("utf8");
+        let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "one structured error per request");
+        assert!(lines[0].contains("\"req-1\""));
+        assert!(lines[0].contains("remote_request_failed"));
+        assert!(lines[1].contains("\"req-2\""));
+        assert!(lines[1].contains("remote_request_failed"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn g10_persistent_bridge_error_envelope_round_trips_through_api_error_schema() {
+        // The bridge-authored `remote_request_failed` envelope is the only line
+        // the bridge itself authors that the local dispatcher must parse (happy
+        // path API responses pass through verbatim). Round-trip it through the
+        // actual API schema error type AND the local response parser so request
+        // correlation (id) and error mapping (code) are exact, not just
+        // string-contains.
+        use crate::api::client::{parse_response_value, ApiClientError};
+        use crate::api::schema::ErrorResponse;
+
+        let request_line = r#"{"id":"req-7","method":"agent.read","params":{}}"#;
+        let mut buf = Vec::<u8>::new();
+        write_persistent_bridge_error_response(
+            &mut buf,
+            request_line,
+            "failed to connect to test api socket: connection refused".to_string(),
+        )
+        .expect("write error envelope");
+
+        let encoded = String::from_utf8(buf).expect("envelope is utf8");
+        let line = encoded.trim_end_matches('\n');
+
+        // 1. Deserializes through the actual API schema error type with exact
+        //    id, code, and message preservation.
+        let parsed: ErrorResponse =
+            serde_json::from_str(line).expect("envelope is a valid ErrorResponse");
+        assert_eq!(parsed.id, "req-7");
+        assert_eq!(parsed.error.code, "remote_request_failed");
+        assert_eq! {
+            parsed.error.message,
+            "failed to connect to test api socket: connection refused"
+        };
+
+        // 2. The local dispatcher reader maps it to the error branch with the
+        //    exact id and code preserved (not a success, not a parse failure).
+        let value: serde_json::Value = serde_json::from_str(line).expect("envelope is json");
+        match parse_response_value(value) {
+            Err(ApiClientError::ErrorResponse(err)) => {
+                assert_eq!(err.id, "req-7");
+                assert_eq!(err.error.code, "remote_request_failed");
+            }
+            other => panic!("expected ErrorResponse mapping, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn g10_pool_starts_new_connection_when_no_idle_matches() {
+        // Cold pool: no reusable idle entry, so the starter is invoked once, the
+        // request is served, and the connection is parked for reuse.
+        let pool = RemoteAgentBridgePool::new(4, PERSISTENT_BRIDGE_IDLE_TTL);
+        let host = sample_host();
+        let state = sample_state("\"$HOME/.local/bin/herdr\"");
+        let request = sample_read_request("req-1");
+        let key = crate::remote_source::RemoteHostKey::new(&host.name, &host.session);
+        reset_fake_bridge("resp-1");
+
+        let response =
+            dispatch_via_remote_bridge_pool(&pool, &host, &state, &request, fake_bridge_starter)
+                .expect("dispatch ok");
+        assert_eq!(response.as_deref(), Some("resp-1"));
+        assert_eq!(fake_bridge_starts(), 1, "cold pool starts one connection");
+        assert_eq!(fake_bridge_writes(), 1);
+        assert_eq!(
+            pool.idle_for(&key),
+            1,
+            "served connection is parked for reuse"
+        );
+        assert_eq!(pool.active_for(&key), 0);
+    }
+
+    #[test]
+    fn g10_pool_reuses_idle_bridge_before_starting_new() {
+        // After one dispatch parks a connection, an identical second dispatch
+        // must REUSE it: the starter is not called again and the same
+        // connection writes again (pool hit, not a fresh start).
+        let pool = RemoteAgentBridgePool::new(4, PERSISTENT_BRIDGE_IDLE_TTL);
+        let host = sample_host();
+        let state = sample_state("\"$HOME/.local/bin/herdr\"");
+        let request = sample_read_request("req-1");
+        let key = crate::remote_source::RemoteHostKey::new(&host.name, &host.session);
+        reset_fake_bridge("resp-1");
+
+        dispatch_via_remote_bridge_pool(&pool, &host, &state, &request, fake_bridge_starter)
+            .expect("prime ok");
+        assert_eq!(fake_bridge_starts(), 1);
+        assert_eq!(pool.idle_for(&key), 1);
+
+        let response =
+            dispatch_via_remote_bridge_pool(&pool, &host, &state, &request, fake_bridge_starter)
+                .expect("reuse ok");
+        assert_eq!(response.as_deref(), Some("resp-1"));
+        assert_eq!(fake_bridge_starts(), 1, "reused, not started");
+        assert_eq!(fake_bridge_writes(), 2, "same connection served both");
+        assert_eq!(pool.idle_for(&key), 1);
+        assert_eq!(pool.active_for(&key), 0);
+    }
+
+    #[test]
+    fn g10_pool_returns_ok_none_when_start_fails_before_write() {
+        // Pre-write start failure: the reservation is released and the caller
+        // gets Ok(None) so it may safely fall back to the one-shot prepared
+        // path (still pre-write; no delivery happened).
+        let pool = RemoteAgentBridgePool::new(4, PERSISTENT_BRIDGE_IDLE_TTL);
+        let host = sample_host();
+        let state = sample_state("\"$HOME/.local/bin/herdr\"");
+        let request = sample_read_request("req-1");
+        let key = crate::remote_source::RemoteHostKey::new(&host.name, &host.session);
+        reset_fake_bridge("resp-1");
+
+        let response =
+            dispatch_via_remote_bridge_pool(&pool, &host, &state, &request, failing_bridge_starter)
+                .expect("start failure is Ok(None), not Err");
+        assert!(response.is_none(), "pre-write failure falls back");
+        assert_eq!(fake_bridge_starts(), 1);
+        assert_eq!(pool.active_for(&key), 0, "reservation released");
+        assert_eq!(pool.idle_for(&key), 0);
+    }
+
+    #[test]
+    fn g10_pool_read_failure_after_write_is_err_no_retry_no_fallback() {
+        // LOAD-BEARING non-idempotent-safety rule: once a write attempt has
+        // begun on a pooled bridge, ANY later failure (read EOF/IO here) maps
+        // to Err, the bridge is discarded, and the caller must NOT retry or
+        // fall back to the one-shot path. Uniform for every routed method.
+        let pool = RemoteAgentBridgePool::new(4, PERSISTENT_BRIDGE_IDLE_TTL);
+        let host = sample_host();
+        let state = sample_state("\"$HOME/.local/bin/herdr\"");
+        let request = sample_read_request("req-1");
+        let key = crate::remote_source::RemoteHostKey::new(&host.name, &host.session);
+        reset_fake_bridge("resp-1");
+        set_fake_bridge_failure(false, true); // write ok, read fails
+
+        let result =
+            dispatch_via_remote_bridge_pool(&pool, &host, &state, &request, fake_bridge_starter);
+        assert!(result.is_err(), "post-write failure is Err, not Ok(None)");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(pool.idle_for(&key), 0, "discarded bridge is not parked");
+        assert_eq!(pool.active_for(&key), 0, "active slot released");
+    }
+
+    #[test]
+    fn g10_pool_write_failure_is_err_no_retry_no_fallback() {
+        // Same boundary, reached on a broken-pipe/partial write: the request
+        // may or may not have been delivered, so it is treated as
+        // delivered-and-failed. Err, discard, no retry/fallback.
+        let pool = RemoteAgentBridgePool::new(4, PERSISTENT_BRIDGE_IDLE_TTL);
+        let host = sample_host();
+        let state = sample_state("\"$HOME/.local/bin/herdr\"");
+        let request = sample_read_request("req-1");
+        let key = crate::remote_source::RemoteHostKey::new(&host.name, &host.session);
+        reset_fake_bridge("resp-1");
+        set_fake_bridge_failure(true, false);
+
+        let result =
+            dispatch_via_remote_bridge_pool(&pool, &host, &state, &request, fake_bridge_starter);
+        assert!(result.is_err());
+        assert_eq!(pool.idle_for(&key), 0);
+        assert_eq!(pool.active_for(&key), 0);
+    }
+
+    #[test]
+    fn g10_pool_returns_ok_none_when_full_without_starting() {
+        // With active + idle == max, reserve_new refuses and the dispatch
+        // returns Ok(None) WITHOUT calling the starter. The limiter-before-pool
+        // ordering means a saturated pool falls back rather than spawning past
+        // the cap.
+        let pool = RemoteAgentBridgePool::new(2, PERSISTENT_BRIDGE_IDLE_TTL);
+        let host = sample_host();
+        let state = sample_state("\"$HOME/.local/bin/herdr\"");
+        let request = sample_read_request("req-1");
+        let key = crate::remote_source::RemoteHostKey::new(&host.name, &host.session);
+        reset_fake_bridge("resp-1");
+
+        assert!(pool.reserve_new(&key).is_some());
+        assert!(pool.reserve_new(&key).is_some());
+        assert!(pool.reserve_new(&key).is_none(), "cap saturated");
+
+        let response =
+            dispatch_via_remote_bridge_pool(&pool, &host, &state, &request, fake_bridge_starter)
+                .expect("full pool is Ok(None)");
+        assert!(response.is_none(), "pool full -> fall back, no spawn");
+        assert_eq!(fake_bridge_starts(), 0, "starter never called");
+
+        pool.release_active(&key);
+        pool.release_active(&key);
+    }
+
+    #[test]
+    fn g10_pool_requires_persistent_capability() {
+        // The pool is used only when capabilities advertise the persistent
+        // method (and the request's normal required methods). Without it the
+        // dispatch fails locally, exactly like the one-shot prepared path, and
+        // before any checkout/start.
+        let pool = RemoteAgentBridgePool::new(4, PERSISTENT_BRIDGE_IDLE_TTL);
+        let host = sample_host();
+        let mut caps = crate::api::schema::FederationCapabilities::current();
+        caps.methods.retain(|m| {
+            m != crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE_PERSISTENT
+        });
+        let state = RemoteApiBridgeState {
+            shell_path: "\"$HOME/.local/bin/herdr\"".to_string(),
+            capabilities: caps,
+        };
+        let request = sample_read_request("req-1");
+        reset_fake_bridge("resp-1");
+
+        let result =
+            dispatch_via_remote_bridge_pool(&pool, &host, &state, &request, fake_bridge_starter);
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("remote_api_bridge_persistent"));
+        assert_eq!(
+            fake_bridge_starts(),
+            0,
+            "validated before any checkout/start"
+        );
+    }
+
+    #[test]
+    fn g10_pool_invalidate_host_prevents_idle_reuse() {
+        // A non-connected transition marks idle entries non-reusable; the next
+        // dispatch must start a fresh connection instead of reusing the retired
+        // one, and the retired entry is reaped at checkout.
+        let pool = RemoteAgentBridgePool::new(4, PERSISTENT_BRIDGE_IDLE_TTL);
+        let host = sample_host();
+        let state = sample_state("\"$HOME/.local/bin/herdr\"");
+        let request = sample_read_request("req-1");
+        let key = crate::remote_source::RemoteHostKey::new(&host.name, &host.session);
+        reset_fake_bridge("resp-1");
+
+        dispatch_via_remote_bridge_pool(&pool, &host, &state, &request, fake_bridge_starter)
+            .expect("prime ok");
+        assert_eq!(pool.idle_for(&key), 1);
+        assert_eq!(fake_bridge_starts(), 1);
+
+        pool.invalidate_host(&key);
+
+        let response =
+            dispatch_via_remote_bridge_pool(&pool, &host, &state, &request, fake_bridge_starter)
+                .expect("post-invalidate dispatch ok");
+        assert_eq!(response.as_deref(), Some("resp-1"));
+        assert_eq!(
+            fake_bridge_starts(),
+            2,
+            "retired entry not reused; started new"
+        );
+        assert_eq!(
+            pool.idle_for(&key),
+            1,
+            "new entry parked; retired one reaped"
+        );
+    }
+
+    #[test]
+    fn g10_pool_invalidate_host_drops_active_returned_connection() {
+        // Generation/epoch invalidation: a bridge checked out (reserved +
+        // started) DURING a disconnect/non-connected transition must NOT be
+        // parked when it later returns via `return_connection(reusable=true)`.
+        // Its captured generation is stale after `invalidate_host` advanced the
+        // host generation, so it is reaped outside the pool lock instead of
+        // being parked with the old identity. `active` is still released
+        // exactly once. Then the next dispatch from the now-empty pool must
+        // start a fresh bridge.
+        let pool = RemoteAgentBridgePool::new(4, PERSISTENT_BRIDGE_IDLE_TTL);
+        let host = sample_host();
+        let state = sample_state("\"$HOME/.local/bin/herdr\"");
+        let identity = PersistentBridgeIdentity::from_host_state(&host, &state);
+        let key = crate::remote_source::RemoteHostKey::new(&host.name, &host.session);
+
+        // Reserve an active slot, capturing the host generation at reserve time
+        // (the invariant a real dispatch relies on).
+        let checked_out_generation = pool.reserve_new(&key).expect("reserve ok under the cap");
+        assert_eq!(pool.active_for(&key), 1);
+
+        // Disconnect/non-connected transition advances the host generation.
+        pool.invalidate_host(&key);
+
+        // The active worker returns its connection as `reusable: true`. The stale
+        // captured generation must prevent parking: the connection is reaped,
+        // idle stays 0, and the active slot is released.
+        let conn: Box<dyn PersistentRemoteBridgeConnection> = Box::new(FakePersistentBridge);
+        pool.return_connection(
+            &key,
+            identity,
+            conn,
+            /* reusable */ true,
+            checked_out_generation,
+        );
+        assert_eq!(
+            pool.idle_for(&key),
+            0,
+            "stale-generation connection is not parked"
+        );
+        assert_eq!(
+            pool.active_for(&key),
+            0,
+            "active slot released exactly once"
+        );
+
+        // The next dispatch from the now-empty pool must start a fresh bridge
+        // (no stale child is reused), then park the fresh one normally.
+        reset_fake_bridge("resp-after");
+        let request = sample_read_request("req-after");
+        let response =
+            dispatch_via_remote_bridge_pool(&pool, &host, &state, &request, fake_bridge_starter)
+                .expect("post-invalidate dispatch ok");
+        assert_eq!(response.as_deref(), Some("resp-after"));
+        assert_eq!(
+            fake_bridge_starts(),
+            1,
+            "started a fresh bridge, not reused"
+        );
+        assert_eq!(pool.idle_for(&key), 1, "fresh connection parked normally");
+        assert_eq!(pool.active_for(&key), 0);
+    }
+
+    #[test]
+    fn g10_pool_drain_removes_idle_and_prevents_stale_active_park() {
+        // Shutdown drain: every idle entry is reaped (removed) and every host
+        // generation advances, so an active connection returning after the drain
+        // is NOT parked. Covers Reviewer B's medium finding: the process-global
+        // pool's idle `SshPersistentBridge` entries are explicitly drained on
+        // shutdown rather than left to OS pipe-close cascade.
+        let pool = RemoteAgentBridgePool::new(4, PERSISTENT_BRIDGE_IDLE_TTL);
+        let host = sample_host();
+        let state = sample_state("\"$HOME/.local/bin/herdr\"");
+        let identity = PersistentBridgeIdentity::from_host_state(&host, &state);
+        let key = crate::remote_source::RemoteHostKey::new(&host.name, &host.session);
+        let request = sample_read_request("req-1");
+        reset_fake_bridge("resp-1");
+
+        // Prime an idle entry.
+        dispatch_via_remote_bridge_pool(&pool, &host, &state, &request, fake_bridge_starter)
+            .expect("prime ok");
+        assert_eq!(pool.idle_for(&key), 1);
+
+        // Simulate an in-flight dispatch still active across the drain.
+        let checked_out_generation = pool.reserve_new(&key).expect("reserve ok");
+        assert_eq!(pool.active_for(&key), 1);
+
+        // Drain at shutdown.
+        pool.drain();
+        assert_eq!(pool.idle_for(&key), 0, "drain removed idle entries");
+        assert_eq!(
+            pool.active_for(&key),
+            1,
+            "in-flight active slot still held across drain"
+        );
+
+        // The in-flight connection returns after drain: stale generation must
+        // prevent parking (reaped outside the lock), and active is released.
+        let conn: Box<dyn PersistentRemoteBridgeConnection> = Box::new(FakePersistentBridge);
+        pool.return_connection(
+            &key,
+            identity,
+            conn,
+            /* reusable */ true,
+            checked_out_generation,
+        );
+        assert_eq!(pool.idle_for(&key), 0, "post-drain return is not parked");
+        assert_eq!(pool.active_for(&key), 0, "active slot released");
+    }
+
+    #[test]
+    fn g10_drain_remote_bridge_pool_is_safe_noop_on_dormant_pool() {
+        // The crate-level shutdown drain is safe to call when the process-global
+        // pool was never used for a real dispatch (the common case for most
+        // Herdr runs): it does not panic and leaves the pool usable. nextest
+        // isolates this in its own process, so the global pool is private here.
+        drain_remote_bridge_pool();
+        drain_remote_bridge_pool();
+        // The global pool is still constructible and correctly capped.
+        assert_eq! {
+            remote_agent_bridge_pool().max_per_key(),
+            REMOTE_AGENT_BRIDGE_POOL_MAX_PER_HOST
+        }
+    }
+
+    #[test]
+    fn g10_pool_stale_identity_is_not_reused() {
+        // A prepared-state/config change (here: shell path) changes the pooled
+        // identity; a mismatched idle entry is not reused and a fresh connection
+        // is started, so a stale child is never reused across a prepared-state
+        // change.
+        let pool = RemoteAgentBridgePool::new(4, PERSISTENT_BRIDGE_IDLE_TTL);
+        let host = sample_host();
+        let request = sample_read_request("req-1");
+        let key = crate::remote_source::RemoteHostKey::new(&host.name, &host.session);
+        reset_fake_bridge("resp-1");
+
+        dispatch_via_remote_bridge_pool(
+            &pool,
+            &host,
+            &sample_state("\"/opt/herdr-a\""),
+            &request,
+            fake_bridge_starter,
+        )
+        .expect("prime ok");
+        assert_eq!(pool.idle_for(&key), 1);
+        assert_eq!(fake_bridge_starts(), 1);
+
+        dispatch_via_remote_bridge_pool(
+            &pool,
+            &host,
+            &sample_state("\"/opt/herdr-b\""),
+            &request,
+            fake_bridge_starter,
+        )
+        .expect("identity-mismatched dispatch ok");
+        assert_eq!(
+            fake_bridge_starts(),
+            2,
+            "mismatched identity -> started new"
+        );
+        // The stale identity-mismatched idle entry is pruned at checkout rather
+        // than left to fill the pool until TTL; only the just-parked entry for
+        // the new identity remains.
+        assert_eq!(
+            pool.idle_for(&key),
+            1,
+            "stale mismatched idle entry pruned, not retained"
+        );
+    }
+
+    #[test]
+    fn g10_pool_idle_ttl_expiry_prunes_at_checkout() {
+        // An idle entry older than the TTL is pruned at checkout rather than
+        // reused; the next dispatch starts a fresh connection.
+        let pool = RemoteAgentBridgePool::new(4, Duration::from_millis(1));
+        let host = sample_host();
+        let state = sample_state("\"$HOME/.local/bin/herdr\"");
+        let request = sample_read_request("req-1");
+        reset_fake_bridge("resp-1");
+
+        dispatch_via_remote_bridge_pool(&pool, &host, &state, &request, fake_bridge_starter)
+            .expect("prime ok");
+        let key = crate::remote_source::RemoteHostKey::new(&host.name, &host.session);
+        assert_eq!(pool.idle_for(&key), 1);
+
+        std::thread::sleep(Duration::from_millis(8));
+
+        dispatch_via_remote_bridge_pool(&pool, &host, &state, &request, fake_bridge_starter)
+            .expect("post-ttl dispatch ok");
+        assert_eq!(fake_bridge_starts(), 2, "expired entry pruned, not reused");
+    }
+
+    #[test]
+    fn g10_pool_serves_concurrent_dispatches_without_corruption() {
+        // The pool is shared across worker threads behind a Mutex. Concurrent
+        // dispatches must all complete with their own correct response and leave
+        // the pool clean (active 0, idle <= max). One-active-per-bridge is
+        // structurally guaranteed: checkout MOVES the Box<dyn connection> out
+        // under the Mutex, so two workers can never hold the same connection.
+        // This test pins thread-safety under real contention.
+        use std::sync::Barrier;
+
+        let max = 4usize;
+        let workers = 4usize;
+        let per_worker = 3usize;
+        let pool = Arc::new(RemoteAgentBridgePool::new(max, PERSISTENT_BRIDGE_IDLE_TTL));
+        let host = Arc::new(sample_host());
+        let state = Arc::new(sample_state("\"$HOME/.local/bin/herdr\""));
+        let start = Arc::new(Barrier::new(workers));
+
+        let oks: Vec<usize> = thread::scope(|s| {
+            let handles: Vec<_> = (0..workers)
+                .map(|w| {
+                    let pool = pool.clone();
+                    let host = host.clone();
+                    let state = state.clone();
+                    let start = start.clone();
+                    s.spawn(move || -> usize {
+                        let worker_response = format!("resp-{w}");
+                        // Each worker thread owns its OWN thread-local fake.
+                        reset_fake_bridge(&worker_response);
+                        start.wait();
+                        let mut ok = 0usize;
+                        for i in 0..per_worker {
+                            let request = sample_read_request(&format!("{worker_response}-{i}"));
+                            let r = dispatch_via_remote_bridge_pool(
+                                &pool,
+                                &host,
+                                &state,
+                                &request,
+                                fake_bridge_starter,
+                            )
+                            .expect("concurrent dispatch ok");
+                            if r.as_deref() == Some(worker_response.as_str()) {
+                                ok += 1;
+                            }
+                        }
+                        ok
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("worker"))
+                .collect()
+        });
+
+        let key = crate::remote_source::RemoteHostKey::new(&host.name, &host.session);
+        assert_eq! {
+            oks.iter().sum::<usize>(),
+            workers * per_worker,
+            "every dispatch returned the worker's own response"
+        }
+        assert_eq!(pool.active_for(&key), 0, "all active slots returned");
+        assert!(pool.idle_for(&key) <= max, "idle within cap");
+    }
+
+    #[test]
+    fn g10_reap_child_returns_quickly_for_exited_process() {
+        // A child that has already exited is reaped immediately on the fast
+        // path (first try_wait succeeds), which is the common teardown case
+        // for a persistent loop that exits on stdin EOF.
+        let mut child = Command::new("true").spawn().expect("spawn true");
+        std::thread::sleep(Duration::from_millis(20)); // let it exit
+        let started = Instant::now();
+        reap_child(&mut child).expect("reap exited child");
+        assert! {
+            started.elapsed() < Duration::from_millis(500),
+            "exited child reaped on the fast path, not the grace window"
+        }
+    }
+
+    #[test]
+    fn g10_reap_child_kills_a_stuck_child() {
+        // A child that refuses to exit within the grace window is force-killed
+        // and reaped so teardown cannot leak a process (a wedged remote loop).
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep 30");
+        let started = Instant::now();
+        reap_child(&mut child).expect("reap kills stuck child");
+        let elapsed = started.elapsed();
+        assert! {
+            elapsed >= PERSISTENT_BRIDGE_REAP_GRACE,
+            "waited the grace window before killing: {elapsed:?}"
+        }
+        assert! {
+            elapsed < PERSISTENT_BRIDGE_REAP_GRACE + Duration::from_secs(3),
+            "killed promptly after the grace window: {elapsed:?}"
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            other => panic!("expected a reaped child, got {other:?}"),
+        }
     }
 }

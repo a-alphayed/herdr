@@ -613,12 +613,34 @@ impl App {
 /// available it reuses that prepared data to skip per-request remote binary
 /// preparation and capability/ping probes; otherwise it uses the existing full
 /// non-interactive bridge path. A fresh SSH process still runs per request in
-/// both paths; this reuses prepared data, not a persistent connection.
+/// the one-shot paths; this reuses prepared data, not a persistent connection.
+///
+/// When the prepared state also advertises the Phase G.10 persistent-bridge
+/// capability, the request is first attempted through the bounded idle bridge
+/// pool ([`crate::remote::try_pooled_remote_api_request`]). That call returns
+/// `Ok(None)` when pool checkout/start fails *before any byte is written* — in
+/// that case this falls back to the one-shot prepared path (still pre-write,
+/// safe). Once the pool has begun a write, any failure is already mapped to an
+/// `Err` by the pool and is returned here as `remote_request_failed` by the
+/// worker, with no retry and no fallback (uniform for every routed method).
 pub(crate) fn real_remote_agent_bridge(
     host: &RemoteHostConfig,
     request: &Request,
     bridge_state: Option<&crate::remote::RemoteApiBridgeState>,
 ) -> std::io::Result<String> {
+    if let Some(state) = bridge_state {
+        if state.capabilities.supports_method(
+            crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE_PERSISTENT,
+        ) {
+            if let Some(response) =
+                crate::remote::try_pooled_remote_api_request(host, state, request)?
+            {
+                return Ok(response);
+            }
+            // Pool checkout/start failed before write: fall through to the
+            // one-shot prepared path below (still pre-write, safe).
+        }
+    }
     match bridge_state {
         Some(state) => {
             crate::remote::send_remote_api_request_with_prepared_state(host, state, request)
@@ -1770,5 +1792,20 @@ mod tests {
         assert!(remote_response_error_code("not json").is_none());
         // Missing `error.code` is not a remote error.
         assert!(remote_response_error_code(r#"{"id":"r","error":{}}"#).is_none());
+    }
+
+    #[test]
+    fn remote_bridge_pool_cap_equals_app_layer_limiter() {
+        // Phase G.10 cross-layer invariant: the remote-layer pool cap
+        // (`REMOTE_AGENT_BRIDGE_POOL_MAX_PER_HOST`) must equal the app-layer
+        // per-(host, session) in-flight limiter
+        // (`REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT`). The limiter is acquired before
+        // the pool is consulted, and the pool cap staying equal to it means
+        // `active + idle` can never exceed the limiter that gates dispatch.
+        // This module can reach both consts, so the equality is pinned here.
+        assert_eq! {
+            crate::remote::REMOTE_AGENT_BRIDGE_POOL_MAX_PER_HOST,
+            REMOTE_AGENT_BRIDGE_PER_HOST_LIMIT
+        };
     }
 }

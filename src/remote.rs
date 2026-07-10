@@ -215,7 +215,7 @@ pub(crate) fn run_remote_terminal_attach(
 }
 
 #[cfg(windows)]
-pub(crate) fn run_remote_api_bridge() -> std::io::Result<()> {
+pub(crate) fn run_remote_api_bridge(_args: &[String]) -> std::io::Result<()> {
     Err(unsupported_remote_error("remote API bridge"))
 }
 
@@ -278,6 +278,25 @@ pub(crate) fn send_remote_api_request_with_prepared_state(
 ) -> std::io::Result<String> {
     Err(unsupported_remote_error("remote API request"))
 }
+
+/// Windows stub: pooled persistent-bridge dispatch is never reached (no remote
+/// support), so always fall back to the one-shot path.
+#[cfg(windows)]
+pub(crate) fn try_pooled_remote_api_request(
+    _host: &crate::remote_target::RemoteHostConfig,
+    _state: &RemoteApiBridgeState,
+    _request: &crate::api::schema::Request,
+) -> std::io::Result<Option<String>> {
+    Ok(None)
+}
+
+/// Windows stub: no persistent-bridge pool exists; mark-only invalidation is a no-op.
+#[cfg(windows)]
+pub(crate) fn invalidate_remote_bridge_pool_host(_key: &crate::remote_source::RemoteHostKey) {}
+
+/// Windows stub: no persistent-bridge pool exists, so shutdown drain is a no-op.
+#[cfg(windows)]
+pub(crate) fn drain_remote_bridge_pool() {}
 
 #[cfg(windows)]
 pub(crate) fn prepare_remote_binary_to_host_noninteractive(
