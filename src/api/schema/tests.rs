@@ -639,27 +639,61 @@ fn current_server_capabilities_include_federation_methods() {
     let capabilities = ServerCapabilities::current();
     let federation = capabilities.federation.expect("federation");
 
-    assert!(federation.supports_method(FederationCapabilities::REMOTE_API_BRIDGE));
-    assert!(federation.supports_method(FederationCapabilities::REMOTE_API_BRIDGE_PERSISTENT));
-    assert!(federation.supports_method(FederationCapabilities::WORKSPACE_CREATE));
-    assert!(federation.supports_method(FederationCapabilities::WORKSPACE_LIST_LOCAL));
-    assert!(federation.supports_method(FederationCapabilities::AGENT_LIST));
-    assert!(federation.supports_method(FederationCapabilities::AGENT_LIST_LOCAL));
-    assert!(federation.supports_method(FederationCapabilities::AGENT_GET));
-    assert!(federation.supports_method(FederationCapabilities::AGENT_READ));
-    assert!(federation.supports_method(FederationCapabilities::AGENT_SEND));
-    assert!(federation.supports_method(FederationCapabilities::AGENT_SUBMIT));
-    assert!(federation.supports_method(FederationCapabilities::AGENT_FOCUS));
-    assert!(federation.supports_method(FederationCapabilities::AGENT_START));
-    assert!(federation.supports_method(FederationCapabilities::AGENT_TEARDOWN));
-    assert!(federation.supports_method(FederationCapabilities::PANE_SPLIT));
-    assert!(federation.supports_method(FederationCapabilities::PANE_CLOSE));
-    assert!(federation.supports_method(FederationCapabilities::TAB_LIST));
-    assert!(federation.supports_method(FederationCapabilities::TAB_CREATE));
-    assert!(federation.supports_method(FederationCapabilities::TAB_FOCUS));
-    assert!(federation.supports_method(FederationCapabilities::TAB_CLOSE));
-    assert!(federation.supports_method(FederationCapabilities::LAYOUT_EXPORT));
-    assert!(federation.supports_method(FederationCapabilities::TERMINAL_ATTACH));
+    // The advertised federation method set is the durable JSON API federation
+    // compatibility contract. Lock the full set (length + exact contents) so an
+    // intentional add/remove is reviewed here, including the rename/focus
+    // methods. Order in the locked set mirrors `FederationCapabilities::current`.
+    let expected: Vec<String> = [
+        FederationCapabilities::REMOTE_API_BRIDGE,
+        FederationCapabilities::REMOTE_API_BRIDGE_PERSISTENT,
+        FederationCapabilities::WORKSPACE_CREATE,
+        FederationCapabilities::WORKSPACE_LIST_LOCAL,
+        FederationCapabilities::WORKSPACE_RENAME,
+        FederationCapabilities::AGENT_LIST,
+        FederationCapabilities::AGENT_LIST_LOCAL,
+        FederationCapabilities::AGENT_GET,
+        FederationCapabilities::AGENT_READ,
+        FederationCapabilities::AGENT_SEND,
+        FederationCapabilities::AGENT_SUBMIT,
+        FederationCapabilities::AGENT_FOCUS,
+        FederationCapabilities::AGENT_START,
+        FederationCapabilities::AGENT_TEARDOWN,
+        FederationCapabilities::PANE_SPLIT,
+        FederationCapabilities::PANE_CLOSE,
+        FederationCapabilities::PANE_RENAME,
+        FederationCapabilities::PANE_FOCUS,
+        FederationCapabilities::PANE_FOCUS_DIRECTION,
+        FederationCapabilities::TAB_LIST,
+        FederationCapabilities::TAB_CREATE,
+        FederationCapabilities::TAB_FOCUS,
+        FederationCapabilities::TAB_CLOSE,
+        FederationCapabilities::TAB_RENAME,
+        FederationCapabilities::LAYOUT_EXPORT,
+        FederationCapabilities::TERMINAL_ATTACH,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+
+    for method in &expected {
+        assert!(
+            federation.supports_method(method),
+            "current federation capabilities missing advertised method {method}"
+        );
+    }
+    assert_eq!(
+        federation.methods.len(),
+        expected.len(),
+        "advertised federation method count changed; review the compatibility contract"
+    );
+    let mut advertised = federation.methods.clone();
+    advertised.sort();
+    let mut expected_sorted = expected.clone();
+    expected_sorted.sort();
+    assert_eq!(
+        advertised, expected_sorted,
+        "advertised federation method set must match the locked compatibility contract"
+    );
 }
 
 #[test]

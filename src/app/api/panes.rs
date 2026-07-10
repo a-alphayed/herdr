@@ -300,6 +300,20 @@ impl App {
             );
         }
 
+        if !self
+            .state
+            .remote_sources
+            .host_capabilities(&host_key)
+            .pane_split
+        {
+            return encode_error_body(
+                id,
+                Self::remote_pane_capability_unavailable_body(
+                    &host.name,
+                    crate::api::schema::FederationCapabilities::PANE_SPLIT,
+                ),
+            );
+        }
         let resolved =
             match resolve_remote_pane_target(&self.state.remote_sources, &host, &selector) {
                 Ok(resolved) => resolved,
@@ -375,6 +389,20 @@ impl App {
             );
         }
 
+        if !self
+            .state
+            .remote_sources
+            .host_capabilities(&host_key)
+            .pane_close
+        {
+            return encode_error_body(
+                id,
+                Self::remote_pane_capability_unavailable_body(
+                    &host.name,
+                    crate::api::schema::FederationCapabilities::PANE_CLOSE,
+                ),
+            );
+        }
         let resolved =
             match resolve_remote_pane_target(&self.state.remote_sources, &host, &selector) {
                 Ok(resolved) => resolved,
@@ -2691,23 +2719,6 @@ mod tests {
         }
     }
 
-    fn seed_remote_projection(app: &mut App) {
-        let host = RemoteHostKey::new("jafar", "default");
-        app.state
-            .remote_sources
-            .replace_connected_snapshot(host.clone(), Vec::new());
-        app.state.remote_sources.apply_projection_snapshot(
-            &host,
-            vec![RemoteProjectionSnapshot {
-                workspace_id: "remote-ws".to_string(),
-                tab_id: Some("remote-tab".to_string()),
-                tab_label: Some("remote".to_string()),
-                status: RemoteProjectionStatus::Available,
-                layout: Some(remote_projection_layout()),
-            }],
-        );
-    }
-
     #[test]
     fn pane_split_without_remote_hosts_keeps_slash_target_local() {
         let mut app = app_with_linked_worktree();
@@ -2797,6 +2808,37 @@ mod tests {
     }
 
     #[test]
+    fn pane_split_missing_capability_rejects_before_send() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities::default(),
+        );
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+
+        let response = app.handle_remote_pane_split_with_sender(
+            "req".into(),
+            host,
+            RemoteTargetSelector::Terminal("remote-term-side".to_string()),
+            remote_pane_split_params(Some("jafar/terminal:remote-term-side")),
+            |_host, _request| panic!("missing capability must not send"),
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "remote_capability_unavailable");
+        assert!(error
+            .error
+            .message
+            .contains(crate::api::schema::FederationCapabilities::PANE_SPLIT));
+    }
+
+    #[test]
     fn remote_pane_split_request_uses_resolved_ids_and_passes_remote_fields_through() {
         let mut params = remote_pane_split_params(Some("jafar/terminal:remote-term-side"));
         params.direction = SplitDirection::Down;
@@ -2835,7 +2877,13 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
         );
-        seed_remote_projection(&mut app);
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_split: true,
+                ..Default::default()
+            },
+        );
         let host = app.remote_hosts.get("jafar").cloned().unwrap();
         let captured = std::cell::RefCell::new(None);
 
@@ -2874,7 +2922,15 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
         );
-        seed_pane_remote_projection_with_tab_list_caps(&mut app);
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_split: true,
+                tab_list: true,
+                layout_export: true,
+                ..Default::default()
+            },
+        );
         let host = app.remote_hosts.get("jafar").cloned().unwrap();
         let call_count = std::cell::Cell::new(0u32);
         let requests = std::cell::RefCell::new(Vec::<Method>::new());
@@ -2983,7 +3039,13 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
         );
-        seed_remote_projection(&mut app);
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_split: true,
+                ..Default::default()
+            },
+        );
 
         let response =
             app.handle_pane_split("req".into(), remote_pane_split_params(Some("jafar/codex")));
@@ -3002,7 +3064,13 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
         );
-        seed_remote_projection(&mut app);
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_split: true,
+                ..Default::default()
+            },
+        );
         let host = app.remote_hosts.get("jafar").cloned().unwrap();
 
         let response = app.handle_remote_pane_split_with_sender(
@@ -3096,7 +3164,13 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
         );
-        seed_remote_projection(&mut app);
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_close: true,
+                ..Default::default()
+            },
+        );
 
         let response =
             app.handle_pane_close("req".into(), remote_pane_close_params("jafar/codex", true));
@@ -3104,6 +3178,36 @@ mod tests {
 
         assert_eq!(error.error.code, "remote_target_error");
         assert!(error.error.message.contains("pane, terminal, or workspace"));
+    }
+
+    #[test]
+    fn pane_close_missing_capability_rejects_before_send() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities::default(),
+        );
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+
+        let response = app.handle_remote_pane_close_with_sender(
+            "req".into(),
+            host,
+            RemoteTargetSelector::Terminal("remote-term-side".to_string()),
+            |_host, _request| panic!("missing capability must not send"),
+        );
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+
+        assert_eq!(error.error.code, "remote_capability_unavailable");
+        assert!(error
+            .error
+            .message
+            .contains(crate::api::schema::FederationCapabilities::PANE_CLOSE));
     }
 
     #[test]
@@ -3115,7 +3219,13 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
         );
-        seed_remote_projection(&mut app);
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_close: true,
+                ..Default::default()
+            },
+        );
         let host = app.remote_hosts.get("jafar").cloned().unwrap();
         let captured = std::cell::RefCell::new(None);
 
@@ -3150,7 +3260,13 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
         );
-        seed_remote_projection(&mut app);
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_close: true,
+                ..Default::default()
+            },
+        );
         let host = app.remote_hosts.get("jafar").cloned().unwrap();
         let captured = std::cell::RefCell::new(None);
 
@@ -3183,7 +3299,13 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
         );
-        seed_remote_projection(&mut app);
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_close: true,
+                ..Default::default()
+            },
+        );
         let host = app.remote_hosts.get("jafar").cloned().unwrap();
 
         let response = app.handle_remote_pane_close_with_sender(

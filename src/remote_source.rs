@@ -126,6 +126,8 @@ pub(crate) struct RemoteSourceCapabilities {
     pub(crate) tab_focus: bool,
     pub(crate) tab_close: bool,
     pub(crate) tab_rename: bool,
+    pub(crate) pane_split: bool,
+    pub(crate) pane_close: bool,
     pub(crate) pane_rename: bool,
     pub(crate) pane_focus: bool,
     pub(crate) pane_focus_direction: bool,

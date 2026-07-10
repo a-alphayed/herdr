@@ -748,6 +748,10 @@ pub(crate) fn parse_ping_response(response: &str) -> io::Result<RemoteSourceCapa
                     .supports_method(crate::api::schema::FederationCapabilities::TAB_CLOSE),
                 tab_rename: federation
                     .supports_method(crate::api::schema::FederationCapabilities::TAB_RENAME),
+                pane_split: federation
+                    .supports_method(crate::api::schema::FederationCapabilities::PANE_SPLIT),
+                pane_close: federation
+                    .supports_method(crate::api::schema::FederationCapabilities::PANE_CLOSE),
                 pane_rename: federation
                     .supports_method(crate::api::schema::FederationCapabilities::PANE_RENAME),
                 pane_focus: federation
@@ -1462,10 +1466,17 @@ mod tests {
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
         assert!(!capabilities.workspace_list_local);
         assert!(!capabilities.workspace_create);
+        assert!(!capabilities.workspace_rename);
         assert!(!capabilities.tab_list);
         assert!(!capabilities.tab_create);
         assert!(!capabilities.tab_focus);
         assert!(!capabilities.tab_close);
+        assert!(!capabilities.tab_rename);
+        assert!(!capabilities.pane_split);
+        assert!(!capabilities.pane_close);
+        assert!(!capabilities.pane_rename);
+        assert!(!capabilities.pane_focus);
+        assert!(!capabilities.pane_focus_direction);
         assert!(!capabilities.layout_export);
         assert_eq!(agents[0].terminal_id, "term-1");
         assert_eq!(workspaces, None);
@@ -1747,15 +1758,50 @@ mod tests {
     }
 
     #[test]
-    fn remote_supervisor_parse_ping_advertises_tab_list_and_layout_export() {
+    fn remote_supervisor_parse_ping_advertises_all_cached_capabilities() {
+        // A remote advertising the full current federation method set converts to
+        // cached capabilities with every cached field true, including the projected
+        // pane split/close fields and the rename/focus/tab/workspace fields.
         let capabilities = parse_ping_response(&pong_response()).unwrap();
         assert!(capabilities.workspace_list_local);
         assert!(capabilities.workspace_create);
+        assert!(capabilities.workspace_rename);
         assert!(capabilities.tab_list);
         assert!(capabilities.tab_create);
         assert!(capabilities.tab_focus);
         assert!(capabilities.tab_close);
+        assert!(capabilities.tab_rename);
+        assert!(capabilities.pane_split);
+        assert!(capabilities.pane_close);
+        assert!(capabilities.pane_rename);
+        assert!(capabilities.pane_focus);
+        assert!(capabilities.pane_focus_direction);
         assert!(capabilities.layout_export);
+    }
+
+    #[test]
+    fn remote_supervisor_ping_succeeds_with_only_required_methods_and_optionals_false() {
+        // A remote that advertises only the supervisor ping-required federation
+        // methods (remote_api_bridge + agent_list_local) still pings successfully
+        // and leaves every optional cached field -- including the projected pane
+        // split/close fields -- false. The new fields must never become ping
+        // prerequisites.
+        let capabilities =
+            parse_ping_response(&pong_response_without_workspace_list_local()).unwrap();
+        assert!(!capabilities.workspace_list_local);
+        assert!(!capabilities.workspace_create);
+        assert!(!capabilities.workspace_rename);
+        assert!(!capabilities.tab_list);
+        assert!(!capabilities.tab_create);
+        assert!(!capabilities.tab_focus);
+        assert!(!capabilities.tab_close);
+        assert!(!capabilities.tab_rename);
+        assert!(!capabilities.pane_split);
+        assert!(!capabilities.pane_close);
+        assert!(!capabilities.pane_rename);
+        assert!(!capabilities.pane_focus);
+        assert!(!capabilities.pane_focus_direction);
+        assert!(!capabilities.layout_export);
     }
 
     #[test]

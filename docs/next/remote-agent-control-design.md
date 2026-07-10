@@ -87,7 +87,7 @@ Broad remote pane/workspace/server/process teardown remains out of scope except 
 
 - API: existing `pane.split` with `{ workspace_id, target_pane_id, direction, ratio, cwd, env, focus }`; no schema change and no protocol bump.
 - CLI: `herdr pane split <host>/<target> --direction right|down`, where `<target>` is `terminal:<id>`, `pane:<id>`, or `workspace:<id>`. Bare/local targets keep the local path.
-- Capability: the route requires the remote host to advertise `pane_split` (in addition to `remote_api_bridge`). A remote that does not advertise it fails with `does not advertise federation method pane_split` and does not fall back.
+- Capability: the route requires the remote host to advertise `pane_split` (in addition to `remote_api_bridge`). After the existing connected check, a missing cached `pane_split` capability fails locally with `remote_capability_unavailable` (`does not advertise federation method pane_split`) before active-tab projection resolution and before bridge dispatch, matching tab/rename/focus behavior; it does not fall back to the bridge path.
 - Target resolution: the controller resolves against live active-tab projections from `layout.export`, not against the agent cache. Stale/unavailable projections and older projections without terminal ids are rejected before mutation.
 - Remote authority: the forwarded request carries the resolved remote `workspace_id` and `target_pane_id`; `cwd` and `env` are remote-scoped and pass through without local expansion.
 - The operation is non-destructive but non-idempotent. It has no confirmation gate and no uncertain-delivery retry.
@@ -98,7 +98,7 @@ Broad remote pane/workspace/server/process teardown remains out of scope except 
 
 - API/schema: `pane.close` uses `{ pane_id, confirm }`. `confirm` defaults to `false` and is omitted when false. Local `pane.close` remains backward-compatible; the existing worktree-group `confirmation_required` guard on the authoritative close path remains separate and is not bypassed by `confirm: true`.
 - CLI: `herdr pane close <host>/<target> --confirm`, where `<target>` is `terminal:<id>`, `pane:<id>`, or `workspace:<id>`. Bare/local targets keep the local path; a configured host-qualified remote target without `--confirm` is rejected before sending.
-- Capability: the route requires the remote host to advertise `pane_close` (in addition to `remote_api_bridge`). A remote that does not advertise it fails clearly with `does not advertise federation method pane_close` and does not fall back.
+- Capability: the route requires the remote host to advertise `pane_close` (in addition to `remote_api_bridge`). After the existing confirmation-required entrypoint and connected check, a missing cached `pane_close` capability fails locally with `remote_capability_unavailable` (`does not advertise federation method pane_close`) before active-tab projection resolution and before bridge dispatch, matching tab/rename/focus behavior; it does not fall back to the bridge path.
 - Target resolution: the controller requires `confirm: true` before host status checks, projection-cache resolution, or bridge send. It resolves host/session-qualified terminal, pane, and workspace selectors against live active-tab projections from `layout.export`; workspace selectors resolve to the focused live projected pane, not to broad workspace close. Stale/unavailable projections and older projections without terminal ids are rejected before mutation.
 - Remote authority: the forwarded request carries the resolved authoritative remote `pane_id` and `confirm: true`. The remote node runs its normal local `close_pane` path, preserving `pane.closed` / `workspace.closed` events, session save, runtime cleanup, and the separate worktree-group confirmation guard. If the closed pane is the last pane, closing the workspace is a consequence of the authoritative local close path, not a separate workspace-close operation.
 - UI: a live projected pane context menu exposes **Close pane**. The confirmation overlay names the host, session, and target label and states that it closes the remote pane/process on that host. Confirm dispatches `tui.remote_projection.pane.close` as `pane.close { pane_id: "<host>/terminal:<terminal_id>", confirm: true }` and returns to the prior local terminal/navigate mode; cancel mutates neither local nor remote panes.
@@ -492,9 +492,9 @@ Before routing remote commands, the aggregator must verify compatibility.
 Existing API support:
 
 - `ResponseResult::Pong` already carries `version`, `protocol`, and optional `ServerCapabilities`.
-- Existing `ServerCapabilities` is currently narrow (for example `live_handoff`) and does not enumerate all API methods needed for federation.
+- `ServerCapabilities` now enumerates the federation method set (`FederationCapabilities`) the local node uses as the durable JSON API federation compatibility contract: it is the authoritative per-method gate for hidden bridge use and routed agent/pane/tab/workspace methods, not just `live_handoff`.
+- The supervisor ping requires only `remote_api_bridge` and `agent_list_local` to succeed; every other advertised method (workspace/tab/pane rename, tab/pane focus, tab create/close, workspace create/list, layout export, projected pane split/close, terminal attach, agent read/send/submit/focus/start/teardown) is an optional cached capability that stays false when a remote does not advertise it. New cached fields must never become ping prerequisites.
 - Phase 0 may rely on `Pong.version` and `Pong.protocol` for compatibility checks.
-- If method-level federation capabilities are required, that is a prerequisite schema change, not a check that exists today.
 
 Required checks:
 
@@ -502,9 +502,9 @@ Required checks:
 - remote Herdr server/session is running or can be started;
 - remote API socket responds;
 - remote protocol version is compatible;
-- required federation methods are supported by protocol version or by a new capability field if added.
+- required federation methods are supported by the advertised `FederationCapabilities` method set (the durable per-method contract above).
 
-Note: `Pong.protocol` is the shared render wire `PROTOCOL_VERSION` (`src/protocol/wire.rs`), not a JSON-API-specific version. It moves when the render protocol changes and does not track JSON-API schema changes, so treat it as a coarse gate only. A federation-specific capability/method set (the prerequisite schema change above) is the durable compatibility contract.
+Note: `Pong.protocol` is the shared render wire `PROTOCOL_VERSION` (`src/protocol/wire.rs`), not a JSON-API-specific version. It moves when the render protocol changes and does not track JSON-API schema changes, so treat it as a coarse diagnostic/attach/live-handoff compatibility signal only. A federation-specific capability/method set is the durable compatibility contract; this capability/protocol negotiation cleanup adds no federation-wide `Pong.protocol` rejection and no render-wire protocol bump. If a same-protocol federation-wide gate is later wanted, that is a separate protected protocol/live-setup decision.
 
 On mismatch:
 
