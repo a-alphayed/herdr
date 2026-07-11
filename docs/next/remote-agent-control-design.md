@@ -558,7 +558,7 @@ The supervisor runs two probes per host/session: a lightweight `ping` on a short
 - **Circuit-breaker versus transient across ping and snapshot**: if `NeedsUpdate` surfaces during snapshot after a successful ping, ping continues on its normal cadence while only the failing deeper probe (snapshot) is held to the fixed long retry — ping is not stopped. If `NeedsUpdate` surfaces on ping, the deeper probes stay deferred until ping recovers.
 - **Recovery**: any successful ping **or** snapshot clears the accumulated transient backoff, so the next transient failure restarts from the first jittered base interval for that host/session.
 
-Probe timing does not change mutating command behavior. Commands still fail fast through the existing cache/status checks (stale, unavailable, disconnected, or missing-metadata targets are rejected before forwarding); there is no command queuing and no uncertain non-idempotent retry.
+Probe timing does not change mutating command behavior. Commands still fail fast through the existing cache/status checks (stale, unavailable, disconnected, or missing-metadata targets are rejected before forwarding); there is no command queuing and no uncertain non-idempotent retry. (See §9 Safe command queue and retry policy for the full operation classification, queue requirements, and future retry preconditions.)
 
 ### 5. Cache consistency and resync
 
@@ -806,11 +806,73 @@ Remote workspace creation is allowed only through explicit capability-gated rout
 
 Current spike API shape: aggregated `agent.list` host-qualifies label fields so they can be passed back to `agent.get/read/send`, but it keeps raw remote `terminal_id`, `pane_id`, `workspace_id`, and `tab_id` values. Those raw IDs are authoritative on the owning host but not globally unique. A future schema should add machine-readable host/session fields instead of encoding location into labels.
 
-Non-idempotent retry rule:
+#### Safe command queue and retry policy
 
-- `agent.send`, `agent.submit`, `pane.split`, `pane.send_text`, `pane.send_keys`, and `pane.send_input` are not idempotent.
-- If the bridge drops after dispatch but before acknowledgement, surface an uncertain-delivery error and do not auto-retry.
-- `agent.list`, `agent.get`, `pane.read`, and status/ping calls are safe to retry within bounded timeout rules.
+Remote-host authority remains unchanged: each remote Herdr node owns its PTYs, panes, hooks, persistence, and child processes. Local queue and retry policy cannot manufacture exactly-once remote semantics.
+
+**Operation classes**
+
+*Retry-safe reads and observations* may be retried within a bounded timeout and backoff:
+- Ping, status, and capability checks (`remote status`, `remote check`).
+- `agent.list`, `agent.list_local`, `agent.get`, `agent.read`.
+- `pane.list`, `pane.get`, `pane.read`.
+- Cache snapshots and refreshes (supervisor `agent.list_local`, workspace/tab/layout polls).
+- Bounded observation and wait primitives that do not inject input (`events.subscribe`, `pane.wait_for_output`).
+
+*Retry-unsafe mutators after uncertain delivery*: `agent.send`, `agent.submit`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.split`, `pane.close`, `tab.create`, `tab.close`, `agent.teardown`, `agent.rename`, `pane.rename`, `tab.rename`, `workspace.rename`, `agent.focus`, `pane.focus`, and `agent.start --host` — unless a future remote endpoint explicitly defines idempotent retry semantics for that operation.
+
+Some operations (focus, rename, tab create/close) may be end-state-idempotent or easily user-repeated, but they are still mutating and remain retry-unsafe absent a remote idempotency or deduplication contract. Denied, unsupported, or protected operations remain denied; queues and retries must not turn denied commands into delayed commands.
+
+**Known-not-dispatched failures**
+
+If and only if Herdr can positively prove no request bytes reached the authoritative remote — local validation failure, confirmation absent or cancelled, denied or unsupported method, missing capability, manual connection-policy rejection, stale or disconnected cache precheck, limiter busy before worker spawn, no bridge opened, or transport failure before any request bytes were written — then the remote was not touched. Retry and queue eligibility still applies per operation class above and must not wake or probe manual-policy hosts. If there is any ambiguity, treat the delivery as uncertain.
+
+**Uncertain delivery for mutators**
+
+Once a request may have reached the remote API or PTY — bridge drop, timeout, lost response, or ambiguous worker failure — the outcome is uncertain. The local node must surface an uncertain-delivery outcome and must not auto-retry. User guidance: inspect and read remote state, then decide manually whether to retry. Error text must not imply success or failure of the remote operation.
+
+**Queue expectations (current behavior and future requirements)**
+
+Current behavior: the local node rejects excess requests with a `remote_bridge_busy` response when the per-host bridge cap is saturated. There is no command queue; commands do not wait for slot availability.
+
+Any future command queue must meet all of these requirements:
+- Bounded per-host and per-session limits; not an unbounded queue.
+- User-visible: pending entries are observable and labeled with host, method, and age.
+- Cancelable before dispatch; cancellation after dispatch is best-effort only and cannot claim remote cancellation.
+- Deadline and expiry based: entries that exceed a wall-clock deadline are dropped before dispatch, not sent to a stale target.
+- Revalidate immediately before dispatch: host status, capability, target resolution, confirmation, and cache freshness must all be rechecked at dispatch time, not at enqueue time.
+- Stale, expired, disconnected, capability-changed, or user-cancelled entries fail before dispatch and do not mutate remote state.
+
+**Staleness**
+
+Queueing must not freeze projection-cache or cache-derived targets indefinitely. Before dispatch, re-resolve or revalidate the target identity against current projection/cache state. Entries targeting remote IDs from a stale, expired, or replaced snapshot must be expired or cancelled, not dispatched to stale remote IDs.
+
+**Future mutating retry requirements**
+
+Automatic retry of mutating commands requires remote idempotency and deduplication support. All of the following are required before any mutating retry path may be introduced:
+- A stable operation id or nonce, bound to the payload, target, and any confirmation value at the time of the original dispatch.
+- Remote-side deduplication and journaling, owned by the authoritative remote host.
+- Defined TTL and result-replay semantics at the remote.
+- Advertisement via federation capability or protocol negotiation; local retry must not assume idempotency based on local judgment alone.
+- Tests covering duplicate delivery at the remote PTY or API boundary.
+- User-visible semantics: a retried operation is labeled as a retry so the user is not surprised if the remote deduplicates it.
+
+Raw terminal input (`pane.send_keys`, `pane.send_input`, `agent.submit` / Enter) remains retry-unsafe unless duplicate suppression is proven at the PTY or application boundary. Local-only deduplication (nonce tracking on the local side only) is insufficient: if the request was delivered and the response was lost, a local dedup guard does not prevent a duplicate from reaching the remote.
+
+**User-facing outcomes**
+
+Commands resolve to one of the following outcomes, and error/status messages must distinguish them clearly:
+
+| Outcome | Description |
+|---|---|
+| Success | Operation completed; remote acknowledged. |
+| Fail-fast (not dispatched) | Known-not-dispatched: rejected before any request bytes were sent. Safe to retry if the underlying condition is fixed. |
+| Busy / not queued | Per-host bridge cap saturated; no queue slot available. Current behavior. |
+| Queued / pending | (Future) Accepted into a bounded queue; not yet dispatched. |
+| Queued cancelled | (Future) User-cancelled before dispatch. Remote not touched. |
+| Queued expired / stale | (Future) Deadline or staleness check failed before dispatch. Remote not touched. |
+| Read exhausted | Retry-safe read or observation timed out or exhausted retries within bounds. |
+| Uncertain delivery | Request may have reached the remote; outcome unknown. Do not auto-retry mutating operations. |
 
 ### 10. Remote agent start placement
 
@@ -1085,6 +1147,8 @@ remote render/terminal attach bridge reuse for focus
 - For read/list/status: retry if safe and within timeout.
 - For send/input/start: do not auto-retry after uncertain dispatch. Surface uncertain-delivery error.
 
+See §9 Safe command queue and retry policy for the full operation classification (retry-safe reads vs. retry-unsafe mutators), known-not-dispatched vs. uncertain-delivery distinction, and user-facing outcome definitions.
+
 ## Testing Strategy
 
 Do not require two physical machines for core tests.
@@ -1306,7 +1370,7 @@ Phase G.8 status: configured remote-agent routed actions now emit structured `re
 
 Phase G.9 status: routed remote-agent bridge dispatch now reuses supervisor-prepared binary/capability state for connected hosts. A successful supervisor ping captures the prepared remote Herdr shell path plus the full advertised `FederationCapabilities` as rebuildable soft state, published through the existing `AppEvent`/reducer path (a `RemoteSourceBridgeState` event) — never by direct `AppState`/`RemoteSourceCache` mutation from the supervisor thread. That prepared state is cached in `RemoteSourceCache` keyed by `RemoteHostKey` and is included in the deferred dispatch descriptor only when the host is `Connected` with cached state. The worker then sends the actual `remote-api-bridge` request built from the cached shell path, after a local cached-capability check using the same required-method mapping as the full bridge path, *without* re-running remote binary preparation, the `remote-federation-capabilities` probe, or the API ping probe. Stale/non-connected `agent.read`, on-demand/no-cache `agent.start --host`, and any non-connected target still fall back to the existing full non-interactive bridge path. The prepared state is invalidated (`mark_status`) whenever the host becomes non-connected, while display caches stay stale as before. This is data reuse only — a fresh SSH process still runs per request — and is explicitly **not** connection pooling: no persistent SSH bridge pool, command queue, retry queue, or non-idempotent retry semantics are introduced (those remain Phase G.10+ work). Response id rewrite, `agent.start` response rewrite, `remote.route.*` telemetry, `remote_request_failed` error mapping, authoritative remote terminal-id rewrite, and the per-host limiter/permit release semantics are all unchanged.
 
-Still future hardening (after G.9): optional connection reuse / bounded bridge pools only if G.9-style supervisor-state reuse still leaves per-request SSH/process startup dominating; command queueing/retry for mutating commands (only if non-idempotent uncertain-delivery rules stay preserved); and cache-mutating remote tab/workspace/pane layout operations.
+Still future hardening (after G.9): optional connection reuse / bounded bridge pools only if G.9-style supervisor-state reuse still leaves per-request SSH/process startup dominating; command queueing/retry for mutating commands, subject to all preconditions in §9 Safe command queue and retry policy (remote idempotency/deduplication contract, bounded/cancelable/expiry-based queue, revalidate-before-dispatch, and no auto-retry after uncertain delivery); and cache-mutating remote tab/workspace/pane layout operations.
 
 Acceptance criteria for current Phase 2 routing:
 
