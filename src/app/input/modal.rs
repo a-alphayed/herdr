@@ -1484,6 +1484,9 @@ impl App {
                 self.focus_workspace_idx_via_api(ws_idx);
                 self.focus_tab_idx_via_api(tab_idx);
                 self.close_active_tab_via_api();
+                // Always leave modal: the API rejects last-tab close without mutating
+                // mode, so unconditional leave_modal is correct here.
+                leave_modal(&mut self.state);
             }
             (ContextMenuKind::RemoteProjectedPane { target }, Some("Attach in new split")) => {
                 self.state.request_remote_attach_in_new_split =
@@ -2550,5 +2553,101 @@ mod tests {
             .expect("target set");
         assert_eq!(stored.host, "jafar");
         assert_eq!(stored.terminal_id, "term-1");
+    }
+
+    #[test]
+    fn context_menu_tab_close_via_api_leaves_context_menu_mode() {
+        // Regression: closing a tab via context menu in the API path must reset mode
+        // out of ContextMenu so subsequent mouse events are not frozen.
+        let mut app = super::super::app_for_mouse_test();
+        let mut ws = crate::workspace::Workspace::test_new("one");
+        ws.test_add_tab(None);
+        ws.test_add_tab(None);
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::ContextMenu;
+
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Tab {
+                ws_idx: 0,
+                tab_idx: 1,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let close_idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Close")
+            .expect("Close item");
+
+        app.apply_context_menu_action_via_api(menu, close_idx);
+
+        assert_eq!(
+            app.state.mode,
+            Mode::Terminal,
+            "mode must leave ContextMenu after tab close"
+        );
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+
+        // Prove the left-click freeze is gone: clicking a remaining tab now works.
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 106, 20));
+        let active_before = app.state.workspaces[0].active_tab;
+        let second_tab = app.state.view.tab_hit_areas[1];
+        app.handle_mouse(super::super::mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            second_tab.x + 1,
+            second_tab.y,
+        ));
+        app.handle_mouse(super::super::mouse(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            second_tab.x + 1,
+            second_tab.y,
+        ));
+        assert_ne!(
+            app.state.workspaces[0].active_tab, active_before,
+            "left-click on a tab must switch active tab after context-menu close"
+        );
+    }
+
+    #[test]
+    fn context_menu_tab_close_via_api_last_tab_still_leaves_context_menu_mode() {
+        // When the API rejects closing the last tab, mode must still leave ContextMenu.
+        let mut app = super::super::app_for_mouse_test();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("solo")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::ContextMenu;
+
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Tab {
+                ws_idx: 0,
+                tab_idx: 0,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let close_idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Close")
+            .expect("Close item");
+
+        app.apply_context_menu_action_via_api(menu, close_idx);
+
+        assert_eq!(
+            app.state.mode,
+            Mode::Terminal,
+            "mode must leave ContextMenu even when last-tab close is rejected"
+        );
+        assert_eq!(
+            app.state.workspaces[0].tabs.len(),
+            1,
+            "last tab must remain"
+        );
+        assert_eq!(app.state.active, Some(0), "workspace must remain active");
     }
 }
