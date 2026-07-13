@@ -7,7 +7,10 @@ use crate::api::schema::{
 };
 use crate::app::{App, Mode};
 
-use super::remote_helpers::{remote_route_plan_error_body, rewrite_remote_response_id_value};
+use super::remote_helpers::{
+    parse_remote_success_response_value, remote_route_plan_error_body,
+    rewrite_remote_response_id_value,
+};
 use super::responses::{encode_error, encode_error_body, encode_success};
 use crate::remote_target::{
     parse_target_route, resolve_remote_tab_target, resolve_remote_workspace_target,
@@ -84,10 +87,6 @@ fn remote_capability_unavailable_body(host: &str, method: &str) -> ErrorBody {
         code: "remote_capability_unavailable".to_string(),
         message: format!("remote host {host} does not advertise federation method {method}"),
     }
-}
-
-fn parse_remote_success_response_value(value: serde_json::Value) -> Option<SuccessResponse> {
-    serde_json::from_value(value).ok()
 }
 
 impl App {
@@ -372,7 +371,13 @@ impl App {
             .unwrap_or_else(|err| encode_error(id, "remote_request_failed", err.to_string()))
     }
 
-    fn refresh_remote_workspace_tabs_and_projection<F>(
+    /// Refresh a remote workspace's cached tab list and active-tab projection
+    /// after a routed remote mutation succeeds, so the cache does not stay
+    /// falsely `Available`/stale once authoritative remote state has changed.
+    ///
+    /// Shared by both tab and pane remote routes (see `app/api/panes.rs`);
+    /// `pub(super)` makes it visible across sibling modules in `app::api`.
+    pub(super) fn refresh_remote_workspace_tabs_and_projection<F>(
         &mut self,
         host: &crate::remote_target::RemoteHostConfig,
         host_key: &crate::remote_source::RemoteHostKey,
@@ -387,6 +392,19 @@ impl App {
             self.state
                 .remote_sources
                 .mark_tab_snapshot_unavailable(host_key, workspace_id);
+            // Refresh metadata cannot be fetched without `tab.list`; mark the
+            // projection unavailable/stale too instead of leaving a
+            // previously cached `Available` projection falsely live.
+            self.state.remote_sources.upsert_projection_snapshot(
+                host_key,
+                crate::remote_source::RemoteProjectionSnapshot {
+                    workspace_id: workspace_id.to_string(),
+                    tab_id: preferred_tab_id.map(str::to_string),
+                    tab_label: None,
+                    status: crate::remote_source::RemoteProjectionStatus::Unavailable,
+                    layout: None,
+                },
+            );
             return;
         }
 

@@ -1,4 +1,4 @@
-use crate::api::schema::ErrorBody;
+use crate::api::schema::{ErrorBody, SuccessResponse};
 use crate::remote_target::RemoteRoutePlanError;
 
 pub(super) fn rewrite_remote_response_id_value(
@@ -30,6 +30,17 @@ pub(super) fn rewrite_remote_response_id_value(
 pub(super) fn rewrite_remote_response_id(response: &str, id: &str) -> std::io::Result<String> {
     let value = rewrite_remote_response_id_value(response, id)?;
     serde_json::to_string(&value).map_err(std::io::Error::other)
+}
+
+/// Parse a rewritten remote API response value as a success response.
+///
+/// Returns `None` for an error response (missing the required `result` field)
+/// or any value that otherwise fails to deserialize as `SuccessResponse`, so
+/// callers can gate cache refresh on an actual successful remote mutation.
+pub(super) fn parse_remote_success_response_value(
+    value: serde_json::Value,
+) -> Option<SuccessResponse> {
+    serde_json::from_value(value).ok()
 }
 
 pub(super) fn remote_route_plan_error_body(err: RemoteRoutePlanError) -> ErrorBody {
