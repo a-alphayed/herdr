@@ -1176,6 +1176,19 @@ pub enum ContextMenuKind {
         focused_pane: Option<RemoteAttachPaneTarget>,
         attached_pane: Option<RemoteAttachPaneTarget>,
     },
+    /// A projected remote source (source-rail row) context menu. Carries the
+    /// configured-host alias so copy actions can resolve the host config. It is
+    /// copy-only and never runs remote commands; right-clicking a rail row must
+    /// not switch the active projected source.
+    RemoteSource {
+        host: crate::remote_source::RemoteHostKey,
+    },
+    /// A projected remote space (workspace list row) context menu. Same copy-only
+    /// semantics as [`ContextMenuKind::RemoteSource`]; the space key carries the
+    /// host alias and projected session.
+    RemoteSpace {
+        key: crate::remote_source::RemoteSpaceKey,
+    },
 }
 
 /// Right-click context menu state.
@@ -1347,6 +1360,10 @@ impl ContextMenuState {
                 attached_pane: None,
                 ..
             } => &["Attach to focused pane", "Attach in new split"],
+            ContextMenuKind::RemoteSource { .. } | ContextMenuKind::RemoteSpace { .. } => &[
+                "Copy remote diagnostics command",
+                "Copy full remote command",
+            ],
         }
     }
 }
@@ -2344,6 +2361,7 @@ impl AppState {
                     }
                 }
                 ContextMenuKind::RemoteProjectedPane { .. } => {}
+                ContextMenuKind::RemoteSource { .. } | ContextMenuKind::RemoteSpace { .. } => {}
                 ContextMenuKind::RemoteAgent {
                     ref focused_pane,
                     ref attached_pane,

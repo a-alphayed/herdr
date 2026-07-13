@@ -1765,7 +1765,7 @@ mod tests {
     }
 
     #[test]
-    fn right_click_remote_space_row_selects_without_context_menu() {
+    fn right_click_remote_space_row_opens_remote_space_menu() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("local")];
         app.state.ensure_test_terminals();
@@ -1785,10 +1785,129 @@ mod tests {
             remote_space_row_y(&app),
         ));
 
-        assert!(app.state.context_menu.is_none());
+        // Right-clicking a remote space row now selects the projected space,
+        // clears the remote agent selection, and opens the remote-space copy
+        // menu instead of a local workspace/pane menu.
+        let menu = app
+            .state
+            .context_menu
+            .as_ref()
+            .expect("remote space context menu opens");
+        assert!(matches!(
+            menu.kind,
+            ContextMenuKind::RemoteSpace { ref key } if key == &remote_space_key()
+        ));
+        assert_eq!(
+            menu.items(),
+            &[
+                "Copy remote diagnostics command",
+                "Copy full remote command"
+            ]
+        );
         assert_eq!(app.state.selected_remote_space, Some(remote_space_key()));
         assert!(app.state.selected_remote_agent.is_none());
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+    }
+
+    #[test]
+    fn right_click_remote_source_rail_row_opens_remote_source_menu_without_switching_source() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("local")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.remote_sources.mark_status(
+            &RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        compute_desktop_view(&mut app);
+        // Stay on the local projection so we can prove right-click does not
+        // switch the active projected source.
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Local);
+        compute_desktop_view(&mut app);
+
+        let rail = app.state.view.source_rail_rect;
+        let rail_row = (rail.y..rail.y + rail.height)
+            .find(|row| {
+                matches!(
+                    app.state.source_rail_target_at(rail.x, *row),
+                    Some(crate::app::state::SidebarSource::Remote(ref host))
+                        if host.host == "jafar"
+                )
+            })
+            .expect("remote source rail row for jafar");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            rail.x,
+            rail_row,
+        ));
+
+        let menu = app
+            .state
+            .context_menu
+            .as_ref()
+            .expect("remote source context menu opens");
+        assert!(matches!(
+            menu.kind,
+            ContextMenuKind::RemoteSource { ref host }
+                if host == &RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME)
+        ));
+        assert_eq!(
+            menu.items(),
+            &[
+                "Copy remote diagnostics command",
+                "Copy full remote command"
+            ]
+        );
+        // Right-click must not switch the active projected source.
+        assert_eq!(
+            app.state.sidebar_source,
+            crate::app::state::SidebarSource::Local
+        );
+        assert_eq!(app.state.mode, Mode::ContextMenu);
+    }
+
+    #[test]
+    fn right_click_local_source_rail_row_stays_consumed_without_remote_menu() {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("local")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.remote_sources.mark_status(
+            &RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        compute_desktop_view(&mut app);
+
+        let rail = app.state.view.source_rail_rect;
+        let rail_row = (rail.y..rail.y + rail.height)
+            .find(|row| {
+                matches!(
+                    app.state.source_rail_target_at(rail.x, *row),
+                    Some(crate::app::state::SidebarSource::Local)
+                )
+            })
+            .expect("local source rail row");
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            rail.x,
+            rail_row,
+        ));
+
+        // Local rail rows must not get remote actions; right-click stays
+        // consumed (no context menu, mode unchanged).
+        assert!(app.state.context_menu.is_none());
         assert_eq!(app.state.mode, Mode::Terminal);
+        assert_eq!(
+            app.state.sidebar_source,
+            crate::app::state::SidebarSource::Local
+        );
     }
 
     #[test]

@@ -1163,6 +1163,55 @@ fn remote_projection_status_label(status: RemoteProjectionStatus) -> &'static st
     }
 }
 
+/// Shell-quote a single POSIX shell argument using single-quote escaping.
+///
+/// Only non-empty values whose characters are all ASCII alphanumeric or one
+/// of `@ % _ + = : , . / -` are left unquoted; every other value (empty
+/// strings, whitespace, and shell metacharacters such as `;`, `&`, `|`, `$`,
+/// backticks, quotes, and backslashes) is wrapped in single quotes, with
+/// embedded single quotes escaped via the standard ` '\'' ` sequence. This
+/// mirrors the stricter private quoting helper already used by the remote SSH
+/// attach/install path (`src/remote/unix.rs`) so the copied command is safe
+/// to paste into a POSIX shell. It is a focused, dependency-free helper
+/// rather than a new external crate.
+pub(crate) fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(
+                    ch,
+                    '@' | '%' | '_' | '+' | '=' | ':' | ',' | '.' | '/' | '-'
+                )
+        })
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Build the safe, non-mutating diagnostics command for a configured-host
+/// alias. Shape: `herdr remote status <quoted-alias> && herdr remote check
+/// <quoted-alias>`. Both `remote status` and `remote check` are read-only and
+/// never spawn or mutate remote state from this command string; running it is
+/// the user's explicit choice after copying it.
+pub(crate) fn remote_diagnostics_command(alias: &str) -> String {
+    let quoted = shell_quote(alias);
+    format!("herdr remote status {quoted} && herdr remote check {quoted}")
+}
+
+/// Build the explicit full remote Herdr client command from a host config's
+/// configured SSH target and session. Shape: `herdr --remote <quoted-target>
+/// --session <quoted-session>`. Uses the raw SSH `target` and configured
+/// `session`, never the alias, matching the `herdr --remote` CLI contract.
+pub(crate) fn remote_full_command(target: &str, session: &str) -> String {
+    format!(
+        "herdr --remote {} --session {}",
+        shell_quote(target),
+        shell_quote(session)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1177,6 +1226,72 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn shell_quote_leaves_safe_tokens_unquoted() {
+        assert_eq!(shell_quote("jafar"), "jafar");
+        assert_eq!(shell_quote("user@host"), "user@host");
+        assert_eq!(shell_quote("10.0.0.5"), "10.0.0.5");
+    }
+
+    #[test]
+    fn shell_quote_wraps_empty_and_unsafe_values() {
+        assert_eq!(shell_quote(""), "''");
+        // Whitespace forces single-quote wrapping.
+        assert_eq!(shell_quote("a b"), "'a b'");
+        // Single quotes are escaped via the standard '\'\'' sequence: one
+        // backslash before the embedded quote in the rendered command text.
+        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+        // Double quotes, backslashes, and shell metacharacters also force wrapping.
+        assert_eq!(shell_quote("a$b"), "'a$b'");
+        assert_eq!(shell_quote("a|b"), "'a|b'");
+        // Command separators/backgrounding characters must also be quoted --
+        // these are not in the safe-unquoted allow-list.
+        assert_eq!(shell_quote("ja;far"), "'ja;far'");
+        assert_eq!(shell_quote("a&b"), "'a&b'");
+    }
+
+    #[test]
+    fn shell_quote_leaves_allow_listed_punctuation_unquoted() {
+        // Every char in the safe-unquoted set together in one token.
+        assert_eq!(shell_quote("user@host:2222"), "user@host:2222");
+        assert_eq!(shell_quote("a_b+c=d,e.f/g-h%i"), "a_b+c=d,e.f/g-h%i");
+    }
+
+    #[test]
+    fn remote_diagnostics_command_quotes_alias_in_both_positions() {
+        let cmd = remote_diagnostics_command("jafar");
+        assert_eq!(cmd, "herdr remote status jafar && herdr remote check jafar");
+
+        // An unsafe alias is quoted in both positions.
+        let cmd = remote_diagnostics_command("ja far");
+        assert_eq!(
+            cmd,
+            "herdr remote status 'ja far' && herdr remote check 'ja far'"
+        );
+
+        // A shell-metacharacter alias (`;`) is quoted in both positions too.
+        let cmd = remote_diagnostics_command("ja;far");
+        assert_eq!(
+            cmd,
+            "herdr remote status 'ja;far' && herdr remote check 'ja;far'"
+        );
+    }
+
+    #[test]
+    fn remote_full_command_uses_target_and_session_not_alias() {
+        // target differs from a typical alias; the command must use the target.
+        let cmd = remote_full_command("user@10.0.0.5", "default");
+        assert_eq!(cmd, "herdr --remote user@10.0.0.5 --session default");
+    }
+
+    #[test]
+    fn remote_full_command_quotes_target_and_session_safely() {
+        // A session name with a space is quoted; a target with a shell
+        // metacharacter is quoted.
+        let cmd = remote_full_command("host'a", "my session");
+        assert_eq!(cmd, "herdr --remote 'host'\\''a' --session 'my session'");
+    }
 
     fn agent_with_fields(
         terminal_id: &str,
