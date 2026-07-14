@@ -119,18 +119,20 @@ manage_ssh_config = true
 
 When enabled, `herdr --remote` writes a private temporary SSH config that includes your `~/.ssh/config` and `/etc/ssh/ssh_config` first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own keepalive settings win. Herdr also uses a private per-attach OpenSSH control socket to reuse the first authenticated connection. Set `manage_ssh_config = false` to run remote attach through plain `ssh` without Herdr's generated config or control socket.
 
-Configured remote hosts define named aliases used by federated/host-qualified remote API controls (remote status/check, agent/pane/tab/workspace routed operations) and configured-host terminal attach. `herdr --remote <target>` at the root still takes a raw SSH target and does not resolve these aliases.
+Configured remote hosts define named aliases used by federated/host-qualified remote API controls (agent/pane/tab/workspace routed operations) and configured-host terminal attach. `herdr --remote <target>` at the root still takes a raw SSH target and does not resolve these aliases.
+
+The read-only `herdr remote list [HOST]` command inspects configured hosts without probing them: it prints each alias, SSH target, remote session, `connection_policy`, and `connect_timeout_secs` from local config only, opening no SSH bridge. Use `herdr remote status [HOST]` for a compact live status table and `herdr remote check [HOST]` for layered SSH/binary/federation/API diagnostics. All three validate remote configuration and resolve the optional `[HOST]` alias before any SSH.
 
 ```toml
 [[remote.hosts]]
 name = "jafar"
 target = "jafar"
 session = "default"
-auto_connect = true
+connection_policy = "auto"
 connect_timeout_secs = 10
 ```
 
-`connect_timeout_secs` bounds the SSH `ConnectTimeout` (whole seconds) used for connection attempts to this host, for both interactive and noninteractive configured-host SSH invocations. Optional; defaults to 10 seconds. Must be between 1 and 300 seconds inclusive; an out-of-range value fails config validation.
+`connection_policy` controls whether the local aggregator reaches a host automatically: `auto` (default) connects/probes at startup and on config reload; `on_demand` is not probed automatically but an explicit mutating command may dispatch on demand; `manual` is never reached implicitly, so sleeping/roaming hosts are not woken just because they are configured. It is the single stored source of truth. The legacy `auto_connect` boolean is a backward-compatible alias only (`true` resolves to `auto`, `false` to `on_demand`); set `connection_policy` directly in new config. `connect_timeout_secs` bounds the SSH `ConnectTimeout` (whole seconds) used for connection attempts to this host, for both interactive and noninteractive configured-host SSH invocations. Optional; defaults to 10 seconds. Must be between 1 and 300 seconds inclusive; an out-of-range value fails config validation.
 
 ## Keybindings
 

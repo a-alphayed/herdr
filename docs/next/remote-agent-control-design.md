@@ -990,7 +990,9 @@ If SteamDeck loses network/Tailscale/SSH access to Jafar:
 Remote host management and diagnostics:
 
 ```bash
-# Implemented read-only diagnostics for configured hosts:
+# Implemented read-only inventory and diagnostics for configured hosts:
+herdr remote list
+herdr remote list jafar
 herdr remote status
 herdr remote status jafar
 herdr remote check
@@ -998,22 +1000,21 @@ herdr remote check jafar
 
 # Planned host management commands, not part of the current MVP implementation:
 herdr remote add jafar --target jafar --session default
-herdr remote list
 herdr remote connect jafar
 herdr remote reconnect jafar
 herdr remote disconnect jafar
 herdr remote remove jafar
 ```
 
-Implemented diagnostic semantics:
+Implemented read-only inventory and diagnostic semantics:
 
+- `remote list [HOST]` is a no-probe configured-host inventory table for all configured hosts or one host alias. It prints host alias, SSH target, remote session, `connection_policy` (via `as_toml_str`), and `connect_timeout_secs` from local config only, without opening an SSH bridge or probing a remote server.
 - `remote status [HOST]` is a compact read-only status table for all configured hosts or one host alias. It validates remote config before SSH and classifies hosts as connected, not running, needs update, unreachable, or error.
 - `remote check [HOST]` is a deeper read-only diagnostic. It separates SSH/binary compatibility, federation capability support, and no-spawn API server status. It does not install/update/restart/spawn remote Herdr.
 - Unknown host filters fail before probing. Invalid remote config, including leading-dash SSH targets, fails before SSH.
 
 Planned host management semantics:
 
-- `remote list` lists configured hosts without mutating them.
 - `remote add` saves config and may validate/provision interactively.
 - `remote connect` ensures a bridge now, interactive if setup is required.
 - `remote reconnect` tears down and reopens bridges.
@@ -1502,7 +1503,7 @@ Implemented Phase 5 hardening:
 
 Remaining non-MVP or later polish:
 
-- planned `remote list` and mutating `remote add/connect/reconnect/disconnect/remove` management commands;
+- planned mutating `remote add/connect/reconnect/disconnect/remove` management commands;
 - automatic remote update/setup orchestration;
 - optional internal SSH ControlMaster optimization;
 - broader multi-host and sleep/offline/wake soak testing.

@@ -72,6 +72,17 @@ already satisfied by that polish.
 Landed resilience/control units on `origin/roadmap/herdr-remote-roadmap`,
 newest first:
 
+- **Remote management/ops polish — read-only command/diagnostic surface
+  (`remote list`)** — added the no-probe `herdr remote list [HOST]`
+  configured-host inventory command. It prints host alias, SSH target, remote
+  session, `connection_policy` (via `as_toml_str`), and `connect_timeout_secs`
+  from local config only, sharing the `status`/`check` config-validation and
+  host-filter path without opening an SSH bridge, probing a remote server, or
+  mutating local/remote state; the existing `remote status`/`remote check`
+  read-only diagnostics are unchanged. No protocol change, no config write, no
+  remote lifecycle change. No commit SHA is invented here; the closeout commit
+  SHA is recorded in the closeout receipt when the work unit lands.
+
 - **Capability/protocol negotiation cleanup** — `a885999` (`refactor:
   centralize remote capability gates`): centralizes advertised federation ->
   cached remote-source capability mapping, adds cache-side route-method checks,
@@ -149,16 +160,12 @@ the ordering below is the recommended sequence. Each unit inherits the
 "Constraints" in the auto-continue provenance guidance below unless a future
 approved unit narrows or widens them on the record.
 
-1. **Remote management/ops polish — read-only command/diagnostic surface
-   first** — e.g. `remote list` and `remote status`/`remote check` diagnostics
-   polish. Read-only in this unit: **no** mutating config and **no** remote
-   lifecycle changes here. This is the first remaining unit.
-2. **Remote management/ops polish — mutating config/bridge lifecycle commands**
+1. **Remote management/ops polish — mutating config/bridge lifecycle commands**
    — e.g. `remote add`/`connect`/`reconnect`/`disconnect`/`remove` if approved
    in the unit. Preserve remote authority, local-config/bridge lifecycle
    boundaries, and normal confirmation gates; **no** broad host/process/server
-   management.
-3. **Setup/update orchestration** — design/implement/test in isolation only.
+   management. This is the first remaining unit.
+2. **Setup/update orchestration** — design/implement/test in isolation only.
    Live install/update of Ahmed's real hosts requires a separate explicit
    approval unless the exact action is recorded in a future approved unit; by
    default this unit does not install/update any real host.
@@ -183,9 +190,9 @@ still govern.
   committed `ROADMAP.md` on `origin/roadmap/herdr-remote-roadmap` ("Next
   queue"). Ahmed explicitly approved (chat, 2026-07-14) lining up the remaining
   queue so auto-continue can run through completion within the recorded
-  constraints. After the committed reusable soak-harness unit lands, the first
-  remaining unit is **Remote management/ops polish — read-only
-  command/diagnostic surface first** (item 1), still subject to the closeout
+  constraints. After the read-only `remote list` diagnostics unit above lands,
+  the first remaining unit is **Remote management/ops polish — mutating
+  config/bridge lifecycle commands** (item 1), still subject to the closeout
   re-checks and constraints below. A next unit that exists only in the closing
   unit's own diff does not count as provenance.
 - **Roadmap ref token.** Roadmap ref token for the roadmap-push regime

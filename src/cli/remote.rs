@@ -7,6 +7,7 @@ pub(super) fn run_remote_command(args: &[String]) -> io::Result<i32> {
     };
 
     match subcommand {
+        "list" => remote_list(&args[1..]),
         "status" => remote_status(&args[1..]),
         "check" => remote_check(&args[1..]),
         "help" | "--help" | "-h" => {
@@ -18,6 +19,22 @@ pub(super) fn run_remote_command(args: &[String]) -> io::Result<i32> {
             Ok(2)
         }
     }
+}
+
+fn remote_list(args: &[String]) -> io::Result<i32> {
+    let hosts = match configured_remote_hosts(args, "herdr remote list [HOST]")? {
+        RemoteHostSelection::Hosts(hosts) => hosts,
+        RemoteHostSelection::Exit(code) => return Ok(code),
+    };
+
+    println!(
+        "{:<20} {:<18} {:<14} {:<10} timeout",
+        "host", "target", "session", "policy"
+    );
+    for host in &hosts {
+        print_list_row(&remote_list_row(host));
+    }
+    Ok(0)
 }
 
 fn remote_status(args: &[String]) -> io::Result<i32> {
@@ -126,6 +143,36 @@ fn print_remote_check(host: &crate::remote_target::RemoteHostConfig) {
         crate::remote::remote_api_status_for_prepared_host_noninteractive(host, &prepared),
     );
     print_check_row(host, &api);
+}
+
+/// Inventory row for `remote list`. Built from a configured host without
+/// probing: it surfaces the alias, SSH target, remote session, connection
+/// policy (via [`RemoteConnectionPolicy::as_toml_str`]), and the SSH connect
+/// timeout. It opens no bridge and touches no remote host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteListRow {
+    host: String,
+    target: String,
+    session: String,
+    policy: &'static str,
+    timeout: String,
+}
+
+fn remote_list_row(host: &crate::remote_target::RemoteHostConfig) -> RemoteListRow {
+    RemoteListRow {
+        host: host.name.clone(),
+        target: host.target.clone(),
+        session: host.session.clone(),
+        policy: host.connection_policy.as_toml_str(),
+        timeout: format!("{}s", host.connect_timeout_secs),
+    }
+}
+
+fn print_list_row(row: &RemoteListRow) {
+    println!(
+        "{:<20} {:<18} {:<14} {:<10} {}",
+        row.host, row.target, row.session, row.policy, row.timeout
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,6 +439,7 @@ fn with_ssh_guidance(detail: &str) -> String {
 
 fn print_remote_help() {
     eprintln!("herdr remote commands:");
+    eprintln!("  herdr remote list [HOST]");
     eprintln!("  herdr remote status [HOST]");
     eprintln!("  herdr remote check [HOST]");
 }
@@ -494,6 +542,145 @@ mod tests {
             err,
             crate::remote_target::RemoteHostConfigError::SshTargetStartsWithDash
         );
+    }
+
+    #[test]
+    fn remote_list_row_surfaces_inventory_fields_without_probing() {
+        // remote_list_row builds the inventory view from a configured host
+        // directly: alias, SSH target, remote session, connection policy via
+        // `as_toml_str()`, and the connect timeout. It performs no IO and never
+        // reaches an SSH/probe helper.
+        let host = host("jafar", "user@jafar", "agents");
+
+        let row = remote_list_row(&host);
+
+        assert_eq!(
+            row,
+            RemoteListRow {
+                host: "jafar".to_string(),
+                target: "user@jafar".to_string(),
+                session: "agents".to_string(),
+                policy: "auto",
+                timeout: "10s".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn remote_list_row_surfaces_connection_policy_via_as_toml_str() {
+        use crate::remote_target::RemoteConnectionPolicy;
+
+        let base = host("jafar", "jafar", "default");
+        assert_eq!(
+            remote_list_row(
+                &base
+                    .clone()
+                    .with_connection_policy(RemoteConnectionPolicy::Auto)
+            )
+            .policy,
+            RemoteConnectionPolicy::Auto.as_toml_str()
+        );
+        assert_eq!(
+            remote_list_row(
+                &base
+                    .clone()
+                    .with_connection_policy(RemoteConnectionPolicy::OnDemand)
+            )
+            .policy,
+            RemoteConnectionPolicy::OnDemand.as_toml_str()
+        );
+        assert_eq!(
+            remote_list_row(&base.with_connection_policy(RemoteConnectionPolicy::Manual)).policy,
+            RemoteConnectionPolicy::Manual.as_toml_str()
+        );
+    }
+
+    #[test]
+    fn remote_list_row_surfaces_custom_connect_timeout_secs() {
+        let host = host("jafar", "jafar", "default").with_connect_timeout_secs(45);
+
+        let row = remote_list_row(&host);
+
+        assert_eq!(row.timeout, "45s");
+    }
+
+    #[test]
+    fn remote_list_routes_through_config_only_without_probing() {
+        // `remote list` shares `configured_remote_hosts` with `remote status`
+        // and `remote check`. That helper loads config, validates the registry,
+        // and resolves the optional host filter WITHOUT opening an SSH bridge,
+        // probing a remote server, or starting anything. Drive it under a
+        // temporary config to assert list inherits the
+        // disabled/no-hosts/unknown-host/invalid-config exit behavior of
+        // status/check and returns valid hosts without probing.
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let prior = std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR);
+        let temp = std::env::temp_dir().join(format!(
+            "herdr-remote-list-cfg-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        fn load_at(path: &std::path::Path, contents: &str) {
+            std::fs::write(path, contents).unwrap();
+            std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, path);
+        }
+
+        // Disabled remote federation -> exit 0 with no hosts returned.
+        load_at(&temp, "[remote]\nenabled = false\n");
+        assert_eq!(
+            configured_remote_hosts(&[], "herdr remote list [HOST]").unwrap(),
+            RemoteHostSelection::Exit(0)
+        );
+
+        // Enabled but no hosts configured -> exit 0.
+        load_at(&temp, "[remote]\nenabled = true\n");
+        assert_eq!(
+            configured_remote_hosts(&[], "herdr remote list [HOST]").unwrap(),
+            RemoteHostSelection::Exit(0)
+        );
+
+        // Enabled with a valid host, but an unknown host filter -> exit 1
+        // before any probe.
+        load_at(
+            &temp,
+            "[remote]\nenabled = true\n[[remote.hosts]]\nname = \"jafar\"\ntarget = \"jafar\"\nsession = \"default\"\n",
+        );
+        assert_eq!(
+            configured_remote_hosts(&["missing".to_string()], "herdr remote list [HOST]").unwrap(),
+            RemoteHostSelection::Exit(1)
+        );
+
+        // Invalid config (leading-dash SSH target) -> exit 1 before any probe.
+        load_at(
+            &temp,
+            "[remote]\nenabled = true\n[[remote.hosts]]\nname = \"bad\"\ntarget = \"-oProxyCommand=x\"\nsession = \"default\"\n",
+        );
+        assert_eq!(
+            configured_remote_hosts(&[], "herdr remote list [HOST]").unwrap(),
+            RemoteHostSelection::Exit(1)
+        );
+
+        // Valid configured host -> returned WITHOUT probing (no SSH/bridge/server).
+        load_at(
+            &temp,
+            "[remote]\nenabled = true\n[[remote.hosts]]\nname = \"jafar\"\ntarget = \"jafar\"\nsession = \"default\"\n",
+        );
+        let hosts = match configured_remote_hosts(&[], "herdr remote list [HOST]").unwrap() {
+            RemoteHostSelection::Hosts(hosts) => hosts,
+            other => panic!("expected hosts for valid config, got {other:?}"),
+        };
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].name, "jafar");
+
+        match prior {
+            Some(value) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, value),
+            None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+        }
+        let _ = std::fs::remove_file(&temp);
     }
 
     #[test]
