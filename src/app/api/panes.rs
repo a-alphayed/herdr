@@ -22,7 +22,10 @@ use super::super::api_helpers::{
     detect_state_from_api, encode_api_keys, encode_api_text, normalize_custom_status,
     normalize_reported_agent_label,
 };
-use super::remote_helpers::{remote_route_plan_error_body, rewrite_remote_response_id_value};
+use super::remote_helpers::{
+    parse_remote_success_response_value, remote_route_plan_error_body,
+    rewrite_remote_response_id_value,
+};
 use super::responses::{encode_error, encode_error_body, encode_success};
 use crate::remote_target::{
     plan_target_route, resolve_remote_pane_target, PlannedTargetRoute, RemotePaneResolveError,
@@ -331,6 +334,9 @@ impl App {
             Ok(value) => value,
             Err(err) => return encode_error(id, "remote_request_failed", err.to_string()),
         };
+        // Only refresh after an actual successful remote mutation; a remote
+        // error response or send failure must not touch the cache. The typed
+        // `PaneInfo` result is the genuine-success gate and yields the tab id.
         if let Ok(SuccessResponse {
             result: ResponseResult::PaneInfo { ref pane },
             ..
@@ -408,23 +414,24 @@ impl App {
                 Ok(resolved) => resolved,
                 Err(err) => return encode_error_body(id, remote_pane_resolve_error_body(err)),
             };
+        let workspace_id = resolved.workspace_id.clone();
         let request = remote_pane_close_request(id.clone(), &resolved.pane_id);
-        let value = match send(&resolved.host, &request)
+        let response_value = match send(&resolved.host, &request)
             .and_then(|response| rewrite_remote_response_id_value(&response, &id))
         {
             Ok(value) => value,
             Err(err) => return encode_error(id, "remote_request_failed", err.to_string()),
         };
-        if serde_json::from_value::<SuccessResponse>(value.clone()).is_ok() {
+        if parse_remote_success_response_value(response_value.clone()).is_some() {
             self.refresh_remote_workspace_tabs_and_projection(
                 &resolved.host,
                 &host_key,
-                &resolved.workspace_id,
+                &workspace_id,
                 None,
                 &mut send,
             );
         }
-        serde_json::to_string(&value)
+        serde_json::to_string(&response_value)
             .unwrap_or_else(|err| encode_error(id, "remote_request_failed", err.to_string()))
     }
 
@@ -531,38 +538,26 @@ impl App {
                 Ok(resolved) => resolved,
                 Err(err) => return encode_error_body(id, remote_pane_resolve_error_body(err)),
             };
+        let workspace_id = resolved.workspace_id.clone();
         let request = remote_pane_rename_request(id.clone(), &resolved.pane_id, label);
-        let value = match send(&resolved.host, &request)
+        let response_value = match send(&resolved.host, &request)
             .and_then(|response| rewrite_remote_response_id_value(&response, &id))
         {
             Ok(value) => value,
             Err(err) => return encode_error(id, "remote_request_failed", err.to_string()),
         };
-        match serde_json::from_value::<SuccessResponse>(value.clone()) {
-            Ok(SuccessResponse {
-                result: ResponseResult::PaneInfo { ref pane },
-                ..
-            }) => {
-                self.refresh_remote_workspace_tabs_and_projection(
-                    &resolved.host,
-                    &host_key,
-                    &pane.workspace_id,
-                    Some(pane.tab_id.as_str()),
-                    &mut send,
-                );
-            }
-            Ok(_) => {
-                self.refresh_remote_workspace_tabs_and_projection(
-                    &resolved.host,
-                    &host_key,
-                    &resolved.workspace_id,
-                    None,
-                    &mut send,
-                );
-            }
-            Err(_) => {}
+        // A successful refresh replaces the old limitation where a renamed
+        // remote pane's label waited for a separate supervisor poll cycle.
+        if parse_remote_success_response_value(response_value.clone()).is_some() {
+            self.refresh_remote_workspace_tabs_and_projection(
+                &resolved.host,
+                &host_key,
+                &workspace_id,
+                None,
+                &mut send,
+            );
         }
-        serde_json::to_string(&value)
+        serde_json::to_string(&response_value)
             .unwrap_or_else(|err| encode_error(id, "remote_request_failed", err.to_string()))
     }
 
@@ -613,38 +608,26 @@ impl App {
                 Ok(resolved) => resolved,
                 Err(err) => return encode_error_body(id, remote_pane_resolve_error_body(err)),
             };
+        let workspace_id = resolved.workspace_id.clone();
         let request = remote_pane_focus_request(id.clone(), &resolved.pane_id);
-        let value = match send(&resolved.host, &request)
+        let response_value = match send(&resolved.host, &request)
             .and_then(|response| rewrite_remote_response_id_value(&response, &id))
         {
             Ok(value) => value,
             Err(err) => return encode_error(id, "remote_request_failed", err.to_string()),
         };
-        match serde_json::from_value::<SuccessResponse>(value.clone()) {
-            Ok(SuccessResponse {
-                result: ResponseResult::PaneInfo { ref pane },
-                ..
-            }) => {
-                self.refresh_remote_workspace_tabs_and_projection(
-                    &resolved.host,
-                    &host_key,
-                    &pane.workspace_id,
-                    Some(pane.tab_id.as_str()),
-                    &mut send,
-                );
-            }
-            Ok(_) => {
-                self.refresh_remote_workspace_tabs_and_projection(
-                    &resolved.host,
-                    &host_key,
-                    &resolved.workspace_id,
-                    None,
-                    &mut send,
-                );
-            }
-            Err(_) => {}
+        // Focus changes `focused_pane_id`; refresh after success even though
+        // it adds a round-trip, so the cached active tab/layout stays true.
+        if parse_remote_success_response_value(response_value.clone()).is_some() {
+            self.refresh_remote_workspace_tabs_and_projection(
+                &resolved.host,
+                &host_key,
+                &workspace_id,
+                None,
+                &mut send,
+            );
         }
-        serde_json::to_string(&value)
+        serde_json::to_string(&response_value)
             .unwrap_or_else(|err| encode_error(id, "remote_request_failed", err.to_string()))
     }
 
@@ -698,23 +681,26 @@ impl App {
                 Ok(resolved) => resolved,
                 Err(err) => return encode_error_body(id, remote_pane_resolve_error_body(err)),
             };
+        let workspace_id = resolved.workspace_id.clone();
         let request = remote_pane_focus_direction_request(id.clone(), &resolved.pane_id, direction);
-        let value = match send(&resolved.host, &request)
+        let response_value = match send(&resolved.host, &request)
             .and_then(|response| rewrite_remote_response_id_value(&response, &id))
         {
             Ok(value) => value,
             Err(err) => return encode_error(id, "remote_request_failed", err.to_string()),
         };
-        if serde_json::from_value::<SuccessResponse>(value.clone()).is_ok() {
+        // Focus changes `focused_pane_id`; refresh after success even though
+        // it adds a round-trip, so the cached active tab/layout stays true.
+        if parse_remote_success_response_value(response_value.clone()).is_some() {
             self.refresh_remote_workspace_tabs_and_projection(
                 &resolved.host,
                 &host_key,
-                &resolved.workspace_id,
+                &workspace_id,
                 None,
                 &mut send,
             );
         }
-        serde_json::to_string(&value)
+        serde_json::to_string(&response_value)
             .unwrap_or_else(|err| encode_error(id, "remote_request_failed", err.to_string()))
     }
 
@@ -2437,8 +2423,8 @@ mod tests {
     use super::*;
     use crate::{
         api::schema::{
-            ErrorResponse, LayoutDescription, LayoutNode, LayoutPane, Method, SplitDirection,
-            SuccessResponse,
+            AgentStatus, ErrorResponse, LayoutDescription, LayoutNode, LayoutPane, Method,
+            SplitDirection, SuccessResponse, TabInfo,
         },
         config::Config,
         remote_source::{
@@ -3056,7 +3042,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_split_remote_request_failure_surfaces_remote_request_failed() {
+    fn pane_split_remote_request_failure_surfaces_remote_request_failed_without_cache_refresh() {
         let mut app = App::new(
             &config_with_remote_host(),
             true,
@@ -3071,19 +3057,42 @@ mod tests {
                 ..Default::default()
             },
         );
+        let host_key = RemoteHostKey::new("jafar", "default");
+        app.state.remote_sources.replace_tab_snapshot(
+            &host_key,
+            "remote-ws",
+            vec![remote_tab_info("remote-tab", "old", true, 1)],
+        );
         let host = app.remote_hosts.get("jafar").cloned().unwrap();
+        let calls = std::cell::Cell::new(0);
 
         let response = app.handle_remote_pane_split_with_sender(
             "req".into(),
             host,
             RemoteTargetSelector::Pane("remote-pane-side".to_string()),
             remote_pane_split_params(Some("jafar/pane:remote-pane-side")),
-            |_host, _request| Err(std::io::Error::other("bridge dropped")),
+            |_host, _request| {
+                calls.set(calls.get() + 1);
+                Err(std::io::Error::other("bridge dropped"))
+            },
         );
         let error: ErrorResponse = serde_json::from_str(&response).unwrap();
 
         assert_eq!(error.error.code, "remote_request_failed");
         assert!(error.error.message.contains("bridge dropped"));
+        assert_eq!(calls.get(), 1);
+        let tabs = app
+            .state
+            .remote_sources
+            .tab_snapshot_for_space(&remote_space_key())
+            .expect("tab snapshot retained");
+        assert_eq!(tabs.status, RemoteProjectionStatus::Available);
+        let projection = app
+            .state
+            .remote_sources
+            .projection_for_space(&remote_space_key())
+            .expect("projection retained");
+        assert_eq!(projection.status, RemoteProjectionStatus::Available);
     }
 
     #[test]
@@ -4679,6 +4688,59 @@ mod tests {
         host_key
     }
 
+    fn remote_space_key() -> crate::remote_source::RemoteSpaceKey {
+        crate::remote_source::RemoteSpaceKey {
+            host: "jafar".to_string(),
+            session: "default".to_string(),
+            workspace_id: "remote-ws".to_string(),
+        }
+    }
+
+    fn remote_tab_info(tab_id: &str, label: &str, focused: bool, number: usize) -> TabInfo {
+        TabInfo {
+            tab_id: tab_id.to_string(),
+            workspace_id: "remote-ws".to_string(),
+            number,
+            label: label.to_string(),
+            focused,
+            pane_count: 2,
+            agent_status: AgentStatus::Idle,
+        }
+    }
+
+    fn remote_ok_response(id: &str) -> String {
+        serde_json::to_string(&SuccessResponse {
+            id: id.to_string(),
+            result: ResponseResult::Ok {},
+        })
+        .unwrap()
+    }
+
+    fn remote_tab_list_response(tabs: Vec<TabInfo>) -> String {
+        serde_json::to_string(&SuccessResponse {
+            id: "remote-source.tab-list".to_string(),
+            result: ResponseResult::TabList { tabs },
+        })
+        .unwrap()
+    }
+
+    fn remote_layout_for_tab(tab_id: &str, focused_pane_id: &str) -> LayoutDescription {
+        let mut layout = remote_projection_layout();
+        layout.tab_id = tab_id.to_string();
+        layout.focused_pane_id = focused_pane_id.to_string();
+        layout
+    }
+
+    fn remote_layout_response(tab_id: &str, focused_pane_id: &str) -> String {
+        serde_json::to_string(&SuccessResponse {
+            id: "remote-source.layout-export".to_string(),
+            result: ResponseResult::LayoutExport {
+                layout: remote_layout_for_tab(tab_id, focused_pane_id),
+            },
+        })
+        .unwrap()
+    }
+
     #[test]
     fn pane_rename_without_remote_hosts_keeps_slash_target_local() {
         let mut app = app_with_linked_worktree();
@@ -4884,6 +4946,273 @@ mod tests {
             panic!("expected pane.focus");
         };
         assert_eq!(focus_params.pane_id, "remote-pane-focused");
+    }
+
+    #[test]
+    fn pane_focus_success_refreshes_remote_workspace_tabs_and_projection() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_focus: true,
+                tab_list: true,
+                layout_export: true,
+                ..Default::default()
+            },
+        );
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+        let mut calls = Vec::new();
+
+        let response = app.handle_remote_pane_focus_with_sender(
+            "local-req".into(),
+            host,
+            RemoteTargetSelector::Pane("remote-pane-side".to_string()),
+            |_sent_host, request| {
+                calls.push(request.clone());
+                match &request.method {
+                    Method::PaneFocus(target) => {
+                        assert_eq!(target.pane_id, "remote-pane-side");
+                        Ok(remote_ok_response("remote-focus"))
+                    }
+                    Method::TabList(params) => {
+                        assert_eq!(params.workspace_id.as_deref(), Some("remote-ws"));
+                        Ok(remote_tab_list_response(vec![remote_tab_info(
+                            "remote-tab-refreshed",
+                            "fresh",
+                            true,
+                            1,
+                        )]))
+                    }
+                    Method::LayoutExport(params) => {
+                        assert_eq!(params.tab_id.as_deref(), Some("remote-tab-refreshed"));
+                        Ok(remote_layout_response(
+                            "remote-tab-refreshed",
+                            "remote-pane-side",
+                        ))
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                }
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "local-req");
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(calls.len(), 3);
+        assert!(matches!(calls[0].method, Method::PaneFocus(_)));
+        assert!(matches!(calls[1].method, Method::TabList(_)));
+        assert!(matches!(calls[2].method, Method::LayoutExport(_)));
+
+        let tabs = app
+            .state
+            .remote_sources
+            .tab_snapshot_for_space(&remote_space_key())
+            .expect("tab snapshot refreshed");
+        assert_eq!(tabs.status, RemoteProjectionStatus::Available);
+        assert_eq!(tabs.tabs.len(), 1);
+        assert_eq!(tabs.tabs[0].tab_id, "remote-tab-refreshed");
+
+        let projection = app
+            .state
+            .remote_sources
+            .projection_for_space(&remote_space_key())
+            .expect("projection refreshed");
+        assert_eq!(projection.status, RemoteProjectionStatus::Available);
+        assert_eq!(projection.tab_id.as_deref(), Some("remote-tab-refreshed"));
+        assert_eq!(projection.tab_label.as_deref(), Some("fresh"));
+        let layout = projection.layout.expect("fresh layout");
+        assert_eq!(layout.tab_id, "remote-tab-refreshed");
+        assert_eq!(layout.focused_pane_id, "remote-pane-side");
+    }
+
+    #[test]
+    fn pane_focus_refresh_tab_list_failure_marks_cached_projection_and_tabs_stale() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        let host_key = seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_focus: true,
+                tab_list: true,
+                layout_export: true,
+                ..Default::default()
+            },
+        );
+        app.state.remote_sources.replace_tab_snapshot(
+            &host_key,
+            "remote-ws",
+            vec![remote_tab_info("remote-tab", "old", true, 1)],
+        );
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+        let mut calls = Vec::new();
+
+        let response = app.handle_remote_pane_focus_with_sender(
+            "local-req".into(),
+            host,
+            RemoteTargetSelector::Pane("remote-pane-side".to_string()),
+            |_sent_host, request| {
+                calls.push(request.clone());
+                match &request.method {
+                    Method::PaneFocus(_) => Ok(remote_ok_response("remote-focus")),
+                    Method::TabList(_) => Err(std::io::Error::other("tab.list failed")),
+                    other => panic!("failed tab.list must stop refresh before {other:?}"),
+                }
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "local-req");
+        assert_eq!(success.result, ResponseResult::Ok {});
+        assert_eq!(calls.len(), 2);
+        assert!(matches!(calls[0].method, Method::PaneFocus(_)));
+        assert!(matches!(calls[1].method, Method::TabList(_)));
+
+        let tabs = app
+            .state
+            .remote_sources
+            .tab_snapshot_for_space(&remote_space_key())
+            .expect("tab snapshot retained");
+        assert_eq!(tabs.status, RemoteProjectionStatus::StaleLastKnown);
+        assert_eq!(tabs.tabs[0].tab_id, "remote-tab");
+
+        let projection = app
+            .state
+            .remote_sources
+            .projection_for_space(&remote_space_key())
+            .expect("projection retained");
+        assert_eq!(projection.status, RemoteProjectionStatus::StaleLastKnown);
+        assert!(projection.layout.is_some());
+    }
+
+    #[test]
+    fn pane_focus_success_without_tab_list_marks_cached_projection_and_tabs_stale() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        let host_key = seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_focus: true,
+                layout_export: true,
+                ..Default::default()
+            },
+        );
+        app.state.remote_sources.replace_tab_snapshot(
+            &host_key,
+            "remote-ws",
+            vec![remote_tab_info("remote-tab", "old", true, 1)],
+        );
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+        let mut calls = 0;
+
+        let response = app.handle_remote_pane_focus_with_sender(
+            "local-req".into(),
+            host,
+            RemoteTargetSelector::Pane("remote-pane-side".to_string()),
+            |_sent_host, request| {
+                calls += 1;
+                match &request.method {
+                    Method::PaneFocus(_) => Ok(remote_ok_response("remote-focus")),
+                    other => panic!("missing tab.list must not send refresh request: {other:?}"),
+                }
+            },
+        );
+
+        let success: SuccessResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(success.id, "local-req");
+        assert_eq!(calls, 1);
+
+        let tabs = app
+            .state
+            .remote_sources
+            .tab_snapshot_for_space(&remote_space_key())
+            .expect("tab snapshot retained");
+        assert_eq!(tabs.status, RemoteProjectionStatus::StaleLastKnown);
+        assert_eq!(tabs.tabs[0].tab_id, "remote-tab");
+
+        let projection = app
+            .state
+            .remote_sources
+            .projection_for_space(&remote_space_key())
+            .expect("projection retained");
+        assert_eq!(projection.status, RemoteProjectionStatus::StaleLastKnown);
+        assert!(projection.layout.is_some());
+    }
+
+    #[test]
+    fn pane_focus_remote_error_response_does_not_refresh_or_invalidate_cache() {
+        let mut app = App::new(
+            &config_with_remote_host(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        let host_key = seed_pane_remote_projection_with_capabilities(
+            &mut app,
+            crate::remote_source::RemoteSourceCapabilities {
+                pane_focus: true,
+                tab_list: true,
+                layout_export: true,
+                ..Default::default()
+            },
+        );
+        app.state.remote_sources.replace_tab_snapshot(
+            &host_key,
+            "remote-ws",
+            vec![remote_tab_info("remote-tab", "old", true, 1)],
+        );
+        let host = app.remote_hosts.get("jafar").cloned().unwrap();
+        let mut calls = 0;
+
+        let response = app.handle_remote_pane_focus_with_sender(
+            "local-req".into(),
+            host,
+            RemoteTargetSelector::Pane("remote-pane-side".to_string()),
+            |_sent_host, request| {
+                calls += 1;
+                match &request.method {
+                    Method::PaneFocus(_) => Ok(
+                        r#"{"id":"remote-focus","error":{"code":"remote_refused","message":"nope"}}"#
+                            .to_string(),
+                    ),
+                    other => panic!("remote error must not send refresh request: {other:?}"),
+                }
+            },
+        );
+
+        let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(error.id, "local-req");
+        assert_eq!(error.error.code, "remote_refused");
+        assert_eq!(calls, 1);
+
+        let tabs = app
+            .state
+            .remote_sources
+            .tab_snapshot_for_space(&remote_space_key())
+            .expect("tab snapshot retained");
+        assert_eq!(tabs.status, RemoteProjectionStatus::Available);
+        let projection = app
+            .state
+            .remote_sources
+            .projection_for_space(&remote_space_key())
+            .expect("projection retained");
+        assert_eq!(projection.status, RemoteProjectionStatus::Available);
     }
 
     #[test]

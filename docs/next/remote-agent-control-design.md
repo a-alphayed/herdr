@@ -1537,6 +1537,39 @@ Constraints:
 - no protocol bump unless implementation changes a wire/API contract;
 - no claim that source projection is current shipped behavior until the UI slice lands.
 
+#### B.5d — Projected source/space diagnostic and full-remote command-copy affordance
+
+Projected remote source rail rows and projected remote space rows expose a
+right-click context menu with exactly two copy-only actions: **Copy remote
+diagnostics command** and **Copy full remote command**. Both actions build a
+command string and copy it to the clipboard through Herdr's existing
+clipboard-write path; neither action runs a command, opens a pane/window,
+SSHes, probes, connects, or mutates local/remote state. This is the B.5d
+escape hatch: it makes the safe CLI diagnostics (`herdr remote status` /
+`herdr remote check`) and the explicit full remote Herdr client
+(`herdr --remote <target> --session <session>`) discoverable from the
+projected UX without folding either into a primary click path.
+
+- Both actions apply the same stale/mismatch guard before copying: they
+  resolve the configured-host `RemoteHostConfig` for the alias and require
+  `config.session` to match the projected space's session. If the host
+  config is missing/stale, or the projected session does not match the
+  configured session, the action shows a `NeedsAttention` toast and does not
+  queue a clipboard write for a possibly-misleading command.
+- **Copy remote diagnostics command** builds
+  `herdr remote status <alias> && herdr remote check <alias>` from the
+  configured-host alias, shell-quoting the alias in both positions, once the
+  guard above resolves a matching config.
+- **Copy full remote command** builds `herdr --remote <target> --session
+  <session>` from the host's configured SSH `target` and configured
+  `session` (`RemoteHostConfig`), never the alias, once the guard above
+  resolves a matching config.
+- Right-clicking a remote source rail row or a remote space row opens the
+  copy-only menu; it does **not** change source selection. Primary
+  left-click source selection remains a read-model switch only — it never
+  runs full remote Herdr or diagnostics automatically. Local and blank rail
+  rows keep their existing right-click consume/no-op behavior.
+
 ### Phase 6 — Optional embedded remote panes
 
 Only if later required, and not as a substitute for source/machine projection.

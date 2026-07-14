@@ -1188,6 +1188,23 @@ impl AppState {
 
             MouseEventKind::Down(MouseButton::Right) if in_sidebar && !self.sidebar_collapsed => {
                 if self.on_source_rail(mouse.column, mouse.row) {
+                    // Right-clicking the source rail never switches the active
+                    // projected source (left-click is the read-model switch).
+                    // A configured remote source row opens the copy-only remote
+                    // source context menu; local rail rows and blank rail rows
+                    // stay consumed/no-op, preserving the existing rail
+                    // consumption behavior.
+                    if let Some(crate::app::state::SidebarSource::Remote(host)) =
+                        self.source_rail_target_at(mouse.column, mouse.row)
+                    {
+                        self.context_menu = Some(ContextMenuState {
+                            kind: ContextMenuKind::RemoteSource { host },
+                            x: mouse.column,
+                            y: mouse.row,
+                            list: MenuListState::new(0),
+                        });
+                        self.mode = Mode::ContextMenu;
+                    }
                     return None;
                 }
                 self.workspace_press = None;
@@ -1202,8 +1219,15 @@ impl AppState {
                 {
                     match target {
                         crate::ui::WorkspaceListRemoteTarget::Space { key } => {
-                            self.selected_remote_space = Some(key);
+                            self.selected_remote_space = Some(key.clone());
                             self.selected_remote_agent = None;
+                            self.context_menu = Some(ContextMenuState {
+                                kind: ContextMenuKind::RemoteSpace { key },
+                                x: mouse.column,
+                                y: mouse.row,
+                                list: MenuListState::new(0),
+                            });
+                            self.mode = Mode::ContextMenu;
                         }
                         crate::ui::WorkspaceListRemoteTarget::New { .. } => {
                             self.selected_remote_space = None;

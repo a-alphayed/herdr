@@ -4,12 +4,13 @@ use ratatui::layout::Direction;
 use ratatui::layout::Rect;
 
 #[cfg(test)]
-use crate::app::state::{PendingRemoteAttach, ToastKind, ToastNotification};
+use crate::app::state::PendingRemoteAttach;
 use crate::{
     app::{
         state::{
             AppState, ContextMenuKind, ContextMenuState, MenuListState, Mode, NavigatorStateFilter,
             RemoteProjectedPaneTarget, RemoteProjectedTabTarget, RemoteProjectedWorkspaceTarget,
+            ToastKind, ToastNotification,
         },
         App,
     },
@@ -1046,6 +1047,18 @@ pub(super) fn apply_context_menu_action(
                 Mode::Navigate
             };
         }
+        (
+            ContextMenuKind::RemoteSource { .. } | ContextMenuKind::RemoteSpace { .. },
+            Some("Copy remote diagnostics command" | "Copy full remote command"),
+        ) => {
+            // The copy affordance is clipboard/registry-backed and is exercised
+            // through apply_context_menu_action_via_api (the real dispatch
+            // path used by both mouse-click-on-item and keyboard Enter). This
+            // state-only keyboard test helper cannot resolve the remote host
+            // registry or queue the clipboard event, so it leaves the modal
+            // cleanly.
+            leave_modal(state);
+        }
         _ => leave_modal(state),
     }
 }
@@ -1484,6 +1497,9 @@ impl App {
                 self.focus_workspace_idx_via_api(ws_idx);
                 self.focus_tab_idx_via_api(tab_idx);
                 self.close_active_tab_via_api();
+                // Always leave modal: the API rejects last-tab close without mutating
+                // mode, so unconditional leave_modal is correct here.
+                leave_modal(&mut self.state);
             }
             (ContextMenuKind::RemoteProjectedPane { target }, Some("Attach in new split")) => {
                 self.state.request_remote_attach_in_new_split =
@@ -1617,7 +1633,105 @@ impl App {
                     Mode::Navigate
                 };
             }
+            (ContextMenuKind::RemoteSource { host }, Some("Copy remote diagnostics command")) => {
+                self.copy_remote_diagnostics_command(host.host, host.session);
+            }
+            (ContextMenuKind::RemoteSpace { key }, Some("Copy remote diagnostics command")) => {
+                self.copy_remote_diagnostics_command(key.host, key.session);
+            }
+            (ContextMenuKind::RemoteSource { host }, Some("Copy full remote command")) => {
+                self.copy_remote_full_command(host.host, host.session);
+            }
+            (ContextMenuKind::RemoteSpace { key }, Some("Copy full remote command")) => {
+                self.copy_remote_full_command(key.host, key.session);
+            }
             _ => leave_modal(&mut self.state),
+        }
+    }
+
+    /// Copy a built remote command string to the clipboard, queue the write so
+    /// it works on both the mouse and keyboard dispatch paths, and leave the
+    /// context menu/modal cleanly. The clipboard event drives the existing
+    /// "copied to clipboard" feedback toast.
+    fn copy_command_to_clipboard(&mut self, command: String) {
+        self.state.request_clipboard_write = Some(command.into_bytes());
+        // The keyboard context-menu path does not call
+        // queue_pending_clipboard_write after dispatch, so queue here to make
+        // the copy work regardless of how the action was triggered. This is
+        // idempotent: the mouse path queues again afterward and the second
+        // take is a no-op.
+        self.queue_pending_clipboard_write();
+        leave_modal(&mut self.state);
+    }
+
+    /// Resolve the configured remote host for a copy action, requiring the
+    /// configured session to match the projected session. Without this guard
+    /// a copied command could target a different session than the projected
+    /// space the user actually clicked. Returns an owned clone so callers can
+    /// build a command string and call `copy_command_to_clipboard` without
+    /// holding a borrow of `self.remote_hosts`. Shared by both the full
+    /// remote copy action and the diagnostics copy action so they apply the
+    /// same stale/mismatch guard.
+    fn resolve_remote_command_config(
+        &self,
+        alias: &str,
+        projected_session: &str,
+    ) -> Option<crate::remote_target::RemoteHostConfig> {
+        self.remote_hosts
+            .get(alias)
+            .filter(|config| config.session == projected_session)
+            .cloned()
+    }
+
+    /// Show the shared "remote command unavailable" `NeedsAttention` toast
+    /// used by both remote copy actions when the host config is missing/stale
+    /// or the projected session no longer matches the configured session, and
+    /// leave the context menu/modal cleanly.
+    fn show_remote_command_unavailable_toast(&mut self) {
+        self.state.toast = Some(ToastNotification {
+            kind: ToastKind::NeedsAttention,
+            title: "remote command unavailable".into(),
+            context: "remote host config is missing or stale; review remote settings".into(),
+            position: None,
+            target: None,
+        });
+        leave_modal(&mut self.state);
+    }
+
+    /// Build and copy the explicit full remote Herdr command (`herdr --remote
+    /// <target> --session <session>`) from the configured host's SSH target and
+    /// configured session. If the host config is missing/stale, or the
+    /// projected session does not match the configured session (which would
+    /// make the copied command target a different session than the projected
+    /// space the user clicked), show a `NeedsAttention` toast and do not copy a
+    /// misleading command. Never runs the command, opens a pane/window, SSHes,
+    /// probes, connects, or mutates local/remote state.
+    fn copy_remote_full_command(&mut self, alias: String, projected_session: String) {
+        match self.resolve_remote_command_config(&alias, &projected_session) {
+            Some(config) => {
+                let command =
+                    crate::remote_target::remote_full_command(&config.target, &config.session);
+                self.copy_command_to_clipboard(command);
+            }
+            None => self.show_remote_command_unavailable_toast(),
+        }
+    }
+
+    /// Build and copy the safe, non-mutating diagnostics command (`herdr
+    /// remote status <alias> && herdr remote check <alias>`) for a configured
+    /// remote host. Applies the same stale/mismatch guard as
+    /// `copy_remote_full_command`: if the host config is missing/stale, or the
+    /// projected session does not match the configured session, show a
+    /// `NeedsAttention` toast and do not queue a clipboard write for a
+    /// possibly-misleading command. Never runs the command, opens a
+    /// pane/window, SSHes, probes, connects, or mutates local/remote state.
+    fn copy_remote_diagnostics_command(&mut self, alias: String, projected_session: String) {
+        match self.resolve_remote_command_config(&alias, &projected_session) {
+            Some(config) => {
+                let command = crate::remote_target::remote_diagnostics_command(&config.name);
+                self.copy_command_to_clipboard(command);
+            }
+            None => self.show_remote_command_unavailable_toast(),
         }
     }
 }
@@ -2550,5 +2664,404 @@ mod tests {
             .expect("target set");
         assert_eq!(stored.host, "jafar");
         assert_eq!(stored.terminal_id, "term-1");
+    }
+
+    #[test]
+    fn context_menu_tab_close_via_api_leaves_context_menu_mode() {
+        // Regression: closing a tab via context menu in the API path must reset mode
+        // out of ContextMenu so subsequent mouse events are not frozen.
+        let mut app = super::super::app_for_mouse_test();
+        let mut ws = crate::workspace::Workspace::test_new("one");
+        ws.test_add_tab(None);
+        ws.test_add_tab(None);
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::ContextMenu;
+
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Tab {
+                ws_idx: 0,
+                tab_idx: 1,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let close_idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Close")
+            .expect("Close item");
+
+        app.apply_context_menu_action_via_api(menu, close_idx);
+
+        assert_eq!(
+            app.state.mode,
+            Mode::Terminal,
+            "mode must leave ContextMenu after tab close"
+        );
+        assert_eq!(app.state.workspaces[0].tabs.len(), 2);
+
+        // Prove the left-click freeze is gone: clicking a remaining tab now works.
+        crate::ui::compute_view(&mut app.state, ratatui::layout::Rect::new(0, 0, 106, 20));
+        let active_before = app.state.workspaces[0].active_tab;
+        let second_tab = app.state.view.tab_hit_areas[1];
+        app.handle_mouse(super::super::mouse(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            second_tab.x + 1,
+            second_tab.y,
+        ));
+        app.handle_mouse(super::super::mouse(
+            crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            second_tab.x + 1,
+            second_tab.y,
+        ));
+        assert_ne!(
+            app.state.workspaces[0].active_tab, active_before,
+            "left-click on a tab must switch active tab after context-menu close"
+        );
+    }
+
+    #[test]
+    fn context_menu_tab_close_via_api_last_tab_still_leaves_context_menu_mode() {
+        // When the API rejects closing the last tab, mode must still leave ContextMenu.
+        let mut app = super::super::app_for_mouse_test();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("solo")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::ContextMenu;
+
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::Tab {
+                ws_idx: 0,
+                tab_idx: 0,
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let close_idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Close")
+            .expect("Close item");
+
+        app.apply_context_menu_action_via_api(menu, close_idx);
+
+        assert_eq!(
+            app.state.mode,
+            Mode::Terminal,
+            "mode must leave ContextMenu even when last-tab close is rejected"
+        );
+        assert_eq!(
+            app.state.workspaces[0].tabs.len(),
+            1,
+            "last tab must remain"
+        );
+        assert_eq!(app.state.active, Some(0), "workspace must remain active");
+    }
+
+    fn app_with_remote_host_for_copy_menu(target: &str) -> App {
+        let mut config = crate::config::Config::default();
+        config.remote.enabled = true;
+        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
+            "jafar", target, "default", true,
+        )];
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(&config, true, None, api_rx, crate::api::EventHub::default())
+    }
+
+    fn remote_source_key_for_copy_menu() -> crate::remote_source::RemoteHostKey {
+        crate::remote_source::RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME)
+    }
+
+    fn remote_space_key_for_copy_menu() -> crate::remote_source::RemoteSpaceKey {
+        crate::remote_source::RemoteSpaceKey {
+            host: "jafar".into(),
+            session: crate::session::DEFAULT_SESSION_NAME.into(),
+            workspace_id: "remote-ws".into(),
+        }
+    }
+
+    fn take_context_menu_clipboard_event(app: &mut App) -> String {
+        assert!(
+            app.state.request_clipboard_write.is_none(),
+            "copy actions must queue a ClipboardWrite event, not leave a pending request"
+        );
+        match app.event_rx.try_recv().expect("clipboard event") {
+            crate::events::AppEvent::ClipboardWrite { content } => {
+                String::from_utf8(content).expect("utf8 clipboard")
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remote_source_copy_diagnostics_command_via_api_queues_clipboard_event() {
+        // Diagnostics copy via a RemoteSource menu queues a clipboard event with
+        // `herdr remote status <quoted-alias> && herdr remote check <quoted-alias>`,
+        // exercised through apply_context_menu_action_via_api (the real dispatch
+        // path), not only the state-only keyboard-test helper.
+        let mut app = app_with_remote_host_for_copy_menu("user@10.0.0.5");
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("local")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::ContextMenu;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::RemoteSource {
+                host: remote_source_key_for_copy_menu(),
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Copy remote diagnostics command")
+            .expect("diagnostics copy item");
+        let menu = ContextMenuState {
+            list: MenuListState::new(idx),
+            ..menu
+        };
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        let text = take_context_menu_clipboard_event(&mut app);
+        assert_eq!(
+            text,
+            "herdr remote status jafar && herdr remote check jafar"
+        );
+        assert!(app.state.toast.is_none());
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn remote_source_copy_diagnostics_command_via_api_shows_needs_attention_toast_when_host_config_missing(
+    ) {
+        // A RemoteSource menu carrying a host alias with no matching configured
+        // host must show a NeedsAttention toast and must not queue a clipboard
+        // write for a diagnostics command against an unconfigured/stale host,
+        // matching the same stale/mismatch guard as full remote copy.
+        let mut app = app_with_remote_host_for_copy_menu("user@10.0.0.5");
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("local")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::ContextMenu;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::RemoteSource {
+                host: crate::remote_source::RemoteHostKey::new(
+                    "missing-host",
+                    crate::session::DEFAULT_SESSION_NAME,
+                ),
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Copy remote diagnostics command")
+            .expect("diagnostics copy item");
+        let menu = ContextMenuState {
+            list: MenuListState::new(idx),
+            ..menu
+        };
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        assert!(
+            app.state.request_clipboard_write.is_none(),
+            "missing host config must not queue a clipboard write"
+        );
+        assert!(
+            app.event_rx.try_recv().is_err(),
+            "missing host config must not queue a ClipboardWrite event"
+        );
+        let toast = app.state.toast.as_ref().expect("NeedsAttention toast");
+        assert_eq!(toast.kind, ToastKind::NeedsAttention);
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn remote_space_copy_diagnostics_command_via_api_shows_needs_attention_toast_on_session_mismatch(
+    ) {
+        // The configured host session ("default") differs from the projected
+        // space's session, which would make a copied diagnostics command
+        // reference a stale/mismatched session. Must show a NeedsAttention
+        // toast and not copy a possibly-misleading command, matching the same
+        // stale/mismatch guard as full remote copy.
+        let mut app = app_with_remote_host_for_copy_menu("user@10.0.0.5");
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("local")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::ContextMenu;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::RemoteSpace {
+                key: crate::remote_source::RemoteSpaceKey {
+                    host: "jafar".into(),
+                    session: "stale-session".into(),
+                    workspace_id: "remote-ws".into(),
+                },
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Copy remote diagnostics command")
+            .expect("diagnostics copy item");
+        let menu = ContextMenuState {
+            list: MenuListState::new(idx),
+            ..menu
+        };
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        assert!(
+            app.state.request_clipboard_write.is_none(),
+            "session mismatch must not queue a clipboard write"
+        );
+        assert!(
+            app.event_rx.try_recv().is_err(),
+            "session mismatch must not queue a ClipboardWrite event"
+        );
+        let toast = app.state.toast.as_ref().expect("NeedsAttention toast");
+        assert_eq!(toast.kind, ToastKind::NeedsAttention);
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn remote_space_copy_full_command_via_api_uses_target_and_session_not_alias() {
+        // Full remote copy via a RemoteSpace menu uses RemoteHostConfig.target and
+        // the configured session, never the alias, exercised through
+        // apply_context_menu_action_via_api.
+        let mut app = app_with_remote_host_for_copy_menu("user@10.0.0.5");
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("local")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::ContextMenu;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::RemoteSpace {
+                key: remote_space_key_for_copy_menu(),
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Copy full remote command")
+            .expect("full remote copy item");
+        let menu = ContextMenuState {
+            list: MenuListState::new(idx),
+            ..menu
+        };
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        let text = take_context_menu_clipboard_event(&mut app);
+        assert_eq!(text, "herdr --remote user@10.0.0.5 --session default");
+        assert!(app.state.toast.is_none());
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn remote_source_copy_full_command_via_api_shows_needs_attention_toast_when_host_config_missing(
+    ) {
+        // A RemoteSource menu carrying a host alias with no matching configured
+        // host must show a NeedsAttention toast and must not queue a clipboard
+        // write for a bogus command.
+        let mut app = app_with_remote_host_for_copy_menu("user@10.0.0.5");
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("local")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::ContextMenu;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::RemoteSource {
+                host: crate::remote_source::RemoteHostKey::new(
+                    "missing-host",
+                    crate::session::DEFAULT_SESSION_NAME,
+                ),
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Copy full remote command")
+            .expect("full remote copy item");
+        let menu = ContextMenuState {
+            list: MenuListState::new(idx),
+            ..menu
+        };
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        assert!(
+            app.state.request_clipboard_write.is_none(),
+            "missing host config must not queue a clipboard write"
+        );
+        assert!(
+            app.event_rx.try_recv().is_err(),
+            "missing host config must not queue a ClipboardWrite event"
+        );
+        let toast = app.state.toast.as_ref().expect("NeedsAttention toast");
+        assert_eq!(toast.kind, ToastKind::NeedsAttention);
+        assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn remote_space_copy_full_command_via_api_shows_needs_attention_toast_on_session_mismatch() {
+        // The configured host session ("default") differs from the projected
+        // space's session, which would make the copied command target the wrong
+        // session. Must show a NeedsAttention toast and not copy a bogus command.
+        let mut app = app_with_remote_host_for_copy_menu("user@10.0.0.5");
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("local")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::ContextMenu;
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::RemoteSpace {
+                key: crate::remote_source::RemoteSpaceKey {
+                    host: "jafar".into(),
+                    session: "stale-session".into(),
+                    workspace_id: "remote-ws".into(),
+                },
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        let idx = menu
+            .items()
+            .iter()
+            .position(|item| *item == "Copy full remote command")
+            .expect("full remote copy item");
+        let menu = ContextMenuState {
+            list: MenuListState::new(idx),
+            ..menu
+        };
+
+        app.apply_context_menu_action_via_api(menu, idx);
+
+        assert!(
+            app.state.request_clipboard_write.is_none(),
+            "session mismatch must not queue a clipboard write"
+        );
+        assert!(
+            app.event_rx.try_recv().is_err(),
+            "session mismatch must not queue a ClipboardWrite event"
+        );
+        let toast = app.state.toast.as_ref().expect("NeedsAttention toast");
+        assert_eq!(toast.kind, ToastKind::NeedsAttention);
+        assert_eq!(app.state.mode, Mode::Terminal);
     }
 }
