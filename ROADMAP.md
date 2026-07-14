@@ -17,8 +17,9 @@ read-set policy).
 
 ## Current state
 
-- Active roadmap ref/tip: `origin/roadmap/herdr-remote-roadmap@a8859995f82d0f697f371b42f84a19f15bf9ba9b`
-  (`refactor: centralize remote capability gates`).
+- Active roadmap ref: `origin/roadmap/herdr-remote-roadmap`. The exact tip is
+  verified during lane closeout and recorded in closeout receipts; completed
+  entries below name landed commits where known.
 - `origin/master@aa9fcaacb36febf55d3399f917cc182f9e08ecb7` is unchanged by the
   roadmap-push regime; the roadmap branch contains that master commit via
   reconciliation `90fa69f` (`chore: reconcile remote roadmap branch`). The
@@ -105,8 +106,9 @@ was exercised; the Jafar real-host (localhost-SSH) smoke was exercised at
 runtime/manually where supported, but no landed Jafar smoke test/script is
 claimed here without a separate committed artifact citing it. A
 validation-only local/fake multi-host sleep/offline/wake soak is recorded
-below; no real-host multi-host sleep/offline/wake soak commit exists yet (see
-"Next queue").
+below, followed by the committed reusable multi-host soak harness and its
+short isolated PASS. No full real-host multi-host sleep/offline/wake soak has
+been run yet.
 
 - **Validation-only local/fake multi-host soak — PASS (2026-07-13)**:
   receipt `.local/reviews/multi-host-local-soak-closeout-receipt.md`. Scope
@@ -122,6 +124,22 @@ below; no real-host multi-host sleep/offline/wake soak commit exists yet (see
   this unit produced evidence only and there is no source commit to
   roadmap-push; the hold was specifically before any real-host soak or next
   roadmap slice.
+- **Committed reusable multi-host soak harness + short isolated PASS
+  (2026-07-14)**: this unit added `scripts/soak_remote_api_bridge_multi_host.sh`
+  — a reusable Docker/localhost-SSH multi-host soak harness for the federated
+  remote-API bridge (multi-host sleep/offline/wake cycling, bounded offline
+  detection, online-host isolation, wake/reconnect, host-qualified identity
+  checks). It was validated with a short isolated run (no real hosts; temp
+  `herdr-fed-soak-*` Docker/localhost-SSH fake remotes only) against the
+  validation binary (sha256
+  `be2631e6e29a767f4af2b03b20c4df9fb39928cf0abc39bb9c7c393177fb1af9`); PASS
+  line: `PASS: multi-host local soak completed elapsed=47s cycles=1
+  hosts=herdr-fed-soak-a herdr-fed-soak-b`. Artifact dir:
+  `.local/reviews/real-configured-host-soak-short-20260714T205244Z/`. Scope was
+  non-destructive/validation-only: **no** real-host install/update or
+  destructive remote ops were run, and fake-remote cleanup was confirmed (no
+  `herdr-fed-soak-*` containers or images left). No commit SHA is invented for
+  this unit's own commit.
 
 ## Next queue
 
@@ -131,24 +149,16 @@ the ordering below is the recommended sequence. Each unit inherits the
 "Constraints" in the auto-continue provenance guidance below unless a future
 approved unit narrows or widens them on the record.
 
-1. **Real configured-host sleep/offline/wake soak and/or committed soak
-   harness** — the next step beyond the completed local/fake Docker/localhost-SSH
-   multi-host soak recorded above. It may use only configured/approved real
-   hosts or an explicitly committed reusable harness/artifact approved in this
-   unit; non-destructive diagnostics/control flows only (read-only
-   status/check, projected attach, headless submit); **no** live
-   install/update, **no** destructive remote actions, **no** PID kill, **no**
-   server/host teardown. This is the first remaining unit.
-2. **Remote management/ops polish — read-only command/diagnostic surface
+1. **Remote management/ops polish — read-only command/diagnostic surface
    first** — e.g. `remote list` and `remote status`/`remote check` diagnostics
    polish. Read-only in this unit: **no** mutating config and **no** remote
-   lifecycle changes here.
-3. **Remote management/ops polish — mutating config/bridge lifecycle commands**
+   lifecycle changes here. This is the first remaining unit.
+2. **Remote management/ops polish — mutating config/bridge lifecycle commands**
    — e.g. `remote add`/`connect`/`reconnect`/`disconnect`/`remove` if approved
    in the unit. Preserve remote authority, local-config/bridge lifecycle
    boundaries, and normal confirmation gates; **no** broad host/process/server
    management.
-4. **Setup/update orchestration** — design/implement/test in isolation only.
+3. **Setup/update orchestration** — design/implement/test in isolation only.
    Live install/update of Ahmed's real hosts requires a separate explicit
    approval unless the exact action is recorded in a future approved unit; by
    default this unit does not install/update any real host.
@@ -169,18 +179,15 @@ next-unit provenance instead of trusting continuity prose. It does not by
 itself authorize anything; the global auto-continue policy and preconditions
 still govern.
 
-- **Next-unit source / provenance.** The accepted next-unit source is this
-  committed `ROADMAP.md` ("Next queue"). Ahmed explicitly approved (chat,
-  2026-07-14) lining up the remaining queue so auto-continue can run through
-  completion within the recorded constraints. Because this `ROADMAP.md` update
-  is authored in the current unit, the **immediate first succession** is
-  authorized by Ahmed's explicit approval recorded here; **after this unit
-  lands**, the committed `ROADMAP.md` on `origin/roadmap/herdr-remote-roadmap`
-  is the durable base-branch next-unit source for later successions. The first
-  remaining unit is **Real configured-host sleep/offline/wake soak and/or
-  committed soak harness** (item 1). A next unit that exists only in the
-  closing unit's own diff does
-  not count as provenance.
+- **Next-unit source / provenance.** The accepted next-unit source is the
+  committed `ROADMAP.md` on `origin/roadmap/herdr-remote-roadmap` ("Next
+  queue"). Ahmed explicitly approved (chat, 2026-07-14) lining up the remaining
+  queue so auto-continue can run through completion within the recorded
+  constraints. After the committed reusable soak-harness unit lands, the first
+  remaining unit is **Remote management/ops polish — read-only
+  command/diagnostic surface first** (item 1), still subject to the closeout
+  re-checks and constraints below. A next unit that exists only in the closing
+  unit's own diff does not count as provenance.
 - **Roadmap ref token.** Roadmap ref token for the roadmap-push regime
   (regime 2): `herdr-remote-roadmap`. The Orchestrator must validate it
   (`git check-ref-format refs/heads/roadmap/herdr-remote-roadmap`) before any
