@@ -8,8 +8,8 @@ use crate::api::schema::{
 use crate::app::{App, Mode};
 
 use super::remote_helpers::{
-    parse_remote_success_response_value, remote_route_plan_error_body,
-    rewrite_remote_response_id_value,
+    parse_remote_success_response_value, remote_capability_unavailable_body,
+    remote_route_plan_error_body, rewrite_remote_response_id_value,
 };
 use super::responses::{encode_error, encode_error_body, encode_success};
 use crate::remote_target::{
@@ -79,13 +79,6 @@ fn remote_host_not_connected_body(host: &str, status: String, noun: &str) -> Err
         message: format!(
             "remote host {host} is {status}; wait for it to reconnect before mutating a remote {noun}"
         ),
-    }
-}
-
-fn remote_capability_unavailable_body(host: &str, method: &str) -> ErrorBody {
-    ErrorBody {
-        code: "remote_capability_unavailable".to_string(),
-        message: format!("remote host {host} does not advertise federation method {method}"),
     }
 }
 
@@ -189,7 +182,7 @@ impl App {
             .state
             .remote_sources
             .host_capabilities(&host_key)
-            .tab_create
+            .supports_route_method(crate::api::schema::FederationCapabilities::TAB_CREATE)
         {
             return encode_error_body(
                 id,
@@ -260,7 +253,7 @@ impl App {
             .state
             .remote_sources
             .host_capabilities(&host_key)
-            .tab_focus
+            .supports_route_method(crate::api::schema::FederationCapabilities::TAB_FOCUS)
         {
             return encode_error_body(
                 id,
@@ -330,7 +323,7 @@ impl App {
             .state
             .remote_sources
             .host_capabilities(&host_key)
-            .tab_close
+            .supports_route_method(crate::api::schema::FederationCapabilities::TAB_CLOSE)
         {
             return encode_error_body(
                 id,
@@ -697,7 +690,7 @@ impl App {
             .state
             .remote_sources
             .host_capabilities(&host_key)
-            .tab_rename
+            .supports_route_method(crate::api::schema::FederationCapabilities::TAB_RENAME)
         {
             return encode_error_body(
                 id,

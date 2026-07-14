@@ -150,6 +150,79 @@ pub(crate) struct RemoteSourceCapabilities {
     pub(crate) layout_export: bool,
 }
 
+impl RemoteSourceCapabilities {
+    /// Build cached route-relevant capabilities from advertised federation
+    /// capabilities.
+    ///
+    /// Centralizes the advertised -> cached mapping so the cached booleans stay
+    /// in lockstep with the [`crate::api::schema::FederationCapabilities`] method
+    /// constants. Required supervisor-ping methods (`remote_api_bridge`,
+    /// `agent_list_local`) are intentionally not cached here: their absence is a
+    /// ping-level failure handled by the supervisor, not a route-level gate. A
+    /// remote advertising only the required ping methods still connects, with
+    /// every optional cached boolean `false`.
+    pub(crate) fn from_federation(federation: &crate::api::schema::FederationCapabilities) -> Self {
+        use crate::api::schema::FederationCapabilities as F;
+        Self {
+            workspace_list_local: federation.supports_method(F::WORKSPACE_LIST_LOCAL),
+            workspace_create: federation.supports_method(F::WORKSPACE_CREATE),
+            workspace_rename: federation.supports_method(F::WORKSPACE_RENAME),
+            tab_list: federation.supports_method(F::TAB_LIST),
+            tab_create: federation.supports_method(F::TAB_CREATE),
+            tab_focus: federation.supports_method(F::TAB_FOCUS),
+            tab_close: federation.supports_method(F::TAB_CLOSE),
+            tab_rename: federation.supports_method(F::TAB_RENAME),
+            pane_split: federation.supports_method(F::PANE_SPLIT),
+            pane_close: federation.supports_method(F::PANE_CLOSE),
+            pane_rename: federation.supports_method(F::PANE_RENAME),
+            pane_focus: federation.supports_method(F::PANE_FOCUS),
+            pane_focus_direction: federation.supports_method(F::PANE_FOCUS_DIRECTION),
+            layout_export: federation.supports_method(F::LAYOUT_EXPORT),
+        }
+    }
+
+    /// Cache-side bridge from a federation method constant to the cached boolean
+    /// a route-level missing-capability gate checks.
+    ///
+    /// This is distinct from
+    /// [`crate::api::schema::FederationCapabilities::supports_method`], which
+    /// tests the *advertised* method set. `supports_route_method` tests the
+    /// *cached* booleans (sourced from a successful supervisor ping), so a
+    /// disconnected/stale host correctly reports `false` for every route method
+    /// even if its last-advertised capabilities listed it. Route gates must read
+    /// this off capabilities obtained via
+    /// [`RemoteSourceCache::host_capabilities`], never off raw advertised
+    /// `FederationCapabilities`, so the disconnect/stale lifecycle stays
+    /// authoritative.
+    ///
+    /// Exhaustive over the cached fields relevant to projection/control routes
+    /// (workspace create/list_local/rename, tab list/create/focus/close/rename,
+    /// pane split/close/rename/focus/focus_direction, layout export). Returns
+    /// `false` for required ping methods (`remote_api_bridge`,
+    /// `agent_list_local`), the persistent bridge/terminal-attach methods, or any
+    /// unrecognized method constant.
+    pub(crate) fn supports_route_method(&self, method: &str) -> bool {
+        use crate::api::schema::FederationCapabilities as F;
+        match method {
+            F::WORKSPACE_LIST_LOCAL => self.workspace_list_local,
+            F::WORKSPACE_CREATE => self.workspace_create,
+            F::WORKSPACE_RENAME => self.workspace_rename,
+            F::TAB_LIST => self.tab_list,
+            F::TAB_CREATE => self.tab_create,
+            F::TAB_FOCUS => self.tab_focus,
+            F::TAB_CLOSE => self.tab_close,
+            F::TAB_RENAME => self.tab_rename,
+            F::PANE_SPLIT => self.pane_split,
+            F::PANE_CLOSE => self.pane_close,
+            F::PANE_RENAME => self.pane_rename,
+            F::PANE_FOCUS => self.pane_focus,
+            F::PANE_FOCUS_DIRECTION => self.pane_focus_direction,
+            F::LAYOUT_EXPORT => self.layout_export,
+            _ => false,
+        }
+    }
+}
+
 /// Projection availability for a single remote workspace's active-tab layout.
 ///
 /// Projections are rebuildable soft state, like the rest of this cache: a fetch
@@ -915,6 +988,113 @@ mod tests {
             }
         );
         assert!(!cache.host_supports_workspace_create(&other));
+    }
+
+    #[test]
+    fn remote_source_capabilities_from_federation_maps_advertised_methods_to_cached_booleans() {
+        use crate::api::schema::FederationCapabilities;
+
+        // Advertising the full current federation method set caches every
+        // route-relevant boolean true.
+        let full = RemoteSourceCapabilities::from_federation(&FederationCapabilities::current());
+        assert!(full.workspace_list_local);
+        assert!(full.workspace_create);
+        assert!(full.workspace_rename);
+        assert!(full.tab_list);
+        assert!(full.tab_create);
+        assert!(full.tab_focus);
+        assert!(full.tab_close);
+        assert!(full.tab_rename);
+        assert!(full.pane_split);
+        assert!(full.pane_close);
+        assert!(full.pane_rename);
+        assert!(full.pane_focus);
+        assert!(full.pane_focus_direction);
+        assert!(full.layout_export);
+
+        // Advertising none of the route-relevant methods caches all booleans
+        // false, matching the default (a remote that advertises only the
+        // required ping methods still connects with empty cached capabilities).
+        let empty = RemoteSourceCapabilities::from_federation(&FederationCapabilities {
+            methods: Vec::new(),
+        });
+        assert_eq!(empty, RemoteSourceCapabilities::default());
+
+        // Advertising a subset caches exactly that subset.
+        let partial = RemoteSourceCapabilities::from_federation(&FederationCapabilities {
+            methods: [
+                FederationCapabilities::TAB_LIST,
+                FederationCapabilities::PANE_SPLIT,
+                FederationCapabilities::REMOTE_API_BRIDGE,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        });
+        assert!(partial.tab_list);
+        assert!(partial.pane_split);
+        assert!(!partial.tab_create);
+        assert!(!partial.layout_export);
+        // Required ping methods are not route-relevant cached capabilities, so
+        // advertising `remote_api_bridge` alone does not flip any cached boolean.
+        assert!(!partial.workspace_list_local);
+    }
+
+    #[test]
+    fn remote_source_supports_route_method_maps_known_constants_and_returns_false_for_unknown() {
+        use crate::api::schema::FederationCapabilities as F;
+
+        // A mixed cached capability set: odd-indexed fields true, even false, so
+        // every constant maps to a distinct expected boolean.
+        let capabilities = RemoteSourceCapabilities {
+            workspace_list_local: true,
+            workspace_create: false,
+            workspace_rename: true,
+            tab_list: false,
+            tab_create: true,
+            tab_focus: false,
+            tab_close: true,
+            tab_rename: false,
+            pane_split: true,
+            pane_close: false,
+            pane_rename: true,
+            pane_focus: false,
+            pane_focus_direction: true,
+            layout_export: false,
+        };
+
+        // Known route-method constants map to their cached booleans.
+        assert!(capabilities.supports_route_method(F::WORKSPACE_LIST_LOCAL));
+        assert!(!capabilities.supports_route_method(F::WORKSPACE_CREATE));
+        assert!(capabilities.supports_route_method(F::WORKSPACE_RENAME));
+        assert!(!capabilities.supports_route_method(F::TAB_LIST));
+        assert!(capabilities.supports_route_method(F::TAB_CREATE));
+        assert!(!capabilities.supports_route_method(F::TAB_FOCUS));
+        assert!(capabilities.supports_route_method(F::TAB_CLOSE));
+        assert!(!capabilities.supports_route_method(F::TAB_RENAME));
+        assert!(capabilities.supports_route_method(F::PANE_SPLIT));
+        assert!(!capabilities.supports_route_method(F::PANE_CLOSE));
+        assert!(capabilities.supports_route_method(F::PANE_RENAME));
+        assert!(!capabilities.supports_route_method(F::PANE_FOCUS));
+        assert!(capabilities.supports_route_method(F::PANE_FOCUS_DIRECTION));
+        assert!(!capabilities.supports_route_method(F::LAYOUT_EXPORT));
+
+        // Required ping methods, persistent bridge, and terminal attach are not
+        // route-relevant cached capabilities, so they always return false even
+        // when the host is otherwise fully capable.
+        assert!(!capabilities.supports_route_method(F::REMOTE_API_BRIDGE));
+        assert!(!capabilities.supports_route_method(F::AGENT_LIST_LOCAL));
+        assert!(!capabilities.supports_route_method(F::REMOTE_API_BRIDGE_PERSISTENT));
+        assert!(!capabilities.supports_route_method(F::TERMINAL_ATTACH));
+
+        // Unknown / non-cached method constants return false.
+        assert!(!capabilities.supports_route_method("not_a_real_method"));
+        assert!(!capabilities.supports_route_method(""));
+
+        // A default (empty) capability set reports false for every route method.
+        let empty = RemoteSourceCapabilities::default();
+        assert!(!empty.supports_route_method(F::PANE_SPLIT));
+        assert!(!empty.supports_route_method(F::TAB_CREATE));
     }
 
     #[test]

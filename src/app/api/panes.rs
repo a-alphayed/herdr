@@ -23,8 +23,8 @@ use super::super::api_helpers::{
     normalize_reported_agent_label,
 };
 use super::remote_helpers::{
-    parse_remote_success_response_value, remote_route_plan_error_body,
-    rewrite_remote_response_id_value,
+    parse_remote_success_response_value, remote_capability_unavailable_body,
+    remote_route_plan_error_body, rewrite_remote_response_id_value,
 };
 use super::responses::{encode_error, encode_error_body, encode_success};
 use crate::remote_target::{
@@ -307,11 +307,11 @@ impl App {
             .state
             .remote_sources
             .host_capabilities(&host_key)
-            .pane_split
+            .supports_route_method(crate::api::schema::FederationCapabilities::PANE_SPLIT)
         {
             return encode_error_body(
                 id,
-                Self::remote_pane_capability_unavailable_body(
+                remote_capability_unavailable_body(
                     &host.name,
                     crate::api::schema::FederationCapabilities::PANE_SPLIT,
                 ),
@@ -399,11 +399,11 @@ impl App {
             .state
             .remote_sources
             .host_capabilities(&host_key)
-            .pane_close
+            .supports_route_method(crate::api::schema::FederationCapabilities::PANE_CLOSE)
         {
             return encode_error_body(
                 id,
-                Self::remote_pane_capability_unavailable_body(
+                remote_capability_unavailable_body(
                     &host.name,
                     crate::api::schema::FederationCapabilities::PANE_CLOSE,
                 ),
@@ -456,13 +456,6 @@ impl App {
                     host.name
                 ),
             })
-        }
-    }
-
-    fn remote_pane_capability_unavailable_body(host: &str, method: &str) -> ErrorBody {
-        ErrorBody {
-            code: "remote_capability_unavailable".to_string(),
-            message: format!("remote host {host} does not advertise federation method {method}"),
         }
     }
 
@@ -523,11 +516,11 @@ impl App {
             .state
             .remote_sources
             .host_capabilities(&host_key)
-            .pane_rename
+            .supports_route_method(crate::api::schema::FederationCapabilities::PANE_RENAME)
         {
             return encode_error_body(
                 id,
-                Self::remote_pane_capability_unavailable_body(
+                remote_capability_unavailable_body(
                     &host.name,
                     crate::api::schema::FederationCapabilities::PANE_RENAME,
                 ),
@@ -593,11 +586,11 @@ impl App {
             .state
             .remote_sources
             .host_capabilities(&host_key)
-            .pane_focus
+            .supports_route_method(crate::api::schema::FederationCapabilities::PANE_FOCUS)
         {
             return encode_error_body(
                 id,
-                Self::remote_pane_capability_unavailable_body(
+                remote_capability_unavailable_body(
                     &host.name,
                     crate::api::schema::FederationCapabilities::PANE_FOCUS,
                 ),
@@ -666,11 +659,11 @@ impl App {
             .state
             .remote_sources
             .host_capabilities(&host_key)
-            .pane_focus_direction
+            .supports_route_method(crate::api::schema::FederationCapabilities::PANE_FOCUS_DIRECTION)
         {
             return encode_error_body(
                 id,
-                Self::remote_pane_capability_unavailable_body(
+                remote_capability_unavailable_body(
                     &host.name,
                     crate::api::schema::FederationCapabilities::PANE_FOCUS_DIRECTION,
                 ),

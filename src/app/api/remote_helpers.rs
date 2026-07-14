@@ -43,6 +43,21 @@ pub(super) fn parse_remote_success_response_value(
     serde_json::from_value(value).ok()
 }
 
+/// Shared `remote_capability_unavailable` error body for route-level
+/// missing-capability gates.
+///
+/// `method` is the advertised federation method constant the route requires
+/// (e.g. [`crate::api::schema::FederationCapabilities::PANE_SPLIT`]). The code
+/// and message shape are part of the documented JSON API contract and must stay
+/// stable: code `remote_capability_unavailable`, message
+/// `remote host {host} does not advertise federation method {method}`.
+pub(super) fn remote_capability_unavailable_body(host: &str, method: &str) -> ErrorBody {
+    ErrorBody {
+        code: "remote_capability_unavailable".to_string(),
+        message: format!("remote host {host} does not advertise federation method {method}"),
+    }
+}
+
 pub(super) fn remote_route_plan_error_body(err: RemoteRoutePlanError) -> ErrorBody {
     match err {
         RemoteRoutePlanError::Parse(err) => ErrorBody {

@@ -6,7 +6,10 @@ use crate::api::schema::{
 };
 use crate::app::App;
 
-use super::remote_helpers::{remote_route_plan_error_body, rewrite_remote_response_id_value};
+use super::remote_helpers::{
+    remote_capability_unavailable_body, remote_route_plan_error_body,
+    rewrite_remote_response_id_value,
+};
 use super::responses::{encode_error, encode_error_body, encode_success};
 use crate::remote_target::{
     parse_target_route, resolve_remote_workspace_target, RemoteTargetSelector,
@@ -181,18 +184,14 @@ impl App {
             .state
             .remote_sources
             .host_capabilities(&host_key)
-            .workspace_rename
+            .supports_route_method(crate::api::schema::FederationCapabilities::WORKSPACE_RENAME)
         {
             return encode_error_body(
                 id,
-                crate::api::schema::ErrorBody {
-                    code: "remote_capability_unavailable".to_string(),
-                    message: format!(
-                        "remote host {} does not advertise federation method {}",
-                        host.name,
-                        crate::api::schema::FederationCapabilities::WORKSPACE_RENAME
-                    ),
-                },
+                remote_capability_unavailable_body(
+                    &host.name,
+                    crate::api::schema::FederationCapabilities::WORKSPACE_RENAME,
+                ),
             );
         }
         let resolved =

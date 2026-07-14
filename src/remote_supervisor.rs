@@ -730,38 +730,7 @@ pub(crate) fn parse_ping_response(response: &str) -> io::Result<RemoteSourceCapa
                     ));
                 }
             }
-            Ok(RemoteSourceCapabilities {
-                workspace_list_local: federation.supports_method(
-                    crate::api::schema::FederationCapabilities::WORKSPACE_LIST_LOCAL,
-                ),
-                workspace_create: federation
-                    .supports_method(crate::api::schema::FederationCapabilities::WORKSPACE_CREATE),
-                workspace_rename: federation
-                    .supports_method(crate::api::schema::FederationCapabilities::WORKSPACE_RENAME),
-                tab_list: federation
-                    .supports_method(crate::api::schema::FederationCapabilities::TAB_LIST),
-                tab_create: federation
-                    .supports_method(crate::api::schema::FederationCapabilities::TAB_CREATE),
-                tab_focus: federation
-                    .supports_method(crate::api::schema::FederationCapabilities::TAB_FOCUS),
-                tab_close: federation
-                    .supports_method(crate::api::schema::FederationCapabilities::TAB_CLOSE),
-                tab_rename: federation
-                    .supports_method(crate::api::schema::FederationCapabilities::TAB_RENAME),
-                pane_split: federation
-                    .supports_method(crate::api::schema::FederationCapabilities::PANE_SPLIT),
-                pane_close: federation
-                    .supports_method(crate::api::schema::FederationCapabilities::PANE_CLOSE),
-                pane_rename: federation
-                    .supports_method(crate::api::schema::FederationCapabilities::PANE_RENAME),
-                pane_focus: federation
-                    .supports_method(crate::api::schema::FederationCapabilities::PANE_FOCUS),
-                pane_focus_direction: federation.supports_method(
-                    crate::api::schema::FederationCapabilities::PANE_FOCUS_DIRECTION,
-                ),
-                layout_export: federation
-                    .supports_method(crate::api::schema::FederationCapabilities::LAYOUT_EXPORT),
-            })
+            Ok(RemoteSourceCapabilities::from_federation(&federation))
         }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
