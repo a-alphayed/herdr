@@ -1139,7 +1139,7 @@ mod tests {
             let window = (base.as_secs() / 4).clamp(1, REMOTE_SOURCE_TRANSIENT_JITTER_WINDOW_SECS);
             let values = [
                 transient_retry_interval(index, "jafar", "default"),
-                transient_retry_interval(index, "home-mini", "dev"),
+                transient_retry_interval(index, "brain", "dev"),
                 transient_retry_interval(index, "steamdeck", "work"),
             ];
             for value in values {
@@ -1158,7 +1158,7 @@ mod tests {
         // below-cap index, so they do not all retry on the same wall-clock tick.
         let de_synchronized = (0u32..5).any(|index| {
             transient_retry_interval(index, "jafar", "default")
-                != transient_retry_interval(index, "home-mini", "default")
+                != transient_retry_interval(index, "brain", "default")
         });
         assert!(
             de_synchronized,
@@ -1177,7 +1177,7 @@ mod tests {
         for index in 5u32..12 {
             for (host, session) in [
                 ("jafar", "default"),
-                ("home-mini", "dev"),
+                ("brain", "dev"),
                 ("steamdeck", "work"),
             ] {
                 let value = transient_retry_interval(index, host, session);
