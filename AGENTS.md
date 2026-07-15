@@ -30,7 +30,7 @@ Ahmed's daily Herdr is this fork, not vanilla/upstream Herdr. Do not reinstall o
 - Linux dev launcher: `herdr-dev` / `/home/amf/.local/bin/ghostty-herdr-dev`, which opens Ghostty around `/home/amf/Projects/herdr/target/debug/herdr`.
 - Main config/state: `~/.config/herdr` and `~/.local/state/herdr`.
 - Dev config/state: `~/.config/herdr-dev` and `~/.local/state/herdr-dev`.
-- `home-mini` main command: `/opt/homebrew/bin/herdr -> /Users/afayed/.local/bin/herdr`, installed from the same fork build shape. The source checkout lives at `/Users/afayed/Projects/herdr`.
+- `brain` main command: `/opt/homebrew/bin/herdr -> /Users/afayed/.local/bin/herdr`, installed from the same fork build shape. The source checkout lives at `/Users/afayed/Projects/herdr`.
 
 Use the main install for Ahmed's real workflow. Use the dev launcher or explicit source-built dev binary for runtime validation. Keep main and dev servers/config/state separate; do not run dev tests in the main workflow server.
 
