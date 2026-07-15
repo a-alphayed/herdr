@@ -17,17 +17,18 @@ read-set policy).
 
 ## Current state
 
-- Active roadmap ref: `origin/roadmap/herdr-remote-roadmap`. The exact tip is
-  verified during lane closeout and recorded in closeout receipts; completed
-  entries below name landed commits where known.
-- `origin/master@aa9fcaacb36febf55d3399f917cc182f9e08ecb7` is unchanged by the
-  roadmap-push regime; the roadmap branch contains that master commit via
-  reconciliation `90fa69f` (`chore: reconcile remote roadmap branch`). The
-  roadmap regime never fast-forwards or pushes `master`/shared refs.
+- `origin/master` tip: `36aa263167d117aa9d9cced2369754cdf87b8fe8`
+  (`chore: rename home-mini test fixtures`).
+- No active roadmap ref/token at this documentation gate. The prior
+  `herdr-remote-roadmap` roadmap is complete and landed to
+  `origin/master@5217edc4c55008155fac101b41a9c04544284770`; the
+  `refs/heads/roadmap/herdr-remote-roadmap` ref was deleted on both the remote
+  and the local checkout after landing. No roadmap-push regime is active.
 - Lane workflow default: on; lane mode default: non-interactive. No standing
-  project trunk/shared auto-land opt-in; `lane auto-continue on` is active for
-  the committed `herdr-remote-roadmap` roadmap per recorded runtime state and
-  the global auto-continue preconditions. See `AGENTS.md` "Local lane closeout
+  project trunk/shared auto-land opt-in. No active auto-continue roadmap regime
+  is recorded in runtime lane state at this documentation gate. The proposed
+  `herdr-follow-on-roadmap` token recorded for the new queue below is **not**
+  activated by this ROADMAP-only unit. See `AGENTS.md` "Local lane closeout
   policy" and the global lane policy.
 
 The remote-agent control sequence that lets a local Herdr controller reach an
@@ -63,13 +64,17 @@ landed and exercised end to end:
 
 Remote hosts remain authoritative for PTYs, panes, hooks, persistence, and
 child processes; the local node only aggregates, caches, and routes/proxies.
-`bb7d717` polished the projected remote space UI; the still-open source
-projection UX parity items (B.4a/B.5b/B.5c/B.5d) are tracked below where not
-already satisfied by that polish.
+`bb7d717` polished the projected remote space UI; remaining source-projection
+UX gaps are audited and implemented as the Meta-Herdr R6.2 projected-UX gap
+audit and bounded UX implementation units of the Next queue below (anchored to
+the committed `### Next presentation layer — Source/machine projection`
+section and the B.5d affordance, not the legacy B.4a/B.5b/B.5c labels).
 
 ## Completed history (remote roadmap)
 
-Landed resilience/control units on `origin/roadmap/herdr-remote-roadmap`,
+Landed resilience/control units from the prior `herdr-remote-roadmap` roadmap
+(now landed to `origin/master@5217edc4c55008155fac101b41a9c04544284770`; the
+`refs/heads/roadmap/herdr-remote-roadmap` ref was deleted after landing),
 newest first:
 
 - **Setup/update orchestration (`remote setup`, explicit configured-host
@@ -92,10 +97,11 @@ newest first:
   `prepare_remote_herdr`/`ensure_remote_server_ready` and an existing
   capability-gated ping; the Windows stub returns the existing unsupported-
   remote error. Runtime bridge lifecycle commands (`remote connect`/
-  `reconnect`/`disconnect`) remain deferred future work, distinct from
-  `remote setup`. No protocol change. No commit SHA is invented here; the
-  closeout commit SHA is recorded in the closeout receipt when the work unit
-  lands.
+  `reconnect`/`disconnect`) were not shipped in this slice (they are now
+  queued as the runtime bridge lifecycle commands unit, the first of the
+  remaining Next queue), distinct from `remote setup`. No protocol
+  change. No commit SHA is invented here; the closeout commit SHA is recorded
+  in the closeout receipt when the work unit lands.
 
 - **Remote management/ops polish — mutating config commands (`remote add`/
   `remote remove`, config-only)** — added the local-config-only `herdr remote
@@ -108,8 +114,9 @@ newest first:
   local-config mutations: they open no SSH bridge, probe nothing, install/start/
   update nothing, kill no processes, close no panes, and delete no remote state.
   Runtime bridge lifecycle commands (`remote connect`/`reconnect`/`disconnect`)
-  and interactive provisioning are explicitly **not** shipped in this slice —
-  they remain future work requiring real host-specific runtime API. No protocol
+  and interactive provisioning are explicitly **not** shipped in this slice
+  (the lifecycle commands are now queued as the runtime bridge lifecycle
+  commands unit, the first of the remaining Next queue). No protocol
   change. No commit SHA is invented here; the closeout commit SHA is recorded
   in the closeout receipt when the work unit lands.
 
@@ -129,8 +136,8 @@ newest first:
   cached remote-source capability mapping, adds cache-side route-method checks,
   and deduplicates `remote_capability_unavailable`; behavior preserved.
 - **Stale projection reconciliation / master repair** — `aa9fcaa` (`fix: refresh
-  stale projected pane cache`, also `origin/master` tip) plus reconciliation
-  `90fa69f` (`chore: reconcile remote roadmap branch`) that lands the master
+  stale projected pane cache`) plus reconciliation `90fa69f` (`chore: reconcile
+  remote roadmap branch`) that lands the master
   commit onto the roadmap branch without touching `master`/shared.
 - **Safe command queue/retry policy** — `e5bc124` (`docs: codify remote command
   retry policy`): preserves non-idempotent/uncertain-delivery rules (no
@@ -149,9 +156,10 @@ Projection UX / Meta-Herdr R6.2 status: `bb7d717` (`feat: polish projected
 remote space UI`) polished the projected remote space UI and `898e6d4` (`feat:
 add projected remote command copy affordance`) added a projected remote command
 copy affordance. The remaining Meta-Herdr R6.2 projected-UX gap audit and any
-B.4a/B.5b/B.5c/B.5d UX work not already satisfied by those commits is **not**
-marked complete and is explicitly deferred out of this auto-continue queue (see
-"Deferred / out of auto-continue queue" below); it is not silently dropped.
+UX work not already satisfied by those commits is **not** marked complete; it
+is queued as the Meta-Herdr R6.2 projected-UX gap audit and bounded UX
+implementation units of the Next queue below (re-sourced 2026-07-15), not
+silently dropped.
 
 Existing validation coverage: the controlled one-hop Docker federation smoke
 was exercised; the Jafar real-host (localhost-SSH) smoke was exercised at
@@ -195,34 +203,72 @@ been run yet.
 
 ## Next queue
 
-The setup/update orchestration unit (`remote setup`, item 1 of the prior
-queue) has landed (see completed history above). The committed next-unit queue
-is now empty: the remaining remote management surface is the deferred runtime
-bridge lifecycle commands below, which are **not** auto-continuable and must be
-re-sourced by an explicit Ahmed prompt or a future approved unit before they
-re-enter this queue. A unit is not "started" until a fresh Orchestrator
-declares it from an approved packet; any future queued unit inherits the
-"Constraints" in the auto-continue provenance guidance below unless a future
-approved unit narrows or widens them on the record.
+Ahmed explicitly re-sourced four units (chat, 2026-07-15). The first of those,
+the degraded-monoculture review clearance, is already completed and landed:
+commit `905eb8aa2900d194da148627c790eb6462169020` (`chore: clear pending
+degraded review markers`) re-reviewed and cleared the two remaining
+`Review-Status: degraded-monoculture` commits
+(`e5bc1242ec5b82d2010fab7906ef82c07a9c9581` and
+`22f3256a80f8d98236bd59afca4314dec7b446ce`) on top of the prior `0bbbad8`
+clearance that already cleared `8b1611a`, `79bd4a2`, and `bb7d717`. No
+degraded markers remain pending, so the remaining committed queue below is the
+three pending units in policy-required order, beginning with runtime bridge
+lifecycle. A unit is not "started" until a fresh Orchestrator declares it
+from an approved packet; any queued unit inherits the "Constraints" in the
+auto-continue provenance guidance below unless a future approved unit narrows
+or widens them on the record.
 
-> **Deferred runtime lifecycle commands** — `remote connect`/`reconnect`/
-> `disconnect` (ensure/teardown/reopen local aggregation bridges) and the
-> interactive provisioning path for `remote add` were intentionally **not**
-> shipped in the config-only `remote add`/`remote remove` unit, and remain
-> deferred after the `remote setup` unit: `remote setup` ships explicit
-> provisioning/setup/update for a configured host, but the runtime bridge
-> *lifecycle* commands require real host-specific runtime API and are a
-> separate future item, re-sourced by an explicit Ahmed prompt or a future
-> approved unit before they re-enter this queue. They are not silently dropped.
+1. **Runtime bridge lifecycle commands** — implement the already-designed
+   `herdr remote connect <HOST>`, `herdr remote reconnect <HOST>`, and
+   `herdr remote disconnect <HOST>` surface:
+   - `connect`: ensure the configured host's local aggregation/API bridge is
+     connected now; do not replace a healthy bridge unnecessarily.
+   - `reconnect`: explicitly discard local bridge/supervisor state for that
+     host and establish a fresh bridge.
+   - `disconnect`: stop only local aggregation/bridges for that host and expose
+     the disconnected state.
+   Remote authority is preserved: none of these stops the remote Herdr server,
+   kills processes, closes remote panes/workspaces, deletes remote state, or
+   performs setup/update. `remote setup` remains the separate provisioning /
+   setup/update path. Implement/test in isolation; live lifecycle action on
+   Ahmed's real hosts requires separate explicit approval.
 
-## Deferred / out of auto-continue queue
+2. **Meta-Herdr R6.2 projected-UX gap audit** — audit current source/machine
+   projection UX against concrete committed design content, not undefined
+   legacy labels:
+   - `docs/next/remote-agent-control-design.md` section
+     `### Next presentation layer — Source/machine projection` and its ordered
+     presentation-layer requirements (vanilla local projection, source rail /
+     projected source state, remote source rendered through the same panel
+     shape);
+   - explicit `#### B.5d — Projected source/space diagnostic and full-remote
+     command-copy affordance`, including its two copy-only context-menu
+     semantics (`Copy remote diagnostics command`, `Copy full remote command`)
+     and its stale/mismatch guard;
+   - the document's source-projection invariants, interaction states,
+     validation requirements, and separately deferred/undefined items such as
+     keyboard source cycling.
+   `B.4a`, `B.5b`, and `B.5c` are legacy ROADMAP labels, not normative specs;
+   keyboard source cycling is deferred but not concretely specified. If no
+   concrete design text maps a legacy label or deferred item to a behavior,
+   record it as an Ahmed-needed clarification rather than inventing criteria.
+   Account for already-landed improvements `bb7d717` (`feat: polish projected
+   remote space UI`) and `898e6d4` (`feat: add projected remote command copy
+   affordance`), so shipped behavior is not reimplemented; audit B.5d only for
+   evidence-backed remaining gaps against its exact committed semantics. This
+   unit is audit-only: produce a concrete gap list, already-satisfied list,
+   bounded recommended implementation slices, validation needs, and protected
+   decisions. No UX implementation in this unit.
 
-- **Meta-Herdr R6.2 projected-UX gap audit and remaining UX work** — deferred
-  out of this auto-continue queue. `bb7d717` and `898e6d4` shipped projection
-  UX improvements; the remaining audit and B.4a/B.5b/B.5c/B.5d work is not
-  complete and is not part of the queue above. It must be re-sourced by an
-  explicit Ahmed prompt or a future approved unit before it re-enters
-  auto-continue. Do not treat it as silently deleted.
+3. **Meta-Herdr R6.2 bounded UX implementation** — implement only concrete
+   gaps from the Meta-Herdr R6.2 projected-UX gap audit unit (unit 2) that map
+   directly to the committed source/machine-projection design and require no
+   new product/architecture decision. Before plan review, verify the audit
+   produced a clear bounded scope; if the audit is vague, finds no remaining
+   gap, relies only on an undefined legacy label, or raises protected
+   UX/architecture choices, hold for Ahmed instead of inventing scope.
+   User-visible changes require Ghostty Herdr Dev end-to-end validation and
+   screenshot proof.
 
 ## Auto-continue provenance guidance
 
@@ -232,25 +278,37 @@ itself authorize anything; the global auto-continue policy and preconditions
 still govern.
 
 - **Next-unit source / provenance.** The accepted next-unit source is the
-  committed `ROADMAP.md` on `origin/roadmap/herdr-remote-roadmap` ("Next
-  queue"). Ahmed explicitly approved (chat, 2026-07-14) lining up the remaining
-  queue so auto-continue can run through completion within the recorded
-  constraints. The **Setup/update orchestration** unit (`remote setup`, the
-  prior item 1 of the Next queue) has now landed (see completed history above).
-  The committed next-unit queue is now empty: the remaining remote management
-  surface is the deferred runtime bridge lifecycle commands (`remote connect`/
-  `reconnect`/`disconnect`), which are a separate future item (see the Deferred
-  note under Next queue), are **not** this queue's next unit, and must be
-  re-sourced by an explicit Ahmed prompt or a future approved unit before they
-  re-enter the queue. A next unit that exists only in the closing unit's own
-  diff does not count as provenance; an empty queue means auto-continue holds
-  for Ahmed rather than inventing a next unit.
-- **Roadmap ref token.** Roadmap ref token for the roadmap-push regime
-  (regime 2): `herdr-remote-roadmap`. The Orchestrator must validate it
-  (`git check-ref-format refs/heads/roadmap/herdr-remote-roadmap`) before any
-  use. Under that regime pushes go **only** to
-  `refs/heads/roadmap/herdr-remote-roadmap` fast-forward/create-only with
-  **no force**; the successor branches off `origin/roadmap/herdr-remote-roadmap`.
+  committed `ROADMAP.md` "Next queue" above. Ahmed explicitly re-sourced four
+  units (chat, 2026-07-15); the first of those, the degraded-monoculture review
+  clearance, is already completed and landed by
+  `905eb8aa2900d194da148627c790eb6462169020`, so the remaining committed queue
+  is the three pending units ordered per global policy and beginning with
+  runtime bridge lifecycle. A next unit that exists only in the closing unit's
+  own diff does not count as provenance; a missing shared landing, a
+  missing/invalid runtime token, or an unclear next unit means auto-continue
+  holds for Ahmed rather than inventing one.
+- **This ROADMAP unit does not activate runtime state.** Recording the
+  `herdr-follow-on-roadmap` token here is documentation only. This unit does
+  not turn on `lane auto-continue`, create or push
+  `refs/heads/roadmap/herdr-follow-on-roadmap`, or land to `master`. The
+  reviewed queue commit must first be landed to shared history (`origin/master`)
+  by a separate Ahmed approval before any queued unit may run under the roadmap
+  regime.
+- **Roadmap ref token and succession base.** Proposed committed token for the
+  new queue: `herdr-follow-on-roadmap` (validates with
+  `git check-ref-format refs/heads/roadmap/herdr-follow-on-roadmap`). Under the
+  roadmap-push regime (regime 2) pushes go **only** to
+  `refs/heads/roadmap/herdr-follow-on-roadmap` fast-forward/create-only with
+  **no force**; `master`/trunk/shared are structurally unreachable by that
+  regime. The first roadmap-push unit (runtime bridge lifecycle commands)
+  bases on the Ahmed-landed `origin/master` commit that contains this reviewed
+  queue, and its reviewed commit creates
+  `refs/heads/roadmap/herdr-follow-on-roadmap` create-only / no-force.
+  Subsequent queued units branch from
+  `origin/roadmap/herdr-follow-on-roadmap` after its verified roadmap-push. If
+  the queue commit is not separately landed to shared history, or runtime lane
+  state does not record a valid active token at the boundary, auto-continue
+  holds.
 - **Constraints (inherited by every queued unit unless re-scoped on the
   record).**
   - No `master`/shared/trunk mutation via the roadmap regime; no force-push.
@@ -261,12 +319,17 @@ still govern.
     non-destructive.
   - Remote management mutating commands preserve remote authority and
     local-config/bridge lifecycle boundaries, and keep normal confirmation
-    gates.
-  - Setup/update orchestration may be implemented/tested in isolation; live
-    install/update of Ahmed's real hosts requires a separate explicit approval
-    unless the exact action is recorded in a future approved unit.
-- **Bounded scope.** Auto-continue stays bounded to the queue above plus the
-  recorded constraints. It never authorizes `master`/trunk/shared pushes,
-  force-push, release/publish, or any protected/product decision; those remain
-  Ahmed-owned or require their own active authorization. Deferred items (R6.2
-  UX) are out of scope until re-sourced.
+    gates. Runtime bridge lifecycle commands (unit 1) act on local aggregation
+    / bridges only; they never stop the remote server, kill processes, close
+    remote panes/workspaces, delete remote state, or perform setup/update.
+  - R6.2 bounded UX implementation (unit 3) requires Ghostty Herdr Dev
+    end-to-end validation and screenshot proof; it is bounded to concrete
+    audit gaps mapped to committed design and holds if scope is vague / none /
+    undefined / protected.
+  - No live real-host install/update or destructive remote op on Ahmed's real
+    hosts unless separately explicitly approved.
+- **Bounded scope.** Auto-continue stays bounded to the remaining three
+  queued units plus the recorded constraints. It never authorizes
+  `master`/trunk/shared pushes, force-push, release/publish, or any
+  protected/product decision; those remain Ahmed-owned or require their own
+  active authorization.
