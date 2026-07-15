@@ -18,6 +18,7 @@ pub(super) fn run_remote_command(args: &[String]) -> io::Result<i32> {
         "check" => remote_check(&args[1..]),
         "add" => remote_add(&args[1..]),
         "remove" => remote_remove(&args[1..]),
+        "setup" => remote_setup(&args[1..]),
         "help" | "--help" | "-h" => {
             print_remote_help();
             Ok(0)
@@ -641,6 +642,169 @@ fn remote_remove(args: &[String]) -> io::Result<i32> {
     Ok(0)
 }
 
+const REMOTE_SETUP_USAGE: &str = "usage: herdr remote setup <HOST> [--handoff]";
+
+/// Explicitly prepare a configured remote host's Herdr for use.
+///
+/// `remote setup` is the explicit live setup/update orchestration command: it
+/// resolves exactly one configured host, then reuses the existing interactive
+/// remote preparation pipeline (SSH target/session validation, remote platform
+/// detection, find/install/update a compatible Herdr binary with the existing
+/// confirmation prompts, ensure the remote server is ready, and a
+/// capability-gated federation ping). Unlike `remote list`/`status`/`check`,
+/// disabled federation and an empty configured-host set are hard errors (exit
+/// 1), not successful no-ops, because `remote setup` is an explicit live
+/// operation. It does not edit local config (`remote add`/`remove` remain the
+/// config mutation commands) and does not stop a remote server except via the
+/// existing per-run confirmation/live-handoff path.
+fn remote_setup(args: &[String]) -> io::Result<i32> {
+    if is_help_request(args) {
+        eprintln!("{REMOTE_SETUP_USAGE}");
+        eprintln!(
+            "  explicitly prepares a configured remote host: validates the SSH target/session,"
+        );
+        eprintln!(
+            "  finds/installs/updates a compatible Herdr binary (prompting when needed), and"
+        );
+        eprintln!("  confirms the remote server/API bridge is usable via a capability-gated ping.");
+        eprintln!(
+            "  --handoff threads the existing live-handoff path when the remote server supports it."
+        );
+        eprintln!(
+            "  does not edit local config; use `remote add`/`remove` to manage configured hosts."
+        );
+        return Ok(0);
+    }
+
+    remote_setup_with(args, |host, live_handoff| {
+        crate::remote::setup_remote_host_interactive(host, live_handoff)
+            .map(|herdr| herdr.shell_path().to_string())
+    })
+}
+
+/// Testable core of `remote setup`: parse `<HOST>`/`--handoff`, resolve exactly
+/// one configured host, then call `setup_fn`. Production wires `setup_fn` to
+/// [`crate::remote::setup_remote_host_interactive`]; tests inject a fake so
+/// CLI behavior is verified without SSH. `setup_fn` is invoked only after
+/// argument parsing and configured-host resolution succeed.
+fn remote_setup_with<F>(args: &[String], setup_fn: F) -> io::Result<i32>
+where
+    F: FnOnce(&crate::remote_target::RemoteHostConfig, bool) -> io::Result<String>,
+{
+    let (host_name, live_handoff) = match parse_setup_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            if !message.is_empty() {
+                eprintln!("{message}");
+            }
+            eprintln!("{REMOTE_SETUP_USAGE}");
+            return Ok(2);
+        }
+    };
+
+    let host = match resolve_setup_host(&host_name) {
+        SetupHostResolution::Host(host) => host,
+        SetupHostResolution::Exit(code) => return Ok(code),
+    };
+
+    let shell_path = match setup_fn(&host, live_handoff) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("remote setup failed for {}: {err}", host.name);
+            return Ok(1);
+        }
+    };
+
+    println!(
+        "Set up remote host {} (target {}, session {}): prepared Herdr at {}.",
+        host.name, host.target, host.session, shell_path
+    );
+    Ok(0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SetupHostResolution {
+    Host(crate::remote_target::RemoteHostConfig),
+    Exit(i32),
+}
+
+/// Parse `<HOST>` plus the optional flag-only `--handoff`. Returns
+/// `(host_name, live_handoff)` or an error message (empty message means a bare
+/// usage error with no specific reason printed before the usage line).
+fn parse_setup_args(args: &[String]) -> Result<(String, bool), String> {
+    let mut host = None;
+    let mut live_handoff = false;
+
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let (flag, inline) = split_inline_value(arg);
+        match flag {
+            "--handoff" => {
+                if inline.is_some() {
+                    return Err("--handoff takes no value".to_string());
+                }
+                live_handoff = true;
+                index += 1;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option: {other}"));
+            }
+            other => {
+                if host.is_some() {
+                    return Err("expected exactly one <HOST>".to_string());
+                }
+                host = Some(other.to_string());
+                index += 1;
+            }
+        }
+    }
+
+    let Some(host) = host else {
+        return Err("missing required <HOST>".to_string());
+    };
+    Ok((host, live_handoff))
+}
+
+/// Resolve exactly one configured remote host for the explicit live
+/// `remote setup` operation. Unlike [`configured_remote_hosts`], disabled
+/// federation and an empty configured-host set are hard errors (exit 1) with a
+/// useful message, not successful no-ops: `remote setup` is an explicit live
+/// operation and must name a real configured host. Invalid config and unknown
+/// aliases also fail (exit 1) before any SSH. Prints the error message itself
+/// and returns the host or an exit code.
+fn resolve_setup_host(host_name: &str) -> SetupHostResolution {
+    let loaded = crate::config::Config::load();
+    let remote = &loaded.config.remote;
+    if !remote.enabled {
+        eprintln!(
+            "remote federation is disabled; set remote.enabled = true and add a host with `herdr remote add` before running `herdr remote setup`."
+        );
+        return SetupHostResolution::Exit(1);
+    }
+
+    let registry =
+        match crate::remote_target::RemoteHostRegistry::from_configs(remote.hosts.clone()) {
+            Ok(registry) => registry,
+            Err(err) => {
+                eprintln!("invalid remote host config: {err}");
+                return SetupHostResolution::Exit(1);
+            }
+        };
+    if registry.list().is_empty() {
+        eprintln!(
+            "remote federation is enabled, but no remote hosts are configured; add one with `herdr remote add <alias> --target <ssh-target>`."
+        );
+        return SetupHostResolution::Exit(1);
+    }
+
+    let Some(host) = registry.get(host_name).cloned() else {
+        eprintln!("unknown remote host: {host_name}");
+        return SetupHostResolution::Exit(1);
+    };
+    SetupHostResolution::Host(host)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RemoteAddParams {
     alias: String,
@@ -919,9 +1083,17 @@ fn print_remote_help() {
     eprintln!("  herdr remote check [HOST]");
     eprintln!("  herdr remote add <alias> --target <ssh-target> [--session <session>] [--connection-policy auto|on_demand|manual] [--connect-timeout-secs N]");
     eprintln!("  herdr remote remove <alias> --confirm");
+    eprintln!("  herdr remote setup <HOST> [--handoff]");
     eprintln!();
     eprintln!("  `remote add`/`remove` edit local config only; they open no SSH bridge and");
     eprintln!("  probe/start/install nothing on the remote host.");
+    eprintln!(
+        "  `remote setup <HOST>` is the explicit live setup/update command: it validates the"
+    );
+    eprintln!(
+        "  configured host, finds/installs/updates a compatible Herdr binary (prompting when"
+    );
+    eprintln!("  needed), and confirms the remote server/API bridge via a capability-gated ping.");
     eprintln!("  runtime bridge lifecycle commands `remote connect`/`reconnect`/`disconnect`");
     eprintln!("  are future work and are not implemented yet.");
 }
@@ -1957,5 +2129,249 @@ mod tests {
 
         let enabled = "[remote]\nenabled = true\n\n[[remote.hosts]]\nname = \"jafar\"\ntarget = \"jafar\"\nsession = \"default\"\n";
         assert!(validate_remote_add(enabled).is_ok());
+    }
+
+    // --- remote setup ---
+
+    #[test]
+    fn parse_setup_args_accepts_host_only() {
+        let (host, handoff) = parse_setup_args(&args(&["jafar"])).unwrap();
+        assert_eq!(host, "jafar");
+        assert!(!handoff);
+    }
+
+    #[test]
+    fn parse_setup_args_accepts_host_and_handoff_in_any_order() {
+        let (host, handoff) = parse_setup_args(&args(&["--handoff", "jafar"])).unwrap();
+        assert_eq!(host, "jafar");
+        assert!(handoff);
+
+        let (host, handoff) = parse_setup_args(&args(&["jafar", "--handoff"])).unwrap();
+        assert_eq!(host, "jafar");
+        assert!(handoff);
+    }
+
+    #[test]
+    fn parse_setup_args_rejects_missing_host() {
+        assert!(parse_setup_args(&args(&[]))
+            .unwrap_err()
+            .contains("missing required <HOST>"));
+        // --handoff without a host is still missing the required positional.
+        assert!(parse_setup_args(&args(&["--handoff"]))
+            .unwrap_err()
+            .contains("missing required <HOST>"));
+    }
+
+    #[test]
+    fn parse_setup_args_rejects_handoff_value() {
+        // --handoff is flag-only; --handoff=value must be rejected.
+        assert!(parse_setup_args(&args(&["jafar", "--handoff=true"]))
+            .unwrap_err()
+            .contains("--handoff takes no value"));
+    }
+
+    #[test]
+    fn parse_setup_args_rejects_unknown_flag() {
+        assert!(parse_setup_args(&args(&["jafar", "--bogus"]))
+            .unwrap_err()
+            .contains("unknown option: --bogus"));
+    }
+
+    #[test]
+    fn parse_setup_args_rejects_multiple_hosts() {
+        assert!(parse_setup_args(&args(&["jafar", "work"]))
+            .unwrap_err()
+            .contains("expected exactly one <HOST>"));
+    }
+
+    #[test]
+    fn remote_setup_help_aliases_return_zero_without_setup_fn() {
+        // help aliases at the `remote setup` command surface return 0 without
+        // resolving config or invoking any setup function.
+        with_temp_config(None, |_path| {
+            for help in ["help", "--help", "-h"] {
+                assert_eq!(remote_setup(&args(&[help])).unwrap(), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn remote_setup_dispatch_routes_help_and_unknown() {
+        // `herdr remote setup` (no sub-args) is a usage error (exit 2).
+        // `herdr remote setup --bogus` is an unknown subcommand-shaped arg that
+        // the usage path reports. Both route through remote_setup, not the
+        // generic help fallback (which returns 2 as well, but via help text).
+        with_temp_config(None, |_path| {
+            assert_eq!(remote_setup(&args(&[])).unwrap(), 2);
+        });
+    }
+
+    #[test]
+    fn resolve_setup_host_returns_disabled_federation_as_error() {
+        // Unlike list/status/check, `remote setup` must NOT succeed (exit 0)
+        // when federation is disabled; it is an explicit live operation.
+        with_temp_config(Some("[remote]\nenabled = false\n"), |_path| {
+            assert_eq!(resolve_setup_host("jafar"), SetupHostResolution::Exit(1));
+        });
+    }
+
+    #[test]
+    fn resolve_setup_host_returns_no_configured_hosts_as_error() {
+        with_temp_config(Some("[remote]\nenabled = true\n"), |_path| {
+            assert_eq!(resolve_setup_host("jafar"), SetupHostResolution::Exit(1));
+        });
+    }
+
+    #[test]
+    fn resolve_setup_host_returns_invalid_config_as_error_before_ssh() {
+        // A leading-dash SSH target is invalid config; resolution must fail
+        // before any SSH/setup function runs.
+        with_temp_config(
+            Some(
+                "[remote]\nenabled = true\n\n[[remote.hosts]]\nname = \"bad\"\ntarget = \"-oProxyCommand=x\"\nsession = \"default\"\n",
+            ),
+            |_path| {
+                assert_eq!(
+                    resolve_setup_host("bad"),
+                    SetupHostResolution::Exit(1)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_setup_host_returns_unknown_host_as_error() {
+        with_temp_config(
+            Some(
+                "[remote]\nenabled = true\n\n[[remote.hosts]]\nname = \"jafar\"\ntarget = \"jafar\"\nsession = \"default\"\n",
+            ),
+            |_path| {
+                assert_eq!(
+                    resolve_setup_host("missing"),
+                    SetupHostResolution::Exit(1)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_setup_host_returns_configured_host() {
+        with_temp_config(
+            Some(
+                "[remote]\nenabled = true\n\n[[remote.hosts]]\nname = \"jafar\"\ntarget = \"user@jafar\"\nsession = \"agents\"\nconnection_policy = \"auto\"\nconnect_timeout_secs = 20\n",
+            ),
+            |_path| {
+                let host = match resolve_setup_host("jafar") {
+                    SetupHostResolution::Host(host) => host,
+                    other => panic!("expected host, got {other:?}"),
+                };
+                assert_eq!(host.name, "jafar");
+                assert_eq!(host.target, "user@jafar");
+                assert_eq!(host.session, "agents");
+            },
+        );
+    }
+
+    #[test]
+    fn remote_setup_with_success_path_invokes_setup_fn_with_resolved_host() {
+        with_temp_config(
+            Some(
+                "[remote]\nenabled = true\n\n[[remote.hosts]]\nname = \"jafar\"\ntarget = \"user@jafar\"\nsession = \"agents\"\n",
+            ),
+            |_path| {
+                let captured_host = std::cell::RefCell::new(None::<String>);
+                let captured_handoff = std::cell::Cell::new(false);
+                let code = remote_setup_with(&args(&["jafar"]), |host, handoff| {
+                    *captured_host.borrow_mut() = Some(host.name.clone());
+                    captured_handoff.set(handoff);
+                    Ok("\"$HOME/.local/bin/herdr\"".to_string())
+                })
+                .unwrap();
+
+                assert_eq!(code, 0);
+                assert_eq!(*captured_host.borrow(), Some("jafar".to_string()));
+                // No --handoff passed -> live_handoff is false.
+                assert!(!captured_handoff.get());
+            },
+        );
+    }
+
+    #[test]
+    fn remote_setup_with_forwards_handoff_to_setup_fn() {
+        with_temp_config(
+            Some(
+                "[remote]\nenabled = true\n\n[[remote.hosts]]\nname = \"jafar\"\ntarget = \"jafar\"\nsession = \"default\"\n",
+            ),
+            |_path| {
+                let captured_handoff = std::cell::Cell::new(false);
+                let code = remote_setup_with(&args(&["jafar", "--handoff"]), |_, handoff| {
+                    captured_handoff.set(handoff);
+                    Ok("\"$HOME/.local/bin/herdr\"".to_string())
+                })
+                .unwrap();
+
+                assert_eq!(code, 0);
+                assert!(captured_handoff.get());
+            },
+        );
+    }
+
+    #[test]
+    fn remote_setup_with_does_not_invoke_setup_fn_on_unknown_host() {
+        with_temp_config(
+            Some(
+                "[remote]\nenabled = true\n\n[[remote.hosts]]\nname = \"jafar\"\ntarget = \"jafar\"\nsession = \"default\"\n",
+            ),
+            |_path| {
+                let code = remote_setup_with(&args(&["missing"]), |_, _| {
+                    panic!("setup_fn must not be called when host resolution fails");
+                })
+                .unwrap();
+                assert_eq!(code, 1);
+            },
+        );
+    }
+
+    #[test]
+    fn remote_setup_with_does_not_invoke_setup_fn_on_disabled_federation() {
+        with_temp_config(Some("[remote]\nenabled = false\n"), |_path| {
+            let code = remote_setup_with(&args(&["jafar"]), |_, _| {
+                panic!("setup_fn must not be called when federation is disabled");
+            })
+            .unwrap();
+            assert_eq!(code, 1);
+        });
+    }
+
+    #[test]
+    fn remote_setup_with_usage_errors_do_not_invoke_setup_fn() {
+        with_temp_config(
+            Some(
+                "[remote]\nenabled = true\n\n[[remote.hosts]]\nname = \"jafar\"\ntarget = \"jafar\"\nsession = \"default\"\n",
+            ),
+            |_path| {
+                let code = remote_setup_with(&args(&[]), |_, _| {
+                    panic!("setup_fn must not be called on a usage error");
+                })
+                .unwrap();
+                assert_eq!(code, 2);
+            },
+        );
+    }
+
+    #[test]
+    fn remote_setup_with_setup_fn_failure_returns_nonzero() {
+        with_temp_config(
+            Some(
+                "[remote]\nenabled = true\n\n[[remote.hosts]]\nname = \"jafar\"\ntarget = \"jafar\"\nsession = \"default\"\n",
+            ),
+            |_path| {
+                let code = remote_setup_with(&args(&["jafar"]), |_, _| {
+                    Err(io::Error::other("simulated remote setup failure"))
+                })
+                .unwrap();
+                assert_eq!(code, 1);
+            },
+        );
     }
 }

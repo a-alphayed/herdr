@@ -215,6 +215,14 @@ pub(crate) fn run_remote_terminal_attach(
 }
 
 #[cfg(windows)]
+pub(crate) fn setup_remote_host_interactive(
+    _host: &crate::remote_target::RemoteHostConfig,
+    _live_handoff: bool,
+) -> std::io::Result<RemoteHerdr> {
+    Err(unsupported_remote_error("remote setup"))
+}
+
+#[cfg(windows)]
 pub(crate) fn run_remote_api_bridge(_args: &[String]) -> std::io::Result<()> {
     Err(unsupported_remote_error("remote API bridge"))
 }

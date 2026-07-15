@@ -414,6 +414,53 @@ pub(crate) fn send_remote_api_request_to_host(
     Ok(response)
 }
 
+/// Explicitly prepare a configured remote host's Herdr for use (the
+/// `herdr remote setup <HOST>` path).
+///
+/// This is a thin configured-host wrapper over the existing interactive remote
+/// preparation pipeline. It reuses [`remote_ssh_for_host`],
+/// [`prepare_remote_herdr`] (which detects the remote platform and finds,
+/// installs, or updates a compatible Herdr binary using the existing
+/// confirmation prompts), and [`ensure_remote_server_ready`] (which uses the
+/// existing confirmed-stop / live-handoff path). It then confirms the remote
+/// server/API bridge is usable by sending an existing capability-gated
+/// [`remote_api_ping_request`] over the interactive path, exactly as a routed
+/// agent request would. When `live_handoff` is true it is threaded into the
+/// prepare/ensure steps so the existing live-handoff path fires if the remote
+/// server advertises it.
+///
+/// No new SSH shell-command shapes, confirmation flows, or remote mutation
+/// behavior are introduced beyond the existing helpers. On success it returns
+/// the prepared [`RemoteHerdr`]; the CLI layer surfaces the alias, target,
+/// session, and `shell_path()`. The caller is responsible for resolving the
+/// configured host and rejecting disabled federation / unknown hosts /
+/// invalid config before calling this.
+pub(crate) fn setup_remote_host_interactive(
+    host: &crate::remote_target::RemoteHostConfig,
+    live_handoff: bool,
+) -> io::Result<RemoteHerdr> {
+    let remote_ssh = remote_ssh_for_host(host);
+    let prepared_remote = prepare_remote_herdr(&remote_ssh, live_handoff)?;
+    ensure_remote_server_ready(
+        &remote_ssh,
+        &prepared_remote.remote_herdr,
+        prepared_remote.installed_or_replaced,
+        prepared_remote.stop_after_install_approved,
+        live_handoff,
+    )?;
+    // Confirm the remote server/API bridge is usable via an existing
+    // capability-gated ping over the interactive bridge path. This is the same
+    // round-trip a routed agent request performs; it does no new mutation.
+    send_remote_api_request_to_host_with_mode(
+        host,
+        &remote_ssh,
+        &prepared_remote.remote_herdr,
+        &remote_api_ping_request(),
+        SshInvocationMode::Interactive,
+    )?;
+    Ok(prepared_remote.remote_herdr)
+}
+
 pub(crate) fn send_remote_api_request_to_host_noninteractive(
     host: &crate::remote_target::RemoteHostConfig,
     request: &crate::api::schema::Request,

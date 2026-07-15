@@ -72,6 +72,31 @@ already satisfied by that polish.
 Landed resilience/control units on `origin/roadmap/herdr-remote-roadmap`,
 newest first:
 
+- **Setup/update orchestration (`remote setup`, explicit configured-host
+  setup/update)** — added the explicit live `herdr remote setup <HOST>
+  [--handoff]` command. It resolves exactly one configured host and rejects
+  disabled federation, unknown hosts, and invalid config before any SSH (these
+  are hard errors, exit 1, not the successful no-ops `remote list`/`status`/
+  `check` use), then reuses the existing interactive remote preparation pipeline:
+  SSH target/session/timeout validation via `RemoteHostConfig`/
+  `RemoteHostRegistry`/`RemoteSsh`, remote platform detection, find/install/
+  update of a compatible Herdr binary through the existing confirmation prompts,
+  `ensure_remote_server_ready` over the existing confirmed-stop/live-handoff
+  path, and a final capability-gated federation `ping`. `--handoff` threads the
+  existing live-handoff path when the remote server advertises it. It preserves
+  the existing non-interactive TTY safety, does not edit local config
+  (`remote add`/`remove` remain the config mutation commands), does not stop a
+  remote server except via the existing per-run confirmation/live-handoff path,
+  and adds no new SSH shell-command shapes, protocol, or JSON API schema. The
+  Unix implementation is a thin wrapper over `remote_ssh_for_host`/
+  `prepare_remote_herdr`/`ensure_remote_server_ready` and an existing
+  capability-gated ping; the Windows stub returns the existing unsupported-
+  remote error. Runtime bridge lifecycle commands (`remote connect`/
+  `reconnect`/`disconnect`) remain deferred future work, distinct from
+  `remote setup`. No protocol change. No commit SHA is invented here; the
+  closeout commit SHA is recorded in the closeout receipt when the work unit
+  lands.
+
 - **Remote management/ops polish — mutating config commands (`remote add`/
   `remote remove`, config-only)** — added the local-config-only `herdr remote
   add <alias> --target <ssh-target>` and confirmed `herdr remote remove <alias>
@@ -170,26 +195,25 @@ been run yet.
 
 ## Next queue
 
-The queue below is the narrow, sourceable remaining next-unit queue. A unit is
-not "started" until a fresh Orchestrator declares it from an approved packet;
-the ordering below is the recommended sequence. Each unit inherits the
+The setup/update orchestration unit (`remote setup`, item 1 of the prior
+queue) has landed (see completed history above). The committed next-unit queue
+is now empty: the remaining remote management surface is the deferred runtime
+bridge lifecycle commands below, which are **not** auto-continuable and must be
+re-sourced by an explicit Ahmed prompt or a future approved unit before they
+re-enter this queue. A unit is not "started" until a fresh Orchestrator
+declares it from an approved packet; any future queued unit inherits the
 "Constraints" in the auto-continue provenance guidance below unless a future
 approved unit narrows or widens them on the record.
 
-1. **Setup/update orchestration** — design/implement/test in isolation only.
-   Live install/update of Ahmed's real hosts requires a separate explicit
-   approval unless the exact action is recorded in a future approved unit; by
-   default this unit does not install/update any real host. This is the first
-   remaining unit.
-
 > **Deferred runtime lifecycle commands** — `remote connect`/`reconnect`/
-> `disconnect` and the interactive provisioning path for `remote add` (SSH,
-> binary check/install/bootstrap, session start, API-bridge validation) were
-> intentionally **not** shipped in the just-completed config-only
-> `remote add`/`remote remove` unit. They require real host-specific runtime
-> API and are a separate future item, re-sourced by an explicit Ahmed prompt
-> or a future approved unit before they re-enter this queue. They are not
-> silently dropped.
+> `disconnect` (ensure/teardown/reopen local aggregation bridges) and the
+> interactive provisioning path for `remote add` were intentionally **not**
+> shipped in the config-only `remote add`/`remote remove` unit, and remain
+> deferred after the `remote setup` unit: `remote setup` ships explicit
+> provisioning/setup/update for a configured host, but the runtime bridge
+> *lifecycle* commands require real host-specific runtime API and are a
+> separate future item, re-sourced by an explicit Ahmed prompt or a future
+> approved unit before they re-enter this queue. They are not silently dropped.
 
 ## Deferred / out of auto-continue queue
 
@@ -211,13 +235,16 @@ still govern.
   committed `ROADMAP.md` on `origin/roadmap/herdr-remote-roadmap` ("Next
   queue"). Ahmed explicitly approved (chat, 2026-07-14) lining up the remaining
   queue so auto-continue can run through completion within the recorded
-  constraints. After the config-only `remote add`/`remote remove` mutation unit
-  above lands, the first remaining unit is **Setup/update orchestration** (item
-  1 of the Next queue), still subject to the closeout re-checks and constraints
-  below. The runtime bridge lifecycle commands (`remote connect`/`reconnect`/
-  `disconnect`) and interactive provisioning remain a deferred future item (see
-  the Deferred note under Next queue), not this queue's next unit. A next unit
-  that exists only in the closing unit's own diff does not count as provenance.
+  constraints. The **Setup/update orchestration** unit (`remote setup`, the
+  prior item 1 of the Next queue) has now landed (see completed history above).
+  The committed next-unit queue is now empty: the remaining remote management
+  surface is the deferred runtime bridge lifecycle commands (`remote connect`/
+  `reconnect`/`disconnect`), which are a separate future item (see the Deferred
+  note under Next queue), are **not** this queue's next unit, and must be
+  re-sourced by an explicit Ahmed prompt or a future approved unit before they
+  re-enter the queue. A next unit that exists only in the closing unit's own
+  diff does not count as provenance; an empty queue means auto-continue holds
+  for Ahmed rather than inventing a next unit.
 - **Roadmap ref token.** Roadmap ref token for the roadmap-push regime
   (regime 2): `herdr-remote-roadmap`. The Orchestrator must validate it
   (`git check-ref-format refs/heads/roadmap/herdr-remote-roadmap`) before any

@@ -155,7 +155,22 @@ herdr remote remove jafar --confirm
 
 `remote remove <alias> --confirm` removes the matching `[[remote.hosts]]` entry. `--confirm` is required. It rejects unknown aliases and leaves the file unchanged on any failure.
 
-Neither command performs any remote lifecycle or destructive action. They do not start, stop, restart, install, or update the remote Herdr server; they do not kill processes, close panes, or delete remote state. Runtime bridge lifecycle commands such as `remote connect`/`reconnect`/`disconnect` are not implemented yet — `remote add`/`remove` only edit local config.
+Neither command performs any remote lifecycle or destructive action. They do not start, stop, restart, install, or update the remote Herdr server; they do not kill processes, close panes, or delete remote state. `remote add`/`remove` only edit local config.
+
+### Explicitly preparing a configured host
+
+While `remote add`/`remove` only edit local config, `herdr remote setup <HOST>` is the explicit live command that prepares a configured host's Herdr for use:
+
+```bash
+herdr remote setup jafar
+herdr remote setup jafar --handoff
+```
+
+`remote setup <HOST>` resolves exactly one configured host and rejects disabled federation, unknown hosts, and invalid configuration before it opens any SSH — unlike `remote list`/`status`/`check`, disabled federation and an empty configured-host set are hard errors, not successful no-ops. It then reuses the existing interactive remote preparation pipeline: it validates the SSH target/session/timeout, detects the remote platform, finds/installs/updates a compatible Herdr binary (prompting when an install/update needs confirmation), makes the remote server ready using the existing confirmed-stop/live-handoff path, and sends a capability-gated federation `ping` to confirm the remote server/API bridge is usable. `--handoff` threads the existing live-handoff path when the remote server advertises it. On success it prints the alias, target, session, and prepared remote Herdr path.
+
+`remote setup` preserves Herdr's existing non-interactive safety: if a setup/update/stop step needs a confirmation prompt and stdin is not an interactive terminal, it fails with the existing actionable guidance instead of silently mutating the remote host. It does not edit local config (use `remote add`/`remove` for that) and does not stop a remote server except through the existing per-run confirmation/live-handoff path. It performs no automatic/background install or update — the background supervisor never installs or updates a remote on its own, and reconnects that find a missing or incompatible remote mark it and surface the error rather than bootstrapping repeatedly.
+
+Runtime bridge lifecycle commands such as `remote connect`/`reconnect`/`disconnect` (ensure/teardown/reopen local aggregation bridges) are a separate future item and are not implemented yet; `remote setup` prepares a host's Herdr for use and is distinct from runtime bridge lifecycle.
 
 ## Keybindings
 
