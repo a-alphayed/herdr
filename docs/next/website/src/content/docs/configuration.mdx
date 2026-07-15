@@ -134,6 +134,29 @@ connect_timeout_secs = 10
 
 `connection_policy` controls whether the local aggregator reaches a host automatically: `auto` (default) connects/probes at startup and on config reload; `on_demand` is not probed automatically but an explicit mutating command may dispatch on demand; `manual` is never reached implicitly, so sleeping/roaming hosts are not woken just because they are configured. It is the single stored source of truth. The legacy `auto_connect` boolean is a backward-compatible alias only (`true` resolves to `auto`, `false` to `on_demand`); set `connection_policy` directly in new config. `connect_timeout_secs` bounds the SSH `ConnectTimeout` (whole seconds) used for connection attempts to this host, for both interactive and noninteractive configured-host SSH invocations. Optional; defaults to 10 seconds. Must be between 1 and 300 seconds inclusive; an out-of-range value fails config validation.
 
+### Adding and removing configured hosts
+
+Configured hosts can also be added and removed from the command line instead of editing `config.toml` by hand. Both commands are local-config mutations only — they preserve your comments and unrelated sections, and they leave the file unchanged if anything fails.
+
+```bash
+herdr remote add jafar --target jafar --session default
+herdr remote add work --target work --session agents --connection-policy on_demand --connect-timeout-secs 20
+herdr remote remove jafar --confirm
+```
+
+`remote add <alias> --target <ssh-target>` writes a `[[remote.hosts]]` entry and enables `[remote]`. Options:
+
+- `--session <session>`: the remote Herdr session name (defaults to `default`).
+- `--connection-policy auto|on_demand|manual`: the connection policy (defaults to `auto`).
+- `--connect-timeout-secs N`: the SSH connect timeout in whole seconds (defaults to `10`).
+- Flags accept `--flag value` or `--flag=value` spelling.
+
+`remote add` is config-only and no-probe: it validates the combined host registry (aliases, targets, sessions, timeouts) and re-parses the resulting TOML before writing, but it opens no SSH bridge, probes nothing, and installs/starts nothing on the remote host. If a Herdr server is running locally, run `herdr server reload-config` afterwards so it applies the new host.
+
+`remote remove <alias> --confirm` removes the matching `[[remote.hosts]]` entry. `--confirm` is required. It rejects unknown aliases and leaves the file unchanged on any failure.
+
+Neither command performs any remote lifecycle or destructive action. They do not start, stop, restart, install, or update the remote Herdr server; they do not kill processes, close panes, or delete remote state. Runtime bridge lifecycle commands such as `remote connect`/`reconnect`/`disconnect` are not implemented yet — `remote add`/`remove` only edit local config.
+
 ## Keybindings
 
 For a guided introduction to the prefix and a vetted prefix-free setup, see [Keyboard](/docs/keyboard/).

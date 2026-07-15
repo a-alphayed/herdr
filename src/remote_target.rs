@@ -333,6 +333,31 @@ impl RemoteHostConfig {
         self
     }
 
+    /// Build a configured remote host from explicit federation fields.
+    ///
+    /// Used by the config-only `remote add` mutation path, which resolves
+    /// `connection_policy` and `connect_timeout_secs` directly from CLI options
+    /// rather than the legacy `auto_connect` boolean. Unlike [`Self::new`],
+    /// this is available on all targets because `remote add` only edits local
+    /// config and never opens an SSH bridge. The caller still validates the
+    /// resulting host through [`RemoteHostRegistry::from_configs`] before
+    /// writing config.
+    pub(crate) fn from_explicit_fields(
+        name: impl Into<String>,
+        target: impl Into<String>,
+        session: impl Into<String>,
+        connection_policy: RemoteConnectionPolicy,
+        connect_timeout_secs: u32,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            target: target.into(),
+            session: session.into(),
+            connection_policy,
+            connect_timeout_secs,
+        }
+    }
+
     /// Override the connection policy. Test-only helper for building hosts
     /// whose policy is not reachable from the legacy bool constructor (e.g.
     /// [`RemoteConnectionPolicy::Manual`]).

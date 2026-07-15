@@ -52,6 +52,26 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
     }
 
     let mut requested_session = None;
+    // `herdr remote add` has its own `--session <remote-session>` flag (the
+    // remote host's session field). When the command prefix built so far is
+    // `herdr remote add ...`, a `--session`/`--session=...` token belongs to
+    // that subcommand and must be preserved for `cli::remote` to parse, rather
+    // than being stolen as the global Herdr session flag.
+    //
+    // This is decided from the cleaned prefix at each `--session` token
+    // (instead of from the raw shape) so the combined form works too: in
+    // `herdr --session <local> remote add ... --session <remote>` the leading
+    // global `--session` is stripped and sets HERDR_SESSION (the cleaned prefix
+    // is still just `herdr` at that point), while the later remote `--session`
+    // sees the cleaned prefix `herdr remote add ...` and is preserved for
+    // `cli::remote`. Global `--session` for other commands (e.g.
+    // `herdr server stop --session=api`) is unaffected, and child-arg `--`
+    // behavior is unchanged.
+    let is_remote_add = |cleaned: &[String]| {
+        cleaned.len() >= 3
+            && cleaned.get(1).map(String::as_str) == Some("remote")
+            && cleaned.get(2).map(String::as_str) == Some("add")
+    };
     let mut index = 1;
     while index < args.len() {
         let arg = &args[index];
@@ -60,6 +80,11 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
             break;
         }
         if arg == "--session" {
+            if is_remote_add(&cleaned) {
+                cleaned.push(arg.clone());
+                index += 1;
+                continue;
+            }
             let Some(value) = args.get(index + 1) else {
                 return Err("missing value for --session".to_string());
             };
@@ -68,6 +93,11 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
             continue;
         }
         if let Some(value) = arg.strip_prefix("--session=") {
+            if is_remote_add(&cleaned) {
+                cleaned.push(arg.clone());
+                index += 1;
+                continue;
+            }
             requested_session = Some(value.to_string());
             index += 1;
             continue;
@@ -640,6 +670,166 @@ mod tests {
         assert_eq!(cleaned, args);
         assert!(std::env::var(SESSION_ENV_VAR).is_err());
         assert!(!explicit_session_requested());
+    }
+
+    #[test]
+    fn configure_from_args_preserves_remote_add_session_flag() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
+        // `herdr remote add ... --session <remote-session>` is the remote host's
+        // session field, not the global Herdr session flag. It must be preserved
+        // for `cli::remote::remote_add` to parse, and must NOT set HERDR_SESSION.
+        let args = vec![
+            "herdr".to_string(),
+            "remote".to_string(),
+            "add".to_string(),
+            "jafar".to_string(),
+            "--target".to_string(),
+            "host".to_string(),
+            "--session".to_string(),
+            "fed".to_string(),
+        ];
+
+        let cleaned = configure_from_args(&args).unwrap();
+
+        assert_eq!(cleaned, args);
+        assert!(std::env::var(SESSION_ENV_VAR).is_err());
+        assert!(!explicit_session_requested());
+    }
+
+    #[test]
+    fn configure_from_args_preserves_remote_add_equals_session_flag() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
+        let args = vec![
+            "herdr".to_string(),
+            "remote".to_string(),
+            "add".to_string(),
+            "jafar".to_string(),
+            "--target".to_string(),
+            "host".to_string(),
+            "--session=fed".to_string(),
+        ];
+
+        let cleaned = configure_from_args(&args).unwrap();
+
+        assert_eq!(cleaned, args);
+        assert!(std::env::var(SESSION_ENV_VAR).is_err());
+        assert!(!explicit_session_requested());
+    }
+
+    #[test]
+    fn configure_from_args_strips_global_session_before_remote_add() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
+        // Global `--session <local-session>` before the `remote add` command
+        // keeps existing behavior: it is stripped and sets HERDR_SESSION.
+        let args = vec![
+            "herdr".to_string(),
+            "--session".to_string(),
+            "work".to_string(),
+            "remote".to_string(),
+            "add".to_string(),
+            "jafar".to_string(),
+            "--target".to_string(),
+            "host".to_string(),
+        ];
+
+        let cleaned = configure_from_args(&args).unwrap();
+
+        assert_eq!(std::env::var(SESSION_ENV_VAR).as_deref(), Ok("work"));
+        assert!(explicit_session_requested());
+        assert_eq!(
+            cleaned,
+            vec!["herdr", "remote", "add", "jafar", "--target", "host"]
+        );
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
+    }
+
+    #[test]
+    fn configure_from_args_combined_global_and_remote_add_session_flag() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
+        // `herdr --session <local> remote add <alias> --target <h> --session
+        // <remote>`: the leading global `--session <local>` is stripped and
+        // sets HERDR_SESSION, while the later remote `--session <remote>` is
+        // preserved for `cli::remote::remote_add`.
+        let args = vec![
+            "herdr".to_string(),
+            "--session".to_string(),
+            "work".to_string(),
+            "remote".to_string(),
+            "add".to_string(),
+            "jafar".to_string(),
+            "--target".to_string(),
+            "host".to_string(),
+            "--session".to_string(),
+            "fed".to_string(),
+        ];
+
+        let cleaned = configure_from_args(&args).unwrap();
+
+        assert_eq!(std::env::var(SESSION_ENV_VAR).as_deref(), Ok("work"));
+        assert!(explicit_session_requested());
+        assert_eq!(
+            cleaned,
+            vec![
+                "herdr",
+                "remote",
+                "add",
+                "jafar",
+                "--target",
+                "host",
+                "--session",
+                "fed",
+            ]
+        );
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
+    }
+
+    #[test]
+    fn configure_from_args_combined_global_and_remote_add_equals_session_flag() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
+        // Same combined form, but the later remote session uses the inline
+        // `--session=<remote>` spelling.
+        let args = vec![
+            "herdr".to_string(),
+            "--session".to_string(),
+            "work".to_string(),
+            "remote".to_string(),
+            "add".to_string(),
+            "jafar".to_string(),
+            "--target".to_string(),
+            "host".to_string(),
+            "--session=fed".to_string(),
+        ];
+
+        let cleaned = configure_from_args(&args).unwrap();
+
+        assert_eq!(std::env::var(SESSION_ENV_VAR).as_deref(), Ok("work"));
+        assert!(explicit_session_requested());
+        assert_eq!(
+            cleaned,
+            vec![
+                "herdr",
+                "remote",
+                "add",
+                "jafar",
+                "--target",
+                "host",
+                "--session=fed",
+            ]
+        );
+        std::env::remove_var(SESSION_ENV_VAR);
+        clear_explicit_session_for_test();
     }
 
     #[test]

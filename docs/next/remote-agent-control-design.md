@@ -211,7 +211,9 @@ SSH target:            jafar
 remote Herdr session:  default
 ```
 
-`remote add` is allowed to be interactive. It may SSH to the host, check/install/bootstrap a compatible Herdr binary, start the remote Herdr session if needed, and validate the remote API bridge.
+`remote add` is allowed to be interactive in the full design. It may SSH to the host, check/install/bootstrap a compatible Herdr binary, start the remote Herdr session if needed, and validate the remote API bridge.
+
+**Shipped scope (config-only, no probe):** the `remote add` implemented in this slice is a local-config mutation only — it writes a `[[remote.hosts]]` entry and enables `[remote]`, resolves `connection_policy`/`connect_timeout_secs` directly from CLI options, and validates the combined host registry before writing — but it opens no SSH bridge, probes nothing, and installs/starts nothing on the remote host. The interactive SSH/bootstrap/provisioning behavior above is intentionally deferred to future `remote connect`/setup/update work and is not claimed by the shipped `remote add`.
 
 ### 2. Start a remote agent
 
@@ -444,7 +446,8 @@ Explicit user-directed commands (`agent start --host`, `remote status`, `remote 
 
 Provisioning split:
 
-- `remote add` / `remote connect` may be interactive and may prompt to install/bootstrap a compatible Herdr binary.
+- The shipped `remote add` is a local-config mutation only (it writes a `[[remote.hosts]]` entry and enables `[remote]`, but opens no SSH bridge and probes nothing). Interactive provisioning — SSH, binary check/install/bootstrap, session start, API-bridge validation — is future `remote connect`/setup/update work, not the shipped `remote add`.
+- `remote connect` (future) may be interactive and may prompt to install/bootstrap a compatible Herdr binary.
 - The background supervisor/watchdog reconnect path must be non-interactive and must never attempt install/bootstrap repeatedly. If the remote binary/session is missing or incompatible during reconnect, mark the remote as `incompatible` or `needs_setup` and surface the error.
 
 ### 2. Remote API bridge
@@ -514,7 +517,7 @@ Note: `Pong.protocol` is the shared render wire `PROTOCOL_VERSION` (`src/protoco
 
 On mismatch:
 
-- `remote add/connect` may offer an interactive bootstrap/update path;
+- `remote connect` (future, not the shipped config-only `remote add`) may offer an interactive bootstrap/update path;
 - background reconnect marks the remote `incompatible` and surfaces an actionable error;
 - do not silently half-enable a remote that cannot support required methods.
 
@@ -998,12 +1001,14 @@ herdr remote status jafar
 herdr remote check
 herdr remote check jafar
 
-# Planned host management commands, not part of the current MVP implementation:
+# Implemented local-config mutations (config-only, no probe/lifecycle):
 herdr remote add jafar --target jafar --session default
+herdr remote remove jafar --confirm
+
+# Planned runtime bridge lifecycle commands, not yet implemented:
 herdr remote connect jafar
 herdr remote reconnect jafar
 herdr remote disconnect jafar
-herdr remote remove jafar
 ```
 
 Implemented read-only inventory and diagnostic semantics:
@@ -1013,13 +1018,17 @@ Implemented read-only inventory and diagnostic semantics:
 - `remote check [HOST]` is a deeper read-only diagnostic. It separates SSH/binary compatibility, federation capability support, and no-spawn API server status. It does not install/update/restart/spawn remote Herdr.
 - Unknown host filters fail before probing. Invalid remote config, including leading-dash SSH targets, fails before SSH.
 
-Planned host management semantics:
+Implemented local-config mutation semantics (config-only, this slice):
 
-- `remote add` saves config and may validate/provision interactively.
+- `remote add <alias> --target <ssh-target>` writes a `[[remote.hosts]]` entry to local config only. It resolves `connection_policy` (optional `--connection-policy auto|on_demand|manual`, default `auto`), `connect_timeout_secs` (optional `--connect-timeout-secs N`, default 10), and `session` (optional `--session <session>`, default `default`) from CLI options, and validates the combined host registry before writing. It opens no SSH bridge, probes nothing, installs/starts nothing, and leaves the file unchanged on any validation failure. Run `herdr server reload-config` afterwards if a local server should apply it.
+- `remote remove <alias> --confirm` removes the matching `[[remote.hosts]]` entry from local config only. `--confirm` is required. It rejects unknown aliases and leaves the file unchanged on any failure; it does not stop the remote Herdr server, kill processes, close panes, or delete remote state.
+
+Planned runtime bridge lifecycle semantics (future work, requires real host-specific runtime API):
+
+- `remote add`/`remote connect` interactive provisioning (SSH, binary check/install/bootstrap, session start, API-bridge validation) is future work; the shipped `remote add` is config-only as above. Use `remote connect`/`reconnect`/`disconnect` once implemented for runtime bridges.
 - `remote connect` ensures a bridge now, interactive if setup is required.
 - `remote reconnect` tears down and reopens bridges.
 - `remote disconnect` stops local aggregation/bridges only; it does not stop the remote Herdr server.
-- `remote remove` removes local config and tears down local bridges/attaches only; it does not stop the remote Herdr server.
 
 Remote agent commands:
 
@@ -1471,6 +1480,7 @@ Implemented in this spike:
 - CLI/API remote `agent.start`, defaulting to a new remote workspace when no remote workspace/tab placement is supplied;
 - federation capability/method negotiation for the hidden remote API bridge and routed agent methods;
 - read-only `herdr remote status [HOST]` and `herdr remote check [HOST]` diagnostics;
+- config-only `herdr remote add <alias> --target <ssh-target>` (local-config mutation: writes a `[[remote.hosts]]` entry and enables `[remote]`, resolves `connection_policy`/`connect_timeout_secs`/`session` from CLI options, validates the combined registry, opens no SSH bridge, probes nothing) and confirmed `herdr remote remove <alias> --confirm` (local-config mutation only); both are no-probe/no-lifecycle and leave the file unchanged on any failure;
 - live remote source failure reasons (`disconnected`, `needs update`, `unreachable`) shared between the supervisor, CLI status, and sidebar labels;
 - sidebar host-state rows for configured auto-connect remotes when no cached agents exist;
 - Docker smoke coverage for the configured one-hop path: get/read/send/focus/start, disconnect, and reconnect;
@@ -1503,7 +1513,7 @@ Implemented Phase 5 hardening:
 
 Remaining non-MVP or later polish:
 
-- planned mutating `remote add/connect/reconnect/disconnect/remove` management commands;
+- planned runtime bridge lifecycle commands `remote connect`/`reconnect`/`disconnect` (requiring real host-specific runtime API), and the interactive provisioning path for `remote add` (SSH/bootstrap/install/session-start); the shipped `remote add`/`remote remove` are config-only as above;
 - automatic remote update/setup orchestration;
 - optional internal SSH ControlMaster optimization;
 - broader multi-host and sleep/offline/wake soak testing.

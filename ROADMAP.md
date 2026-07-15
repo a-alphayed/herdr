@@ -72,6 +72,22 @@ already satisfied by that polish.
 Landed resilience/control units on `origin/roadmap/herdr-remote-roadmap`,
 newest first:
 
+- **Remote management/ops polish — mutating config commands (`remote add`/
+  `remote remove`, config-only)** — added the local-config-only `herdr remote
+  add <alias> --target <ssh-target>` and confirmed `herdr remote remove <alias>
+  --confirm` commands. `remote add` writes a `[[remote.hosts]]` entry and
+  enables `[remote]`, resolving `connection_policy`/`connect_timeout_secs`/
+  `session` directly from CLI options and validating the combined host registry
+  before writing; `remote remove` requires `--confirm`, rejects unknown aliases,
+  and leaves the file unchanged on any failure. Both are line-preserving
+  local-config mutations: they open no SSH bridge, probe nothing, install/start/
+  update nothing, kill no processes, close no panes, and delete no remote state.
+  Runtime bridge lifecycle commands (`remote connect`/`reconnect`/`disconnect`)
+  and interactive provisioning are explicitly **not** shipped in this slice —
+  they remain future work requiring real host-specific runtime API. No protocol
+  change. No commit SHA is invented here; the closeout commit SHA is recorded
+  in the closeout receipt when the work unit lands.
+
 - **Remote management/ops polish — read-only command/diagnostic surface
   (`remote list`)** — added the no-probe `herdr remote list [HOST]`
   configured-host inventory command. It prints host alias, SSH target, remote
@@ -160,15 +176,20 @@ the ordering below is the recommended sequence. Each unit inherits the
 "Constraints" in the auto-continue provenance guidance below unless a future
 approved unit narrows or widens them on the record.
 
-1. **Remote management/ops polish — mutating config/bridge lifecycle commands**
-   — e.g. `remote add`/`connect`/`reconnect`/`disconnect`/`remove` if approved
-   in the unit. Preserve remote authority, local-config/bridge lifecycle
-   boundaries, and normal confirmation gates; **no** broad host/process/server
-   management. This is the first remaining unit.
-2. **Setup/update orchestration** — design/implement/test in isolation only.
+1. **Setup/update orchestration** — design/implement/test in isolation only.
    Live install/update of Ahmed's real hosts requires a separate explicit
    approval unless the exact action is recorded in a future approved unit; by
-   default this unit does not install/update any real host.
+   default this unit does not install/update any real host. This is the first
+   remaining unit.
+
+> **Deferred runtime lifecycle commands** — `remote connect`/`reconnect`/
+> `disconnect` and the interactive provisioning path for `remote add` (SSH,
+> binary check/install/bootstrap, session start, API-bridge validation) were
+> intentionally **not** shipped in the just-completed config-only
+> `remote add`/`remote remove` unit. They require real host-specific runtime
+> API and are a separate future item, re-sourced by an explicit Ahmed prompt
+> or a future approved unit before they re-enter this queue. They are not
+> silently dropped.
 
 ## Deferred / out of auto-continue queue
 
@@ -190,11 +211,13 @@ still govern.
   committed `ROADMAP.md` on `origin/roadmap/herdr-remote-roadmap` ("Next
   queue"). Ahmed explicitly approved (chat, 2026-07-14) lining up the remaining
   queue so auto-continue can run through completion within the recorded
-  constraints. After the read-only `remote list` diagnostics unit above lands,
-  the first remaining unit is **Remote management/ops polish — mutating
-  config/bridge lifecycle commands** (item 1), still subject to the closeout
-  re-checks and constraints below. A next unit that exists only in the closing
-  unit's own diff does not count as provenance.
+  constraints. After the config-only `remote add`/`remote remove` mutation unit
+  above lands, the first remaining unit is **Setup/update orchestration** (item
+  1 of the Next queue), still subject to the closeout re-checks and constraints
+  below. The runtime bridge lifecycle commands (`remote connect`/`reconnect`/
+  `disconnect`) and interactive provisioning remain a deferred future item (see
+  the Deferred note under Next queue), not this queue's next unit. A next unit
+  that exists only in the closing unit's own diff does not count as provenance.
 - **Roadmap ref token.** Roadmap ref token for the roadmap-push regime
   (regime 2): `herdr-remote-roadmap`. The Orchestrator must validate it
   (`git check-ref-format refs/heads/roadmap/herdr-remote-roadmap`) before any

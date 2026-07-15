@@ -8,8 +8,9 @@ mod theme;
 
 pub use self::{
     io::{
-        config_diagnostic_summary, config_dir, config_path, load_live_config,
-        remove_keybinding_config_sections, remove_section_key, state_dir, upsert_section_bool,
+        append_remote_host_block, config_diagnostic_summary, config_dir, config_path,
+        ensure_remote_enabled, load_live_config, remove_keybinding_config_sections,
+        remove_remote_host_block, remove_section_key, state_dir, upsert_section_bool,
         upsert_section_value,
     },
     keybinds::{
