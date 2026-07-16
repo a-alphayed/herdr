@@ -17,8 +17,8 @@ read-set policy).
 
 ## Current state
 
-- `origin/master` tip: `36aa263167d117aa9d9cced2369754cdf87b8fe8`
-  (`chore: rename home-mini test fixtures`).
+- `origin/master` tip: `bd37a2151d999b90d4679d8dc84f57faf9de688b`
+  (`docs: audit projected host ux gaps`).
 - No active roadmap ref/token at this documentation gate. The prior
   `herdr-remote-roadmap` roadmap is complete and landed to
   `origin/master@5217edc4c55008155fac101b41a9c04544284770`; the
@@ -64,11 +64,14 @@ landed and exercised end to end:
 
 Remote hosts remain authoritative for PTYs, panes, hooks, persistence, and
 child processes; the local node only aggregates, caches, and routes/proxies.
-`bb7d717` polished the projected remote space UI; remaining source-projection
-UX gaps are audited and implemented as the Meta-Herdr R6.2 projected-UX gap
-audit and bounded UX implementation units of the Next queue below (anchored to
-the committed `### Next presentation layer — Source/machine projection`
-section and the B.5d affordance, not the legacy B.4a/B.5b/B.5c labels).
+`bb7d717` polished the projected remote space UI; the remaining
+source-projection UX gaps were audited by the landed Meta-Herdr R6.2
+projected-UX gap audit (`bd37a21`, `docs: audit projected host ux gaps`), whose
+artifact `docs/next/r6-2-projected-ux-gap-audit.md` is the authoritative
+implementation source for the bounded Hosts-section implementation — the
+immediate R6.2 next unit of the Next queue below (anchored to the committed
+`### Next presentation layer — Source/machine projection` section and the
+B.5d affordance, not the legacy B.4a/B.5b/B.5c labels).
 
 ## Completed history (remote roadmap)
 
@@ -97,9 +100,10 @@ newest first:
   `prepare_remote_herdr`/`ensure_remote_server_ready` and an existing
   capability-gated ping; the Windows stub returns the existing unsupported-
   remote error. Runtime bridge lifecycle commands (`remote connect`/
-  `reconnect`/`disconnect`) were not shipped in this slice (they are now
-  queued as the runtime bridge lifecycle commands unit, the first of the
-  remaining Next queue), distinct from `remote setup`. No protocol
+  `reconnect`/`disconnect`) were not shipped in this slice (they remain queued
+  as the runtime bridge lifecycle commands unit, a distinct pending item of
+  the Next queue, not the immediate R6.2 next unit), distinct from `remote
+  setup`. No protocol
   change. No commit SHA is invented here; the closeout commit SHA is recorded
   in the closeout receipt when the work unit lands.
 
@@ -115,8 +119,9 @@ newest first:
   update nothing, kill no processes, close no panes, and delete no remote state.
   Runtime bridge lifecycle commands (`remote connect`/`reconnect`/`disconnect`)
   and interactive provisioning are explicitly **not** shipped in this slice
-  (the lifecycle commands are now queued as the runtime bridge lifecycle
-  commands unit, the first of the remaining Next queue). No protocol
+  (the lifecycle commands remain queued as the runtime bridge lifecycle
+  commands unit, a distinct pending item of the Next queue, not the immediate
+  R6.2 next unit). No protocol
   change. No commit SHA is invented here; the closeout commit SHA is recorded
   in the closeout receipt when the work unit lands.
 
@@ -155,11 +160,14 @@ newest first:
 Projection UX / Meta-Herdr R6.2 status: `bb7d717` (`feat: polish projected
 remote space UI`) polished the projected remote space UI and `898e6d4` (`feat:
 add projected remote command copy affordance`) added a projected remote command
-copy affordance. The remaining Meta-Herdr R6.2 projected-UX gap audit and any
-UX work not already satisfied by those commits is **not** marked complete; it
-is queued as the Meta-Herdr R6.2 projected-UX gap audit and bounded UX
-implementation units of the Next queue below (re-sourced 2026-07-15), not
-silently dropped.
+copy affordance. The Meta-Herdr R6.2 projected-UX gap audit is **complete and
+landed** at `origin/master@bd37a2151d999b90d4679d8dc84f57faf9de688b` (`bd37a21`,
+`docs: audit projected host ux gaps`); its artifact
+`docs/next/r6-2-projected-ux-gap-audit.md` is the authoritative
+implementation source for the bounded Hosts-section implementation, the
+immediate R6.2 next unit of the Next queue below. No UX work beyond
+`bb7d717`/`898e6d4` is marked shipped; the only remaining UX work is that
+bounded Hosts-section implementation.
 
 Existing validation coverage: the controlled one-hop Docker federation smoke
 was exercised; the Jafar real-host (localhost-SSH) smoke was exercised at
@@ -211,15 +219,79 @@ degraded review markers`) re-reviewed and cleared the two remaining
 (`e5bc1242ec5b82d2010fab7906ef82c07a9c9581` and
 `22f3256a80f8d98236bd59afca4314dec7b446ce`) on top of the prior `0bbbad8`
 clearance that already cleared `8b1611a`, `79bd4a2`, and `bb7d717`. No
-degraded markers remain pending, so the remaining committed queue below is the
-three pending units in policy-required order, beginning with runtime bridge
-lifecycle. A unit is not "started" until a fresh Orchestrator declares it
-from an approved packet; any queued unit inherits the "Constraints" in the
+degraded markers remain pending. The Meta-Herdr R6.2 projected-UX gap audit
+(former unit 2 of the queue) is also complete and landed at
+`origin/master@bd37a2151d999b90d4679d8dc84f57faf9de688b` (`bd37a21`,
+`docs: audit projected host ux gaps`), so the remaining committed queue below
+is the two pending units, with the bounded Hosts-section implementation as the
+immediate R6.2 next unit and runtime bridge lifecycle a distinct pending item.
+A unit is not "started" until a fresh Orchestrator declares it from an
+approved packet; any queued unit inherits the "Constraints" in the
 auto-continue provenance guidance below unless a future approved unit narrows
 or widens them on the record.
 
-1. **Runtime bridge lifecycle commands** — implement the already-designed
-   `herdr remote connect <HOST>`, `herdr remote reconnect <HOST>`, and
+1. **Meta-Herdr R6.2 bounded Hosts-section implementation** — the immediate
+   R6.2 next unit. Implement only the bounded, audit-sourced Hosts-section
+   work recorded in the authoritative landed audit artifact
+   `docs/next/r6-2-projected-ux-gap-audit.md` (`bd37a21`); it authorizes no
+   product/architecture decision beyond that artifact. Scope by audit gap:
+   - **G1** (high, UX parity): replace the compact 10-column source rail with
+     a full-width `Hosts` section analogous to `Spaces` — a `" hosts"` header
+     mirroring `" spaces"`/`" agents"` (`overlay0`/BOLD, leading space) above
+     space-like host rows that share Spaces' spacing, selection, and
+     interaction footprint. The section always shows on expanded desktop,
+     including with zero configured remote hosts (it still contains `local`)
+     and at ordinary narrow expanded-desktop widths: the full-width section
+     removes the extra 10-column rail, so `Hosts` must not be hidden merely
+     because `screen.width` cannot fit the rail-era
+     `SOURCE_RAIL_WIDTH + sidebar_min_width`. The section is absent only for
+     collapsed sidebar and mobile, whose local-only/specialized behavior is
+     unchanged (no new mobile/collapsed design). `local` is always listed
+     first, then configured `brain`/future hosts.
+   - **G2** (medium, parity): add host-list scroll state (analogous to
+     `workspace_scroll`) so hosts scroll rather than clip beyond the visible
+     height.
+   - **G3** (medium, parity): route wheel over the Hosts section to scroll /
+     move host selection like Spaces, replacing the current rail `ScrollUp`/
+     `ScrollDown` consume/no-op.
+   - **G4** (medium, parity): add in-section keyboard/navigation parity for
+     host selection within the Hosts section, mirroring Spaces Navigate
+     behavior. This is ordinary in-section parity, explicitly distinct from
+     deferred **global** source cycling (a dedicated host-switch keybind),
+     which is NOT a gap.
+   Preserved boundaries (must not regress): `SidebarSource` stays a
+   read-model-only selection (`select_sidebar_source` switches the read model;
+   no local focus/PTY/hook/dirty/workspace-ownership mutation); exact B.5d
+   right-click semantics (right-click opens the copy-only `Copy remote
+   diagnostics command` / `Copy full remote command` menu without switching
+   source, local/blank rows stay consumed/no-op, alias-vs-target/session
+   command strings stay clipboard-only, and the stale/mismatch
+   `resolve_remote_command_config` guard is unchanged); remote-host runtime
+   authority/capability gates (remote projection stays read-only; remote `new`
+   footer stays gated on connected + `workspace_create` capability); and the
+   audit's deferred items stay deferred — global keyboard source cycling,
+   projection-persistence fallback, all-machines/unified overview, and legacy
+   `B.4a`/`B.5b`/`B.5c` labels are not normative and must not be invented.
+   `effective_sidebar_source`'s safe fallback to `Local` for collapsed/mobile
+   is preserved. Implementation follows the audit's ordered internal slices:
+   (a) full-width heading/rows replacing the rail, (b) shared selection/
+   hit-testing/scroll/navigation parity, (c) responsive/fallback regression
+   tests. If space-like geometry needs multi-row host cards with metadata
+   remote hosts lack data for, or any new keybind beyond in-section parity,
+   stop and surface it as an Ahmed-needed decision; do not invent product
+   behavior.
+   Validation: `just check` plus isolated Ghostty Herdr Dev end-to-end
+   validation and inspected screenshot proof (source-built dev binary via
+   `ghostty-herdr-dev`; isolated `herdr-dev` config/state or temp `XDG_*`;
+   cover local/brain/future-host transitions, Connected/Disconnected/
+   NeedsUpdate/Unreachable status rendering, B.5d right-click on both row
+   kinds, and banner/empty/no-space states; never touch Ahmed's main workflow
+   server). This is a user-visible unit: the screenshot proof is a gate, not
+   optional.
+
+2. **Runtime bridge lifecycle commands** — a distinct pending item, not the
+   immediate R6.2 next unit. Implement the already-designed `herdr remote
+   connect <HOST>`, `herdr remote reconnect <HOST>`, and
    `herdr remote disconnect <HOST>` surface:
    - `connect`: ensure the configured host's local aggregation/API bridge is
      connected now; do not replace a healthy bridge unnecessarily.
@@ -233,43 +305,6 @@ or widens them on the record.
    setup/update path. Implement/test in isolation; live lifecycle action on
    Ahmed's real hosts requires separate explicit approval.
 
-2. **Meta-Herdr R6.2 projected-UX gap audit** — audit current source/machine
-   projection UX against concrete committed design content, not undefined
-   legacy labels:
-   - `docs/next/remote-agent-control-design.md` section
-     `### Next presentation layer — Source/machine projection` and its ordered
-     presentation-layer requirements (vanilla local projection, source rail /
-     projected source state, remote source rendered through the same panel
-     shape);
-   - explicit `#### B.5d — Projected source/space diagnostic and full-remote
-     command-copy affordance`, including its two copy-only context-menu
-     semantics (`Copy remote diagnostics command`, `Copy full remote command`)
-     and its stale/mismatch guard;
-   - the document's source-projection invariants, interaction states,
-     validation requirements, and separately deferred/undefined items such as
-     keyboard source cycling.
-   `B.4a`, `B.5b`, and `B.5c` are legacy ROADMAP labels, not normative specs;
-   keyboard source cycling is deferred but not concretely specified. If no
-   concrete design text maps a legacy label or deferred item to a behavior,
-   record it as an Ahmed-needed clarification rather than inventing criteria.
-   Account for already-landed improvements `bb7d717` (`feat: polish projected
-   remote space UI`) and `898e6d4` (`feat: add projected remote command copy
-   affordance`), so shipped behavior is not reimplemented; audit B.5d only for
-   evidence-backed remaining gaps against its exact committed semantics. This
-   unit is audit-only: produce a concrete gap list, already-satisfied list,
-   bounded recommended implementation slices, validation needs, and protected
-   decisions. No UX implementation in this unit.
-
-3. **Meta-Herdr R6.2 bounded UX implementation** — implement only concrete
-   gaps from the Meta-Herdr R6.2 projected-UX gap audit unit (unit 2) that map
-   directly to the committed source/machine-projection design and require no
-   new product/architecture decision. Before plan review, verify the audit
-   produced a clear bounded scope; if the audit is vague, finds no remaining
-   gap, relies only on an undefined legacy label, or raises protected
-   UX/architecture choices, hold for Ahmed instead of inventing scope.
-   User-visible changes require Ghostty Herdr Dev end-to-end validation and
-   screenshot proof.
-
 ## Auto-continue provenance guidance
 
 This section exists so a future lane auto-continue boundary can prove
@@ -279,14 +314,17 @@ still govern.
 
 - **Next-unit source / provenance.** The accepted next-unit source is the
   committed `ROADMAP.md` "Next queue" above. Ahmed explicitly re-sourced four
-  units (chat, 2026-07-15); the first of those, the degraded-monoculture review
-  clearance, is already completed and landed by
-  `905eb8aa2900d194da148627c790eb6462169020`, so the remaining committed queue
-  is the three pending units ordered per global policy and beginning with
-  runtime bridge lifecycle. A next unit that exists only in the closing unit's
-  own diff does not count as provenance; a missing shared landing, a
-  missing/invalid runtime token, or an unclear next unit means auto-continue
-  holds for Ahmed rather than inventing one.
+  units (chat, 2026-07-15); the degraded-monoculture review clearance is
+  already completed and landed by `905eb8aa2900d194da148627c790eb6462169020`,
+  and the Meta-Herdr R6.2 projected-UX gap audit is completed and landed at
+  `origin/master@bd37a2151d999b90d4679d8dc84f57faf9de688b` (`bd37a21`,
+  `docs: audit projected host ux gaps`), so the remaining committed queue is
+  the two pending units, with the bounded Hosts-section implementation as the
+  immediate R6.2 next unit and runtime bridge lifecycle a distinct pending
+  item. A next unit that exists only in the closing unit's own diff does not
+  count as provenance; a missing shared landing, a missing/invalid runtime
+  token, or an unclear next unit means auto-continue holds for Ahmed rather
+  than inventing one.
 - **This ROADMAP unit does not activate runtime state.** Recording the
   `herdr-follow-on-roadmap` token here is documentation only. This unit does
   not turn on `lane auto-continue`, create or push
@@ -300,9 +338,9 @@ still govern.
   roadmap-push regime (regime 2) pushes go **only** to
   `refs/heads/roadmap/herdr-follow-on-roadmap` fast-forward/create-only with
   **no force**; `master`/trunk/shared are structurally unreachable by that
-  regime. The first roadmap-push unit (runtime bridge lifecycle commands)
-  bases on the Ahmed-landed `origin/master` commit that contains this reviewed
-  queue, and its reviewed commit creates
+  regime. The first roadmap-push unit (the bounded Hosts-section
+  implementation) bases on the Ahmed-landed `origin/master` commit that
+  contains this reviewed queue, and its reviewed commit creates
   `refs/heads/roadmap/herdr-follow-on-roadmap` create-only / no-force.
   Subsequent queued units branch from
   `origin/roadmap/herdr-follow-on-roadmap` after its verified roadmap-push. If
@@ -319,17 +357,20 @@ still govern.
     non-destructive.
   - Remote management mutating commands preserve remote authority and
     local-config/bridge lifecycle boundaries, and keep normal confirmation
-    gates. Runtime bridge lifecycle commands (unit 1) act on local aggregation
-    / bridges only; they never stop the remote server, kill processes, close
-    remote panes/workspaces, delete remote state, or perform setup/update.
-  - R6.2 bounded UX implementation (unit 3) requires Ghostty Herdr Dev
-    end-to-end validation and screenshot proof; it is bounded to concrete
-    audit gaps mapped to committed design and holds if scope is vague / none /
-    undefined / protected.
+    gates. Runtime bridge lifecycle commands (the distinct pending item) act
+    on local aggregation / bridges only; they never stop the remote server,
+    kill processes, close remote panes/workspaces, delete remote state, or
+    perform setup/update.
+  - The bounded Hosts-section implementation (the immediate R6.2 next unit)
+    requires `just check` plus Ghostty Herdr Dev end-to-end validation and
+    screenshot proof; it is bounded to concrete audit gaps (G1-G4) mapped to
+    committed design and the landed audit artifact, and holds if scope is
+    vague / none / undefined / protected.
   - No live real-host install/update or destructive remote op on Ahmed's real
     hosts unless separately explicitly approved.
-- **Bounded scope.** Auto-continue stays bounded to the remaining three
-  queued units plus the recorded constraints. It never authorizes
+- **Bounded scope.** Auto-continue stays bounded to the remaining two queued
+  units (the bounded Hosts-section implementation and runtime bridge
+  lifecycle) plus the recorded constraints. It never authorizes
   `master`/trunk/shared pushes, force-push, release/publish, or any
   protected/product decision; those remain Ahmed-owned or require their own
   active authorization.
