@@ -280,6 +280,27 @@ fn remote_source_host_keys(
         .collect()
 }
 
+/// Build the pure display/read-model collection of *all* configured remote
+/// host keys (every `connection_policy`, including `manual`/`on_demand`).
+///
+/// This is intentionally separate from [`seed_remote_source_hosts`], which
+/// only seeds auto-connect hosts into the cache. Configured hosts that do not
+/// auto-connect must stay visible in the Hosts section without a synthetic
+/// [`crate::remote_source::RemoteSourceCache`] entry, so this collection is
+/// merged with cached statuses only when building host rows and never mutates
+/// the cache, supervisor, or scheduler state.
+fn configured_remote_host_keys(
+    registry: &crate::remote_target::RemoteHostRegistry,
+) -> std::collections::BTreeSet<crate::remote_source::RemoteHostKey> {
+    registry
+        .list()
+        .into_iter()
+        .map(|host| {
+            crate::remote_source::RemoteHostKey::new(host.name.clone(), host.session.clone())
+        })
+        .collect()
+}
+
 fn seed_remote_source_hosts(
     remote_sources: &mut crate::remote_source::RemoteSourceCache,
     registry: &crate::remote_target::RemoteHostRegistry,
@@ -616,6 +637,7 @@ impl App {
 
         let mut remote_sources = crate::remote_source::RemoteSourceCache::default();
         seed_remote_source_hosts(&mut remote_sources, &remote_hosts);
+        let configured_remote_hosts = configured_remote_host_keys(&remote_hosts);
         let agent_manifest_summaries = crate::detect::manifest::reload_manifests();
         let theme_runtime = theme_runtime_config(config, true);
         let (theme_palette, theme_name) = resolve_effective_theme(&theme_runtime, None);
@@ -627,6 +649,7 @@ impl App {
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces,
             remote_sources,
+            configured_remote_hosts,
             sidebar_source: state::SidebarSource::Local,
             active,
             previous_pane_focus: None,
@@ -689,10 +712,11 @@ impl App {
             tab_scroll: 0,
             tab_scroll_follow_active: true,
             mobile_switcher_scroll: 0,
+            host_list_scroll: 0,
             view: state::ViewState {
                 layout: state::ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
-                source_rail_rect: Rect::default(),
+                hosts_section_rect: Rect::default(),
                 sidebar_panel_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),
@@ -1606,9 +1630,34 @@ impl App {
 
         if !invalid_section("remote") {
             let previous_remote_hosts = remote_source_host_keys(&self.remote_hosts);
+            let previous_configured_hosts = configured_remote_host_keys(&self.remote_hosts);
             self.remote_hosts = remote_host_registry_from_config(config);
             let current_remote_hosts = remote_source_host_keys(&self.remote_hosts);
-            for host in previous_remote_hosts.difference(&current_remote_hosts) {
+            let current_configured_hosts = configured_remote_host_keys(&self.remote_hosts);
+            // Removed hosts = union of:
+            //  - auto-start hosts that stopped auto-starting (removed, or
+            //    switched auto->manual/on_demand): clears their cache entry and
+            //    any projection. Preserves the existing auto-policy cleanup and
+            //    its auto->manual / auto_connect=false tests.
+            //  - any configured host that disappeared (incl. manual/on_demand
+            //    display-only hosts, and every host when remote is disabled):
+            //    clears a stale `sidebar_source`/projection that would otherwise
+            //    point at a host no longer in the host list.
+            // The BTreeSet union dedupes a host in both sets so it fires a
+            // single cleanup event. `RemoteSourceRemoved` never inserts a
+            // synthetic cache entry: `remote_sources.remove_host` is a no-op
+            // for never-cached manual/on_demand hosts, so the no-cache
+            // on-demand precheck is unaffected.
+            let mut removed_remote_hosts = previous_remote_hosts
+                .difference(&current_remote_hosts)
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            removed_remote_hosts.extend(
+                previous_configured_hosts
+                    .difference(&current_configured_hosts)
+                    .cloned(),
+            );
+            for host in removed_remote_hosts {
                 let _ = self
                     .state
                     .handle_app_event(AppEvent::RemoteSourceRemoved { host: host.clone() });
@@ -1617,6 +1666,7 @@ impl App {
                 &mut self.remote_source_supervisors,
             );
             seed_remote_source_hosts(&mut self.state.remote_sources, &self.remote_hosts);
+            self.state.configured_remote_hosts = current_configured_hosts;
             self.remote_source_supervisors = start_remote_source_supervisors_if_enabled(
                 self.no_session,
                 &self.remote_hosts,
@@ -3419,6 +3469,125 @@ connection_policy = "manual"
         assert!(host.connection_policy.is_manual());
         assert!(app.state.remote_sources.list_host_statuses().is_empty());
         assert!(app.state.remote_sources.list_entries().is_empty());
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_clears_selection_when_configured_display_only_host_removed() {
+        // Reviewer B finding: a configured manual/on_demand no-cache host is
+        // visible/selectable, but reload cleanup previously compared only
+        // auto-start hosts. Removing the host from config (or disabling remote)
+        // must clear a stale `sidebar_source` projection, update the configured
+        // display collection, and never synthetically insert a cache entry.
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-manual-host-removed");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        std::fs::write(
+            &path,
+            r#"
+[remote]
+enabled = true
+
+[[remote.hosts]]
+name = "brain"
+target = "brain"
+session = "default"
+connection_policy = "manual"
+"#,
+        )
+        .unwrap();
+        let mut app = test_app();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+
+        let brain = crate::remote_source::RemoteHostKey::new("brain", "default");
+        // Visible as a configured display-only host, never cached.
+        assert!(app.state.configured_remote_hosts.contains(&brain));
+        assert!(app.state.remote_sources.host_status(&brain).is_none());
+        assert!(crate::ui::host_list_entries(&app.state)
+            .iter()
+            .any(|entry| entry.source == crate::app::state::SidebarSource::Remote(brain.clone())));
+
+        // Select the display-only host (read-model only).
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(brain.clone()));
+        assert_eq!(
+            app.state.sidebar_source,
+            crate::app::state::SidebarSource::Remote(brain.clone())
+        );
+
+        // Remove the host from config and reload.
+        std::fs::write(&path, "\n[remote]\nenabled = true\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+
+        // Selection falls back to Local; the configured collection and host rows
+        // no longer carry the removed host; the cache stays synthetic-free.
+        assert_eq!(
+            app.state.sidebar_source,
+            crate::app::state::SidebarSource::Local,
+            "stale projection must fall back to Local when the selected display-only host disappears"
+        );
+        assert!(!app.state.configured_remote_hosts.contains(&brain));
+        assert!(app.state.remote_sources.host_status(&brain).is_none());
+        assert!(crate::ui::host_list_entries(&app.state)
+            .iter()
+            .all(|entry| entry.source != crate::app::state::SidebarSource::Remote(brain.clone())));
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_clears_selection_when_remote_disabled() {
+        // Disabling remote must also clear a stale projection onto an on_demand
+        // display-only host and empty the configured display collection, with no
+        // synthetic cache insertion.
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-remote-disabled");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        std::fs::write(
+            &path,
+            r#"
+[remote]
+enabled = true
+
+[[remote.hosts]]
+name = "future"
+target = "future"
+session = "default"
+connection_policy = "on_demand"
+"#,
+        )
+        .unwrap();
+        let mut app = test_app();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+
+        let future = crate::remote_source::RemoteHostKey::new("future", "default");
+        assert!(app.state.configured_remote_hosts.contains(&future));
+        assert!(app.state.remote_sources.host_status(&future).is_none());
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(future.clone()));
+
+        // Disable remote entirely and reload.
+        std::fs::write(&path, "\n[remote]\nenabled = false\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+
+        assert_eq!(
+            app.state.sidebar_source,
+            crate::app::state::SidebarSource::Local
+        );
+        assert!(app.state.configured_remote_hosts.is_empty());
+        assert!(app.state.remote_sources.host_status(&future).is_none());
+        assert!(app.state.remote_sources.list_host_statuses().is_empty());
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

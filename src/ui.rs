@@ -52,9 +52,13 @@ pub(crate) use self::scrollbar::{
     scrollbar_offset_from_row, scrollbar_thumb_grab_offset, should_show_scrollbar,
 };
 use self::settings::render_settings_overlay;
+/// `host_list_entries` is consumed by `compute_view_internal` (render geometry)
+/// and by host selection/navigation helpers in `actions.rs`/`navigate.rs`, so
+/// it is re-exported for non-test cross-module use.
+pub(crate) use self::sidebar::host_list_entries;
 #[cfg(test)]
 pub(crate) use self::sidebar::{
-    all_source_agent_panel_entries, compute_workspace_list_areas, source_rail_entries,
+    all_source_agent_panel_entries, compute_workspace_list_areas, host_list_row_areas,
     WorkspaceListRemoteRowArea,
 };
 use self::sidebar::{render_sidebar, render_sidebar_collapsed};
@@ -84,13 +88,14 @@ pub(crate) use self::{
         agent_panel_entry_gap_after, agent_panel_scroll_metrics, agent_panel_scrollbar_rect,
         agent_panel_toggle_rect, collapsed_sidebar_sections, collapsed_sidebar_toggle_rect,
         compute_workspace_card_areas, expanded_sidebar_sections, expanded_sidebar_toggle_rect,
-        normalized_workspace_scroll, sidebar_section_divider_rect, source_rail_should_show,
-        source_rail_target_at, source_rail_width, workspace_drop_indicator_row,
-        workspace_list_entries, workspace_list_entries_expanded, workspace_list_footer_rect,
-        workspace_list_local_actions_rect, workspace_list_menu_button_rect,
-        workspace_list_new_button_rect, workspace_list_rect, workspace_list_remote_target_at,
-        workspace_list_scroll_metrics, workspace_list_scrollbar_rect, workspace_parent_group_state,
-        AgentPanelEntry, WorkspaceListEntry, WorkspaceListRemoteTarget,
+        host_list_scroll_metrics, host_list_scrollbar_rect, host_target_at, hosts_section_height,
+        normalized_host_list_scroll, normalized_workspace_scroll, sidebar_section_divider_rect,
+        workspace_drop_indicator_row, workspace_list_entries, workspace_list_entries_expanded,
+        workspace_list_footer_rect, workspace_list_local_actions_rect,
+        workspace_list_menu_button_rect, workspace_list_new_button_rect, workspace_list_rect,
+        workspace_list_remote_target_at, workspace_list_scroll_metrics,
+        workspace_list_scrollbar_rect, workspace_parent_group_state, AgentPanelEntry,
+        WorkspaceListEntry, WorkspaceListRemoteTarget,
     },
 };
 pub(crate) use self::{
@@ -231,51 +236,54 @@ fn compute_view_internal(
     let desired_panel_w = app
         .sidebar_width
         .clamp(app.sidebar_min_width, app.sidebar_max_width);
-    let rail_w = if !app.sidebar_collapsed && source_rail_should_show(app, area) {
-        source_rail_width()
-    } else {
-        0
-    };
+    // The compact 10-column source rail is gone: the expanded desktop sidebar
+    // now owns a full-width Hosts section above the Spaces/Agents panel. No
+    // extra rail width is added, so ordinary narrow expanded-desktop widths
+    // no longer hide the section merely because they cannot fit the old
+    // `SOURCE_RAIL_WIDTH + sidebar_min_width`.
     let sidebar_w = if app.sidebar_collapsed {
         match app.sidebar_collapsed_mode {
             crate::config::SidebarCollapsedModeConfig::Compact => COLLAPSED_WIDTH,
             crate::config::SidebarCollapsedModeConfig::Hidden => 0,
         }
     } else {
-        let max_panel_w = area.width.saturating_sub(rail_w).saturating_sub(1);
-        let panel_w = if max_panel_w == 0 {
+        let max_panel_w = area.width.saturating_sub(1);
+        if max_panel_w == 0 {
             desired_panel_w
         } else {
             desired_panel_w
                 .min(max_panel_w)
                 .max(app.sidebar_min_width.min(max_panel_w))
-        };
-        rail_w.saturating_add(panel_w)
+        }
     };
 
     let [sidebar_area, main_area] =
         Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(1)]).areas(area);
-    let source_rail_rect = if rail_w > 0 && sidebar_area.width > rail_w {
-        Rect::new(sidebar_area.x, sidebar_area.y, rail_w, sidebar_area.height)
+    let (hosts_section_rect, sidebar_panel_rect) = if app.sidebar_collapsed {
+        (Rect::default(), sidebar_area)
     } else {
-        Rect::default()
-    };
-    let sidebar_panel_rect = if app.sidebar_collapsed {
-        sidebar_area
-    } else if source_rail_rect != Rect::default() {
-        Rect::new(
-            sidebar_area.x + source_rail_rect.width,
-            sidebar_area.y,
-            sidebar_area.width.saturating_sub(source_rail_rect.width),
-            sidebar_area.height,
-        )
-    } else {
-        sidebar_area
+        let host_count = host_list_entries(app).len() as u16;
+        let hosts_section_height = hosts_section_height(host_count, sidebar_area.height);
+        let hosts_section_rect = if hosts_section_height == 0 {
+            Rect::default()
+        } else {
+            Rect::new(
+                sidebar_area.x,
+                sidebar_area.y,
+                sidebar_area.width,
+                hosts_section_height,
+            )
+        };
+        let panel_y = sidebar_area.y.saturating_add(hosts_section_height);
+        let panel_height = sidebar_area.height.saturating_sub(hosts_section_height);
+        let sidebar_panel_rect =
+            Rect::new(sidebar_area.x, panel_y, sidebar_area.width, panel_height);
+        (hosts_section_rect, sidebar_panel_rect)
     };
 
     app.view.layout = ViewLayout::Desktop;
     app.view.sidebar_rect = sidebar_area;
-    app.view.source_rail_rect = source_rail_rect;
+    app.view.hosts_section_rect = hosts_section_rect;
     app.view.sidebar_panel_rect = sidebar_panel_rect;
 
     let (tab_bar_rect, terminal_area) = app
@@ -287,6 +295,8 @@ fn compute_view_internal(
     if !app.sidebar_collapsed {
         app.workspace_scroll =
             normalized_workspace_scroll(app, sidebar_panel_rect, app.workspace_scroll);
+        app.host_list_scroll =
+            crate::ui::sidebar::normalized_host_list_scroll(app, app.host_list_scroll);
         let (_, detail_area) =
             expanded_sidebar_sections(sidebar_panel_rect, app.sidebar_section_split);
         let max_agent_scroll = agent_panel_scroll_metrics(app, detail_area).max_offset_from_bottom;
@@ -296,6 +306,7 @@ fn compute_view_internal(
             .workspace_scroll
             .min(app.workspaces.len().saturating_sub(1));
         app.agent_panel_scroll = 0;
+        app.host_list_scroll = 0;
     }
 
     let workspace_card_areas = if app.sidebar_collapsed {
@@ -327,7 +338,7 @@ fn compute_view_internal(
         app.view = crate::app::ViewState {
             layout: ViewLayout::Desktop,
             sidebar_rect: sidebar_area,
-            source_rail_rect,
+            hosts_section_rect,
             sidebar_panel_rect,
             workspace_card_areas,
             tab_bar_rect: Rect::default(),
@@ -401,7 +412,7 @@ fn compute_view_internal(
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
         sidebar_rect: sidebar_area,
-        source_rail_rect,
+        hosts_section_rect,
         sidebar_panel_rect,
         workspace_card_areas,
         tab_bar_rect,
@@ -456,7 +467,7 @@ fn compute_mobile_view(
         app.view = crate::app::ViewState {
             layout: ViewLayout::Mobile,
             sidebar_rect: Rect::default(),
-            source_rail_rect: Rect::default(),
+            hosts_section_rect: Rect::default(),
             sidebar_panel_rect: Rect::default(),
             workspace_card_areas: Vec::new(),
             tab_bar_rect: Rect::default(),
@@ -509,7 +520,7 @@ fn compute_mobile_view(
     app.view = crate::app::ViewState {
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
-        source_rail_rect: Rect::default(),
+        hosts_section_rect: Rect::default(),
         sidebar_panel_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
         tab_bar_rect: Rect::default(),
@@ -1620,7 +1631,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_view_allocates_source_rail_and_panel_rects_for_remote_sources() {
+    fn compute_view_allocates_hosts_section_and_panel_rects_for_remote_sources() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
@@ -1640,26 +1651,40 @@ mod tests {
 
         compute_view(&mut app, Rect::new(0, 0, 100, 20));
 
-        assert_eq!(app.view.source_rail_rect, Rect::new(0, 0, 10, 20));
-        assert_eq!(app.view.sidebar_panel_rect, Rect::new(10, 0, 26, 20));
-        assert_eq!(app.view.sidebar_rect, Rect::new(0, 0, 36, 20));
-        let labels = source_rail_entries(&app)
+        // Full-width Hosts section sits above the Spaces/Agents panel: header
+        // (1 row) + local + two remote hosts = 4 rows, full sidebar width.
+        assert_eq!(app.view.hosts_section_rect, Rect::new(0, 0, 26, 4));
+        assert_eq!(app.view.sidebar_panel_rect, Rect::new(0, 4, 26, 16));
+        assert_eq!(app.view.sidebar_rect, Rect::new(0, 0, 26, 20));
+        let labels = host_list_entries(&app)
             .into_iter()
             .map(|entry| entry.label)
             .collect::<Vec<_>>();
         assert_eq!(labels, vec!["local", "jafar", "jafar/agents"]);
+        // The section header occupies row 0, so the first host row is row 1.
         assert_eq!(
-            source_rail_target_at(&app, 0, 0),
+            host_target_at(&app, 0, 0),
+            None,
+            "header row is not a host target"
+        );
+        assert_eq!(
+            host_target_at(&app, 0, 1),
             Some(crate::app::state::SidebarSource::Local)
         );
         assert_eq!(
-            source_rail_target_at(&app, 0, 1),
+            host_target_at(&app, 0, 2),
             Some(crate::app::state::SidebarSource::Remote(default_host))
         );
     }
 
     #[test]
-    fn compute_view_suppresses_source_rail_when_width_cannot_fit_minimum_panel() {
+    fn compute_view_keeps_hosts_section_on_narrow_expanded_desktop() {
+        // G1: an ordinary narrow EXPANDED-DESKTOP width (just above the mobile
+        // threshold) must still show a usable Hosts section. The old compact
+        // rail was width-gated and hid when the screen could not fit
+        // rail_width + sidebar_min_width; the full-width Hosts section is never
+        // suppressed for width alone on desktop (only the mobile layout and
+        // the collapsed sidebar drop it).
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
@@ -1671,15 +1696,29 @@ mod tests {
             &host,
             crate::remote_source::RemoteConnectionStatus::Connected,
         );
-        app.sidebar_source = crate::app::state::SidebarSource::Remote(host);
+        app.sidebar_source = crate::app::state::SidebarSource::Remote(host.clone());
 
-        compute_view(&mut app, Rect::new(0, 0, 28, 20));
+        // Width 70 is above the mobile threshold (64) but still a narrow
+        // desktop sidebar.
+        compute_view(&mut app, Rect::new(0, 0, 70, 20));
 
-        assert_eq!(app.view.source_rail_rect, Rect::default());
-        assert_eq!(app.view.sidebar_panel_rect, app.view.sidebar_rect);
+        assert_eq!(app.view.layout, ViewLayout::Desktop);
+        // Hosts section is present (not Rect::default()) and full sidebar
+        // width; the Spaces/Agents panel sits below it and stays viable.
+        assert_ne!(app.view.hosts_section_rect, Rect::default());
+        assert_eq!(
+            app.view.hosts_section_rect.width,
+            app.view.sidebar_rect.width
+        );
+        assert!(app.view.sidebar_panel_rect.height > 0);
+        assert_eq!(
+            app.view.sidebar_panel_rect.y,
+            app.view.hosts_section_rect.y + app.view.hosts_section_rect.height
+        );
+        // The projected remote selection is still effective (no local fallback).
         assert_eq!(
             app.effective_sidebar_source(),
-            crate::app::state::SidebarSource::Local
+            crate::app::state::SidebarSource::Remote(host)
         );
     }
 

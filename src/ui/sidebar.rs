@@ -16,7 +16,11 @@ use crate::terminal::TerminalRuntimeRegistry;
 
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
-const SOURCE_RAIL_WIDTH: u16 = 10;
+const HOSTS_SECTION_HEADER_ROWS: u16 = 1;
+/// Minimum rows reserved for the Spaces/Agents panel when allocating the
+/// Hosts section vertically. Keeps the existing panel viable (its split needs
+/// ~6 rows) while the Hosts list scrolls when it overflows.
+const HOSTS_MIN_PANEL_ROWS: u16 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentPanelEntryLocation {
@@ -49,14 +53,14 @@ pub(crate) struct AgentPanelEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SourceRailEntry {
+pub(crate) struct HostListEntry {
     pub(crate) source: SidebarSource,
     pub(crate) label: String,
     pub(crate) status: Option<crate::remote_source::RemoteConnectionStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SourceRailRowArea {
+pub(crate) struct HostRowArea {
     pub(crate) source: SidebarSource,
     pub(crate) rect: Rect,
 }
@@ -94,52 +98,61 @@ impl AgentPanelEntry {
     }
 }
 
-pub(crate) fn source_rail_width() -> u16 {
-    SOURCE_RAIL_WIDTH
-}
-
-pub(crate) fn source_rail_should_show(app: &AppState, screen: Rect) -> bool {
-    !app.sidebar_collapsed
-        && !app.remote_sources.list_host_statuses().is_empty()
-        && screen.width > SOURCE_RAIL_WIDTH + app.sidebar_min_width
-}
-
-pub(crate) fn source_rail_entries(app: &AppState) -> Vec<SourceRailEntry> {
-    let mut entries = Vec::new();
-    if app.remote_sources.list_host_statuses().is_empty() {
-        return entries;
-    }
-
-    entries.push(SourceRailEntry {
+pub(crate) fn host_list_entries(app: &AppState) -> Vec<HostListEntry> {
+    // `local` is always first. Configured host keys (every `connection_policy`,
+    // including `manual`/`on_demand`) are merged with cached statuses only here,
+    // so a display-only configured host never becomes a synthetic
+    // `RemoteSourceCache` entry.
+    let mut entries = vec![HostListEntry {
         source: SidebarSource::Local,
         label: "local".to_string(),
         status: None,
-    });
-    let mut remote_entries = app.remote_sources.list_host_statuses();
-    remote_entries.sort_by(source_rail_host_status_order);
-    entries.extend(remote_entries.into_iter().map(|entry| SourceRailEntry {
-        source: SidebarSource::Remote(entry.host.clone()),
-        label: remote_host_label(&entry.host),
-        status: Some(entry.status),
-    }));
+    }];
+
+    // Union of cached host keys and configured display-only host keys.
+    let mut host_keys: std::collections::BTreeSet<crate::remote_source::RemoteHostKey> = app
+        .remote_sources
+        .list_host_statuses()
+        .into_iter()
+        .map(|entry| entry.host)
+        .collect();
+    host_keys.extend(app.configured_remote_hosts.iter().cloned());
+
+    let mut remote_entries: Vec<HostListEntry> = host_keys
+        .into_iter()
+        .map(|host| {
+            let status = app.remote_sources.host_status(&host);
+            HostListEntry {
+                label: remote_host_label(&host),
+                source: SidebarSource::Remote(host),
+                status,
+            }
+        })
+        .collect();
+    remote_entries.sort_by(host_list_order);
+    entries.extend(remote_entries);
     entries
 }
 
-fn source_rail_host_status_order(
-    left: &crate::remote_source::RemoteHostStatusEntry,
-    right: &crate::remote_source::RemoteHostStatusEntry,
-) -> std::cmp::Ordering {
-    left.host
+fn host_list_order(left: &HostListEntry, right: &HostListEntry) -> std::cmp::Ordering {
+    let left_key = match &left.source {
+        SidebarSource::Local => return std::cmp::Ordering::Less,
+        SidebarSource::Remote(host) => host,
+    };
+    let right_key = match &right.source {
+        SidebarSource::Local => return std::cmp::Ordering::Greater,
+        SidebarSource::Remote(host) => host,
+    };
+    left_key
         .host
-        .cmp(&right.host.host)
+        .cmp(&right_key.host)
         .then_with(|| {
-            source_rail_session_rank(&left.host.session)
-                .cmp(&source_rail_session_rank(&right.host.session))
+            host_session_rank(&left_key.session).cmp(&host_session_rank(&right_key.session))
         })
-        .then_with(|| left.host.session.cmp(&right.host.session))
+        .then_with(|| left_key.session.cmp(&right_key.session))
 }
 
-fn source_rail_session_rank(session: &str) -> u8 {
+fn host_session_rank(session: &str) -> u8 {
     if session == crate::session::DEFAULT_SESSION_NAME {
         0
     } else {
@@ -147,7 +160,7 @@ fn source_rail_session_rank(session: &str) -> u8 {
     }
 }
 
-fn source_rail_status_marker(
+fn host_status_marker(
     status: crate::remote_source::RemoteConnectionStatus,
     p: &Palette,
 ) -> (&'static str, Style) {
@@ -169,35 +182,147 @@ fn source_rail_status_marker(
     }
 }
 
-fn source_rail_row_areas(app: &AppState, area: Rect) -> Vec<SourceRailRowArea> {
-    if area.width == 0 || area.height == 0 {
-        return Vec::new();
+/// Bounded vertical allocation for the Hosts section: header + all hosts when
+/// they fit, otherwise cap the Hosts viewport while reserving a viable
+/// Spaces/Agents panel and letting the host list scroll.
+pub(crate) fn hosts_section_height(host_count: u16, total_h: u16) -> u16 {
+    if total_h == 0 {
+        return 0;
     }
-
-    source_rail_entries(app)
-        .into_iter()
-        .enumerate()
-        .filter_map(|(idx, entry)| {
-            let y = area.y.saturating_add(idx as u16);
-            (y < area.y + area.height).then_some(SourceRailRowArea {
-                source: entry.source,
-                rect: Rect::new(area.x, y, area.width, 1),
-            })
-        })
-        .collect()
+    let desired = HOSTS_SECTION_HEADER_ROWS.saturating_add(host_count);
+    // Keep the Spaces/Agents panel viable when there is room; on very short
+    // sidebars leave at least one row for the panel and still show the header
+    // + `local` when possible.
+    let max_hosts = if total_h > HOSTS_MIN_PANEL_ROWS {
+        total_h.saturating_sub(HOSTS_MIN_PANEL_ROWS)
+    } else {
+        total_h.saturating_sub(1)
+    };
+    desired.min(max_hosts)
 }
 
-pub(crate) fn source_rail_target_at(app: &AppState, col: u16, row: u16) -> Option<SidebarSource> {
-    let area = app.view.source_rail_rect;
-    source_rail_row_areas(app, area)
-        .into_iter()
-        .find_map(|entry| {
-            (col >= entry.rect.x
-                && col < entry.rect.x + entry.rect.width
-                && row >= entry.rect.y
-                && row < entry.rect.y + entry.rect.height)
-                .then_some(entry.source)
-        })
+/// Content rect for the Hosts section: full sidebar width minus the right-edge
+/// divider column (the sidebar separator is drawn over the last column).
+pub(crate) fn hosts_section_content_rect(area: Rect) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return Rect::default();
+    }
+    Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height)
+}
+
+/// Body rect below the Hosts header, narrowed by one column when a scrollbar
+/// is needed.
+pub(crate) fn host_list_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
+    let content = hosts_section_content_rect(area);
+    if content.width == 0 || content.height <= HOSTS_SECTION_HEADER_ROWS {
+        return Rect::default();
+    }
+    let body_y = content.y.saturating_add(HOSTS_SECTION_HEADER_ROWS);
+    let body_height = (content.y + content.height).saturating_sub(body_y);
+    let body_width = content.width.saturating_sub(u16::from(has_scrollbar));
+    Rect::new(content.x, body_y, body_width, body_height)
+}
+
+fn host_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> usize {
+    let body = host_list_body_rect(area, false);
+    if body.width == 0 || body.height == 0 {
+        return 0;
+    }
+    let total = host_list_entries(app).len();
+    let remaining = total.saturating_sub(scroll);
+    remaining.min(body.height as usize)
+}
+
+pub(crate) fn host_list_scroll_metrics(app: &AppState, area: Rect) -> crate::pane::ScrollMetrics {
+    let entries = host_list_entries(app);
+    let total_rows = entries.len();
+    let scroll = app.host_list_scroll.min(total_rows.saturating_sub(1));
+    let viewport_rows = host_list_visible_count(app, area, scroll);
+    let max_offset_from_bottom = total_rows.saturating_sub(viewport_rows);
+    let offset_from_bottom = total_rows
+        .saturating_sub(scroll)
+        .saturating_sub(viewport_rows);
+    crate::pane::ScrollMetrics {
+        offset_from_bottom,
+        max_offset_from_bottom,
+        viewport_rows,
+    }
+}
+
+pub(crate) fn host_list_scrollbar_rect(app: &AppState, area: Rect) -> Option<Rect> {
+    let metrics = host_list_scroll_metrics(app, area);
+    let body = host_list_body_rect(area, true);
+    (should_show_scrollbar(metrics) && body.width > 0 && body.height > 0).then_some(Rect::new(
+        area.x + area.width.saturating_sub(2),
+        body.y,
+        1,
+        body.height,
+    ))
+}
+
+pub(crate) fn normalized_host_list_scroll(app: &AppState, requested: usize) -> usize {
+    let area = app.view.hosts_section_rect;
+    if area == Rect::default() {
+        return 0;
+    }
+    let entry_count = host_list_entries(app).len();
+    if entry_count == 0 {
+        return 0;
+    }
+    // Clamp to the viewport's true maximum first-visible offset
+    // (`entry_count - viewport_capacity`), which is 0 when every entry fits.
+    // This prevents a stale nonzero scroll from skipping `local`/leading hosts
+    // after the list shrinks until it fits (e.g. hosts disconnecting). Clamping
+    // to `entry_count - 1` instead would leave a dangling offset that hides
+    // leading rows. `viewport_capacity` is the body height (scrollbar presence
+    // only narrows the body width, not its height), and every mutation path
+    // normalizes before metrics are read, so scrollbar/drag/wheel math stays
+    // consistent.
+    let viewport_capacity = host_list_body_rect(area, false).height as usize;
+    let max_first_visible = entry_count.saturating_sub(viewport_capacity);
+    requested.min(max_first_visible)
+}
+
+/// Scroll-aware host row areas, accounting for the header offset and the
+/// current `host_list_scroll`. Off-viewport rows are unreachable here.
+pub(crate) fn host_list_row_areas(app: &AppState) -> Vec<HostRowArea> {
+    let area = app.view.hosts_section_rect;
+    if area == Rect::default() {
+        return Vec::new();
+    }
+    let metrics = host_list_scroll_metrics(app, area);
+    let body = host_list_body_rect(area, should_show_scrollbar(metrics));
+    if body.width == 0 || body.height == 0 {
+        return Vec::new();
+    }
+    let entries = host_list_entries(app);
+    let mut rows = Vec::new();
+    let mut y = body.y;
+    let body_bottom = body.y + body.height;
+    for entry in entries.into_iter().skip(app.host_list_scroll) {
+        if y >= body_bottom {
+            break;
+        }
+        rows.push(HostRowArea {
+            source: entry.source,
+            rect: Rect::new(body.x, y, body.width, 1),
+        });
+        y = y.saturating_add(1);
+    }
+    rows
+}
+
+pub(crate) fn host_target_at(app: &AppState, col: u16, row: u16) -> Option<SidebarSource> {
+    if app.view.hosts_section_rect == Rect::default() {
+        return None;
+    }
+    host_list_row_areas(app).into_iter().find_map(|entry| {
+        (col >= entry.rect.x
+            && col < entry.rect.x + entry.rect.width
+            && row >= entry.rect.y
+            && row < entry.rect.y + entry.rect.height)
+            .then_some(entry.source)
+    })
 }
 
 fn sidebar_section_heights(total_h: u16, split_ratio: f32) -> (u16, u16) {
@@ -1543,7 +1668,7 @@ pub(super) fn render_sidebar(
         buf[(sep_x, y)].set_style(sep_style);
     }
 
-    render_source_rail(app, frame, app.view.source_rail_rect);
+    render_hosts_section(app, frame, app.view.hosts_section_rect);
 
     let panel_area = if app.view.sidebar_panel_rect == Rect::default() {
         area
@@ -1557,74 +1682,96 @@ pub(super) fn render_sidebar(
     render_sidebar_toggle(app, frame, area, false, p);
 }
 
-fn render_source_rail(app: &AppState, frame: &mut Frame, area: Rect) {
+fn render_hosts_section(app: &AppState, frame: &mut Frame, area: Rect) {
     if area == Rect::default() {
         return;
     }
 
     let p = &app.palette;
+
+    // Section header mirrors the ` spaces` / ` agents` language.
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            " hosts",
+            Style::default().fg(p.overlay0).add_modifier(Modifier::BOLD),
+        )])),
+        Rect::new(area.x, area.y, area.width.saturating_sub(1), 1),
+    );
+
+    let metrics = host_list_scroll_metrics(app, area);
+    let scrollbar_rect = host_list_scrollbar_rect(app, area);
+    let rows = host_list_row_areas(app);
     let selected_source = app.effective_sidebar_source();
-    let separator_x = area.x + area.width.saturating_sub(1);
-    let buf = frame.buffer_mut();
-    for y in area.y..area.y + area.height {
-        buf[(separator_x, y)].set_symbol("│");
-        buf[(separator_x, y)].set_style(Style::default().fg(p.surface_dim));
+
+    for row in &rows {
+        let entry = host_list_entries(app)
+            .into_iter()
+            .find(|entry| entry.source == row.source);
+        let Some(entry) = entry else {
+            continue;
+        };
+        render_host_row(app, &entry, row.rect, &selected_source, p, frame);
     }
 
-    let entries = source_rail_entries(app);
-    for (idx, entry) in entries.iter().enumerate() {
-        let y = area.y.saturating_add(idx as u16);
-        if y >= area.y + area.height {
-            break;
+    if let Some(track) = scrollbar_rect {
+        render_scrollbar(frame, metrics, track, p.surface_dim, p.overlay0, "▕");
+    }
+}
+
+fn render_host_row(
+    _app: &AppState,
+    entry: &HostListEntry,
+    rect: Rect,
+    selected_source: &SidebarSource,
+    p: &Palette,
+    frame: &mut Frame,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+
+    let selected = entry.source == *selected_source;
+    // A configured display-only host with no cached status is treated locally
+    // as stale/disconnected for presentation only; this never becomes cache
+    // state.
+    let stale = entry.status.is_none() || entry.status.is_some_and(|s| !s.is_connected());
+    let style = if selected {
+        Style::default()
+            .fg(p.text)
+            .bg(p.surface0)
+            .add_modifier(Modifier::BOLD)
+    } else if stale {
+        Style::default().fg(p.overlay0).add_modifier(Modifier::DIM)
+    } else {
+        Style::default().fg(p.subtext0)
+    };
+    if selected {
+        let buf = frame.buffer_mut();
+        for x in rect.x..rect.x + rect.width {
+            buf[(x, rect.y)].set_style(Style::default().bg(p.surface0));
         }
-        let row = SourceRailRowArea {
-            source: entry.source.clone(),
-            rect: Rect::new(area.x, y, area.width, 1),
-        };
-        let selected = entry.source == selected_source;
-        let stale = entry.status.is_some_and(|status| !status.is_connected());
-        let style = if selected {
-            Style::default()
-                .fg(p.text)
-                .bg(p.surface0)
-                .add_modifier(Modifier::BOLD)
-        } else if stale {
-            Style::default().fg(p.overlay0).add_modifier(Modifier::DIM)
+    }
+
+    // Right-edge status marker for cached remote statuses.
+    let marker_rect = entry
+        .status
+        .and_then(|_| (rect.width > 1).then_some(Rect::new(rect.x + rect.width - 1, rect.y, 1, 1)));
+    let label_width = rect.width.saturating_sub(u16::from(marker_rect.is_some()));
+    frame.render_widget(
+        Paragraph::new(truncate_text(&entry.label, label_width as usize)).style(style),
+        Rect::new(rect.x, rect.y, label_width, 1),
+    );
+    if let (Some(status), Some(marker_rect)) = (entry.status, marker_rect) {
+        let (symbol, marker_style) = host_status_marker(status, p);
+        let marker_style = if selected {
+            marker_style.bg(p.surface0)
         } else {
-            Style::default().fg(p.subtext0)
+            marker_style
         };
-        if selected {
-            let buf = frame.buffer_mut();
-            for x in row.rect.x..row.rect.x + row.rect.width.saturating_sub(1) {
-                buf[(x, row.rect.y)].set_style(Style::default().bg(p.surface0));
-            }
-        }
-        let content_width = row.rect.width.saturating_sub(1);
-        let marker_rect = entry.status.and_then(|_| {
-            (content_width > 0).then_some(Rect::new(
-                row.rect.x + content_width.saturating_sub(1),
-                row.rect.y,
-                1,
-                1,
-            ))
-        });
-        let label_width = content_width.saturating_sub(u16::from(marker_rect.is_some()));
         frame.render_widget(
-            Paragraph::new(truncate_text(&entry.label, label_width as usize)).style(style),
-            Rect::new(row.rect.x, row.rect.y, label_width, 1),
+            Paragraph::new(Span::styled(symbol, marker_style)),
+            marker_rect,
         );
-        if let (Some(status), Some(marker_rect)) = (entry.status, marker_rect) {
-            let (symbol, marker_style) = source_rail_status_marker(status, p);
-            let marker_style = if selected {
-                marker_style.bg(p.surface0)
-            } else {
-                marker_style
-            };
-            frame.render_widget(
-                Paragraph::new(Span::styled(symbol, marker_style)),
-                marker_rect,
-            );
-        }
     }
 }
 
@@ -2328,8 +2475,8 @@ mod tests {
 
     fn select_remote_projection(app: &mut AppState, host: &RemoteHostKey) {
         app.view.layout = crate::app::state::ViewLayout::Desktop;
-        app.view.source_rail_rect = Rect::new(0, 0, source_rail_width(), 20);
-        app.view.sidebar_panel_rect = Rect::new(source_rail_width(), 0, app.sidebar_width, 20);
+        app.view.hosts_section_rect = Rect::new(0, 0, app.sidebar_width, 4);
+        app.view.sidebar_panel_rect = Rect::new(0, 4, app.sidebar_width, 16);
         app.select_sidebar_source(SidebarSource::Remote(host.clone()));
     }
 
@@ -2350,11 +2497,11 @@ mod tests {
             .collect()
     }
 
-    fn rendered_source_rail_buffer(app: &AppState, area: Rect) -> ratatui::buffer::Buffer {
+    fn rendered_hosts_section_buffer(app: &AppState, area: Rect) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(area.width, area.height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_source_rail(app, frame, area))
+            .draw(|frame| render_hosts_section(app, frame, area))
             .unwrap();
 
         terminal.backend().buffer().clone()
@@ -3482,7 +3629,7 @@ mod tests {
     }
 
     #[test]
-    fn source_rail_remote_status_markers_render_in_status_column() {
+    fn hosts_section_remote_status_markers_render_in_status_column() {
         let mut app = crate::app::state::AppState::test_new();
         for (host, status) in [
             (
@@ -3507,73 +3654,202 @@ mod tests {
                 status,
             );
         }
-        let area = Rect::new(0, 0, source_rail_width(), 8);
-        app.view.source_rail_rect = area;
+        // Header (row 0) + local (row 1) + four remote hosts (rows 2..6).
+        let width = 10u16;
+        let area = Rect::new(0, 0, width, 8);
+        app.view.hosts_section_rect = area;
 
-        let buffer = rendered_source_rail_buffer(&app, area);
+        let buffer = rendered_hosts_section_buffer(&app, area);
         let marker_x = area.x + area.width - 2;
 
-        assert_eq!(buffer[(marker_x, 1)].symbol(), "●");
-        assert_eq!(buffer[(marker_x, 1)].style().fg, Some(app.palette.green));
-        assert_eq!(buffer[(marker_x, 2)].symbol(), "○");
-        assert_eq!(buffer[(marker_x, 2)].style().fg, Some(app.palette.overlay0));
-        assert!(buffer[(marker_x, 2)]
-            .style()
-            .add_modifier
-            .contains(Modifier::DIM));
-        assert_eq!(buffer[(marker_x, 3)].symbol(), "↑");
-        assert_eq!(buffer[(marker_x, 3)].style().fg, Some(app.palette.yellow));
+        assert_eq!(buffer[(marker_x, 2)].symbol(), "●");
+        assert_eq!(buffer[(marker_x, 2)].style().fg, Some(app.palette.green));
+        assert_eq!(buffer[(marker_x, 3)].symbol(), "○");
+        assert_eq!(buffer[(marker_x, 3)].style().fg, Some(app.palette.overlay0));
         assert!(buffer[(marker_x, 3)]
             .style()
             .add_modifier
-            .contains(Modifier::BOLD));
-        assert_eq!(buffer[(marker_x, 4)].symbol(), "×");
-        assert_eq!(buffer[(marker_x, 4)].style().fg, Some(app.palette.red));
+            .contains(Modifier::DIM));
+        assert_eq!(buffer[(marker_x, 4)].symbol(), "↑");
+        assert_eq!(buffer[(marker_x, 4)].style().fg, Some(app.palette.yellow));
         assert!(buffer[(marker_x, 4)]
+            .style()
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(buffer[(marker_x, 5)].symbol(), "×");
+        assert_eq!(buffer[(marker_x, 5)].style().fg, Some(app.palette.red));
+        assert!(buffer[(marker_x, 5)]
             .style()
             .add_modifier
             .contains(Modifier::BOLD));
     }
 
     #[test]
-    fn source_rail_selected_remote_marker_keeps_surface_background() {
+    fn hosts_section_selected_remote_marker_keeps_surface_background() {
         let mut app = crate::app::state::AppState::test_new();
         let host = RemoteHostKey::new("charlie", crate::session::DEFAULT_SESSION_NAME);
         app.remote_sources.mark_status(
             &host,
             crate::remote_source::RemoteConnectionStatus::NeedsUpdate,
         );
-        let area = Rect::new(0, 0, source_rail_width(), 4);
-        app.view.source_rail_rect = area;
-        app.view.sidebar_panel_rect = Rect::new(source_rail_width(), 0, app.sidebar_width, 4);
+        let width = 10u16;
+        let area = Rect::new(0, 0, width, 4);
+        app.view.hosts_section_rect = area;
         app.select_sidebar_source(SidebarSource::Remote(host));
 
-        let buffer = rendered_source_rail_buffer(&app, area);
+        let buffer = rendered_hosts_section_buffer(&app, area);
         let marker_x = area.x + area.width - 2;
-        let marker_style = buffer[(marker_x, 1)].style();
+        let marker_style = buffer[(marker_x, 2)].style();
 
-        assert_eq!(buffer[(marker_x, 1)].symbol(), "↑");
+        assert_eq!(buffer[(marker_x, 2)].symbol(), "↑");
         assert_eq!(marker_style.fg, Some(app.palette.yellow));
         assert_eq!(marker_style.bg, Some(app.palette.surface0));
         assert!(marker_style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
-    fn source_rail_remote_label_truncates_before_marker() {
+    fn hosts_section_remote_label_truncates_before_marker() {
         let mut app = crate::app::state::AppState::test_new();
         app.remote_sources.mark_status(
             &RemoteHostKey::new("verylongremotehost", crate::session::DEFAULT_SESSION_NAME),
             crate::remote_source::RemoteConnectionStatus::Connected,
         );
-        let area = Rect::new(0, 0, source_rail_width(), 4);
-        app.view.source_rail_rect = area;
+        let width = 10u16;
+        let area = Rect::new(0, 0, width, 4);
+        app.view.hosts_section_rect = area;
 
-        let buffer = rendered_source_rail_buffer(&app, area);
-        let row = (0..area.width)
-            .map(|x| buffer[(x, 1)].symbol())
+        let buffer = rendered_hosts_section_buffer(&app, area);
+        // Header occupies row 0 and local occupies row 1, so the remote host
+        // renders on row 2. The right-edge divider column (area.width - 1) is
+        // drawn by render_sidebar, not render_hosts_section, so read only the
+        // content columns up to and including the status marker.
+        let row = (0..(area.width - 1))
+            .map(|x| buffer[(x, 2)].symbol())
             .collect::<String>();
 
-        assert_eq!(row, "verylon…●│");
+        assert_eq!(row, "verylon…●");
+    }
+
+    #[test]
+    fn configured_manual_and_on_demand_hosts_visible_without_cache_entries() {
+        // G1: configured manual/on_demand hosts are carried by the pure display
+        // collection and merged with cached statuses only when building host
+        // rows. They must NEVER become synthetic RemoteSourceCache entries, so
+        // the on-demand dispatch contract (no-cache precheck passes; cached
+        // non-connected fails fast) is preserved.
+        let mut app = crate::app::state::AppState::test_new();
+        let auto_host = RemoteHostKey::new("alpha", crate::session::DEFAULT_SESSION_NAME);
+        app.remote_sources.mark_status(
+            &auto_host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        // Configured display-only hosts (manual / on_demand) carried only by
+        // the pure display collection, NOT seeded into the cache.
+        let manual = RemoteHostKey::new("brain", crate::session::DEFAULT_SESSION_NAME);
+        let on_demand = RemoteHostKey::new("future", "agents");
+        app.configured_remote_hosts = [manual.clone(), on_demand.clone()].into_iter().collect();
+
+        let entries = host_list_entries(&app);
+        let labels: Vec<_> = entries.iter().map(|entry| entry.label.clone()).collect();
+        // local first, then deterministic host/session order across the union
+        // of cached + configured-only hosts.
+        assert_eq!(labels, vec!["local", "alpha", "brain", "future/agents"]);
+
+        // Critical boundary: the configured-only hosts are NOT in the cache.
+        assert!(app.remote_sources.host_status(&manual).is_none());
+        assert!(app.remote_sources.host_status(&on_demand).is_none());
+        // The cached auto host is unaffected.
+        assert!(app.remote_sources.host_status(&auto_host).is_some());
+
+        // A configured-only host renders with no cached status (stale styling is
+        // derived locally by the row builder), never as a synthetic entry.
+        let manual_entry = entries
+            .iter()
+            .find(|entry| entry.source == SidebarSource::Remote(manual.clone()))
+            .expect("manual host present in entries");
+        assert!(manual_entry.status.is_none());
+    }
+
+    #[test]
+    fn host_list_scroll_clamps_and_renders_scrollbar_when_overflowing() {
+        // G2/G3: a long host list is capped to the Hosts viewport, scrolls, and
+        // renders a scrollbar; scroll offsets clamp at the bounds, mirroring the
+        // existing Spaces workspace-list scroll behavior.
+        let mut app = crate::app::state::AppState::test_new();
+        for i in 0..30 {
+            let host =
+                RemoteHostKey::new(format!("host{i:02}"), crate::session::DEFAULT_SESSION_NAME);
+            app.remote_sources.mark_status(
+                &host,
+                crate::remote_source::RemoteConnectionStatus::Connected,
+            );
+        }
+        // Small Hosts section: header + 3 body rows.
+        let area = Rect::new(0, 0, 26, 4);
+        app.view.hosts_section_rect = area;
+
+        let metrics = host_list_scroll_metrics(&app, area);
+        // 30 remote hosts + local = 31 entries; viewport = 3 body rows.
+        assert_eq!(metrics.viewport_rows, 3);
+        assert_eq!(metrics.max_offset_from_bottom, 31 - 3);
+        assert!(should_show_scrollbar(metrics));
+        assert!(host_list_scrollbar_rect(&app, area).is_some());
+
+        // Scrolling past the last visible offset clamps to the viewport's true
+        // maximum first-visible offset (entry_count - viewport_capacity = 28),
+        // not entry_count - 1, so the trailing viewport shows the last hosts.
+        app.host_list_scroll = normalized_host_list_scroll(&app, 100);
+        assert_eq!(app.host_list_scroll, 28);
+
+        // Visible rows track the scroll offset: only the viewport-height rows
+        // starting just below the header are reachable hit targets.
+        app.host_list_scroll = 5;
+        let rows = host_list_row_areas(&app);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].rect.y, area.y + 1);
+    }
+
+    #[test]
+    fn host_list_scroll_clamps_to_zero_when_list_shrinks_to_fit() {
+        // Reviewer B finding 1: after an overflow-scrolled host list shrinks
+        // until all entries fit, a stale nonzero scroll must clamp to 0 (the
+        // viewport's true maximum first-visible offset), not entry_count - 1,
+        // so `local`/leading hosts are never skipped.
+        let mut app = crate::app::state::AppState::test_new();
+        for i in 0..30 {
+            app.remote_sources.mark_status(
+                &RemoteHostKey::new(format!("host{i:02}"), crate::session::DEFAULT_SESSION_NAME),
+                crate::remote_source::RemoteConnectionStatus::Connected,
+            );
+        }
+        // Header + 3 body rows -> viewport capacity 3; 31 entries overflow.
+        let area = Rect::new(0, 0, 26, 4);
+        app.view.hosts_section_rect = area;
+        app.host_list_scroll = 5;
+        let overflow_metrics = host_list_scroll_metrics(&app, area);
+        assert!(overflow_metrics.max_offset_from_bottom > 0);
+
+        // Shrink: only one host survives, so local + 1 = 2 entries fit the
+        // 3-row viewport.
+        let keeper = RemoteHostKey::new("host00", crate::session::DEFAULT_SESSION_NAME);
+        app.remote_sources = crate::remote_source::RemoteSourceCache::default();
+        app.remote_sources.mark_status(
+            &keeper,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+
+        // The stale scroll (5) must clamp to 0 now that everything fits.
+        app.host_list_scroll = normalized_host_list_scroll(&app, app.host_list_scroll);
+        assert_eq!(app.host_list_scroll, 0);
+
+        // Local and the surviving host are both visible (no leading skip).
+        let visible: Vec<_> = host_list_row_areas(&app)
+            .into_iter()
+            .map(|row| row.source)
+            .collect();
+        assert!(visible.contains(&SidebarSource::Local));
+        assert!(visible.contains(&SidebarSource::Remote(keeper)));
+        assert_eq!(visible.len(), 2);
     }
 
     #[test]

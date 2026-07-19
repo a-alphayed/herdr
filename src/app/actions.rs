@@ -1306,6 +1306,59 @@ impl AppState {
         }
     }
 
+    /// Move the selected Hosts-section entry by `delta` rows, clamping at the
+    /// list bounds, and keep the new selection visible by scrolling the host
+    /// viewport. This is read-model-only: it selects a [`SidebarSource`] and
+    /// never mutates local workspace/focus, PTY ownership, or remote state.
+    ///
+    /// Section-scoped: when the Hosts section is absent (`hosts_section_rect`
+    /// is default, i.e. collapsed/mobile/tiny), the reserved Navigate keys stay
+    /// consumed but this is a no-op, so a hidden remote selection is never
+    /// staged and later surfaced when the section returns.
+    pub(crate) fn move_selected_host_by_delta(&mut self, delta: isize) {
+        if self.view.hosts_section_rect == ratatui::layout::Rect::default() {
+            return;
+        }
+        let entries = crate::ui::host_list_entries(self);
+        if entries.is_empty() {
+            return;
+        }
+        let current = self.effective_sidebar_source();
+        let current_pos = entries
+            .iter()
+            .position(|entry| entry.source == current)
+            .unwrap_or(0);
+        let target_pos = current_pos
+            .saturating_add_signed(delta)
+            .min(entries.len() - 1);
+        if let Some(entry) = entries.get(target_pos) {
+            self.select_sidebar_source(entry.source.clone());
+            self.ensure_host_visible(target_pos);
+        }
+    }
+
+    /// Scroll the Hosts viewport so host entry `idx` stays visible, mirroring
+    /// `ensure_workspace_visible`'s clamp-into-view behavior.
+    pub(crate) fn ensure_host_visible(&mut self, idx: usize) {
+        let area = self.view.hosts_section_rect;
+        if area == ratatui::layout::Rect::default() {
+            return;
+        }
+        let viewport = crate::ui::host_list_scroll_metrics(self, area).viewport_rows;
+        if viewport == 0 {
+            return;
+        }
+        let scroll = self.host_list_scroll;
+        let target = if idx < scroll {
+            idx
+        } else if idx >= scroll.saturating_add(viewport) {
+            idx.saturating_add(1).saturating_sub(viewport)
+        } else {
+            scroll
+        };
+        self.host_list_scroll = crate::ui::normalized_host_list_scroll(self, target);
+    }
+
     pub fn next_workspace(&mut self) {
         if self.workspaces.is_empty() {
             return;
@@ -3889,8 +3942,8 @@ mod tests {
 
     fn select_remote_projection(state: &mut AppState, host: &RemoteHostKey) {
         state.view.layout = crate::app::state::ViewLayout::Desktop;
-        state.view.source_rail_rect = Rect::new(0, 0, 10, 20);
-        state.view.sidebar_panel_rect = Rect::new(10, 0, state.sidebar_width, 20);
+        state.view.hosts_section_rect = Rect::new(0, 0, state.sidebar_width, 4);
+        state.view.sidebar_panel_rect = Rect::new(0, 4, state.sidebar_width, 16);
         state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
     }
 

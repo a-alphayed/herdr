@@ -130,6 +130,8 @@ pub(super) fn render_navigate_overlay(app: &AppState, frame: &mut Frame, area: R
         Span::styled(" back  ", dim),
         Span::styled(workspace_nav, key),
         Span::styled(" ws  ", dim),
+        Span::styled("shift+↑/↓", key),
+        Span::styled(" host  ", dim),
         Span::styled("⇥", key),
         Span::styled(" pane  ", dim),
         Span::styled(goto, key),

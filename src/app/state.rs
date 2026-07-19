@@ -729,13 +729,14 @@ pub enum ViewLayout {
 
 pub struct ViewState {
     pub layout: ViewLayout,
-    /// Total desktop sidebar rect, including the optional source rail and the
-    /// right-edge divider.
+    /// Total desktop sidebar rect, including the Hosts section, the
+    /// Spaces/Agents panel, and the right-edge divider.
     pub sidebar_rect: Rect,
-    /// Optional source rail shown beside the expanded desktop sidebar panel.
-    pub source_rail_rect: Rect,
-    /// Sidebar content panel rect. This is the area used by workspace and
-    /// agent panel render/input helpers.
+    /// Optional Hosts section shown above the expanded desktop sidebar panel.
+    /// `Rect::default()` for collapsed sidebar or mobile layout.
+    pub hosts_section_rect: Rect,
+    /// Sidebar content panel rect (Spaces/Agents). This is the area used by
+    /// workspace and agent panel render/input helpers.
     pub sidebar_panel_rect: Rect,
     pub workspace_card_areas: Vec<WorkspaceCardArea>,
     pub tab_bar_rect: Rect,
@@ -1099,6 +1100,9 @@ pub(crate) enum DragTarget {
         insert_idx: Option<usize>,
     },
     WorkspaceListScrollbar {
+        grab_row_offset: u16,
+    },
+    HostListScrollbar {
         grab_row_offset: u16,
     },
     AgentPanelScrollbar {
@@ -1481,6 +1485,14 @@ pub struct AppState {
     pub(crate) public_pane_id_aliases: std::collections::HashMap<String, PaneId>,
     pub workspaces: Vec<Workspace>,
     pub remote_sources: crate::remote_source::RemoteSourceCache,
+    /// Configured remote host keys carried as a pure display/read-model
+    /// collection so `manual`/`on_demand` hosts stay visible in the Hosts
+    /// section without a synthetic [`crate::remote_source::RemoteSourceCache`]
+    /// entry. Merged with cached host statuses only when building host rows;
+    /// never mutates the cache, auto-connect host selection, supervisor, or
+    /// scheduler state.
+    pub(crate) configured_remote_hosts:
+        std::collections::BTreeSet<crate::remote_source::RemoteHostKey>,
     pub(crate) sidebar_source: SidebarSource,
     pub active: Option<usize>,
     pub(crate) previous_pane_focus: Option<PaneFocusTarget>,
@@ -1544,6 +1556,10 @@ pub struct AppState {
     pub tab_scroll: usize,
     pub tab_scroll_follow_active: bool,
     pub mobile_switcher_scroll: usize,
+    /// Hosts-section list scroll offset. Like `workspace_scroll`, it is a
+    /// row index into the host list entries and is normalized/clamped against
+    /// the Hosts viewport before each render.
+    pub host_list_scroll: usize,
     // View geometry (computed before render, consumed by render + mouse)
     pub view: ViewState,
     pub(crate) drag: Option<DragState>,
@@ -1675,12 +1691,18 @@ impl AppState {
         self.selected_remote_agent = None;
         self.workspace_scroll = 0;
         self.agent_panel_scroll = 0;
+        // The host list viewport is intentionally NOT reset here: its content
+        // (local + every configured/cached host) is independent of the selected
+        // source, so resetting it on selection would hide a just-clicked host in
+        // a scrolled list. Keyboard navigation keeps the selection reachable via
+        // `ensure_host_visible`, and render-time `normalized_host_list_scroll`
+        // clamps the offset.
     }
 
     pub(crate) fn effective_sidebar_source(&self) -> SidebarSource {
         if self.view.layout != ViewLayout::Desktop
             || self.sidebar_collapsed
-            || self.view.source_rail_rect == Rect::default()
+            || self.view.hosts_section_rect == Rect::default()
         {
             return SidebarSource::Local;
         }
@@ -1879,6 +1901,7 @@ impl AppState {
             public_pane_id_aliases: std::collections::HashMap::new(),
             workspaces: Vec::new(),
             remote_sources: crate::remote_source::RemoteSourceCache::default(),
+            configured_remote_hosts: std::collections::BTreeSet::new(),
             sidebar_source: SidebarSource::Local,
             active: None,
             previous_pane_focus: None,
@@ -1932,10 +1955,11 @@ impl AppState {
             tab_scroll: 0,
             tab_scroll_follow_active: true,
             mobile_switcher_scroll: 0,
+            host_list_scroll: 0,
             view: ViewState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
-                source_rail_rect: Rect::default(),
+                hosts_section_rect: Rect::default(),
                 sidebar_panel_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),

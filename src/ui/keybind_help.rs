@@ -106,6 +106,7 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
             help_entry("tab / shift+tab", "cycle pane"),
             help_entry("enter", "open workspace"),
             help_entry("1..9", "switch workspace"),
+            help_entry("shift+up / shift+down", "host list"),
         ],
     ));
 

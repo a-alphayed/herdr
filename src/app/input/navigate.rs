@@ -6,7 +6,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Direction;
 
 use crate::{
@@ -347,6 +347,8 @@ impl App {
             NavigateAction::OpenNavigator => {
                 self.state.open_navigator_from(&self.terminal_runtimes)
             }
+            NavigateAction::HostUp => self.state.move_selected_host_by_delta(-1),
+            NavigateAction::HostDown => self.state.move_selected_host_by_delta(1),
         }
 
         finish_action_context(&mut self.state, context, previous_mode);
@@ -1082,6 +1084,17 @@ pub(super) fn handle_navigate_reserved_key(state: &mut AppState, key: TerminalKe
         }
     }
 
+    // Reserved Navigate-only Hosts-section keys (pure-state path mirror of
+    // `navigate_reserved_action_for_key`'s HostUp/HostDown mapping).
+    if code == KeyCode::Up && modifiers == KeyModifiers::SHIFT {
+        state.move_selected_host_by_delta(-1);
+        return true;
+    }
+    if code == KeyCode::Down && modifiers == KeyModifiers::SHIFT {
+        state.move_selected_host_by_delta(1);
+        return true;
+    }
+
     if state.keybinds.navigate.workspace_up.matches_direct_key(key) {
         state.move_selected_workspace_by_visible_delta(-1);
         return true;
@@ -1139,6 +1152,17 @@ fn navigate_reserved_action_for_key(state: &AppState, key: TerminalKey) -> Optio
             KeyCode::Right => return Some(NavigateAction::FocusPaneRight),
             _ => {}
         }
+    }
+
+    // Reserved Navigate-only Hosts-section keys: Shift+Up / Shift+Down move
+    // and clamp the selected host and keep it visible without leaving
+    // Navigate mode. They are reserved in `reserve_navigate_runtime_keys`, so
+    // they can never collide with a configured Navigate binding here.
+    if code == KeyCode::Up && modifiers == KeyModifiers::SHIFT {
+        return Some(NavigateAction::HostUp);
+    }
+    if code == KeyCode::Down && modifiers == KeyModifiers::SHIFT {
+        return Some(NavigateAction::HostDown);
     }
 
     if state.keybinds.navigate.workspace_up.matches_direct_key(key)
@@ -1247,6 +1271,11 @@ pub(crate) enum NavigateAction {
     OpenNotificationTarget,
     Detach,
     OpenNavigator,
+    /// Navigate-only: move the selected Hosts-section entry up/down and keep
+    /// it visible without leaving Navigate mode. Reserved `Shift+Up` /
+    /// `Shift+Down` runtime keys, so they are never user-configurable.
+    HostUp,
+    HostDown,
 }
 
 fn indexed_navigation_action(
@@ -1582,6 +1611,8 @@ pub(super) fn execute_navigate_action_in_context(
             leave_navigate_mode(state);
         }
         NavigateAction::OpenNavigator => state.open_navigator_from(terminal_runtimes),
+        NavigateAction::HostUp => state.move_selected_host_by_delta(-1),
+        NavigateAction::HostDown => state.move_selected_host_by_delta(1),
     }
 
     finish_action_context(state, context, previous_mode);
@@ -2890,5 +2921,120 @@ last_pane = "prefix+tab"
 
         assert!(state.detach_requested);
         assert!(!state.should_quit);
+    }
+
+    #[test]
+    fn navigate_shift_arrows_move_host_selection_without_leaving_navigate_mode() {
+        // G4: Shift+Up / Shift+Down are reserved Navigate-only keys that move
+        // and clamp the selected Hosts-section entry and keep it visible,
+        // without leaving Navigate mode. Plain Up/Down still navigate
+        // workspaces (tested elsewhere) and do not become host cycling.
+        let mut state = state_with_workspaces(&["main"]);
+        state.mode = Mode::Navigate;
+        let alpha =
+            crate::remote_source::RemoteHostKey::new("alpha", crate::session::DEFAULT_SESSION_NAME);
+        let bravo =
+            crate::remote_source::RemoteHostKey::new("bravo", crate::session::DEFAULT_SESSION_NAME);
+        state.remote_sources.mark_status(
+            &alpha,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        state.remote_sources.mark_status(
+            &bravo,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        state.view.hosts_section_rect = ratatui::layout::Rect::new(0, 0, 26, 4);
+        state.sidebar_source = crate::app::state::SidebarSource::Local;
+
+        // local -> alpha -> bravo.
+        handle_navigate_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+        );
+        assert_eq!(
+            state.sidebar_source,
+            crate::app::state::SidebarSource::Remote(alpha.clone())
+        );
+        assert_eq!(state.mode, Mode::Navigate);
+        handle_navigate_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+        );
+        assert_eq!(
+            state.sidebar_source,
+            crate::app::state::SidebarSource::Remote(bravo.clone())
+        );
+
+        // Clamp at the bottom: stays on bravo.
+        handle_navigate_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+        );
+        assert_eq!(
+            state.sidebar_source,
+            crate::app::state::SidebarSource::Remote(bravo.clone())
+        );
+
+        // bravo -> alpha -> local.
+        handle_navigate_key(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        assert_eq!(
+            state.sidebar_source,
+            crate::app::state::SidebarSource::Remote(alpha.clone())
+        );
+        handle_navigate_key(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        assert_eq!(
+            state.sidebar_source,
+            crate::app::state::SidebarSource::Local
+        );
+        // Clamp at the top: stays on local.
+        handle_navigate_key(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        assert_eq!(
+            state.sidebar_source,
+            crate::app::state::SidebarSource::Local
+        );
+        assert_eq!(state.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn navigate_shift_arrows_do_not_select_host_when_section_absent() {
+        // Reviewer B finding 2: Navigate Shift+Up/Shift+Down host movement is
+        // section-scoped. When the Hosts section is absent (collapsed/mobile),
+        // the reserved keys stay consumed (mode stays Navigate) but must NOT
+        // mutate sidebar_source, so a hidden remote selection is never staged
+        // and later surfaced when the section returns.
+        let mut state = state_with_workspaces(&["main"]);
+        state.mode = Mode::Navigate;
+        let alpha =
+            crate::remote_source::RemoteHostKey::new("alpha", crate::session::DEFAULT_SESSION_NAME);
+        state.remote_sources.mark_status(
+            &alpha,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        // Section absent even though hosts exist in the read model.
+        state.view.hosts_section_rect = ratatui::layout::Rect::default();
+        state.sidebar_source = crate::app::state::SidebarSource::Local;
+
+        handle_navigate_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+        );
+        assert_eq!(state.mode, Mode::Navigate, "reserved key is still consumed");
+        assert_eq!(
+            state.sidebar_source,
+            crate::app::state::SidebarSource::Local,
+            "section-absent movement must not stage a hidden remote selection"
+        );
+        handle_navigate_key(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        assert_eq!(
+            state.sidebar_source,
+            crate::app::state::SidebarSource::Local
+        );
+
+        // When the section returns, no hidden remote selection is surfaced.
+        state.view.hosts_section_rect = ratatui::layout::Rect::new(0, 0, 26, 4);
+        assert_eq!(
+            state.effective_sidebar_source(),
+            crate::app::state::SidebarSource::Local
+        );
     }
 }

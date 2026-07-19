@@ -557,8 +557,23 @@ impl AppState {
                         return None;
                     }
 
-                    if self.on_source_rail(mouse.column, mouse.row) {
-                        if let Some(source) = self.source_rail_target_at(mouse.column, mouse.row) {
+                    if self.on_hosts_section(mouse.column, mouse.row) {
+                        if let Some(target) =
+                            self.host_list_scrollbar_target_at(mouse.column, mouse.row)
+                        {
+                            match target {
+                                ScrollbarClickTarget::Thumb { grab_row_offset } => {
+                                    self.drag = Some(DragState {
+                                        target: DragTarget::HostListScrollbar { grab_row_offset },
+                                    });
+                                }
+                                ScrollbarClickTarget::Track { offset_from_bottom } => {
+                                    self.set_host_list_offset_from_bottom(offset_from_bottom);
+                                }
+                            }
+                            return None;
+                        }
+                        if let Some(source) = self.host_target_at(mouse.column, mouse.row) {
                             self.select_sidebar_source(source);
                         }
                         return None;
@@ -928,6 +943,13 @@ impl AppState {
                                 self.set_agent_panel_offset_from_bottom(offset_from_bottom);
                             }
                         }
+                        DragTarget::HostListScrollbar { grab_row_offset } => {
+                            if let Some(offset_from_bottom) =
+                                self.host_list_offset_for_drag_row(mouse.row, *grab_row_offset)
+                            {
+                                self.set_host_list_offset_from_bottom(offset_from_bottom);
+                            }
+                        }
                         DragTarget::PaneSplit {
                             path,
                             direction,
@@ -1129,7 +1151,15 @@ impl AppState {
             }
 
             MouseEventKind::ScrollUp if in_sidebar => {
-                if self.on_source_rail(mouse.column, mouse.row) {
+                if self.on_hosts_section(mouse.column, mouse.row) {
+                    let area = self.view.hosts_section_rect;
+                    if crate::ui::should_show_scrollbar(crate::ui::host_list_scroll_metrics(
+                        self, area,
+                    )) {
+                        self.scroll_host_list(-1);
+                    } else {
+                        self.move_selected_host_by_delta(-1);
+                    }
                     return None;
                 }
                 let agent_area = self.agent_panel_rect();
@@ -1151,7 +1181,15 @@ impl AppState {
                 }
             }
             MouseEventKind::ScrollDown if in_sidebar => {
-                if self.on_source_rail(mouse.column, mouse.row) {
+                if self.on_hosts_section(mouse.column, mouse.row) {
+                    let area = self.view.hosts_section_rect;
+                    if crate::ui::should_show_scrollbar(crate::ui::host_list_scroll_metrics(
+                        self, area,
+                    )) {
+                        self.scroll_host_list(1);
+                    } else {
+                        self.move_selected_host_by_delta(1);
+                    }
                     return None;
                 }
                 let agent_area = self.agent_panel_rect();
@@ -1187,15 +1225,14 @@ impl AppState {
             }
 
             MouseEventKind::Down(MouseButton::Right) if in_sidebar && !self.sidebar_collapsed => {
-                if self.on_source_rail(mouse.column, mouse.row) {
-                    // Right-clicking the source rail never switches the active
+                if self.on_hosts_section(mouse.column, mouse.row) {
+                    // Right-clicking the Hosts section never switches the active
                     // projected source (left-click is the read-model switch).
-                    // A configured remote source row opens the copy-only remote
-                    // source context menu; local rail rows and blank rail rows
-                    // stay consumed/no-op, preserving the existing rail
-                    // consumption behavior.
+                    // A remote host row opens the copy-only remote source
+                    // context menu (exact B.5d); local/header/blank rows stay
+                    // consumed/no-op.
                     if let Some(crate::app::state::SidebarSource::Remote(host)) =
-                        self.source_rail_target_at(mouse.column, mouse.row)
+                        self.host_target_at(mouse.column, mouse.row)
                     {
                         self.context_menu = Some(ContextMenuState {
                             kind: ContextMenuKind::RemoteSource { host },

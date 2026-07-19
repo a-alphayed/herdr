@@ -687,6 +687,13 @@ fn reserve_navigate_runtime_keys(registry: &mut BindingRegistry) {
         (KeyCode::Tab, KeyModifiers::empty()),
         (KeyCode::BackTab, KeyModifiers::empty()),
         (KeyCode::Tab, KeyModifiers::SHIFT),
+        // Reserved Navigate-only Hosts-section keys: Shift+Up / Shift+Down
+        // move and clamp the selected host in the expanded-desktop Hosts
+        // section. Reserving them here means a user config that tries to
+        // assign either combo to another Navigate action is rejected/disabled
+        // with the standard collision diagnostic.
+        (KeyCode::Up, KeyModifiers::SHIFT),
+        (KeyCode::Down, KeyModifiers::SHIFT),
         (KeyCode::Left, KeyModifiers::empty()),
         (KeyCode::Right, KeyModifiers::empty()),
     ] {
@@ -1764,6 +1771,33 @@ navigate_workspace_up = ["esc", "alt+esc", "enter", "1", "tab", "shift+tab", "le
                 .count(),
             8
         );
+    }
+
+    #[test]
+    fn navigate_bindings_reject_shift_arrow_host_keys() {
+        // G4: Shift+Up / Shift+Down are reserved Navigate-only Hosts-section
+        // runtime keys. A user config that assigns either combo to another
+        // Navigate action is rejected/disabled with the standard collision
+        // diagnostic (kept "navigate reserved keys").
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+navigate_workspace_up = "shift+up"
+navigate_workspace_down = "shift+down"
+"#,
+        )
+        .unwrap();
+        let keybinds = config.keybinds();
+        let diagnostics = config.collect_diagnostics();
+
+        assert!(keybinds.navigate.workspace_up.bindings.is_empty());
+        assert!(keybinds.navigate.workspace_down.bindings.is_empty());
+        assert!(diagnostics.iter().any(|diag| {
+            diag.contains("navigate reserved keys") && diag.contains("keys.navigate_workspace_up")
+        }));
+        assert!(diagnostics.iter().any(|diag| {
+            diag.contains("navigate reserved keys") && diag.contains("keys.navigate_workspace_down")
+        }));
     }
 
     #[test]
