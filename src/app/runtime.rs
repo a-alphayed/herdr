@@ -103,13 +103,31 @@ impl App {
                 request,
                 respond_to,
             } => {
-                let response = self.handle_api_request_after_internal_events_drained(*request);
-                if !skip_default_workspace {
-                    changed |= self.ensure_default_workspace();
+                // Try the local lifecycle seam (connect/reconnect/disconnect)
+                // before the synchronous fallback: it is a deferred, off-loop
+                // action that must not block the App loop on remote SSH/reap.
+                match self.handle_deferred_remote_lifecycle_api_request(*request, respond_to) {
+                    crate::app::DeferredRemoteLifecycleOutcome::Handled => {
+                        if !skip_default_workspace {
+                            changed |= self.ensure_default_workspace();
+                        }
+                        self.sync_prefix_input_source(previous_mode);
+                        changed
+                    }
+                    crate::app::DeferredRemoteLifecycleOutcome::NotHandled {
+                        request,
+                        respond_to,
+                    } => {
+                        let response =
+                            self.handle_api_request_after_internal_events_drained(*request);
+                        if !skip_default_workspace {
+                            changed |= self.ensure_default_workspace();
+                        }
+                        let _ = respond_to.send(response);
+                        self.sync_prefix_input_source(previous_mode);
+                        changed
+                    }
                 }
-                let _ = respond_to.send(response);
-                self.sync_prefix_input_source(previous_mode);
-                changed
             }
         }
     }

@@ -2603,6 +2603,7 @@ impl AppState {
                 capabilities,
                 projections,
                 tabs,
+                ..
             } => {
                 self.remote_sources
                     .replace_connected_snapshot(host.clone(), agents);
@@ -2626,11 +2627,13 @@ impl AppState {
                 self.remote_sources.remove_agent(&key);
                 Vec::new()
             }
-            AppEvent::RemoteSourceDisconnected { host, status } => {
+            AppEvent::RemoteSourceDisconnected { host, status, .. } => {
                 self.remote_sources.mark_status(&host, status);
                 Vec::new()
             }
-            AppEvent::RemoteSourceBridgeState { host, bridge_state } => {
+            AppEvent::RemoteSourceBridgeState {
+                host, bridge_state, ..
+            } => {
                 // C3: a bridge-state event is published only from a successful
                 // supervisor ping, so it proves the host is reachable. Mark the
                 // host `Connected` (a snapshot may not have arrived yet -> no
@@ -2861,6 +2864,12 @@ impl AppState {
             AppEvent::WorktreeAddFinished(_) => Vec::new(),
             AppEvent::WorktreeRemoveFinished(_) => Vec::new(),
             AppEvent::PluginCommandFinished { .. } => Vec::new(),
+            // Lifecycle completion events are App-only bookkeeping that drive
+            // the pending `respond_to` channel; they never mutate the pure
+            // AppState and produce no pane updates. The App resolves the
+            // pending responder before/instead of forwarding these here.
+            AppEvent::RemoteSourceLifecycleAttempt { .. } => Vec::new(),
+            AppEvent::RemoteSourcePoolDrainCompleted { .. } => Vec::new(),
         }
     }
 
@@ -4069,6 +4078,7 @@ mod tests {
         let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            generation: 0,
             host: host.clone(),
             agents: vec![remote_agent("remote-term", "smoke-agent")],
             workspaces: None,
@@ -4105,6 +4115,7 @@ mod tests {
         let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            generation: 0,
             host: host.clone(),
             agents: Vec::new(),
             workspaces: Some(vec![remote_workspace("remote-ws", "blank shell")]),
@@ -4133,6 +4144,7 @@ mod tests {
         let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            generation: 0,
             host: host.clone(),
             agents: Vec::new(),
             workspaces: Some(Vec::new()),
@@ -4174,6 +4186,7 @@ mod tests {
         state.active = None;
         let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            generation: 0,
             host: host.clone(),
             agents: Vec::new(),
             workspaces: Some(vec![remote_workspace("remote-ws", "metadata label")]),
@@ -4185,6 +4198,7 @@ mod tests {
         agent.cwd = Some("/home/amf/tmp".to_string());
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            generation: 0,
             host: host.clone(),
             agents: vec![agent],
             workspaces: None,
@@ -4210,6 +4224,7 @@ mod tests {
         let mut state = AppState::test_new();
         let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            generation: 0,
             host: host.clone(),
             agents: vec![remote_agent("remote-term", "smoke-agent")],
             workspaces: None,
@@ -4219,6 +4234,7 @@ mod tests {
         });
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceDisconnected {
+            generation: 0,
             host: host.clone(),
             status: crate::remote_source::RemoteConnectionStatus::Unreachable,
         });
@@ -4245,6 +4261,7 @@ mod tests {
         let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
 
         let updates = state.handle_app_event(AppEvent::RemoteSourceDisconnected {
+            generation: 0,
             host: host.clone(),
             status: crate::remote_source::RemoteConnectionStatus::NeedsUpdate,
         });
@@ -4261,6 +4278,7 @@ mod tests {
         let mut state = AppState::test_new();
         let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            generation: 0,
             host: host.clone(),
             agents: vec![remote_agent_with_revision(
                 "remote-term",
@@ -4318,6 +4336,7 @@ mod tests {
         let keep = RemoteHostKey::new("jafar", "default");
         let remove = RemoteHostKey::new("jafar", "agents");
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            generation: 0,
             host: keep.clone(),
             agents: vec![remote_agent("remote-term", "keep")],
             workspaces: None,
@@ -4326,6 +4345,7 @@ mod tests {
             tabs: Vec::new(),
         });
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            generation: 0,
             host: remove.clone(),
             agents: vec![remote_agent("remote-term", "remove")],
             workspaces: None,
@@ -4362,6 +4382,7 @@ mod tests {
         let keep = RemoteHostKey::new("jafar", "default");
         let remove = RemoteHostKey::new("jafar", "agents");
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            generation: 0,
             host: keep.clone(),
             agents: vec![remote_agent("keep-term", "keep")],
             workspaces: None,
@@ -4370,6 +4391,7 @@ mod tests {
             tabs: Vec::new(),
         });
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            generation: 0,
             host: remove.clone(),
             agents: vec![remote_agent("remove-term", "remove")],
             workspaces: None,
@@ -4421,6 +4443,7 @@ mod tests {
             },
         );
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            generation: 0,
             host: keep,
             agents: vec![remote_agent("keep-term", "keep")],
             workspaces: None,
@@ -4429,6 +4452,7 @@ mod tests {
             tabs: Vec::new(),
         });
         state.handle_app_event(AppEvent::RemoteSourceSnapshot {
+            generation: 0,
             host: remove.clone(),
             agents: vec![remote_agent("remove-term", "remove")],
             workspaces: None,

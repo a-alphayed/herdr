@@ -132,6 +132,12 @@ pub enum AppEvent {
     /// A connected authoritative remote host/session reported a full agent snapshot.
     RemoteSourceSnapshot {
         host: RemoteHostKey,
+        /// Supervisor incarnation that produced this snapshot. The App accepts a
+        /// remote-source event only when the host/session still matches the
+        /// loaded registry and the currently active keyed handle carries this
+        /// exact generation; a retired predecessor's queued/late event is
+        /// rejected so a same-host reconnect cannot admit stale data.
+        generation: u64,
         agents: Vec<AgentInfo>,
         workspaces: Option<Vec<WorkspaceInfo>>,
         capabilities: RemoteSourceCapabilities,
@@ -152,6 +158,9 @@ pub enum AppEvent {
     /// A remote host/session became unreachable or incompatible; keep last-known agents stale.
     RemoteSourceDisconnected {
         host: RemoteHostKey,
+        /// Supervisor incarnation that produced this status; see
+        /// [`AppEvent::RemoteSourceSnapshot`] generation filtering.
+        generation: u64,
         status: RemoteConnectionStatus,
     },
     /// A connected authoritative remote host/session published prepared bridge
@@ -163,10 +172,37 @@ pub enum AppEvent {
     /// not connection pooling.
     RemoteSourceBridgeState {
         host: RemoteHostKey,
+        /// Supervisor incarnation that captured this prepared state; see
+        /// [`AppEvent::RemoteSourceSnapshot`] generation filtering.
+        generation: u64,
         bridge_state: crate::remote::RemoteApiBridgeState,
     },
     /// A remote host/session was removed from aggregation state.
     RemoteSourceRemoved { host: RemoteHostKey },
+    /// A deferred runtime lifecycle attempt (connect/reconnect initial ping)
+    /// finished for one supervisor incarnation. Tagged with the exact
+    /// generation/epoch the App installed; if that generation is no longer the
+    /// active one (superseded by reconnect/disconnect/config reload), the App
+    /// already resolved its pending responder with a deterministic superseded
+    /// error and ignores this event. Otherwise the App resolves the pending
+    /// responder with the resulting LOCAL aggregation status. This event never
+    /// reaches the pure [`AppState`] reducer: lifecycle completion is App-only
+    /// bookkeeping that drives the pending `respond_to` channel.
+    RemoteSourceLifecycleAttempt {
+        host: RemoteHostKey,
+        generation: u64,
+        outcome: crate::remote_supervisor::RemoteSourceLifecycleOutcome,
+    },
+    /// A deferred persistent-bridge pool cleanup (disconnect) finished reaping
+    /// one host's idle bridges off-loop. Tagged with the lifecycle generation
+    /// the App installed when it advanced the pool generation; if superseded,
+    /// the pending responder was already resolved and this event is ignored.
+    /// Otherwise the App resolves the disconnect pending responder with
+    /// success. App-only bookkeeping; never reaches the pure reducer.
+    RemoteSourcePoolDrainCompleted {
+        host: RemoteHostKey,
+        generation: u64,
+    },
     /// A remote workspace create request succeeded on the authoritative host.
     RemoteWorkspaceCreateSucceeded {
         host: RemoteHostKey,

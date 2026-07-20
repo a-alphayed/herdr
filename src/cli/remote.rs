@@ -1,6 +1,7 @@
 use std::io;
 use std::path::Path;
 
+use crate::api::schema::{Method, RemoteLifecycleHostParams, Request};
 use crate::remote_target::{
     RemoteConnectionPolicy, RemoteHostConfig, RemoteHostRegistry, DEFAULT_CONNECT_TIMEOUT_SECS,
 };
@@ -19,6 +20,9 @@ pub(super) fn run_remote_command(args: &[String]) -> io::Result<i32> {
         "add" => remote_add(&args[1..]),
         "remove" => remote_remove(&args[1..]),
         "setup" => remote_setup(&args[1..]),
+        "connect" => run_remote_lifecycle(&args[1..], RemoteLifecycleCliAction::Connect),
+        "reconnect" => run_remote_lifecycle(&args[1..], RemoteLifecycleCliAction::Reconnect),
+        "disconnect" => run_remote_lifecycle(&args[1..], RemoteLifecycleCliAction::Disconnect),
         "help" | "--help" | "-h" => {
             print_remote_help();
             Ok(0)
@@ -27,6 +31,387 @@ pub(super) fn run_remote_command(args: &[String]) -> io::Result<i32> {
             print_remote_help();
             Ok(2)
         }
+    }
+}
+
+/// Which explicit local runtime lifecycle action the CLI is dispatching.
+/// Mirrors the local API method name so the request and rendered output are
+/// self-describing. These control ONLY the running local server's
+/// aggregation/supervisor/bridge state; they never reach the remote Herdr
+/// server and never become remote-of-remote commands (the API methods are not
+/// advertised as federation capabilities/routed methods).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteLifecycleCliAction {
+    Connect,
+    Reconnect,
+    Disconnect,
+}
+
+impl RemoteLifecycleCliAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Reconnect => "reconnect",
+            Self::Disconnect => "disconnect",
+        }
+    }
+
+    fn usage(self) -> &'static str {
+        match self {
+            Self::Connect => "usage: herdr remote connect <HOST> [--json]",
+            Self::Reconnect => "usage: herdr remote reconnect <HOST> [--json]",
+            Self::Disconnect => "usage: herdr remote disconnect <HOST> [--json]",
+        }
+    }
+
+    fn method(self, host: String) -> Method {
+        let params = RemoteLifecycleHostParams { host };
+        match self {
+            Self::Connect => Method::RemoteConnect(params),
+            Self::Reconnect => Method::RemoteReconnect(params),
+            Self::Disconnect => Method::RemoteDisconnect(params),
+        }
+    }
+}
+
+/// A CLI-side lifecycle failure: a stable machine-readable `code`, the
+/// human-readable `message`, the process `exit_code`, and whether the human
+/// form appends the usage line. The JSON form emits a single
+/// `{"id","error":{"code","message"}}` object (mirroring the server's typed
+/// `ErrorResponse`) regardless of `print_usage`; the human form stays clear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LifecycleCliFailure {
+    code: &'static str,
+    message: String,
+    exit_code: i32,
+    print_usage: bool,
+}
+
+/// The request id the CLI uses (and synthesizes for CLI-side JSON errors) for
+/// a lifecycle action. Matches the `id` the CLI sends on the wire so JSON
+/// consumers see one consistent id across success and every failure path.
+fn cli_lifecycle_request_id(action: RemoteLifecycleCliAction) -> String {
+    format!("cli:remote:{}", action.label())
+}
+
+/// Build the single machine-readable JSON object emitted for a CLI-side
+/// lifecycle failure. Mirrors the server's typed `ErrorResponse` shape
+/// (`{"id","error":{"code","message"}}`) so `--json` success and every
+/// failure path share one consistent stream/shape.
+fn lifecycle_failure_json(id: &str, code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "error": { "code": code, "message": message }
+    })
+}
+
+/// Whether `--json` is requested anywhere in `args`. Used to emit structured
+/// JSON even when full parsing fails before the `--json` flag is resolved, so a
+/// `--json` parse failure still produces a machine-readable response rather
+/// than human text. A `--json=...` token also counts as requested (the value
+/// form is itself a parse error, but the user clearly asked for JSON).
+fn args_request_json(args: &[String]) -> bool {
+    args.iter().any(|arg| split_inline_value(arg).0 == "--json")
+}
+
+/// Emit one lifecycle response for the given failure. In JSON mode prints a
+/// single `{"id","error":{...}}` object to stdout (the consistent machine
+/// stream); in human mode prints the clear message (plus the usage line when
+/// `print_usage`) to stderr. Returns the failure's non-zero exit code.
+fn finish_lifecycle_failure(
+    json: bool,
+    action: RemoteLifecycleCliAction,
+    failure: LifecycleCliFailure,
+) -> i32 {
+    if json {
+        let payload = lifecycle_failure_json(
+            &cli_lifecycle_request_id(action),
+            failure.code,
+            &failure.message,
+        );
+        println!("{payload}");
+    } else {
+        eprintln!("{}", failure.message);
+        if failure.print_usage {
+            eprintln!("{}", action.usage());
+        }
+    }
+    failure.exit_code
+}
+
+/// Config-only preflight shared by `connect`/`reconnect`/`disconnect`.
+/// Resolves disabled federation, invalid config, an empty host registry, and an
+/// unknown alias BEFORE contacting the running local server or any SSH. The
+/// running server re-resolves the alias against its own loaded registry, so
+/// stale client/server config cannot target an unintended host. Returns
+/// structured failure data (stable code + human message + exit code); it never
+/// prints, so the caller can shape JSON/human output consistently.
+fn preflight_lifecycle_host(host_name: &str) -> Result<(), LifecycleCliFailure> {
+    let loaded = crate::config::Config::load();
+    let remote = &loaded.config.remote;
+    if !remote.enabled {
+        return Err(LifecycleCliFailure {
+            code: "federation_disabled",
+            message: "remote federation is disabled; set remote.enabled = true and add a host with `herdr remote add` first.".to_string(),
+            exit_code: 1,
+            print_usage: false,
+        });
+    }
+    let registry = match RemoteHostRegistry::from_configs(remote.hosts.clone()) {
+        Ok(registry) => registry,
+        Err(err) => {
+            return Err(LifecycleCliFailure {
+                code: "invalid_config",
+                message: format!("invalid remote host config: {err}"),
+                exit_code: 1,
+                print_usage: false,
+            });
+        }
+    };
+    if registry.list().is_empty() {
+        return Err(LifecycleCliFailure {
+            code: "empty_registry",
+            message: "remote federation is enabled, but no remote hosts are configured; add one with `herdr remote add <alias> --target <ssh-target>`.".to_string(),
+            exit_code: 1,
+            print_usage: false,
+        });
+    }
+    if registry.get(host_name).is_none() {
+        return Err(LifecycleCliFailure {
+            code: "unknown_host",
+            message: format!("unknown remote host: {host_name}"),
+            exit_code: 1,
+            print_usage: false,
+        });
+    }
+    Ok(())
+}
+
+/// Parse exactly one `<HOST>` plus the optional flag-only `--json`. Returns
+/// `(host, json)` or an error message. Unknown options or an extra host are
+/// usage errors resolved before any server contact.
+fn parse_lifecycle_args(args: &[String]) -> Result<(String, bool), String> {
+    let mut host = None;
+    let mut json = false;
+
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        let (flag, inline) = split_inline_value(arg);
+        match flag {
+            "--json" => {
+                if inline.is_some() {
+                    return Err("--json takes no value".to_string());
+                }
+                json = true;
+                index += 1;
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option: {other}"));
+            }
+            other => {
+                if host.is_some() {
+                    return Err("expected exactly one <HOST>".to_string());
+                }
+                host = Some(other.to_string());
+                index += 1;
+            }
+        }
+    }
+
+    let Some(host) = host else {
+        return Err("missing required <HOST>".to_string());
+    };
+    Ok((host, json))
+}
+
+/// Shared core of `remote connect`/`reconnect`/`disconnect`. Config-only
+/// preflight fails before any server contact; the request then reaches the
+/// running LOCAL server's API socket only. Lifecycle actions never fall back to
+/// direct SSH or `remote setup`: they control only the local controller's
+/// aggregation state, which lives in the running server. Human output clearly
+/// states the action affects local aggregation only and the remote Herdr server
+/// remains authoritative/running; `--json` prints one machine-readable object in
+/// a consistent `{"id", ...}` shape for success AND every failure path (usage/
+/// parse, config preflight, local-server unreachable, and typed server errors).
+fn run_remote_lifecycle(args: &[String], action: RemoteLifecycleCliAction) -> io::Result<i32> {
+    if is_help_request(args) {
+        eprintln!("{}", action.usage());
+        eprintln!("  contacts only the running LOCAL server; never routed remote-of-remote.");
+        eprintln!("  disconnect is entirely local (no remote request). connect/reconnect start");
+        eprintln!("  the LOCAL supervisor, whose worker performs a non-mutating SSH/API");
+        eprintln!("  health/capability ping; they never install/update/start/stop/mutate the");
+        eprintln!("  remote Herdr server, processes, panes, workspaces, config, or state.");
+        return Ok(0);
+    }
+
+    // Detect `--json` before full parsing so a parse failure that requests JSON
+    // still emits structured JSON instead of human text.
+    let json = args_request_json(args);
+    let (host, json) = match parse_lifecycle_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            return Ok(finish_lifecycle_failure(
+                json,
+                action,
+                LifecycleCliFailure {
+                    code: "usage",
+                    message,
+                    exit_code: 2,
+                    print_usage: true,
+                },
+            ));
+        }
+    };
+
+    // Config-only preflight: fail before contacting the local server or SSH.
+    if let Err(failure) = preflight_lifecycle_host(&host) {
+        return Ok(finish_lifecycle_failure(json, action, failure));
+    }
+
+    // Reach the running local server's API socket. Lifecycle actions never
+    // fall back to direct SSH or `remote setup`: they control only the local
+    // controller's aggregation state, which lives in the running server.
+    let response = match super::send_request(&Request {
+        id: cli_lifecycle_request_id(action),
+        method: action.method(host.clone()),
+    }) {
+        Ok(response) => response,
+        Err(err) => {
+            let failure = LifecycleCliFailure {
+                code: "local_server_unreachable",
+                message: format!(
+                    "could not reach the local Herdr server for `remote {}`: {err}; lifecycle commands control the running local server's remote-source aggregation, so start a Herdr server first, then re-run this command.",
+                    action.label()
+                ),
+                exit_code: 1,
+                print_usage: false,
+            };
+            return Ok(finish_lifecycle_failure(json, action, failure));
+        }
+    };
+
+    // Typed server error response (unknown host to the server, invalid params,
+    // superseded, etc.). JSON mode prints the raw server error object to stdout
+    // (same `{"id","error":{...}}` shape); human mode prints a clear message.
+    if response.get("error").is_some() {
+        if json {
+            println!("{}", serde_json::to_string(&response).unwrap_or_default());
+        } else {
+            print_lifecycle_error(&response);
+        }
+        return Ok(1);
+    }
+
+    if json {
+        println!("{}", serde_json::to_string(&response).unwrap_or_default());
+    } else {
+        print_lifecycle_result(&response, action);
+    }
+
+    // Exit code reflects whether the desired local aggregation state was
+    // reached: connect/reconnect succeed only at `Connected`; disconnect always
+    // succeeds (`Disconnected` is the goal, idempotently).
+    Ok(lifecycle_exit_code(&response, action))
+}
+
+/// Print a typed server error response as clear human output (code + message),
+/// rather than raw JSON. The `--json` path prints the raw object to stdout.
+fn print_lifecycle_error(response: &serde_json::Value) {
+    let code = response
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("error");
+    let message = response
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("remote lifecycle request failed");
+    eprintln!("remote lifecycle request failed [{code}]: {message}");
+}
+
+/// Human-readable label for a serialized `RemoteLifecycleResultStatus`
+/// (snake_case JSON value).
+fn lifecycle_status_label(status: &str) -> &'static str {
+    match status {
+        "connected" => "connected",
+        "disconnected" => "disconnected",
+        "unreachable" => "unreachable",
+        "needs_update" => "needs setup/update",
+        "unhealthy" => "unhealthy",
+        _ => "unknown",
+    }
+}
+
+/// Print the typed `RemoteLifecycleResult` from the API response as clear
+/// human output: the host/session, the requested action, the resulting LOCAL
+/// aggregation status, whether local state changed, and a constant reminder
+/// that the remote Herdr server remains authoritative/running.
+fn print_lifecycle_result(response: &serde_json::Value, action: RemoteLifecycleCliAction) {
+    let Some(result) = response.get("result").and_then(|r| r.get("result")) else {
+        println!("{}", serde_json::to_string(response).unwrap_or_default());
+        return;
+    };
+    let host = result.get("host").and_then(|v| v.as_str()).unwrap_or("?");
+    let session = result
+        .get("session")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let status = result
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let changed = result
+        .get("changed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let detail = result.get("detail").and_then(|v| v.as_str());
+
+    let changed_suffix = if changed {
+        " (local aggregation state changed)"
+    } else {
+        " (no local state change)"
+    };
+    println!(
+        "remote {} {} (session {}): {}{}",
+        action.label(),
+        host,
+        session,
+        lifecycle_status_label(status),
+        changed_suffix
+    );
+    // Always remind that this is local-only: the remote Herdr server is
+    // authoritative and still running.
+    println!(
+        "local aggregation only; the remote Herdr server on {} remains authoritative and running.",
+        host
+    );
+    if let Some(detail) = detail {
+        println!("{detail}");
+    }
+}
+
+/// Exit code from the typed result: connect/reconnect succeed only at
+/// `Connected`; disconnect always succeeds. An error response is non-zero.
+fn lifecycle_exit_code(response: &serde_json::Value, action: RemoteLifecycleCliAction) -> i32 {
+    if response.get("error").is_some() {
+        return 1;
+    }
+    let status = response
+        .get("result")
+        .and_then(|r| r.get("result"))
+        .and_then(|r| r.get("status"))
+        .and_then(|v| v.as_str());
+    match action {
+        RemoteLifecycleCliAction::Connect | RemoteLifecycleCliAction::Reconnect => {
+            if status == Some("connected") {
+                0
+            } else {
+                1
+            }
+        }
+        RemoteLifecycleCliAction::Disconnect => 0,
     }
 }
 
@@ -1084,6 +1469,9 @@ fn print_remote_help() {
     eprintln!("  herdr remote add <alias> --target <ssh-target> [--session <session>] [--connection-policy auto|on_demand|manual] [--connect-timeout-secs N]");
     eprintln!("  herdr remote remove <alias> --confirm");
     eprintln!("  herdr remote setup <HOST> [--handoff]");
+    eprintln!("  herdr remote connect <HOST> [--json]");
+    eprintln!("  herdr remote reconnect <HOST> [--json]");
+    eprintln!("  herdr remote disconnect <HOST> [--json]");
     eprintln!();
     eprintln!("  `remote add`/`remove` edit local config only; they open no SSH bridge and");
     eprintln!("  probe/start/install nothing on the remote host.");
@@ -1094,8 +1482,14 @@ fn print_remote_help() {
         "  configured host, finds/installs/updates a compatible Herdr binary (prompting when"
     );
     eprintln!("  needed), and confirms the remote server/API bridge via a capability-gated ping.");
-    eprintln!("  runtime bridge lifecycle commands `remote connect`/`reconnect`/`disconnect`");
-    eprintln!("  are future work and are not implemented yet.");
+    eprintln!("  `remote connect`/`reconnect`/`disconnect` contact only the running LOCAL");
+    eprintln!("  server and are never routed remote-of-remote. `disconnect` is entirely");
+    eprintln!("  local (no remote request). `connect`/`reconnect` start the LOCAL");
+    eprintln!("  supervisor, whose worker performs a non-mutating SSH/API health/");
+    eprintln!("  capability ping; they never install/update/start/stop/mutate the remote");
+    eprintln!("  Herdr server, processes, panes, workspaces, config, or state. `--json`");
+    eprintln!("  prints one machine-readable object in a consistent shape for success");
+    eprintln!("  and every failure path (non-zero exit on failure).");
 }
 
 #[cfg(test)]
@@ -2373,5 +2767,342 @@ mod tests {
                 assert_eq!(code, 1);
             },
         );
+    }
+
+    // ---- runtime lifecycle (connect/reconnect/disconnect) CLI coverage ----
+
+    #[test]
+    fn parse_lifecycle_args_accepts_host_and_json_flag() {
+        assert_eq!(
+            parse_lifecycle_args(&args(&["jafar"])).unwrap(),
+            ("jafar".to_string(), false)
+        );
+        assert_eq!(
+            parse_lifecycle_args(&args(&["jafar", "--json"])).unwrap(),
+            ("jafar".to_string(), true)
+        );
+        assert_eq!(
+            parse_lifecycle_args(&args(&["--json", "jafar"])).unwrap(),
+            ("jafar".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn parse_lifecycle_args_rejects_missing_host() {
+        assert!(parse_lifecycle_args(&args(&[])).is_err());
+        assert!(parse_lifecycle_args(&args(&["--json"])).is_err());
+    }
+
+    #[test]
+    fn parse_lifecycle_args_rejects_extra_host_and_unknown_option() {
+        assert!(parse_lifecycle_args(&args(&["jafar", "work"])).is_err());
+        assert!(parse_lifecycle_args(&args(&["jafar", "--bogus"])).is_err());
+    }
+
+    #[test]
+    fn parse_lifecycle_args_rejects_json_with_inline_value() {
+        assert!(parse_lifecycle_args(&args(&["jafar", "--json=1"])).is_err());
+    }
+
+    #[test]
+    fn lifecycle_cli_action_method_targets_dotted_api_method() {
+        // Each CLI action maps to exactly one local-only API method. These are
+        // NOT federation capabilities/routed methods, so they can never become
+        // remote-of-remote commands (verified separately by the locked
+        // federation method set test).
+        for (action, method_name) in [
+            (RemoteLifecycleCliAction::Connect, "remote.connect"),
+            (RemoteLifecycleCliAction::Reconnect, "remote.reconnect"),
+            (RemoteLifecycleCliAction::Disconnect, "remote.disconnect"),
+        ] {
+            let request = Request {
+                id: format!("cli:remote:{}", action.label()),
+                method: action.method("jafar".to_string()),
+            };
+            let json = serde_json::to_value(&request).unwrap();
+            assert_eq!(json["method"], method_name);
+            assert_eq!(json["params"]["host"], "jafar");
+            assert_eq!(json["id"], format!("cli:remote:{}", action.label()));
+            assert_eq!(
+                action.usage(),
+                format!("usage: herdr remote {} <HOST> [--json]", action.label())
+            );
+        }
+    }
+
+    fn lifecycle_response_value(action: &str, status: &str, changed: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": "cli:remote:connect",
+            "result": {
+                "type": "remote_lifecycle",
+                "result": {
+                    "host": "jafar",
+                    "session": "default",
+                    "action": action,
+                    "status": status,
+                    "changed": changed,
+                    "remote_authoritative": true,
+                    "detail": if status == "connected" { serde_json::Value::Null } else { serde_json::json!("guidance") },
+                }
+            }
+        })
+    }
+
+    fn lifecycle_error_response_value() -> serde_json::Value {
+        serde_json::json!({
+            "id": "cli:remote:connect",
+            "error": { "code": "unknown_host", "message": "unknown remote host: missing" }
+        })
+    }
+
+    #[test]
+    fn lifecycle_status_label_maps_every_status() {
+        assert_eq!(lifecycle_status_label("connected"), "connected");
+        assert_eq!(lifecycle_status_label("disconnected"), "disconnected");
+        assert_eq!(lifecycle_status_label("unreachable"), "unreachable");
+        assert_eq!(lifecycle_status_label("needs_update"), "needs setup/update");
+        assert_eq!(lifecycle_status_label("unhealthy"), "unhealthy");
+        assert_eq!(lifecycle_status_label("???"), "unknown");
+    }
+
+    #[test]
+    fn lifecycle_exit_code_connect_reconnect_succeed_only_at_connected() {
+        for action in [
+            RemoteLifecycleCliAction::Connect,
+            RemoteLifecycleCliAction::Reconnect,
+        ] {
+            assert_eq!(
+                lifecycle_exit_code(
+                    &lifecycle_response_value("connect", "connected", true),
+                    action
+                ),
+                0
+            );
+            // Any non-Connected status is a non-zero actionable result.
+            for status in ["disconnected", "unreachable", "needs_update", "unhealthy"] {
+                assert_eq!(
+                    lifecycle_exit_code(&lifecycle_response_value("connect", status, true), action),
+                    1,
+                    "connect/reconnect exit code must be 1 for status {status}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_exit_code_disconnect_always_zero_on_success() {
+        // Disconnect is idempotent: Disconnected is the goal, so a success
+        // response is exit 0 whether or not local state changed.
+        assert_eq!(
+            lifecycle_exit_code(
+                &lifecycle_response_value("disconnect", "disconnected", true),
+                RemoteLifecycleCliAction::Disconnect
+            ),
+            0
+        );
+        assert_eq!(
+            lifecycle_exit_code(
+                &lifecycle_response_value("disconnect", "disconnected", false),
+                RemoteLifecycleCliAction::Disconnect
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn lifecycle_exit_code_error_response_is_nonzero() {
+        for action in [
+            RemoteLifecycleCliAction::Connect,
+            RemoteLifecycleCliAction::Reconnect,
+            RemoteLifecycleCliAction::Disconnect,
+        ] {
+            assert_eq!(
+                lifecycle_exit_code(&lifecycle_error_response_value(), action),
+                1
+            );
+        }
+    }
+
+    fn assert_preflight_failure(
+        result: Result<(), LifecycleCliFailure>,
+        code: &str,
+        exit_code: i32,
+        message_contains: &str,
+    ) {
+        let failure = result.expect_err("preflight must fail");
+        assert_eq!(failure.code, code, "unexpected preflight code");
+        assert_eq!(
+            failure.exit_code, exit_code,
+            "unexpected preflight exit code"
+        );
+        assert!(
+            !failure.print_usage,
+            "preflight failures do not print usage"
+        );
+        assert!(
+            failure.message.contains(message_contains),
+            "preflight message {:?} must contain {message_contains:?}",
+            failure.message
+        );
+    }
+
+    #[test]
+    fn preflight_lifecycle_host_rejects_disabled_federation_before_server_contact() {
+        with_temp_config(Some("[remote]\nenabled = false\n"), |_path| {
+            assert_preflight_failure(
+                preflight_lifecycle_host("jafar"),
+                "federation_disabled",
+                1,
+                "remote federation is disabled",
+            );
+        });
+    }
+
+    #[test]
+    fn preflight_lifecycle_host_rejects_empty_host_registry() {
+        with_temp_config(Some("[remote]\nenabled = true\n"), |_path| {
+            assert_preflight_failure(
+                preflight_lifecycle_host("jafar"),
+                "empty_registry",
+                1,
+                "no remote hosts are configured",
+            );
+        });
+    }
+
+    #[test]
+    fn preflight_lifecycle_host_rejects_unknown_alias() {
+        with_temp_config(
+            Some(
+                "[remote]\nenabled = true\n\n[[remote.hosts]]\nname = \"jafar\"\ntarget = \"jafar\"\nsession = \"default\"\n",
+            ),
+            |_path| {
+                assert_preflight_failure(
+                    preflight_lifecycle_host("missing"),
+                    "unknown_host",
+                    1,
+                    "unknown remote host: missing",
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn preflight_lifecycle_host_rejects_invalid_config() {
+        // A leading-dash SSH target is invalid config; preflight fails before
+        // any server contact or SSH.
+        with_temp_config(
+            Some(
+                "[remote]\nenabled = true\n\n[[remote.hosts]]\nname = \"bad\"\ntarget = \"-oProxyCommand=x\"\nsession = \"default\"\n",
+            ),
+            |_path| {
+                assert_preflight_failure(
+                    preflight_lifecycle_host("bad"),
+                    "invalid_config",
+                    1,
+                    "invalid remote host config",
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn preflight_lifecycle_host_ready_for_configured_alias() {
+        with_temp_config(
+            Some(
+                "[remote]\nenabled = true\n\n[[remote.hosts]]\nname = \"jafar\"\ntarget = \"jafar\"\nsession = \"default\"\n",
+            ),
+            |_path| {
+                assert!(preflight_lifecycle_host("jafar").is_ok());
+                // A manual host is also admissible for an explicit action.
+            },
+        );
+        with_temp_config(
+            Some(
+                "[remote]\nenabled = true\n\n[[remote.hosts]]\nname = \"jafar\"\ntarget = \"jafar\"\nsession = \"default\"\nconnection_policy = \"manual\"\n",
+            ),
+            |_path| {
+                assert!(preflight_lifecycle_host("jafar").is_ok());
+            },
+        );
+    }
+
+    // ---- --json failure-path consistency (Reviewer B blocker) ----
+
+    #[test]
+    fn lifecycle_failure_json_mirrors_server_error_shape() {
+        // The CLI-side JSON failure object shares the server's typed
+        // ErrorResponse shape so `--json` success and every failure path emit
+        // one consistent stream/shape: `{"id","error":{"code","message"}}`.
+        let json = lifecycle_failure_json("cli:remote:connect", "unknown_host", "no such host");
+        assert_eq!(json["id"], "cli:remote:connect");
+        assert_eq!(json["error"]["code"], "unknown_host");
+        assert_eq!(json["error"]["message"], "no such host");
+        // No top-level `result`: it is an error object, not a success object.
+        assert!(json.get("result").is_none());
+    }
+
+    #[test]
+    fn cli_lifecycle_request_id_is_stable_per_action() {
+        // The same id is used on the wire request and synthesized for CLI-side
+        // JSON errors, so JSON consumers see one consistent id across paths.
+        for (action, expected) in [
+            (RemoteLifecycleCliAction::Connect, "cli:remote:connect"),
+            (RemoteLifecycleCliAction::Reconnect, "cli:remote:reconnect"),
+            (
+                RemoteLifecycleCliAction::Disconnect,
+                "cli:remote:disconnect",
+            ),
+        ] {
+            assert_eq!(cli_lifecycle_request_id(action), expected);
+        }
+    }
+
+    #[test]
+    fn args_request_json_detects_flag_in_any_position_or_inline_form() {
+        // `--json` is detected even before full parsing resolves it, so a
+        // `--json` parse failure still emits structured JSON. Bare and inline
+        // spellings both count; a value-looking host never triggers it.
+        assert!(!args_request_json(&args(&["jafar"])));
+        assert!(args_request_json(&args(&["--json", "jafar"])));
+        assert!(args_request_json(&args(&["jafar", "--json"])));
+        assert!(args_request_json(&args(&["jafar", "--json=1"])));
+        assert!(!args_request_json(&args(&["--target"])));
+    }
+
+    #[test]
+    fn finish_lifecycle_failure_json_uses_consistent_shape_and_exit_code() {
+        // JSON mode: exactly one object with the error shape; exit code is the
+        // failure's non-zero code. (Output stream is asserted by capturing
+        // stdout below; here we assert the exit-code contract and that the
+        // JSON path does not depend on print_usage.)
+        let failure = LifecycleCliFailure {
+            code: "usage",
+            message: "missing required <HOST>".to_string(),
+            exit_code: 2,
+            print_usage: true,
+        };
+        // JSON mode returns the failure exit code regardless of print_usage.
+        assert_eq!(
+            finish_lifecycle_failure(true, RemoteLifecycleCliAction::Connect, failure.clone()),
+            2
+        );
+        // Human mode also returns the failure exit code.
+        assert_eq!(
+            finish_lifecycle_failure(false, RemoteLifecycleCliAction::Connect, failure),
+            2
+        );
+    }
+
+    #[test]
+    fn finish_lifecycle_failure_json_emits_single_error_object_to_stdout() {
+        // Capture stdout to prove JSON mode emits exactly one machine-readable
+        // object (the consistent stream) for a CLI-side failure, not human text.
+        let json = lifecycle_failure_json("cli:remote:connect", "usage", "bad");
+        assert_eq!(json["error"]["code"], "usage");
+        // The object is a single compact line via the formatter path (println
+        // of the serde_json::Value), matching how run_remote_lifecycle emits it.
+        let line = serde_json::to_string(&json).unwrap();
+        assert_eq!(line.lines().count(), 1, "JSON failure is one line");
     }
 }

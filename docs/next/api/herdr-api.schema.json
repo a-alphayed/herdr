@@ -2937,6 +2937,18 @@
           ],
           "type": "string"
         },
+        "RemoteLifecycleHostParams": {
+          "description": "Parameters for the local-only `remote.connect`, `remote.reconnect`, and\n`remote.disconnect` lifecycle methods.\n\n`host` is the configured remote host alias. The running local server\nre-resolves it against its own loaded registry so a stale client/server\nconfig cannot target an unintended host. These methods control only the\nrunning local controller's aggregation/supervisor/bridge state; they are\nreached only on the running LOCAL server and are never routed\nremote-of-remote (not advertised as federation capabilities/routed\nmethods). `disconnect` is entirely local and sends no remote request.\n`connect`/`reconnect` deliberately cause the LOCAL supervisor worker to\nperform a non-mutating SSH/API health/capability ping; they never\nprovision/install/update/start/stop/mutate the remote Herdr server,\nprocesses, panes, workspaces, config, or state, and never open a new remote\nshell-command shape.",
+          "properties": {
+            "host": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "host"
+          ],
+          "type": "object"
+        },
         "ServerLiveHandoffParams": {
           "properties": {
             "expected_protocol": {
@@ -4937,6 +4949,54 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PluginPaneCloseParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "remote.connect",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RemoteLifecycleHostParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "remote.reconnect",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RemoteLifecycleHostParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "remote.disconnect",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/RemoteLifecycleHostParams"
             }
           },
           "required": [
@@ -7421,6 +7481,84 @@
           ],
           "type": "string"
         },
+        "RemoteLifecycleAction": {
+          "description": "Which explicit runtime lifecycle action the caller requested. Mirrors the\nCLI method and the local API method name so the response is self-describing.",
+          "enum": [
+            "connect",
+            "reconnect",
+            "disconnect"
+          ],
+          "type": "string"
+        },
+        "RemoteLifecycleResult": {
+          "description": "Typed result of a local-only runtime lifecycle action.\n\nReports the host alias, the remote session the local controller aggregates,\nthe requested action, the resulting LOCAL aggregation status, whether local\nruntime state changed, and a constant reminder that the remote Herdr server\nremains authoritative/running. `detail` carries actionable guidance\n(e.g. needs-setup, unreachable SSH) when applicable.",
+          "properties": {
+            "action": {
+              "$ref": "#/schemas/success_response/$defs/RemoteLifecycleAction"
+            },
+            "changed": {
+              "type": "boolean"
+            },
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "host": {
+              "type": "string"
+            },
+            "remote_authoritative": {
+              "description": "Always `true`: lifecycle actions never stop/restart the remote Herdr\nserver. The remote host remains authoritative and running; only the\nlocal controller's aggregation/supervisor/bridge state is affected.",
+              "type": "boolean"
+            },
+            "session": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/schemas/success_response/$defs/RemoteLifecycleResultStatus"
+            }
+          },
+          "required": [
+            "host",
+            "session",
+            "action",
+            "status",
+            "changed",
+            "remote_authoritative"
+          ],
+          "type": "object"
+        },
+        "RemoteLifecycleResultStatus": {
+          "description": "Resulting LOCAL aggregation status for a host after a lifecycle action. This\nis the cached [`crate::remote_source::RemoteConnectionStatus`] projection\ninto the JSON API shape (the local controller's view), NOT a fresh probe of\nthe remote host. `remote status`/`check` remain the direct remote-health\ndiagnostics; lifecycle results report local aggregation state only.",
+          "oneOf": [
+            {
+              "const": "connected",
+              "description": "The host's local aggregation is `Connected` after the action.",
+              "type": "string"
+            },
+            {
+              "const": "disconnected",
+              "description": "The host's local aggregation is `Disconnected` (explicit disconnect, or\na connect/reconnect that could not establish a connection yet but left a\nretrying supervisor alive).",
+              "type": "string"
+            },
+            {
+              "const": "unreachable",
+              "description": "A connect/reconnect attempt reached the host but its remote Herdr is\nunreachable right now; local aggregation is marked stale/unreachable.",
+              "type": "string"
+            },
+            {
+              "const": "needs_update",
+              "description": "A connect/reconnect attempt found a missing/incompatible remote Herdr;\nlocal aggregation is marked needs-update and no install/update ran.",
+              "type": "string"
+            },
+            {
+              "const": "unhealthy",
+              "description": "The host had no live/healthy supervisor and the connect/reconnect\nattempt is in flight or failed before a definitive status (the local\nretrying supervisor remains alive).",
+              "type": "string"
+            }
+          ]
+        },
         "ResponseResult": {
           "oneOf": [
             {
@@ -8433,6 +8571,22 @@
                 "type",
                 "status",
                 "diagnostics"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "result": {
+                  "$ref": "#/schemas/success_response/$defs/RemoteLifecycleResult"
+                },
+                "type": {
+                  "const": "remote_lifecycle",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "result"
               ],
               "type": "object"
             },

@@ -1784,6 +1784,34 @@ impl RemoteAgentBridgePool {
         }
     }
 
+    /// Strong per-host drain for an explicit runtime lifecycle action
+    /// (disconnect/reconnect). Advances this host's pool generation and moves
+    /// every idle bridge for `key` into owned cleanup work under the pool lock,
+    /// then returns the owned connections so the caller reaps them (child
+    /// stdin close + reap) outside the lock -- never on the App/headless/
+    /// render/input loop. Active checked-out bridges are left to finish, but
+    /// their captured generation is now stale, so [`Self::return_connection`]
+    /// reaps instead of parking them. This is distinct from the mark-only
+    /// [`Self::invalidate_host`] (lazy invalidation on a non-connected
+    /// transition): it actually removes ownership of idle bridges now and
+    /// hands them to the caller to drop. Other hosts are untouched. Safe to
+    /// call on a host with no pooled bridges (returns empty).
+    pub(crate) fn drain_host(
+        &self,
+        key: &crate::remote_source::RemoteHostKey,
+    ) -> Vec<Box<dyn PersistentRemoteBridgeConnection>> {
+        let mut inner = self.lock();
+        let Some(host_pool) = inner.hosts.get_mut(key) else {
+            return Vec::new();
+        };
+        host_pool.generation = host_pool.generation.wrapping_add(1);
+        host_pool
+            .idle
+            .drain(..)
+            .map(|entry| entry.connection)
+            .collect()
+    }
+
     /// Drain every idle bridge for every host and advance every host generation
     /// so an active bridge returning after this drain is not parked. Idle
     /// connections are collected under the lock and reaped (child stdin close +
@@ -1852,6 +1880,109 @@ pub(crate) fn remote_agent_bridge_pool() -> &'static RemoteAgentBridgePool {
 /// the transition is not parked.
 pub(crate) fn invalidate_remote_bridge_pool_host(key: &crate::remote_source::RemoteHostKey) {
     remote_agent_bridge_pool().invalidate_host(key);
+}
+
+/// Synchronous per-host drain+reap for a lifecycle supervisor worker
+/// (connect/reconnect) to run before its initial ping. Collects this host's
+/// idle bridges under the pool lock and drops them here (off-loop, in the
+/// worker thread) so the fresh generation starts with no stale pooled
+/// bridges. Distinct from the mark-only [`invalidate_remote_bridge_pool_host`].
+/// Other hosts are untouched. Safe on a dormant pool / host with no idle
+/// bridges. Re-exported cross-platform by [`crate::remote`].
+pub(crate) fn drain_remote_bridge_pool_host_inline(key: &crate::remote_source::RemoteHostKey) {
+    let drained = remote_agent_bridge_pool().drain_host(key);
+    drop(drained);
+}
+
+/// Off-loop per-host drain+reap with deferred completion for an explicit
+/// disconnect. Collects this host's idle bridges under the pool lock, spawns a
+/// bounded cleanup worker that drops/reaps them outside the lock and off-loop,
+/// then reports completion back to the App through
+/// [`AppEvent::RemoteSourcePoolDrainCompleted`] tagged with `generation`.
+/// Active checked-out bridges are left to finish, but their captured
+/// generation is now stale so they cannot re-pool. Other hosts are untouched.
+/// Safe on a dormant pool / host with no idle bridges (still reports
+/// completion so the disconnect pending responder always resolves).
+/// Re-exported cross-platform by [`crate::remote`].
+pub(crate) fn drain_remote_bridge_pool_host_off_loop(
+    key: crate::remote_source::RemoteHostKey,
+    generation: u64,
+    event_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+) {
+    let drained = remote_agent_bridge_pool().drain_host(&key);
+    std::thread::spawn(move || {
+        // Reap outside the pool lock + off-loop: each drop closes stdin +
+        // reaps the ssh child (ControlPersist cleanup via `RemoteSsh::Drop`).
+        // The completion guard guarantees the disconnect pending responder is
+        // resolved exactly once even if a drop/reap panics: `complete()` sends
+        // the normal completion and disarms the fallback; `Drop` sends a
+        // fallback completion only if `complete()` never ran. The App treats a
+        // completion for a superseded/already-resolved generation as a no-op,
+        // so a late fallback can never double-resolve.
+        let mut guard = PoolDrainCompletionGuard::new(key, generation, event_tx);
+        drop(drained);
+        guard.complete();
+    });
+}
+
+/// Completion guard for [`drain_remote_bridge_pool_host_off_loop`]. Guarantees
+/// the disconnect pending responder resolves exactly once even if dropping
+/// (reaping) the drained connections panics: [`Self::complete`] sends the
+/// normal completion and disarms; `Drop` sends a fallback completion only if
+/// `complete` never ran. Mirrors [`LifecycleCompletionGuard`]; the App's
+/// remove-on-resolve admission makes a late fallback a harmless no-op.
+struct PoolDrainCompletionGuard {
+    host: crate::remote_source::RemoteHostKey,
+    generation: u64,
+    event_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    completed: bool,
+}
+
+impl PoolDrainCompletionGuard {
+    fn new(
+        host: crate::remote_source::RemoteHostKey,
+        generation: u64,
+        event_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    ) -> Self {
+        Self {
+            host,
+            generation,
+            event_tx,
+            completed: false,
+        }
+    }
+
+    /// Send the normal pool-drain completion and disarm the fallback. Idempotent.
+    fn complete(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        let _ =
+            self.event_tx
+                .blocking_send(crate::events::AppEvent::RemoteSourcePoolDrainCompleted {
+                    host: self.host.clone(),
+                    generation: self.generation,
+                });
+    }
+}
+
+impl Drop for PoolDrainCompletionGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        // Panic while dropping/reaping drained connections: still report
+        // completion so the disconnect responder is never stranded. Harmless
+        // if the generation was already superseded/resolved.
+        self.completed = true;
+        let _ =
+            self.event_tx
+                .blocking_send(crate::events::AppEvent::RemoteSourcePoolDrainCompleted {
+                    host: self.host.clone(),
+                    generation: self.generation,
+                });
+    }
 }
 
 /// Drain the process-global persistent-bridge pool at process shutdown: reap
@@ -6985,6 +7116,131 @@ mod tests {
         );
         assert_eq!(pool.idle_for(&key), 0, "post-drain return is not parked");
         assert_eq!(pool.active_for(&key), 0, "active slot released");
+    }
+
+    #[test]
+    fn g10_pool_drain_host_targets_one_host_and_leaves_others_untouched() {
+        // Per-host lifecycle drain (disconnect/reconnect): `drain_host` removes
+        // ONLY the named host's idle bridges under the pool lock and advances
+        // ONLY that host's generation, so an active connection returning after
+        // the drain is NOT parked (stale generation). Other hosts are left
+        // untouched. Distinct from the mark-only `invalidate_host` (lazy) and
+        // the process-wide `drain` (shutdown).
+        let pool = RemoteAgentBridgePool::new(4, PERSISTENT_BRIDGE_IDLE_TTL);
+        let host_a = sample_host();
+        let host_b = crate::remote_target::RemoteHostConfig::new(
+            "work",
+            "user@work:2222",
+            crate::session::DEFAULT_SESSION_NAME,
+            true,
+        );
+        let state = sample_state("\"$HOME/.local/bin/herdr\"");
+        let identity_a = PersistentBridgeIdentity::from_host_state(&host_a, &state);
+        let key_a = crate::remote_source::RemoteHostKey::new(&host_a.name, &host_a.session);
+        let key_b = crate::remote_source::RemoteHostKey::new(&host_b.name, &host_b.session);
+        let request = sample_read_request("req-1");
+        reset_fake_bridge("resp-1");
+
+        // Prime an idle entry for each of two hosts.
+        dispatch_via_remote_bridge_pool(&pool, &host_a, &state, &request, fake_bridge_starter)
+            .expect("prime host_a ok");
+        dispatch_via_remote_bridge_pool(&pool, &host_b, &state, &request, fake_bridge_starter)
+            .expect("prime host_b ok");
+        assert_eq!(pool.idle_for(&key_a), 1);
+        assert_eq!(pool.idle_for(&key_b), 1);
+
+        // An in-flight dispatch on host_a is still active across the drain.
+        let checked_out_generation = pool.reserve_new(&key_a).expect("reserve ok");
+        assert_eq!(pool.active_for(&key_a), 1);
+
+        // Per-host drain of host_a only.
+        let drained = pool.drain_host(&key_a);
+        assert_eq!(
+            drained.len(),
+            1,
+            "drain_host returned host_a's one idle connection"
+        );
+        assert_eq!(pool.idle_for(&key_a), 0, "host_a idle drained");
+        assert_eq!(
+            pool.idle_for(&key_b),
+            1,
+            "host_b idle untouched by a per-host drain"
+        );
+        assert_eq!(
+            pool.active_for(&key_a),
+            1,
+            "in-flight active slot still held across the per-host drain"
+        );
+
+        // The in-flight host_a connection returns after the drain: stale
+        // generation must prevent parking (reaped), and active is released.
+        let conn: Box<dyn PersistentRemoteBridgeConnection> = Box::new(FakePersistentBridge);
+        pool.return_connection(
+            &key_a,
+            identity_a,
+            conn,
+            /* reusable */ true,
+            checked_out_generation,
+        );
+        assert_eq!(pool.idle_for(&key_a), 0, "post-drain return is not parked");
+        assert_eq!(pool.active_for(&key_a), 0, "active slot released");
+    }
+
+    #[test]
+    fn g10_pool_drain_completion_guard_complete_then_drop_emits_once() {
+        // The disconnect off-loop reap guard must report completion exactly
+        // once even if dropping drained connections would panic. Normal
+        // `complete()` sends the completion and disarms the Drop fallback, so
+        // exactly one RemoteSourcePoolDrainCompleted event is emitted.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::events::AppEvent>(4);
+        let host = crate::remote_source::RemoteHostKey::new("jafar", "default");
+        {
+            let mut guard = PoolDrainCompletionGuard::new(host.clone(), 11, tx);
+            guard.complete();
+            // Idempotent: a second complete is a no-op.
+            guard.complete();
+        }
+        match rx.blocking_recv().expect("normal completion emitted") {
+            crate::events::AppEvent::RemoteSourcePoolDrainCompleted {
+                host: ev_host,
+                generation,
+            } => {
+                assert_eq!(ev_host, host);
+                assert_eq!(generation, 11);
+            }
+            other => panic!("expected PoolDrainCompleted, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no fallback after normal complete (exactly once)"
+        );
+    }
+
+    #[test]
+    fn g10_pool_drain_completion_guard_drop_without_complete_fires_fallback() {
+        // A panic while dropping drained connections must still report
+        // completion so the disconnect responder is never stranded. Dropping
+        // the guard without calling complete simulates that panic path.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::events::AppEvent>(4);
+        let host = crate::remote_source::RemoteHostKey::new("jafar", "default");
+        {
+            let _guard = PoolDrainCompletionGuard::new(host.clone(), 23, tx);
+            // no complete -> drop fires fallback
+        }
+        match rx.blocking_recv().expect("fallback completion emitted") {
+            crate::events::AppEvent::RemoteSourcePoolDrainCompleted {
+                host: ev_host,
+                generation,
+            } => {
+                assert_eq!(ev_host, host);
+                assert_eq!(generation, 23);
+            }
+            other => panic!("expected PoolDrainCompleted, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one completion from the guard"
+        );
     }
 
     #[test]

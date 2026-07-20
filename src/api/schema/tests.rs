@@ -156,6 +156,68 @@ fn request_round_trips_for_workspace_list_local() {
 }
 
 #[test]
+fn request_round_trips_for_remote_lifecycle_methods() {
+    // The three local-only runtime lifecycle methods round-trip with their
+    // dotted method names and a single host-alias param. They are not
+    // federation capabilities/routed methods (verified separately by the
+    // locked federation method set test).
+    for (method_name, action) in [
+        (
+            "remote.connect",
+            Method::RemoteConnect(RemoteLifecycleHostParams {
+                host: "jafar".into(),
+            }),
+        ),
+        (
+            "remote.reconnect",
+            Method::RemoteReconnect(RemoteLifecycleHostParams {
+                host: "jafar".into(),
+            }),
+        ),
+        (
+            "remote.disconnect",
+            Method::RemoteDisconnect(RemoteLifecycleHostParams {
+                host: "jafar".into(),
+            }),
+        ),
+    ] {
+        let request = Request {
+            id: "req_remote_lifecycle".into(),
+            method: action,
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], method_name);
+        assert_eq!(json["params"]["host"], "jafar");
+        let restored: Request = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, request);
+    }
+}
+
+#[test]
+fn remote_lifecycle_result_round_trips() {
+    let response = SuccessResponse {
+        id: "req_remote_lifecycle".into(),
+        result: ResponseResult::RemoteLifecycle {
+            result: RemoteLifecycleResult {
+                host: "jafar".into(),
+                session: "default".into(),
+                action: RemoteLifecycleAction::Reconnect,
+                status: RemoteLifecycleResultStatus::Connected,
+                changed: true,
+                remote_authoritative: true,
+                detail: Some("local aggregation only".into()),
+            },
+        },
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("\"type\":\"remote_lifecycle\""));
+    assert!(json.contains("\"action\":\"reconnect\""));
+    assert!(json.contains("\"remote_authoritative\":true"));
+    let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
+    assert_eq!(restored, response);
+}
+
+#[test]
 fn request_round_trips_for_server_reload_agent_manifests() {
     let request = Request {
         id: "req_reload_agent_manifests".into(),

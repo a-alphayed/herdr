@@ -9,6 +9,7 @@ mod layouts;
 mod panes;
 pub(crate) mod plugins;
 mod remote_helpers;
+pub(crate) mod remotes;
 mod responses;
 mod session;
 mod tabs;
@@ -156,6 +157,25 @@ impl App {
 
         if let AppEvent::WorktreeRemoveFinished(result) = ev {
             self.handle_worktree_remove_finished(*result);
+            return;
+        }
+
+        // Deferred local lifecycle completion events are App-only bookkeeping
+        // that drive the pending `respond_to` channel; they never mutate the
+        // pure AppState and produce no pane updates. Resolve the pending
+        // responder (or no-op if superseded) and return without forwarding to
+        // the reducer.
+        if let AppEvent::RemoteSourceLifecycleAttempt {
+            host,
+            generation,
+            outcome,
+        } = ev
+        {
+            self.handle_remote_lifecycle_attempt(host, generation, outcome);
+            return;
+        }
+        if let AppEvent::RemoteSourcePoolDrainCompleted { host, generation } = ev {
+            self.handle_remote_pool_drain_completed(host, generation);
             return;
         }
 
@@ -311,21 +331,32 @@ impl App {
     }
 
     fn remote_source_event_is_from_unconfigured_host(&self, ev: &AppEvent) -> bool {
+        // Admit a remote-source event only when the host/session still matches
+        // the loaded registry AND (for generation-tagged supervisor events) an
+        // active keyed handle with the identical generation exists. This admits
+        // explicit manual/on_demand supervisors started by a lifecycle action
+        // while rejecting queued/late events from a retired predecessor (after
+        // a same-host reconnect, a disconnect, or a config reload). With no
+        // active handle for the host there is no current supervisor, so its
+        // events are stale by definition.
         match ev {
-            AppEvent::RemoteSourceSnapshot { host, .. }
-            | AppEvent::RemoteSourceAgentUpdated { host, .. }
-            | AppEvent::RemoteSourceDisconnected { host, .. }
-            | AppEvent::RemoteSourceBridgeState { host, .. } => {
-                !self.remote_host_is_configured(host)
+            AppEvent::RemoteSourceSnapshot {
+                host, generation, ..
+            }
+            | AppEvent::RemoteSourceDisconnected {
+                host, generation, ..
+            }
+            | AppEvent::RemoteSourceBridgeState {
+                host, generation, ..
+            } => {
+                !self.remote_host_session_is_configured(host)
+                    || !self.remote_source_generation_is_active(host, *generation)
+            }
+            AppEvent::RemoteSourceAgentUpdated { host, .. } => {
+                !self.remote_host_session_is_configured(host)
             }
             _ => false,
         }
-    }
-
-    fn remote_host_is_configured(&self, host: &crate::remote_source::RemoteHostKey) -> bool {
-        self.remote_hosts.get(&host.host).is_some_and(|config| {
-            config.session == host.session && config.connection_policy.starts_automatically()
-        })
     }
 
     fn reset_agent_detection_for_agents(&self, agents: &[crate::detect::Agent]) {

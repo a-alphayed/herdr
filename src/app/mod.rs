@@ -24,6 +24,7 @@ mod theme_sync;
 mod worktrees;
 
 pub(crate) use api::agents_deferred::DeferredRemoteAgentOutcome;
+pub(crate) use api::remotes::DeferredRemoteLifecycleOutcome;
 pub(crate) use api::{remote_agent_start_request, rewrite_remote_agent_start_response};
 
 use std::collections::{HashMap, HashSet};
@@ -145,6 +146,26 @@ pub struct App {
     pub(crate) remote_hosts: crate::remote_target::RemoteHostRegistry,
     pub(crate) remote_source_supervisors:
         Vec<crate::remote_supervisor::RemoteSourceSupervisorHandle>,
+    /// Pending one-shot `respond_to` channels for in-flight local-only runtime
+    /// lifecycle actions (`remote.connect`/`reconnect`/`disconnect`), keyed by
+    /// the process-unique supervisor/lifecycle generation that will resolve
+    /// them. At most one entry per host: a new lifecycle action for a host
+    /// first deterministically supersedes (resolves with an error) any prior
+    /// pending responder for that host. connect/reconnect are resolved by a
+    /// generation-tagged [`AppEvent::RemoteSourceLifecycleAttempt`]; disconnect
+    /// by a generation-tagged [`AppEvent::RemoteSourcePoolDrainCompleted`].
+    /// App-only runtime state: never in the pure `AppState`/`RemoteSourceCache`.
+    pub(crate) pending_remote_lifecycle:
+        std::collections::HashMap<u64, crate::app::api::remotes::PendingRemoteLifecycleResponder>,
+    /// Injectable lifecycle supervisor starter for deferred (off-loop)
+    /// `remote.connect`/`reconnect`. Defaults to spawning the real off-loop
+    /// worker ([`crate::app::api::remotes::spawn_remote_lifecycle_supervisor`]);
+    /// tests inject a fake that returns an inert stub handle and emits nothing
+    /// so the App planning/admission/responder logic is exercised without real
+    /// SSH. `disconnect` never starts a supervisor (it stops one + drains the
+    /// pool off-loop), so it does not consult this field.
+    pub(crate) lifecycle_supervisor_starter:
+        crate::app::api::remotes::RemoteLifecycleSupervisorStarter,
     /// Injectable dispatch starter for deferred (off-loop) remote-agent bridge
     /// dispatch. Defaults to spawning a background thread that runs the bridge;
     /// tests inject a fake starter to prove the loop continues while the
@@ -265,19 +286,6 @@ fn start_remote_source_supervisors_if_enabled(
     }
 
     crate::remote_supervisor::start_remote_source_supervisors(registry, event_tx)
-}
-
-fn remote_source_host_keys(
-    registry: &crate::remote_target::RemoteHostRegistry,
-) -> std::collections::BTreeSet<crate::remote_source::RemoteHostKey> {
-    registry
-        .list()
-        .into_iter()
-        .filter(|host| host.connection_policy.starts_automatically())
-        .map(|host| {
-            crate::remote_source::RemoteHostKey::new(host.name.clone(), host.session.clone())
-        })
-        .collect()
 }
 
 /// Build the pure display/read-model collection of *all* configured remote
@@ -904,6 +912,9 @@ impl App {
             config_reloaded_from_disk: false,
             remote_hosts,
             remote_source_supervisors,
+            pending_remote_lifecycle: std::collections::HashMap::new(),
+            lifecycle_supervisor_starter:
+                crate::app::api::remotes::spawn_remote_lifecycle_supervisor,
             remote_agent_dispatch_starter:
                 crate::app::api::agents_deferred::spawn_remote_agent_dispatch,
             prefix_input_source: Box::new(crate::platform::RealPrefixInputSource::default()),
@@ -1629,42 +1640,68 @@ impl App {
         }
 
         if !invalid_section("remote") {
-            let previous_remote_hosts = remote_source_host_keys(&self.remote_hosts);
             let previous_configured_hosts = configured_remote_host_keys(&self.remote_hosts);
+            // Snapshot every host that currently has a cache entry (auto-seeded
+            // or explicitly connected via a lifecycle action), across every
+            // connection policy. Config reload retires all active handles /
+            // generations, so each prior active cache entry must be marked
+            // non-connected (stale) rather than retain `Connected`/prepared
+            // state; only hosts that disappeared from the registry entirely
+            // are removed.
+            let previous_cached_hosts: std::collections::BTreeSet<
+                crate::remote_source::RemoteHostKey,
+            > = self
+                .state
+                .remote_sources
+                .list_host_statuses()
+                .into_iter()
+                .map(|entry| entry.host)
+                .collect();
             self.remote_hosts = remote_host_registry_from_config(config);
-            let current_remote_hosts = remote_source_host_keys(&self.remote_hosts);
             let current_configured_hosts = configured_remote_host_keys(&self.remote_hosts);
-            // Removed hosts = union of:
-            //  - auto-start hosts that stopped auto-starting (removed, or
-            //    switched auto->manual/on_demand): clears their cache entry and
-            //    any projection. Preserves the existing auto-policy cleanup and
-            //    its auto->manual / auto_connect=false tests.
-            //  - any configured host that disappeared (incl. manual/on_demand
-            //    display-only hosts, and every host when remote is disabled):
-            //    clears a stale `sidebar_source`/projection that would otherwise
-            //    point at a host no longer in the host list.
-            // The BTreeSet union dedupes a host in both sets so it fires a
-            // single cleanup event. `RemoteSourceRemoved` never inserts a
-            // synthetic cache entry: `remote_sources.remove_host` is a no-op
-            // for never-cached manual/on_demand hosts, so the no-cache
-            // on-demand precheck is unaffected.
-            let mut removed_remote_hosts = previous_remote_hosts
-                .difference(&current_remote_hosts)
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>();
-            removed_remote_hosts.extend(
+
+            // Config reload retires every active lifecycle generation: resolve
+            // any in-flight pending responder with a deterministic superseded
+            // error so its later completion event is a no-op.
+            self.supersede_all_pending_remote_lifecycle();
+
+            // Stop every supervisor handle (any policy). Their generation-tagged
+            // late events are rejected by admission since no matching handle
+            // remains afterwards.
+            crate::remote_supervisor::stop_remote_source_supervisors(
+                &mut self.remote_source_supervisors,
+            );
+
+            // Remove cache entries for hosts that disappeared from the registry
+            // entirely (including every host when remote is disabled).
+            // `RemoteSourceRemoved` never inserts a synthetic cache entry:
+            // `remote_sources.remove_host` is a no-op for never-cached hosts.
+            let truly_removed: std::collections::BTreeSet<crate::remote_source::RemoteHostKey> =
                 previous_configured_hosts
                     .difference(&current_configured_hosts)
-                    .cloned(),
-            );
-            for host in removed_remote_hosts {
+                    .cloned()
+                    .collect();
+            for host in &truly_removed {
                 let _ = self
                     .state
                     .handle_app_event(AppEvent::RemoteSourceRemoved { host: host.clone() });
             }
-            crate::remote_supervisor::stop_remote_source_supervisors(
-                &mut self.remote_source_supervisors,
-            );
+
+            // Mark every still-configured host that had a prior active cache
+            // entry `Disconnected` (keeps last-known agent/workspace/
+            // projection/tab data as stale, drops prepared state). A
+            // still-configured manual/on_demand host remains visible but
+            // disconnected with no prepared state; a switched-away auto host
+            // is not silently dropped mid-session.
+            for host in &previous_cached_hosts {
+                if current_configured_hosts.contains(host) {
+                    self.state.remote_sources.mark_status(
+                        host,
+                        crate::remote_source::RemoteConnectionStatus::Disconnected,
+                    );
+                }
+            }
+
             seed_remote_source_hosts(&mut self.state.remote_sources, &self.remote_hosts);
             self.state.configured_remote_hosts = current_configured_hosts;
             self.remote_source_supervisors = start_remote_source_supervisors_if_enabled(
@@ -1988,6 +2025,24 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    /// Register an inert stub supervisor handle (no worker thread) for `host`
+    /// at `generation` so the App's generation-filtered remote-source event
+    /// admission accepts its events. Tests that feed supervisor events
+    /// directly through `handle_internal_event` call this first; the reducer
+    /// behavior is otherwise unchanged.
+    fn register_supervisor_stub(
+        app: &mut App,
+        host: &crate::remote_source::RemoteHostKey,
+        generation: u64,
+    ) {
+        app.remote_source_supervisors.push(
+            crate::remote_supervisor::RemoteSourceSupervisorHandle::test_stub(
+                host.clone(),
+                generation,
+            ),
+        );
     }
 
     fn test_mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -2417,6 +2472,7 @@ mod tests {
         let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
 
         let host = crate::remote_source::RemoteHostKey::new("jafar", "default");
+        register_supervisor_stub(&mut app, &host, 1);
         // Seeded `Disconnected` at startup (auto-connect host), so prepared
         // state is not available yet and there are no agents.
         assert_eq!(
@@ -2436,6 +2492,7 @@ mod tests {
         };
         app.handle_internal_event(AppEvent::RemoteSourceBridgeState {
             host: host.clone(),
+            generation: 1,
             bridge_state: bridge_state.clone(),
         });
 
@@ -2457,6 +2514,7 @@ mod tests {
         // A later non-connected mark still invalidates the prepared state.
         app.handle_internal_event(AppEvent::RemoteSourceDisconnected {
             host: host.clone(),
+            generation: 1,
             status: crate::remote_source::RemoteConnectionStatus::Unreachable,
         });
         assert_eq!(
@@ -2504,6 +2562,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::RemoteSourceSnapshot {
             host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
+            generation: 1,
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
@@ -2526,6 +2585,7 @@ mod tests {
 
         app.handle_internal_event(AppEvent::RemoteSourceSnapshot {
             host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
+            generation: 1,
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
@@ -2546,9 +2606,12 @@ mod tests {
             "jafar", "jafar", "default", true,
         )];
         let mut app = App::new(&config, true, None, api_rx, crate::api::EventHub::default());
+        let host = crate::remote_source::RemoteHostKey::new("jafar", "default");
+        register_supervisor_stub(&mut app, &host, 1);
 
         app.handle_internal_event(AppEvent::RemoteSourceSnapshot {
             host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
+            generation: 1,
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
@@ -3355,7 +3418,12 @@ session = "agents"
     }
 
     #[test]
-    fn reload_config_removes_remote_source_when_auto_connect_is_disabled() {
+    fn reload_config_marks_remote_source_disconnected_when_auto_connect_disabled() {
+        // Config reload retires every active handle/generation and marks each
+        // still-configured host with a prior cache entry `Disconnected` (stale),
+        // rather than removing it, so a switched-away host stays visible with
+        // no prepared state. Late supervisor events have no matching active
+        // handle and are dropped.
         let _guard = config_env_lock().lock().unwrap();
         let path = temp_config_path("reload-config-remote-auto-connect");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -3396,24 +3464,37 @@ auto_connect = false
         let report = app.reload_config();
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
 
-        let host = app.remote_hosts.get("jafar").unwrap();
-        assert!(!host.connection_policy.starts_automatically());
-        assert!(app.state.remote_sources.list_host_statuses().is_empty());
+        let host_cfg = app.remote_hosts.get("jafar").unwrap();
+        assert!(!host_cfg.connection_policy.starts_automatically());
+        // Still configured but no longer auto: the prior cache entry stays,
+        // marked Disconnected (no prepared state), rather than removed.
+        let host = crate::remote_source::RemoteHostKey::new("jafar", "default");
+        assert_eq!(
+            app.state.remote_sources.host_status(&host),
+            Some(crate::remote_source::RemoteConnectionStatus::Disconnected)
+        );
         assert!(app.state.remote_sources.list_entries().is_empty());
 
+        // Late supervisor events have no matching active handle (reload stopped
+        // every handle), so they are dropped and cannot revive the host.
         app.handle_internal_event(AppEvent::RemoteSourceDisconnected {
             host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
+            generation: 99,
             status: crate::remote_source::RemoteConnectionStatus::Unreachable,
         });
         app.handle_internal_event(AppEvent::RemoteSourceSnapshot {
             host: crate::remote_source::RemoteHostKey::new("jafar", "default"),
+            generation: 99,
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
             projections: Vec::new(),
             tabs: Vec::new(),
         });
-        assert!(app.state.remote_sources.list_host_statuses().is_empty());
+        assert_eq!(
+            app.state.remote_sources.host_status(&host),
+            Some(crate::remote_source::RemoteConnectionStatus::Disconnected)
+        );
         assert!(app.state.remote_sources.list_entries().is_empty());
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
@@ -3421,10 +3502,11 @@ auto_connect = false
     }
 
     #[test]
-    fn reload_config_removes_remote_source_when_switched_to_manual_policy() {
+    fn reload_config_marks_remote_source_disconnected_when_switched_to_manual_policy() {
         // Switching a host away from `Auto` (here to `connection_policy =
-        // "manual"`) must remove its automatic source row, mirroring the
-        // legacy `auto_connect = false` reload behavior.
+        // "manual"`) retires its active handle and marks the prior cache entry
+        // `Disconnected` (stale), keeping the host visible with no prepared
+        // state instead of removing it.
         let _guard = config_env_lock().lock().unwrap();
         let path = temp_config_path("reload-config-remote-manual-policy");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -3467,7 +3549,13 @@ connection_policy = "manual"
 
         let host = app.remote_hosts.get("jafar").unwrap();
         assert!(host.connection_policy.is_manual());
-        assert!(app.state.remote_sources.list_host_statuses().is_empty());
+        // Still configured (manual) but retired: the prior cache entry stays,
+        // marked Disconnected with no prepared state, not removed.
+        let key = crate::remote_source::RemoteHostKey::new("jafar", "default");
+        assert_eq!(
+            app.state.remote_sources.host_status(&key),
+            Some(crate::remote_source::RemoteConnectionStatus::Disconnected)
+        );
         assert!(app.state.remote_sources.list_entries().is_empty());
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
@@ -3612,6 +3700,7 @@ connection_policy = "on_demand"
         assert!(app.remote_hosts.get("jafar").is_none());
 
         app.handle_internal_event(AppEvent::RemoteSourceBridgeState {
+            generation: 1,
             host: host.clone(),
             bridge_state: test_bridge_state(),
         });
@@ -3651,6 +3740,7 @@ connection_policy = "on_demand"
             .is_manual());
 
         app.handle_internal_event(AppEvent::RemoteSourceBridgeState {
+            generation: 1,
             host: host.clone(),
             bridge_state: test_bridge_state(),
         });
@@ -3667,9 +3757,11 @@ connection_policy = "on_demand"
     #[test]
     fn app_ignores_remote_source_bridge_state_after_auto_connect_disabled() {
         // After a reload disables auto-connect on a previously automatic host,
-        // its automatic source row is removed. A late `RemoteSourceBridgeState`
-        // event must not recreate the host or prepared state, mirroring the
-        // stale snapshot/disconnect reload protection.
+        // its prior cache entry is marked `Disconnected` (stale), not removed:
+        // the host stays visible with no prepared state. A late
+        // `RemoteSourceBridgeState` event from a retired generation must not
+        // recreate prepared state or flip the host back to `Connected`, because
+        // reload stopped every handle so no active generation admits it.
         let _guard = config_env_lock().lock().unwrap();
         let path = temp_config_path("ignore-bridge-state-auto-connect-disabled");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -3715,16 +3807,29 @@ auto_connect = false
             .unwrap()
             .connection_policy
             .starts_automatically());
-        assert!(app.state.remote_sources.list_host_statuses().is_empty());
-
+        // Still configured but no longer auto: the prior cache entry stays,
+        // marked `Disconnected` (stale), rather than removed.
         let host = crate::remote_source::RemoteHostKey::new("jafar", "default");
+        assert_eq!(app.state.remote_sources.list_host_statuses().len(), 1);
+        assert_eq!(
+            app.state.remote_sources.host_status(&host),
+            Some(crate::remote_source::RemoteConnectionStatus::Disconnected)
+        );
+
         app.handle_internal_event(AppEvent::RemoteSourceBridgeState {
+            generation: 1,
             host: host.clone(),
             bridge_state: test_bridge_state(),
         });
 
-        assert!(app.state.remote_sources.host_status(&host).is_none());
-        assert!(app.state.remote_sources.list_host_statuses().is_empty());
+        // The late bridge-state event has no matching active generation (reload
+        // stopped every handle), so it is rejected by admission: the host stays
+        // `Disconnected` with no prepared state.
+        assert_eq!(
+            app.state.remote_sources.host_status(&host),
+            Some(crate::remote_source::RemoteConnectionStatus::Disconnected)
+        );
+        assert_eq!(app.state.remote_sources.list_host_statuses().len(), 1);
         assert!(app
             .state
             .remote_sources
@@ -3738,9 +3843,11 @@ auto_connect = false
     #[test]
     fn app_ignores_remote_source_bridge_state_after_switched_to_manual() {
         // After a reload switches a previously automatic host to a `Manual`
-        // connection policy, its automatic source row is removed. A late
-        // `RemoteSourceBridgeState` event must not recreate the host or prepared
-        // state, mirroring the stale snapshot/disconnect reload protection.
+        // connection policy, its prior cache entry is marked `Disconnected`
+        // (stale), not removed: the host stays visible with no prepared state.
+        // A late `RemoteSourceBridgeState` event from a retired generation must
+        // not recreate prepared state or flip the host back to `Connected`,
+        // because reload stopped every handle so no active generation admits it.
         let _guard = config_env_lock().lock().unwrap();
         let path = temp_config_path("ignore-bridge-state-switched-to-manual");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -3786,16 +3893,29 @@ connection_policy = "manual"
             .unwrap()
             .connection_policy
             .is_manual());
-        assert!(app.state.remote_sources.list_host_statuses().is_empty());
-
+        // Still configured (manual) but retired: the prior cache entry stays,
+        // marked `Disconnected` (stale), rather than removed.
         let host = crate::remote_source::RemoteHostKey::new("jafar", "default");
+        assert_eq!(app.state.remote_sources.list_host_statuses().len(), 1);
+        assert_eq!(
+            app.state.remote_sources.host_status(&host),
+            Some(crate::remote_source::RemoteConnectionStatus::Disconnected)
+        );
+
         app.handle_internal_event(AppEvent::RemoteSourceBridgeState {
+            generation: 1,
             host: host.clone(),
             bridge_state: test_bridge_state(),
         });
 
-        assert!(app.state.remote_sources.host_status(&host).is_none());
-        assert!(app.state.remote_sources.list_host_statuses().is_empty());
+        // The late bridge-state event has no matching active generation (reload
+        // stopped every handle), so it is rejected by admission: the host stays
+        // `Disconnected` with no prepared state.
+        assert_eq!(
+            app.state.remote_sources.host_status(&host),
+            Some(crate::remote_source::RemoteConnectionStatus::Disconnected)
+        );
+        assert_eq!(app.state.remote_sources.list_host_statuses().len(), 1);
         assert!(app
             .state
             .remote_sources

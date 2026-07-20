@@ -728,4 +728,156 @@ run_herdr "$REMOTE_SESSION" remote-api-ping "$ALIAS" >/dev/null
 create_remote_smoke_agent
 wait_for_single_connected_local_agent "$HOST_AGENT" 120 >/dev/null
 
-echo "remote API bridge Docker smoke passed: probes, supervisor cache, host-qualified get/read/send/focus/start, disconnect, and reconnect succeeded"
+# ---- explicit runtime bridge lifecycle (connect/reconnect/disconnect) ----
+# These control ONLY the running local server's aggregation/supervisor/bridge
+# state. The remote Herdr server/agent in the container must stay alive and
+# authoritative throughout: a disconnect makes the LOCAL aggregated entry
+# stale/disconnected while the remote keeps running (verified by querying the
+# remote server directly over SSH, bypassing the local server).
+
+LIFECYCLE_HELPER="$BASE/lifecycle_helper.py"
+cat >"$LIFECYCLE_HELPER" <<'PY'
+import json
+import sys
+
+
+def parse(text):
+    decoder = json.JSONDecoder()
+    idx = 0
+    payload = None
+    while idx < len(text):
+        idx = text.find("{", idx)
+        if idx == -1:
+            break
+        try:
+            payload, idx = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            idx += 1
+            continue
+    return payload
+
+
+mode = sys.argv[1]
+text = sys.argv[2]
+payload = parse(text)
+if payload is None:
+    raise SystemExit(f"no JSON payload found in: {text!r}")
+if payload.get("error") is not None:
+    raise SystemExit(f"unexpected error response: {payload}")
+result = payload.get("result") or {}
+if result.get("type") != "remote_lifecycle":
+    raise SystemExit(f"unexpected result.type: {result.get('type')!r}")
+inner = result.get("result") or {}
+if mode == "status":
+    print(inner.get("status", ""))
+elif mode == "changed":
+    print("true" if inner.get("changed") else "false")
+elif mode == "remote_authoritative":
+    print("true" if inner.get("remote_authoritative") else "false")
+elif mode == "action":
+    print(inner.get("action", ""))
+else:
+    raise SystemExit(f"unknown mode: {mode!r}")
+PY
+
+run_lifecycle_json() {
+  local action="$1"
+  run_herdr "$LOCAL_SESSION" remote "$action" "$ALIAS" --json
+}
+
+assert_lifecycle() {
+  local action="$1"
+  local expected_status="$2"
+  local expected_changed="$3"
+  local output status changed authoritative
+  output="$(run_lifecycle_json "$action")"
+  status="$(python3 "$LIFECYCLE_HELPER" status "$output")"
+  changed="$(python3 "$LIFECYCLE_HELPER" changed "$output")"
+  authoritative="$(python3 "$LIFECYCLE_HELPER" remote_authoritative "$output")"
+  [[ "$status" == "$expected_status" ]] || {
+    echo "error: remote $action expected status $expected_status, got $status" >&2
+    exit 1
+  }
+  [[ "$changed" == "$expected_changed" ]] || {
+    echo "error: remote $action expected changed $expected_changed, got $changed" >&2
+    exit 1
+  }
+  [[ "$authoritative" == "true" ]] || {
+    echo "error: remote $action did not report remote_authoritative=true" >&2
+    exit 1
+  }
+}
+
+remote_agent_listed() {
+  # The remote Herdr server in the container is independent of local
+  # aggregation; prove it stays alive/authoritative after a local disconnect
+  # by querying it directly over SSH (bypassing the local server entirely).
+  local out
+  out="$(run_remote_ssh "/usr/local/bin/herdr --session $REMOTE_SESSION agent list 2>/dev/null" || true)"
+  [[ -n "$out" ]] && json_has_agent "$out" "smoke-agent"
+}
+
+# Precondition: the supervisor-driven reconnect above left the host connected
+# with exactly one smoke-agent.
+wait_for_single_connected_local_agent "$HOST_AGENT" 120 >/dev/null
+
+# (2) disconnect: local entry goes stale/disconnected while the remote server/
+# agent in the container stays alive and authoritative.
+assert_lifecycle disconnect disconnected true
+wait_for_local_agent_disconnected "$HOST_AGENT" 120 >/dev/null
+remote_agent_listed || {
+  echo "error: remote agent must remain alive after a local disconnect" >&2
+  exit 1
+}
+
+# (3) repeated disconnect is idempotent (changed=false).
+assert_lifecycle disconnect disconnected false
+
+# (4) connect restores local aggregation without setup/update (changed=true).
+assert_lifecycle connect connected true
+wait_for_single_connected_local_agent "$HOST_AGENT" 120 >/dev/null
+# A second healthy connect preserves state (idempotent, changed=false).
+assert_lifecycle connect connected false
+
+# (5) reconnect yields fresh local bridge/supervisor state with a single
+# connected agent (no duplicates).
+assert_lifecycle reconnect connected true
+wait_for_single_connected_local_agent "$HOST_AGENT" 120 >/dev/null
+
+# (6) stopping the fake SSH endpoint: connect/reconnect return non-zero with a
+# non-connected (unreachable/disconnected/needs_update) LOCAL status, never an
+# install/bootstrap attempt. Wait for the supervisor to observe the dead
+# endpoint first so the cached status is non-connected and connect probes a
+# fresh generation rather than taking the idempotent Connected path.
+docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+wait_for_local_agent_disconnected "$HOST_AGENT" 120 >/dev/null
+
+set +e
+connect_dead_out="$(run_lifecycle_json connect)"
+connect_dead_rc=$?
+set -e
+[[ $connect_dead_rc -ne 0 ]] || {
+  echo "error: connect against a dead endpoint must exit non-zero (got $connect_dead_rc)" >&2
+  exit 1
+}
+connect_dead_status="$(python3 "$LIFECYCLE_HELPER" status "$connect_dead_out")"
+[[ "$connect_dead_status" != "connected" ]] || {
+  echo "error: connect against a dead endpoint must not report connected" >&2
+  exit 1
+}
+
+set +e
+reconnect_dead_out="$(run_lifecycle_json reconnect)"
+reconnect_dead_rc=$?
+set -e
+[[ $reconnect_dead_rc -ne 0 ]] || {
+  echo "error: reconnect against a dead endpoint must exit non-zero (got $reconnect_dead_rc)" >&2
+  exit 1
+}
+reconnect_dead_status="$(python3 "$LIFECYCLE_HELPER" status "$reconnect_dead_out")"
+[[ "$reconnect_dead_status" != "connected" ]] || {
+  echo "error: reconnect against a dead endpoint must not report connected" >&2
+  exit 1
+}
+
+echo "remote API bridge Docker smoke passed: probes, supervisor cache, host-qualified get/read/send/focus/start, supervisor disconnect/reconnect, and explicit connect/reconnect/disconnect lifecycle (local-only, idempotent, dead-endpoint non-zero) succeeded"

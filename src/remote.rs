@@ -302,6 +302,30 @@ pub(crate) fn try_pooled_remote_api_request(
 #[cfg(windows)]
 pub(crate) fn invalidate_remote_bridge_pool_host(_key: &crate::remote_source::RemoteHostKey) {}
 
+/// Windows stub: no persistent-bridge pool exists; the inline lifecycle
+/// drain+reap is a no-op (remote support is unix-only, so this is never
+/// reached with real work on Windows).
+#[cfg(windows)]
+pub(crate) fn drain_remote_bridge_pool_host_inline(_key: &crate::remote_source::RemoteHostKey) {}
+
+/// Windows stub: no persistent-bridge pool exists; the disconnect off-loop
+/// drain has nothing to reap, but it still reports completion from an off-loop
+/// worker (never `blocking_send` directly on the App async runtime, matching
+/// the unix contract). No remote mutation occurs on Windows.
+#[cfg(windows)]
+pub(crate) fn drain_remote_bridge_pool_host_off_loop(
+    key: crate::remote_source::RemoteHostKey,
+    generation: u64,
+    event_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+) {
+    std::thread::spawn(move || {
+        let _ = event_tx.blocking_send(crate::events::AppEvent::RemoteSourcePoolDrainCompleted {
+            host: key,
+            generation,
+        });
+    });
+}
+
 /// Windows stub: no persistent-bridge pool exists, so shutdown drain is a no-op.
 #[cfg(windows)]
 pub(crate) fn drain_remote_bridge_pool() {}

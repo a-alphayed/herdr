@@ -231,6 +231,9 @@ pub enum ResponseResult {
         status: crate::config::ConfigReloadStatus,
         diagnostics: Vec<String>,
     },
+    RemoteLifecycle {
+        result: crate::api::schema::remotes::RemoteLifecycleResult,
+    },
     Ok {},
 }
 

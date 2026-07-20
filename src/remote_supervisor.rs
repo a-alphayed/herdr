@@ -57,17 +57,60 @@ const TRANSIENT_BACKOFF_MAX_SHIFT: u32 = 5;
 const REMOTE_SOURCE_TRANSIENT_JITTER_WINDOW_SECS: u64 = 30;
 
 pub(crate) struct RemoteSourceSupervisorHandle {
+    pub(crate) host_key: RemoteHostKey,
+    /// Process-locally unique incarnation generation/epoch. Every event
+    /// published by this handle's worker is tagged with it; the App accepts a
+    /// remote-source event only when an active keyed handle carries this exact
+    /// generation, so a same-host predecessor's queued/late event is rejected
+    /// after a reconnect/disconnect/config reload.
+    pub(crate) generation: u64,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl RemoteSourceSupervisorHandle {
-    fn start(host: RemoteHostConfig, event_tx: mpsc::Sender<AppEvent>) -> Self {
+    /// Start a supervisor with an explicit incarnation generation and the
+    /// optional lifecycle completion hook. Used by the lifecycle connect/
+    /// reconnect path so the worker emits exactly one
+    /// [`AppEvent::RemoteSourceLifecycleAttempt`] after its initial ping.
+    pub(crate) fn start_with_lifecycle(
+        host: RemoteHostConfig,
+        event_tx: mpsc::Sender<AppEvent>,
+        generation: u64,
+    ) -> Self {
+        Self::start_inner(host, event_tx, generation, Some(generation))
+    }
+
+    fn start_with_generation(
+        host: RemoteHostConfig,
+        event_tx: mpsc::Sender<AppEvent>,
+        generation: u64,
+    ) -> Self {
+        Self::start_inner(host, event_tx, generation, None)
+    }
+
+    fn start_inner(
+        host: RemoteHostConfig,
+        event_tx: mpsc::Sender<AppEvent>,
+        generation: u64,
+        lifecycle: Option<u64>,
+    ) -> Self {
+        let host_key = RemoteHostKey::new(host.name.clone(), host.session.clone());
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
-        let thread =
-            thread::spawn(move || remote_source_supervisor_loop(host, event_tx, thread_stop));
+        let thread = thread::spawn(move || {
+            remote_source_supervisor_loop_with_generation(
+                host,
+                event_tx,
+                thread_stop,
+                send_remote_api_request_with_send_result,
+                generation,
+                lifecycle,
+            )
+        });
         Self {
+            host_key,
+            generation,
             stop,
             thread: Some(thread),
         }
@@ -87,13 +130,35 @@ impl Drop for RemoteSourceSupervisorHandle {
     }
 }
 
+#[cfg(test)]
+impl RemoteSourceSupervisorHandle {
+    /// Construct an inert stub handle (no worker thread) carrying only the
+    /// host key + generation used by remote-source event admission. Lets tests
+    /// exercise the App admission/reducer path without spawning real
+    /// supervisors. The stop flag is preset so a stray drop is a no-op.
+    pub(crate) fn test_stub(host_key: RemoteHostKey, generation: u64) -> Self {
+        Self {
+            host_key,
+            generation,
+            stop: Arc::new(AtomicBool::new(true)),
+            thread: None,
+        }
+    }
+}
+
 pub(crate) fn start_remote_source_supervisors(
     registry: &RemoteHostRegistry,
     event_tx: mpsc::Sender<AppEvent>,
 ) -> Vec<RemoteSourceSupervisorHandle> {
     auto_connect_hosts(registry)
         .into_iter()
-        .map(|host| RemoteSourceSupervisorHandle::start(host, event_tx.clone()))
+        .map(|host| {
+            RemoteSourceSupervisorHandle::start_with_generation(
+                host,
+                event_tx.clone(),
+                next_supervisor_generation(),
+            )
+        })
         .collect()
 }
 
@@ -113,17 +178,112 @@ pub(crate) fn auto_connect_hosts(registry: &RemoteHostRegistry) -> Vec<RemoteHos
         .collect()
 }
 
-fn remote_source_supervisor_loop(
-    host: RemoteHostConfig,
+/// Outcome of a deferred runtime lifecycle initial ping attempt, reported
+/// through [`AppEvent::RemoteSourceLifecycleAttempt`] after the worker's first
+/// ping. `Connected` means the first ping succeeded (the App flips the cached
+/// status to `Connected`); `Disconnected(status)` carries the failure status
+/// (`Unreachable`/`NeedsUpdate`/`Disconnected`) so the App resolves the pending
+/// responder with an actionable non-zero result while leaving the retrying
+/// supervisor alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteSourceLifecycleOutcome {
+    Connected,
+    Disconnected(RemoteConnectionStatus),
+}
+
+/// Process-local monotonically unique supervisor incarnation counter. Every
+/// supervisor handle (auto-start, explicit connect/reconnect) allocates a fresh
+/// generation here; lifecycle pool drains allocate from the same counter so a
+/// pending lifecycle responder token is process-unique. Starts at 1 so 0 can
+/// never be confused with a live generation.
+static NEXT_SUPERVISOR_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Allocate the next process-unique supervisor/lifecycle generation.
+pub(crate) fn next_supervisor_generation() -> u64 {
+    NEXT_SUPERVISOR_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Worker-scope fallback completion guard for a lifecycle-attempted supervisor
+/// (explicit `remote connect`/`reconnect`). Socket dispatch waits on the App's
+/// pending lifecycle `respond_to` with no timeout, so a worker that panics or
+/// exits before its normal first-ping completion emit would strand the CLI
+/// indefinitely. This guard closes that gap.
+///
+/// [`LifecycleCompletionGuard::emit`] performs the normal emit and disarms the
+/// fallback. `Drop` emits a fallback [`AppEvent::RemoteSourceLifecycleAttempt`]
+/// only if the normal emit never ran (a panic in the pre-loop inline pool
+/// drain, the send path outside the guarded ping, or any early exit before the
+/// first ping). Because the App resolves the pending responder solely for a
+/// still-active generation -- it removes the entry on supersession
+/// (reconnect/disconnect/config reload) and on the first resolution -- a late
+/// fallback after normal completion or after a supersession is a harmless
+/// generation no-op: it can never double-resolve the responder. The guard
+/// itself emits at most once (the `emitted` flag), so normal + drop never
+/// double-send for one generation.
+struct LifecycleCompletionGuard {
+    host_key: RemoteHostKey,
+    generation: u64,
     event_tx: mpsc::Sender<AppEvent>,
-    stop: Arc<AtomicBool>,
-) {
-    remote_source_supervisor_loop_with(
-        host,
-        event_tx,
-        stop,
-        send_remote_api_request_with_send_result,
-    );
+    /// Whether the normal completion has already been emitted (or deliberately
+    /// skipped on stop). Disarms the `Drop` fallback.
+    emitted: bool,
+}
+
+impl LifecycleCompletionGuard {
+    fn new(host_key: RemoteHostKey, generation: u64, event_tx: mpsc::Sender<AppEvent>) -> Self {
+        Self {
+            host_key,
+            generation,
+            event_tx,
+            emitted: false,
+        }
+    }
+
+    /// Perform the normal lifecycle completion emit and disarm the fallback.
+    /// Idempotent: only the first call emits; later calls (e.g. on subsequent
+    /// ping iterations) are no-ops, so the responder resolves exactly once.
+    /// Honors `stop` exactly like the pre-guard code (a worker stopped before
+    /// the emit skips the send); since `stop` is only set after the pending
+    /// responder was already superseded, that skip never strands it.
+    fn emit(&mut self, outcome: RemoteSourceLifecycleOutcome, stop: &AtomicBool) {
+        if self.emitted {
+            return;
+        }
+        self.emitted = true;
+        if !stop.load(Ordering::Relaxed) {
+            let _ = self
+                .event_tx
+                .blocking_send(AppEvent::RemoteSourceLifecycleAttempt {
+                    host: self.host_key.clone(),
+                    generation: self.generation,
+                    outcome,
+                });
+        }
+    }
+}
+
+impl Drop for LifecycleCompletionGuard {
+    fn drop(&mut self) {
+        if self.emitted {
+            return;
+        }
+        // Panic / early exit before the normal emit: emit a fallback failure
+        // completion so the pending responder can never be stranded. Harmless
+        // if the generation was already superseded/resolved (the App treats a
+        // completion for a missing pending entry as a no-op). Mark emitted so a
+        // theoretical second drop path cannot double-send.
+        self.emitted = true;
+        let _ = self
+            .event_tx
+            .blocking_send(AppEvent::RemoteSourceLifecycleAttempt {
+                host: self.host_key.clone(),
+                generation: self.generation,
+                outcome: RemoteSourceLifecycleOutcome::Disconnected(
+                    RemoteConnectionStatus::Disconnected,
+                ),
+            });
+    }
 }
 
 /// Result of one supervisor bridge round-trip: the JSON response plus any
@@ -173,11 +333,29 @@ fn send_remote_api_request_with_send_result(
     })
 }
 
+/// Test-only wrapper around [`remote_source_supervisor_loop_with_generation`]
+/// that allocates a fresh generation and runs without a lifecycle completion
+/// hook. Production starts supervisors through [`RemoteSourceSupervisorHandle`].
+#[cfg(test)]
 fn remote_source_supervisor_loop_with<F>(
     host: RemoteHostConfig,
     event_tx: mpsc::Sender<AppEvent>,
     stop: Arc<AtomicBool>,
     send: F,
+) where
+    F: Fn(&RemoteHostConfig, &Request) -> io::Result<RemoteSourceSendResult>,
+{
+    let generation = next_supervisor_generation();
+    remote_source_supervisor_loop_with_generation(host, event_tx, stop, send, generation, None);
+}
+
+fn remote_source_supervisor_loop_with_generation<F>(
+    host: RemoteHostConfig,
+    event_tx: mpsc::Sender<AppEvent>,
+    stop: Arc<AtomicBool>,
+    send: F,
+    generation: u64,
+    lifecycle: Option<u64>,
 ) where
     F: Fn(&RemoteHostConfig, &Request) -> io::Result<RemoteSourceSendResult>,
 {
@@ -187,10 +365,45 @@ fn remote_source_supervisor_loop_with<F>(
     let mut capabilities = RemoteSourceCapabilities::default();
     let mut transient_backoff = TransientBackoff::default();
 
+    // Worker-scope fallback completion guard for a lifecycle-attempted
+    // supervisor (explicit connect/reconnect). Wraps the WHOLE worker body --
+    // including the pre-loop inline pool drain below -- so a panic outside the
+    // guarded first ping still emits exactly one completion and can never
+    // strand the pending `respond_to`. Normal emit disarms it; a late fallback
+    // after supersession/normal-completion is a harmless generation no-op.
+    let mut lifecycle_guard = lifecycle
+        .map(|_| LifecycleCompletionGuard::new(host_key.clone(), generation, event_tx.clone()));
+
+    // When a lifecycle generation is attached (explicit connect/reconnect),
+    // drain/reap this host's idle pooled bridges off-loop BEFORE the initial
+    // ping so the fresh generation starts with no stale pooled bridges. The
+    // collect-under-lock is fast; the reap (ssh child cleanup) happens here in
+    // the worker thread, never on the App/headless/render/input loop. A panic
+    // here is caught by `lifecycle_guard`'s Drop fallback.
+    if lifecycle_guard.is_some() {
+        crate::remote::drain_remote_bridge_pool_host_inline(&host_key);
+    }
+
+    // Only the very first ping of a lifecycle attempt is panic-guarded and
+    // resolves the pending responder; subsequent pings use the normal path.
+    let mut first_lifecycle_attempt = lifecycle_guard.is_some();
+
     while !stop.load(Ordering::Relaxed) {
         let now = Instant::now();
         if now >= next_ping {
-            match send_ping(&host, &send) {
+            // The first ping of a lifecycle-attempted supervisor is guarded
+            // against a panicking send closure so the lifecycle responder is
+            // never left hanging: a panic maps to a generic failure status and
+            // the completion event is still emitted exactly once via the guard.
+            let ping_result = if first_lifecycle_attempt {
+                first_lifecycle_attempt = false;
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| send_ping(&host, &send)))
+                    .map_err(|_| io::Error::other("remote supervisor lifecycle ping panicked"))
+                    .and_then(|inner| inner)
+            } else {
+                send_ping(&host, &send)
+            };
+            let lifecycle_outcome = match ping_result {
                 Ok((next_capabilities, bridge_state)) => {
                     capabilities = next_capabilities;
                     // Any successful round-trip proves the host is reachable
@@ -206,10 +419,12 @@ fn remote_source_supervisor_loop_with<F>(
                         if !stop.load(Ordering::Relaxed) {
                             let _ = event_tx.blocking_send(AppEvent::RemoteSourceBridgeState {
                                 host: host_key.clone(),
+                                generation,
                                 bridge_state,
                             });
                         }
                     }
+                    RemoteSourceLifecycleOutcome::Connected
                 }
                 Err(err) => {
                     if stop.load(Ordering::Relaxed) {
@@ -219,6 +434,7 @@ fn remote_source_supervisor_loop_with<F>(
                     let status = remote_source_failure_status(&err);
                     let _ = event_tx.blocking_send(AppEvent::RemoteSourceDisconnected {
                         host: host_key.clone(),
+                        generation,
                         status,
                     });
                     let retry_interval = retry_interval_for_failure(
@@ -234,7 +450,17 @@ fn remote_source_supervisor_loop_with<F>(
                     // single transient failure does not double-escalate the
                     // shared backoff through both ping and snapshot this tick.
                     next_snapshot = next_snapshot.max(now + retry_interval);
+                    RemoteSourceLifecycleOutcome::Disconnected(status)
                 }
+            };
+            // Resolve the pending responder exactly once via the guard (the
+            // normal emit disarms its Drop fallback). The guard is a no-op on
+            // every subsequent ping, so the responder resolves exactly once;
+            // a superseding reconnect/disconnect/config reload already
+            // resolved it with a deterministic superseded error and a late
+            // completion here is ignored by the App.
+            if let Some(guard) = lifecycle_guard.as_mut() {
+                guard.emit(lifecycle_outcome, &stop);
             }
         }
 
@@ -247,6 +473,7 @@ fn remote_source_supervisor_loop_with<F>(
                     }
                     let _ = event_tx.blocking_send(AppEvent::RemoteSourceSnapshot {
                         host: host_key.clone(),
+                        generation,
                         agents,
                         workspaces,
                         capabilities,
@@ -265,6 +492,7 @@ fn remote_source_supervisor_loop_with<F>(
                     let status = remote_source_failure_status(&err);
                     let _ = event_tx.blocking_send(AppEvent::RemoteSourceDisconnected {
                         host: host_key.clone(),
+                        generation,
                         status,
                     });
                     let retry_interval = retry_interval_for_failure(
@@ -1241,6 +1469,88 @@ mod tests {
         );
     }
 
+    // ---- LifecycleCompletionGuard: resolve-exactly-once on panic/early-exit ----
+
+    fn guard_host_key() -> RemoteHostKey {
+        RemoteHostKey::new("jafar", "default")
+    }
+
+    #[test]
+    fn lifecycle_guard_drop_without_emit_fires_fallback_disconnected() {
+        // A worker that panics or exits before its normal emit must still emit
+        // exactly one completion so the pending responder is never stranded.
+        // Dropping the guard without calling emit simulates that path.
+        let (tx, mut rx) = mpsc::channel(4);
+        {
+            let _guard = LifecycleCompletionGuard::new(guard_host_key(), 42, tx);
+            // no emit -> drop fires fallback
+        }
+        let AppEvent::RemoteSourceLifecycleAttempt {
+            host,
+            generation,
+            outcome,
+        } = rx.blocking_recv().expect("fallback completion emitted")
+        else {
+            panic!("expected RemoteSourceLifecycleAttempt");
+        };
+        assert_eq!(host, guard_host_key());
+        assert_eq!(generation, 42);
+        assert_eq!(
+            outcome,
+            RemoteSourceLifecycleOutcome::Disconnected(RemoteConnectionStatus::Disconnected)
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one completion from the guard"
+        );
+    }
+
+    #[test]
+    fn lifecycle_guard_emit_then_drop_emits_exactly_once() {
+        // Normal emit disarms the Drop fallback: exactly one completion with
+        // the real outcome, never two.
+        let (tx, mut rx) = mpsc::channel(4);
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let mut guard = LifecycleCompletionGuard::new(guard_host_key(), 7, tx);
+            guard.emit(RemoteSourceLifecycleOutcome::Connected, &stop);
+            // A second emit is a no-op (exactly-once).
+            guard.emit(
+                RemoteSourceLifecycleOutcome::Disconnected(RemoteConnectionStatus::Unreachable),
+                &stop,
+            );
+        }
+        let AppEvent::RemoteSourceLifecycleAttempt {
+            generation,
+            outcome,
+            ..
+        } = rx.blocking_recv().expect("normal completion emitted")
+        else {
+            panic!("expected RemoteSourceLifecycleAttempt");
+        };
+        assert_eq!(generation, 7);
+        assert_eq!(outcome, RemoteSourceLifecycleOutcome::Connected);
+        assert!(
+            rx.try_recv().is_err(),
+            "no fallback after normal emit (exactly once)"
+        );
+    }
+
+    #[test]
+    fn lifecycle_guard_emit_skips_send_on_stop_but_never_strands() {
+        // stop is only set after the responder was already superseded, so
+        // skipping the send on stop never strands it; the guard marks emitted
+        // so the Drop fallback does not double-send either.
+        let (tx, mut rx) = mpsc::channel(4);
+        let stop = Arc::new(AtomicBool::new(true));
+        {
+            let mut guard = LifecycleCompletionGuard::new(guard_host_key(), 9, tx);
+            guard.emit(RemoteSourceLifecycleOutcome::Connected, &stop);
+        }
+        // No event sent (stop), and no fallback double-send.
+        assert!(rx.try_recv().is_err(), "no send on stop and no fallback");
+    }
+
     #[test]
     fn remote_supervisor_loop_sends_snapshot_on_success() {
         let (tx, mut rx) = mpsc::channel(4);
@@ -1279,6 +1589,7 @@ mod tests {
             capabilities,
             projections,
             tabs,
+            ..
         } = event
         else {
             panic!("expected snapshot event");
@@ -1347,7 +1658,10 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
-        let AppEvent::RemoteSourceBridgeState { host, bridge_state } = first else {
+        let AppEvent::RemoteSourceBridgeState {
+            host, bridge_state, ..
+        } = first
+        else {
             panic!("expected RemoteSourceBridgeState event first, got {first:?}");
         };
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
@@ -1428,6 +1742,7 @@ mod tests {
             capabilities,
             projections,
             tabs,
+            ..
         } = event
         else {
             panic!("expected snapshot event");
@@ -1471,7 +1786,7 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
-        let AppEvent::RemoteSourceDisconnected { host, status } = event else {
+        let AppEvent::RemoteSourceDisconnected { host, status, .. } = event else {
             panic!("expected disconnected event");
         };
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
@@ -1513,7 +1828,7 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
-        let AppEvent::RemoteSourceDisconnected { host, status } = event else {
+        let AppEvent::RemoteSourceDisconnected { host, status, .. } = event else {
             panic!("expected disconnected event, not a snapshot");
         };
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
@@ -1548,7 +1863,7 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
-        let AppEvent::RemoteSourceDisconnected { host, status } = event else {
+        let AppEvent::RemoteSourceDisconnected { host, status, .. } = event else {
             panic!("expected disconnected event");
         };
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
@@ -1584,7 +1899,7 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
-        let AppEvent::RemoteSourceDisconnected { host, status } = event else {
+        let AppEvent::RemoteSourceDisconnected { host, status, .. } = event else {
             panic!("expected disconnected event");
         };
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));
@@ -1619,7 +1934,7 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         handle.join().unwrap();
 
-        let AppEvent::RemoteSourceDisconnected { host, status } = event else {
+        let AppEvent::RemoteSourceDisconnected { host, status, .. } = event else {
             panic!("expected disconnected event");
         };
         assert_eq!(host, RemoteHostKey::new("jafar", "default"));

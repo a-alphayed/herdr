@@ -6,6 +6,7 @@ pub mod events;
 pub mod integrations;
 pub mod panes;
 pub mod plugins;
+pub mod remotes;
 pub mod response;
 pub mod server;
 pub mod session;
@@ -19,6 +20,7 @@ pub use events::*;
 pub use integrations::*;
 pub use panes::*;
 pub use plugins::*;
+pub use remotes::*;
 pub use response::*;
 pub use server::*;
 pub use session::*;
@@ -211,6 +213,16 @@ pub enum Method {
     PluginPaneFocus(PluginPaneFocusParams),
     #[serde(rename = "plugin.pane.close")]
     PluginPaneClose(PluginPaneCloseParams),
+    // Local-only runtime lifecycle methods. Control only the running local
+    // controller's aggregation/supervisor/bridge state. Not advertised as
+    // federation capabilities/routed methods, so they cannot become
+    // remote-of-remote commands. See [`remotes`] for the full contract.
+    #[serde(rename = "remote.connect")]
+    RemoteConnect(RemoteLifecycleHostParams),
+    #[serde(rename = "remote.reconnect")]
+    RemoteReconnect(RemoteLifecycleHostParams),
+    #[serde(rename = "remote.disconnect")]
+    RemoteDisconnect(RemoteLifecycleHostParams),
 }
 
 #[cfg(test)]

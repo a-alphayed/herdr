@@ -2888,6 +2888,19 @@ impl HeadlessServer {
                 respond_to,
             } => (*request, respond_to),
         };
+        // Local-only runtime lifecycle seam (connect/reconnect/disconnect):
+        // deferred, off-loop. Must not block the headless loop on remote
+        // SSH/reap. Falls through to the synchronous path if not owned here.
+        let (request, respond_to) = match self
+            .app
+            .handle_deferred_remote_lifecycle_api_request(request, respond_to)
+        {
+            crate::app::DeferredRemoteLifecycleOutcome::Handled => return changed,
+            crate::app::DeferredRemoteLifecycleOutcome::NotHandled {
+                request,
+                respond_to,
+            } => (*request, respond_to),
+        };
         let response = if matches!(&request.method, api::schema::Method::ServerReloadConfig(_)) {
             let report = self.reload_server_config(true);
             serde_json::to_string(&api::schema::SuccessResponse {

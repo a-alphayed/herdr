@@ -354,6 +354,9 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PluginPaneOpen(_) => "plugin.pane.open",
         Method::PluginPaneFocus(_) => "plugin.pane.focus",
         Method::PluginPaneClose(_) => "plugin.pane.close",
+        Method::RemoteConnect(_) => "remote.connect",
+        Method::RemoteReconnect(_) => "remote.reconnect",
+        Method::RemoteDisconnect(_) => "remote.disconnect",
     }
 }
 
