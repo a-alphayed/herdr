@@ -698,7 +698,12 @@ fn live_handoff_preserves_pane_process_io() {
         "second:after-handoff-second",
         Duration::from_secs(5),
     );
-    wait_for_output(&api_socket, &second_pane_id, "second:after-handoff-sec");
+    // The marker-file read above already proves the full payload arrived. The
+    // host-selection rail narrows this split's second pane at an 80-column
+    // client, so the visible-screen read can wrap mid-word (e.g.
+    // "second:after-handof\nf-second"); use a short, non-wrapping prefix here
+    // instead of asserting the full string against wrapped visible output.
+    wait_for_output(&api_socket, &second_pane_id, "second:after-");
 
     let _ = request(
         &api_socket,

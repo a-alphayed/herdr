@@ -1306,17 +1306,17 @@ impl AppState {
         }
     }
 
-    /// Move the selected Hosts-section entry by `delta` rows, clamping at the
+    /// Move the selected host-rail entry by `delta` rows, clamping at the
     /// list bounds, and keep the new selection visible by scrolling the host
     /// viewport. This is read-model-only: it selects a [`SidebarSource`] and
     /// never mutates local workspace/focus, PTY ownership, or remote state.
     ///
-    /// Section-scoped: when the Hosts section is absent (`hosts_section_rect`
-    /// is default, i.e. collapsed/mobile/tiny), the reserved Navigate keys stay
+    /// Rail-scoped: when the host rail is absent (`host_rail_rect` is
+    /// default, i.e. collapsed/mobile/tiny), the reserved Navigate keys stay
     /// consumed but this is a no-op, so a hidden remote selection is never
-    /// staged and later surfaced when the section returns.
+    /// staged and later surfaced when the rail returns.
     pub(crate) fn move_selected_host_by_delta(&mut self, delta: isize) {
-        if self.view.hosts_section_rect == ratatui::layout::Rect::default() {
+        if self.view.host_rail_rect == ratatui::layout::Rect::default() {
             return;
         }
         let entries = crate::ui::host_list_entries(self);
@@ -1337,10 +1337,10 @@ impl AppState {
         }
     }
 
-    /// Scroll the Hosts viewport so host entry `idx` stays visible, mirroring
-    /// `ensure_workspace_visible`'s clamp-into-view behavior.
+    /// Scroll the host rail viewport so host entry `idx` stays visible,
+    /// mirroring `ensure_workspace_visible`'s clamp-into-view behavior.
     pub(crate) fn ensure_host_visible(&mut self, idx: usize) {
-        let area = self.view.hosts_section_rect;
+        let area = self.view.host_rail_rect;
         if area == ratatui::layout::Rect::default() {
             return;
         }
@@ -3951,8 +3951,9 @@ mod tests {
 
     fn select_remote_projection(state: &mut AppState, host: &RemoteHostKey) {
         state.view.layout = crate::app::state::ViewLayout::Desktop;
-        state.view.hosts_section_rect = Rect::new(0, 0, state.sidebar_width, 4);
-        state.view.sidebar_panel_rect = Rect::new(0, 4, state.sidebar_width, 16);
+        let rail_w = crate::ui::host_rail_width();
+        state.view.host_rail_rect = Rect::new(0, 0, rail_w, 20);
+        state.view.sidebar_panel_rect = Rect::new(rail_w, 0, state.sidebar_width, 20);
         state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
     }
 

@@ -52,9 +52,9 @@ pub(crate) use self::scrollbar::{
     scrollbar_offset_from_row, scrollbar_thumb_grab_offset, should_show_scrollbar,
 };
 use self::settings::render_settings_overlay;
-/// `host_list_entries` is consumed by `compute_view_internal` (render geometry)
-/// and by host selection/navigation helpers in `actions.rs`/`navigate.rs`, so
-/// it is re-exported for non-test cross-module use.
+/// `host_list_entries` is consumed by host selection/navigation helpers in
+/// `actions.rs`/`navigate.rs` (and by `render_host_rail` internally), so it is
+/// re-exported for non-test cross-module use.
 pub(crate) use self::sidebar::host_list_entries;
 #[cfg(test)]
 pub(crate) use self::sidebar::{
@@ -88,7 +88,7 @@ pub(crate) use self::{
         agent_panel_entry_gap_after, agent_panel_scroll_metrics, agent_panel_scrollbar_rect,
         agent_panel_toggle_rect, collapsed_sidebar_sections, collapsed_sidebar_toggle_rect,
         compute_workspace_card_areas, expanded_sidebar_sections, expanded_sidebar_toggle_rect,
-        host_list_scroll_metrics, host_list_scrollbar_rect, host_target_at, hosts_section_height,
+        host_list_scroll_metrics, host_list_scrollbar_rect, host_rail_width, host_target_at,
         normalized_host_list_scroll, normalized_workspace_scroll, sidebar_section_divider_rect,
         workspace_drop_indicator_row, workspace_list_entries, workspace_list_entries_expanded,
         workspace_list_footer_rect, workspace_list_local_actions_rect,
@@ -236,54 +236,61 @@ fn compute_view_internal(
     let desired_panel_w = app
         .sidebar_width
         .clamp(app.sidebar_min_width, app.sidebar_max_width);
-    // The compact 10-column source rail is gone: the expanded desktop sidebar
-    // now owns a full-width Hosts section above the Spaces/Agents panel. No
-    // extra rail width is added, so ordinary narrow expanded-desktop widths
-    // no longer hide the section merely because they cannot fit the old
-    // `SOURCE_RAIL_WIDTH + sidebar_min_width`.
+    // Ahmed's 2026-07-20 correction restores a dedicated, fixed-width
+    // full-height host-selection rail beside the Spaces/Agents panel (the
+    // pre-existing `SOURCE_RAIL_WIDTH = 10` rail pattern), replacing the
+    // full-width Hosts section that briefly lived above the panel. Unlike the
+    // old compact rail, the new rail is never gated by remote-cache state or
+    // by width: it is always present on expanded desktop (only collapsed
+    // sidebar and mobile layout drop it), so ordinary narrow expanded-desktop
+    // widths and local-only setups both keep it visible.
+    let rail_w = if app.sidebar_collapsed {
+        0
+    } else {
+        host_rail_width()
+    };
     let sidebar_w = if app.sidebar_collapsed {
         match app.sidebar_collapsed_mode {
             crate::config::SidebarCollapsedModeConfig::Compact => COLLAPSED_WIDTH,
             crate::config::SidebarCollapsedModeConfig::Hidden => 0,
         }
     } else {
-        let max_panel_w = area.width.saturating_sub(1);
-        if max_panel_w == 0 {
+        let max_panel_w = area.width.saturating_sub(rail_w).saturating_sub(1);
+        let panel_w = if max_panel_w == 0 {
             desired_panel_w
         } else {
             desired_panel_w
                 .min(max_panel_w)
                 .max(app.sidebar_min_width.min(max_panel_w))
-        }
+        };
+        rail_w.saturating_add(panel_w)
     };
 
     let [sidebar_area, main_area] =
         Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(1)]).areas(area);
-    let (hosts_section_rect, sidebar_panel_rect) = if app.sidebar_collapsed {
-        (Rect::default(), sidebar_area)
+    let host_rail_rect = if app.sidebar_collapsed {
+        Rect::default()
+    } else if rail_w > 0 && sidebar_area.width > rail_w {
+        Rect::new(sidebar_area.x, sidebar_area.y, rail_w, sidebar_area.height)
     } else {
-        let host_count = host_list_entries(app).len() as u16;
-        let hosts_section_height = hosts_section_height(host_count, sidebar_area.height);
-        let hosts_section_rect = if hosts_section_height == 0 {
-            Rect::default()
-        } else {
-            Rect::new(
-                sidebar_area.x,
-                sidebar_area.y,
-                sidebar_area.width,
-                hosts_section_height,
-            )
-        };
-        let panel_y = sidebar_area.y.saturating_add(hosts_section_height);
-        let panel_height = sidebar_area.height.saturating_sub(hosts_section_height);
-        let sidebar_panel_rect =
-            Rect::new(sidebar_area.x, panel_y, sidebar_area.width, panel_height);
-        (hosts_section_rect, sidebar_panel_rect)
+        Rect::default()
+    };
+    let sidebar_panel_rect = if app.sidebar_collapsed {
+        sidebar_area
+    } else if host_rail_rect != Rect::default() {
+        Rect::new(
+            sidebar_area.x + host_rail_rect.width,
+            sidebar_area.y,
+            sidebar_area.width.saturating_sub(host_rail_rect.width),
+            sidebar_area.height,
+        )
+    } else {
+        sidebar_area
     };
 
     app.view.layout = ViewLayout::Desktop;
     app.view.sidebar_rect = sidebar_area;
-    app.view.hosts_section_rect = hosts_section_rect;
+    app.view.host_rail_rect = host_rail_rect;
     app.view.sidebar_panel_rect = sidebar_panel_rect;
 
     let (tab_bar_rect, terminal_area) = app
@@ -338,7 +345,7 @@ fn compute_view_internal(
         app.view = crate::app::ViewState {
             layout: ViewLayout::Desktop,
             sidebar_rect: sidebar_area,
-            hosts_section_rect,
+            host_rail_rect,
             sidebar_panel_rect,
             workspace_card_areas,
             tab_bar_rect: Rect::default(),
@@ -412,7 +419,7 @@ fn compute_view_internal(
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
         sidebar_rect: sidebar_area,
-        hosts_section_rect,
+        host_rail_rect,
         sidebar_panel_rect,
         workspace_card_areas,
         tab_bar_rect,
@@ -467,7 +474,7 @@ fn compute_mobile_view(
         app.view = crate::app::ViewState {
             layout: ViewLayout::Mobile,
             sidebar_rect: Rect::default(),
-            hosts_section_rect: Rect::default(),
+            host_rail_rect: Rect::default(),
             sidebar_panel_rect: Rect::default(),
             workspace_card_areas: Vec::new(),
             tab_bar_rect: Rect::default(),
@@ -520,7 +527,7 @@ fn compute_mobile_view(
     app.view = crate::app::ViewState {
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
-        hosts_section_rect: Rect::default(),
+        host_rail_rect: Rect::default(),
         sidebar_panel_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
         tab_bar_rect: Rect::default(),
@@ -1476,15 +1483,17 @@ mod tests {
         compute_view(&mut app, Rect::new(0, 0, 80, 20));
         let single_tab_terminal_area = app.view.terminal_area;
         assert_eq!(app.view.tab_bar_rect, Rect::default());
-        assert_eq!(single_tab_terminal_area, Rect::new(26, 0, 54, 20));
+        // Main area starts right after the rail-plus-panel sidebar
+        // (`host_rail_width()` wider than the panel alone).
+        assert_eq!(single_tab_terminal_area, Rect::new(36, 0, 44, 20));
         assert!(app.view.tab_hit_areas.is_empty());
         assert_eq!(app.view.new_tab_hit_area, Rect::default());
 
         app.workspaces[0].test_add_tab(Some("logs"));
         compute_view(&mut app, Rect::new(0, 0, 80, 20));
 
-        assert_eq!(app.view.tab_bar_rect, Rect::new(26, 0, 54, 1));
-        assert_eq!(app.view.terminal_area, Rect::new(26, 1, 54, 19));
+        assert_eq!(app.view.tab_bar_rect, Rect::new(36, 0, 44, 1));
+        assert_eq!(app.view.terminal_area, Rect::new(36, 1, 44, 19));
         assert_eq!(app.view.tab_hit_areas.len(), 2);
         assert!(app.view.tab_hit_areas.iter().all(|rect| rect.width > 0));
         assert!(app.view.new_tab_hit_area.width > 0);
@@ -1528,8 +1537,11 @@ mod tests {
         let one_tab_size = app.workspaces[0].tabs[0].runtimes[&one_tab_pane].current_size();
         let two_tab_size =
             app.workspaces[1].tabs[background_tab].runtimes[&two_tab_pane].current_size();
-        assert_eq!(one_tab_size, (20, 53));
-        assert_eq!(two_tab_size, (19, 53));
+        // Column width shrinks by the rail's fixed width versus the
+        // pre-rail expectation; row counts are unaffected (the rail only
+        // consumes columns).
+        assert_eq!(one_tab_size, (20, 43));
+        assert_eq!(two_tab_size, (19, 43));
     }
 
     #[tokio::test]
@@ -1612,7 +1624,12 @@ mod tests {
 
         compute_view(&mut app, Rect::new(0, 0, 100, 20));
 
-        assert_eq!(app.view.sidebar_rect.width, 30);
+        // Total sidebar is the fixed-width host rail plus the clamped
+        // Spaces/Agents panel: the panel itself still clamps to the
+        // configured max, but the rail adds its own fixed width on top.
+        assert_eq!(app.view.sidebar_panel_rect.width, 30);
+        assert_eq!(app.view.host_rail_rect.width, host_rail_width());
+        assert_eq!(app.view.sidebar_rect.width, host_rail_width() + 30);
     }
 
     #[test]
@@ -1627,11 +1644,15 @@ mod tests {
 
         compute_view(&mut app, Rect::new(0, 0, 100, 20));
 
-        assert_eq!(app.view.sidebar_rect.width, 22);
+        // Same rail-plus-panel total as the max-width case above, clamped to
+        // the configured min on the panel side.
+        assert_eq!(app.view.sidebar_panel_rect.width, 22);
+        assert_eq!(app.view.host_rail_rect.width, host_rail_width());
+        assert_eq!(app.view.sidebar_rect.width, host_rail_width() + 22);
     }
 
     #[test]
-    fn compute_view_allocates_hosts_section_and_panel_rects_for_remote_sources() {
+    fn compute_view_allocates_host_rail_and_panel_rects_for_remote_sources() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
@@ -1651,17 +1672,17 @@ mod tests {
 
         compute_view(&mut app, Rect::new(0, 0, 100, 20));
 
-        // Full-width Hosts section sits above the Spaces/Agents panel: header
-        // (1 row) + local + two remote hosts = 4 rows, full sidebar width.
-        assert_eq!(app.view.hosts_section_rect, Rect::new(0, 0, 26, 4));
-        assert_eq!(app.view.sidebar_panel_rect, Rect::new(0, 4, 26, 16));
-        assert_eq!(app.view.sidebar_rect, Rect::new(0, 0, 26, 20));
+        // The dedicated 10-column host rail sits beside the Spaces/Agents
+        // panel at full sidebar height (never a full-width section above it).
+        assert_eq!(app.view.host_rail_rect, Rect::new(0, 0, 10, 20));
+        assert_eq!(app.view.sidebar_panel_rect, Rect::new(10, 0, 26, 20));
+        assert_eq!(app.view.sidebar_rect, Rect::new(0, 0, 36, 20));
         let labels = host_list_entries(&app)
             .into_iter()
             .map(|entry| entry.label)
             .collect::<Vec<_>>();
         assert_eq!(labels, vec!["local", "jafar", "jafar/agents"]);
-        // The section header occupies row 0, so the first host row is row 1.
+        // Row 0 is the ` hosts` header, so the first host row is row 1.
         assert_eq!(
             host_target_at(&app, 0, 0),
             None,
@@ -1678,13 +1699,12 @@ mod tests {
     }
 
     #[test]
-    fn compute_view_keeps_hosts_section_on_narrow_expanded_desktop() {
-        // G1: an ordinary narrow EXPANDED-DESKTOP width (just above the mobile
-        // threshold) must still show a usable Hosts section. The old compact
-        // rail was width-gated and hid when the screen could not fit
-        // rail_width + sidebar_min_width; the full-width Hosts section is never
-        // suppressed for width alone on desktop (only the mobile layout and
-        // the collapsed sidebar drop it).
+    fn compute_view_keeps_host_rail_on_narrow_expanded_desktop() {
+        // Ahmed's 2026-07-20 correction: an ordinary narrow EXPANDED-DESKTOP
+        // width (just above the mobile threshold) must still show the fixed
+        // 10-column host rail beside the panel. The rail is never suppressed
+        // for width alone on desktop (only the mobile layout and the
+        // collapsed sidebar drop it).
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
@@ -1703,22 +1723,46 @@ mod tests {
         compute_view(&mut app, Rect::new(0, 0, 70, 20));
 
         assert_eq!(app.view.layout, ViewLayout::Desktop);
-        // Hosts section is present (not Rect::default()) and full sidebar
-        // width; the Spaces/Agents panel sits below it and stays viable.
-        assert_ne!(app.view.hosts_section_rect, Rect::default());
-        assert_eq!(
-            app.view.hosts_section_rect.width,
-            app.view.sidebar_rect.width
-        );
+        // The rail is present (not Rect::default()), fixed at 10 columns, and
+        // full sidebar height; the panel sits directly beside it (never below).
+        assert_ne!(app.view.host_rail_rect, Rect::default());
+        assert_eq!(app.view.host_rail_rect.width, 10);
+        assert_eq!(app.view.host_rail_rect.height, app.view.sidebar_rect.height);
         assert!(app.view.sidebar_panel_rect.height > 0);
         assert_eq!(
-            app.view.sidebar_panel_rect.y,
-            app.view.hosts_section_rect.y + app.view.hosts_section_rect.height
+            app.view.sidebar_panel_rect.x,
+            app.view.host_rail_rect.x + app.view.host_rail_rect.width
         );
+        assert_eq!(app.view.sidebar_panel_rect.y, app.view.host_rail_rect.y);
         // The projected remote selection is still effective (no local fallback).
         assert_eq!(
             app.effective_sidebar_source(),
             crate::app::state::SidebarSource::Remote(host)
+        );
+    }
+
+    #[test]
+    fn compute_view_keeps_host_rail_present_with_local_only() {
+        // The dedicated host rail is never suppressed just because no remote
+        // host is configured or cached — it always shows the ` hosts` header
+        // with `local` as a selectable row, matching the ROADMAP host-rail
+        // contract (not the old cache-only visibility gate).
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+
+        compute_view(&mut app, Rect::new(0, 0, 100, 20));
+
+        assert_eq!(app.view.host_rail_rect, Rect::new(0, 0, 10, 20));
+        assert_eq!(
+            app.effective_sidebar_source(),
+            crate::app::state::SidebarSource::Local
+        );
+        assert_eq!(
+            host_target_at(&app, 0, 1),
+            Some(crate::app::state::SidebarSource::Local)
         );
     }
 

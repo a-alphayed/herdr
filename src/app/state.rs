@@ -729,12 +729,13 @@ pub enum ViewLayout {
 
 pub struct ViewState {
     pub layout: ViewLayout,
-    /// Total desktop sidebar rect, including the Hosts section, the
+    /// Total desktop sidebar rect, including the host rail, the
     /// Spaces/Agents panel, and the right-edge divider.
     pub sidebar_rect: Rect,
-    /// Optional Hosts section shown above the expanded desktop sidebar panel.
-    /// `Rect::default()` for collapsed sidebar or mobile layout.
-    pub hosts_section_rect: Rect,
+    /// Fixed-width host-selection rail rendered to the left of the expanded
+    /// desktop sidebar panel. `Rect::default()` for collapsed sidebar or
+    /// mobile layout.
+    pub host_rail_rect: Rect,
     /// Sidebar content panel rect (Spaces/Agents). This is the area used by
     /// workspace and agent panel render/input helpers.
     pub sidebar_panel_rect: Rect,
@@ -1702,7 +1703,7 @@ impl AppState {
     pub(crate) fn effective_sidebar_source(&self) -> SidebarSource {
         if self.view.layout != ViewLayout::Desktop
             || self.sidebar_collapsed
-            || self.view.hosts_section_rect == Rect::default()
+            || self.view.host_rail_rect == Rect::default()
         {
             return SidebarSource::Local;
         }
@@ -1959,7 +1960,7 @@ impl AppState {
             view: ViewState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
-                hosts_section_rect: Rect::default(),
+                host_rail_rect: Rect::default(),
                 sidebar_panel_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),

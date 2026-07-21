@@ -16,11 +16,12 @@ use crate::terminal::TerminalRuntimeRegistry;
 
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
-const HOSTS_SECTION_HEADER_ROWS: u16 = 1;
-/// Minimum rows reserved for the Spaces/Agents panel when allocating the
-/// Hosts section vertically. Keeps the existing panel viable (its split needs
-/// ~6 rows) while the Hosts list scrolls when it overflows.
-const HOSTS_MIN_PANEL_ROWS: u16 = 6;
+const HOST_RAIL_HEADER_ROWS: u16 = 1;
+/// Fixed width of the dedicated host-selection rail beside the Spaces/Agents
+/// panel, matching the established pre-existing rail pattern
+/// (`SOURCE_RAIL_WIDTH`). The rail is always full sidebar height on expanded
+/// desktop; it is never sized to the current host count.
+const HOST_RAIL_WIDTH: u16 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentPanelEntryLocation {
@@ -182,42 +183,31 @@ fn host_status_marker(
     }
 }
 
-/// Bounded vertical allocation for the Hosts section: header + all hosts when
-/// they fit, otherwise cap the Hosts viewport while reserving a viable
-/// Spaces/Agents panel and letting the host list scroll.
-pub(crate) fn hosts_section_height(host_count: u16, total_h: u16) -> u16 {
-    if total_h == 0 {
-        return 0;
-    }
-    let desired = HOSTS_SECTION_HEADER_ROWS.saturating_add(host_count);
-    // Keep the Spaces/Agents panel viable when there is room; on very short
-    // sidebars leave at least one row for the panel and still show the header
-    // + `local` when possible.
-    let max_hosts = if total_h > HOSTS_MIN_PANEL_ROWS {
-        total_h.saturating_sub(HOSTS_MIN_PANEL_ROWS)
-    } else {
-        total_h.saturating_sub(1)
-    };
-    desired.min(max_hosts)
+/// Fixed width of the dedicated host-selection rail.
+pub(crate) fn host_rail_width() -> u16 {
+    HOST_RAIL_WIDTH
 }
 
-/// Content rect for the Hosts section: full sidebar width minus the right-edge
-/// divider column (the sidebar separator is drawn over the last column).
-pub(crate) fn hosts_section_content_rect(area: Rect) -> Rect {
+/// Content rect for the host rail: rail width minus the right-edge column
+/// reserved for the rail's own internal divider (drawn by `render_host_rail`,
+/// separate from the outer sidebar/main-area divider drawn by
+/// `render_sidebar`).
+pub(crate) fn host_rail_content_rect(area: Rect) -> Rect {
     if area.width == 0 || area.height == 0 {
         return Rect::default();
     }
     Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height)
 }
 
-/// Body rect below the Hosts header, narrowed by one column when a scrollbar
-/// is needed.
+/// Body rect below the ` hosts` header, narrowed by one column when a
+/// scrollbar is needed. The rail is full sidebar height, so the body always
+/// spans the remaining rows below the single header row.
 pub(crate) fn host_list_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
-    let content = hosts_section_content_rect(area);
-    if content.width == 0 || content.height <= HOSTS_SECTION_HEADER_ROWS {
+    let content = host_rail_content_rect(area);
+    if content.width == 0 || content.height <= HOST_RAIL_HEADER_ROWS {
         return Rect::default();
     }
-    let body_y = content.y.saturating_add(HOSTS_SECTION_HEADER_ROWS);
+    let body_y = content.y.saturating_add(HOST_RAIL_HEADER_ROWS);
     let body_height = (content.y + content.height).saturating_sub(body_y);
     let body_width = content.width.saturating_sub(u16::from(has_scrollbar));
     Rect::new(content.x, body_y, body_width, body_height)
@@ -261,7 +251,7 @@ pub(crate) fn host_list_scrollbar_rect(app: &AppState, area: Rect) -> Option<Rec
 }
 
 pub(crate) fn normalized_host_list_scroll(app: &AppState, requested: usize) -> usize {
-    let area = app.view.hosts_section_rect;
+    let area = app.view.host_rail_rect;
     if area == Rect::default() {
         return 0;
     }
@@ -286,7 +276,7 @@ pub(crate) fn normalized_host_list_scroll(app: &AppState, requested: usize) -> u
 /// Scroll-aware host row areas, accounting for the header offset and the
 /// current `host_list_scroll`. Off-viewport rows are unreachable here.
 pub(crate) fn host_list_row_areas(app: &AppState) -> Vec<HostRowArea> {
-    let area = app.view.hosts_section_rect;
+    let area = app.view.host_rail_rect;
     if area == Rect::default() {
         return Vec::new();
     }
@@ -313,7 +303,7 @@ pub(crate) fn host_list_row_areas(app: &AppState) -> Vec<HostRowArea> {
 }
 
 pub(crate) fn host_target_at(app: &AppState, col: u16, row: u16) -> Option<SidebarSource> {
-    if app.view.hosts_section_rect == Rect::default() {
+    if app.view.host_rail_rect == Rect::default() {
         return None;
     }
     host_list_row_areas(app).into_iter().find_map(|entry| {
@@ -1668,7 +1658,7 @@ pub(super) fn render_sidebar(
         buf[(sep_x, y)].set_style(sep_style);
     }
 
-    render_hosts_section(app, frame, app.view.hosts_section_rect);
+    render_host_rail(app, frame, app.view.host_rail_rect);
 
     let panel_area = if app.view.sidebar_panel_rect == Rect::default() {
         area
@@ -1682,14 +1672,25 @@ pub(super) fn render_sidebar(
     render_sidebar_toggle(app, frame, area, false, p);
 }
 
-fn render_hosts_section(app: &AppState, frame: &mut Frame, area: Rect) {
+fn render_host_rail(app: &AppState, frame: &mut Frame, area: Rect) {
     if area == Rect::default() {
         return;
     }
 
     let p = &app.palette;
 
-    // Section header mirrors the ` spaces` / ` agents` language.
+    // The rail's own internal divider separates it from the adjacent
+    // Spaces/Agents panel. Unlike the outer sidebar/main-area divider (drawn
+    // by `render_sidebar`), it is a static visual element: it never reflects
+    // Navigate-mode accent styling and is never draggable.
+    let divider_x = area.x + area.width.saturating_sub(1);
+    let buf = frame.buffer_mut();
+    for y in area.y..area.y + area.height {
+        buf[(divider_x, y)].set_symbol("│");
+        buf[(divider_x, y)].set_style(Style::default().fg(p.surface_dim));
+    }
+
+    // Header mirrors the ` spaces` / ` agents` language.
     frame.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
             " hosts",
@@ -2475,8 +2476,9 @@ mod tests {
 
     fn select_remote_projection(app: &mut AppState, host: &RemoteHostKey) {
         app.view.layout = crate::app::state::ViewLayout::Desktop;
-        app.view.hosts_section_rect = Rect::new(0, 0, app.sidebar_width, 4);
-        app.view.sidebar_panel_rect = Rect::new(0, 4, app.sidebar_width, 16);
+        let rail_w = host_rail_width();
+        app.view.host_rail_rect = Rect::new(0, 0, rail_w, 20);
+        app.view.sidebar_panel_rect = Rect::new(rail_w, 0, app.sidebar_width, 20);
         app.select_sidebar_source(SidebarSource::Remote(host.clone()));
     }
 
@@ -2497,11 +2499,11 @@ mod tests {
             .collect()
     }
 
-    fn rendered_hosts_section_buffer(app: &AppState, area: Rect) -> ratatui::buffer::Buffer {
+    fn rendered_host_rail_buffer(app: &AppState, area: Rect) -> ratatui::buffer::Buffer {
         let backend = ratatui::backend::TestBackend::new(area.width, area.height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| render_hosts_section(app, frame, area))
+            .draw(|frame| render_host_rail(app, frame, area))
             .unwrap();
 
         terminal.backend().buffer().clone()
@@ -2950,6 +2952,135 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!rows.iter().any(|row| row.contains("jafar spaces")));
         assert!(rows.iter().any(|row| row.contains("tmp")));
+    }
+
+    #[test]
+    fn switching_sidebar_source_shows_only_selected_host_without_mixing() {
+        // ROADMAP host-rail contract: the Spaces/Agents panel is scoped only
+        // to `effective_sidebar_source()`, and switching sources replaces its
+        // contents entirely. Distinct local, remote A ("alpha"), and remote B
+        // ("bravo") fixtures prove `workspace_list_entries` (Spaces) and
+        // `agent_panel_entries` (Agents) never mix local/remote or two remote
+        // hosts, in either direction of the switch.
+        let mut app = crate::app::state::AppState::test_new();
+        let local_ws = Workspace::test_new("local-space");
+        let local_pane = local_ws.tabs[0].root_pane;
+        app.workspaces = vec![local_ws];
+        app.active = Some(0);
+        app.selected = 0;
+        app.ensure_test_terminals();
+        let local_terminal_id = app.workspaces[0].tabs[0].panes[&local_pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&local_terminal_id)
+            .unwrap()
+            .detected_agent = Some(Agent::Pi);
+
+        let host_a = RemoteHostKey::new("alpha", crate::session::DEFAULT_SESSION_NAME);
+        let host_b = RemoteHostKey::new("bravo", crate::session::DEFAULT_SESSION_NAME);
+        app.remote_sources.replace_workspace_snapshot(
+            host_a.clone(),
+            vec![remote_workspace("remote-ws", "alpha space")],
+        );
+        app.remote_sources.replace_connected_snapshot(
+            host_a.clone(),
+            vec![remote_agent(
+                "alpha-term",
+                "alpha-agent",
+                AgentStatus::Working,
+                1,
+            )],
+        );
+        app.remote_sources.replace_workspace_snapshot(
+            host_b.clone(),
+            vec![remote_workspace("remote-ws", "bravo space")],
+        );
+        app.remote_sources.replace_connected_snapshot(
+            host_b.clone(),
+            vec![remote_agent(
+                "bravo-term",
+                "bravo-agent",
+                AgentStatus::Working,
+                1,
+            )],
+        );
+
+        // Local is the default/effective source: only the local workspace and
+        // agent are visible, nothing from either remote host.
+        let local_spaces = workspace_entries(&app);
+        assert_eq!(local_spaces.len(), 1);
+        assert!(matches!(
+            local_spaces[0],
+            WorkspaceListEntry::Workspace { ws_idx: 0, .. }
+        ));
+        let local_agents = agent_panel_entries(&app);
+        assert_eq!(local_agents.len(), 1);
+        assert!(matches!(
+            local_agents[0].location,
+            AgentPanelEntryLocation::Local { ws_idx: 0, .. }
+        ));
+
+        // Selecting remote A shows only remote A's space/agent: no local
+        // workspace and nothing from remote B.
+        select_remote_projection(&mut app, &host_a);
+        let alpha_spaces = workspace_entries(&app);
+        assert_eq!(alpha_spaces.len(), 1);
+        assert!(matches!(
+            &alpha_spaces[0],
+            WorkspaceListEntry::RemoteSpace { key, label, .. }
+                if key.host == "alpha" && label == "alpha space"
+        ));
+        let alpha_agents = agent_panel_entries(&app);
+        assert_eq!(alpha_agents.len(), 1);
+        assert_eq!(alpha_agents[0].primary_label, "alpha-agent");
+        assert_eq!(
+            alpha_agents[0].location,
+            AgentPanelEntryLocation::Remote {
+                host: "alpha".to_string(),
+                session: crate::session::DEFAULT_SESSION_NAME.to_string(),
+                terminal_id: "alpha-term".to_string(),
+            }
+        );
+
+        // Switching to remote B fully replaces the panel contents: remote
+        // A's space/agent are entirely gone, and only remote B's are
+        // present (no accumulation, no cross-host mixing).
+        select_remote_projection(&mut app, &host_b);
+        let bravo_spaces = workspace_entries(&app);
+        assert_eq!(bravo_spaces.len(), 1);
+        assert!(matches!(
+            &bravo_spaces[0],
+            WorkspaceListEntry::RemoteSpace { key, label, .. }
+                if key.host == "bravo" && label == "bravo space"
+        ));
+        let bravo_agents = agent_panel_entries(&app);
+        assert_eq!(bravo_agents.len(), 1);
+        assert_eq!(bravo_agents[0].primary_label, "bravo-agent");
+        assert_eq!(
+            bravo_agents[0].location,
+            AgentPanelEntryLocation::Remote {
+                host: "bravo".to_string(),
+                session: crate::session::DEFAULT_SESSION_NAME.to_string(),
+                terminal_id: "bravo-term".to_string(),
+            }
+        );
+
+        // Switching back to local restores exactly the local fixture, with
+        // no remote residue from either host.
+        app.select_sidebar_source(SidebarSource::Local);
+        let restored_local_spaces = workspace_entries(&app);
+        assert_eq!(restored_local_spaces.len(), 1);
+        assert!(matches!(
+            restored_local_spaces[0],
+            WorkspaceListEntry::Workspace { ws_idx: 0, .. }
+        ));
+        let restored_local_agents = agent_panel_entries(&app);
+        assert_eq!(restored_local_agents.len(), 1);
+        assert!(matches!(
+            restored_local_agents[0].location,
+            AgentPanelEntryLocation::Local { ws_idx: 0, .. }
+        ));
     }
 
     #[test]
@@ -3629,7 +3760,7 @@ mod tests {
     }
 
     #[test]
-    fn hosts_section_remote_status_markers_render_in_status_column() {
+    fn host_rail_remote_status_markers_render_in_status_column() {
         let mut app = crate::app::state::AppState::test_new();
         for (host, status) in [
             (
@@ -3657,9 +3788,9 @@ mod tests {
         // Header (row 0) + local (row 1) + four remote hosts (rows 2..6).
         let width = 10u16;
         let area = Rect::new(0, 0, width, 8);
-        app.view.hosts_section_rect = area;
+        app.view.host_rail_rect = area;
 
-        let buffer = rendered_hosts_section_buffer(&app, area);
+        let buffer = rendered_host_rail_buffer(&app, area);
         let marker_x = area.x + area.width - 2;
 
         assert_eq!(buffer[(marker_x, 2)].symbol(), "●");
@@ -3685,7 +3816,7 @@ mod tests {
     }
 
     #[test]
-    fn hosts_section_selected_remote_marker_keeps_surface_background() {
+    fn host_rail_selected_remote_marker_keeps_surface_background() {
         let mut app = crate::app::state::AppState::test_new();
         let host = RemoteHostKey::new("charlie", crate::session::DEFAULT_SESSION_NAME);
         app.remote_sources.mark_status(
@@ -3694,10 +3825,10 @@ mod tests {
         );
         let width = 10u16;
         let area = Rect::new(0, 0, width, 4);
-        app.view.hosts_section_rect = area;
+        app.view.host_rail_rect = area;
         app.select_sidebar_source(SidebarSource::Remote(host));
 
-        let buffer = rendered_hosts_section_buffer(&app, area);
+        let buffer = rendered_host_rail_buffer(&app, area);
         let marker_x = area.x + area.width - 2;
         let marker_style = buffer[(marker_x, 2)].style();
 
@@ -3708,7 +3839,7 @@ mod tests {
     }
 
     #[test]
-    fn hosts_section_remote_label_truncates_before_marker() {
+    fn host_rail_remote_label_truncates_before_marker() {
         let mut app = crate::app::state::AppState::test_new();
         app.remote_sources.mark_status(
             &RemoteHostKey::new("verylongremotehost", crate::session::DEFAULT_SESSION_NAME),
@@ -3716,13 +3847,14 @@ mod tests {
         );
         let width = 10u16;
         let area = Rect::new(0, 0, width, 4);
-        app.view.hosts_section_rect = area;
+        app.view.host_rail_rect = area;
 
-        let buffer = rendered_hosts_section_buffer(&app, area);
+        let buffer = rendered_host_rail_buffer(&app, area);
         // Header occupies row 0 and local occupies row 1, so the remote host
         // renders on row 2. The right-edge divider column (area.width - 1) is
-        // drawn by render_sidebar, not render_hosts_section, so read only the
-        // content columns up to and including the status marker.
+        // the rail's own internal divider (drawn by `render_host_rail`, not
+        // the outer sidebar/main-area divider from `render_sidebar`), so read
+        // only the content columns up to and including the status marker.
         let row = (0..(area.width - 1))
             .map(|x| buffer[(x, 2)].symbol())
             .collect::<String>();
@@ -3784,9 +3916,9 @@ mod tests {
                 crate::remote_source::RemoteConnectionStatus::Connected,
             );
         }
-        // Small Hosts section: header + 3 body rows.
+        // Small host rail viewport: header + 3 body rows.
         let area = Rect::new(0, 0, 26, 4);
-        app.view.hosts_section_rect = area;
+        app.view.host_rail_rect = area;
 
         let metrics = host_list_scroll_metrics(&app, area);
         // 30 remote hosts + local = 31 entries; viewport = 3 body rows.
@@ -3824,7 +3956,7 @@ mod tests {
         }
         // Header + 3 body rows -> viewport capacity 3; 31 entries overflow.
         let area = Rect::new(0, 0, 26, 4);
-        app.view.hosts_section_rect = area;
+        app.view.host_rail_rect = area;
         app.host_list_scroll = 5;
         let overflow_metrics = host_list_scroll_metrics(&app, area);
         assert!(overflow_metrics.max_offset_from_bottom > 0);

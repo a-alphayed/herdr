@@ -2926,7 +2926,7 @@ last_pane = "prefix+tab"
     #[test]
     fn navigate_shift_arrows_move_host_selection_without_leaving_navigate_mode() {
         // G4: Shift+Up / Shift+Down are reserved Navigate-only keys that move
-        // and clamp the selected Hosts-section entry and keep it visible,
+        // and clamp the selected host-rail entry and keep it visible,
         // without leaving Navigate mode. Plain Up/Down still navigate
         // workspaces (tested elsewhere) and do not become host cycling.
         let mut state = state_with_workspaces(&["main"]);
@@ -2943,7 +2943,8 @@ last_pane = "prefix+tab"
             &bravo,
             crate::remote_source::RemoteConnectionStatus::Connected,
         );
-        state.view.hosts_section_rect = ratatui::layout::Rect::new(0, 0, 26, 4);
+        state.view.host_rail_rect =
+            ratatui::layout::Rect::new(0, 0, crate::ui::host_rail_width(), 20);
         state.sidebar_source = crate::app::state::SidebarSource::Local;
 
         // local -> alpha -> bravo.
@@ -2998,10 +2999,10 @@ last_pane = "prefix+tab"
     #[test]
     fn navigate_shift_arrows_do_not_select_host_when_section_absent() {
         // Reviewer B finding 2: Navigate Shift+Up/Shift+Down host movement is
-        // section-scoped. When the Hosts section is absent (collapsed/mobile),
-        // the reserved keys stay consumed (mode stays Navigate) but must NOT
+        // rail-scoped. When the host rail is absent (collapsed/mobile), the
+        // reserved keys stay consumed (mode stays Navigate) but must NOT
         // mutate sidebar_source, so a hidden remote selection is never staged
-        // and later surfaced when the section returns.
+        // and later surfaced when the rail returns.
         let mut state = state_with_workspaces(&["main"]);
         state.mode = Mode::Navigate;
         let alpha =
@@ -3010,8 +3011,8 @@ last_pane = "prefix+tab"
             &alpha,
             crate::remote_source::RemoteConnectionStatus::Connected,
         );
-        // Section absent even though hosts exist in the read model.
-        state.view.hosts_section_rect = ratatui::layout::Rect::default();
+        // Rail absent even though hosts exist in the read model.
+        state.view.host_rail_rect = ratatui::layout::Rect::default();
         state.sidebar_source = crate::app::state::SidebarSource::Local;
 
         handle_navigate_key(
@@ -3030,8 +3031,9 @@ last_pane = "prefix+tab"
             crate::app::state::SidebarSource::Local
         );
 
-        // When the section returns, no hidden remote selection is surfaced.
-        state.view.hosts_section_rect = ratatui::layout::Rect::new(0, 0, 26, 4);
+        // When the rail returns, no hidden remote selection is surfaced.
+        state.view.host_rail_rect =
+            ratatui::layout::Rect::new(0, 0, crate::ui::host_rail_width(), 20);
         assert_eq!(
             state.effective_sidebar_source(),
             crate::app::state::SidebarSource::Local

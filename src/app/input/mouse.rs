@@ -557,7 +557,7 @@ impl AppState {
                         return None;
                     }
 
-                    if self.on_hosts_section(mouse.column, mouse.row) {
+                    if self.on_host_rail(mouse.column, mouse.row) {
                         if let Some(target) =
                             self.host_list_scrollbar_target_at(mouse.column, mouse.row)
                         {
@@ -1151,8 +1151,8 @@ impl AppState {
             }
 
             MouseEventKind::ScrollUp if in_sidebar => {
-                if self.on_hosts_section(mouse.column, mouse.row) {
-                    let area = self.view.hosts_section_rect;
+                if self.on_host_rail(mouse.column, mouse.row) {
+                    let area = self.view.host_rail_rect;
                     if crate::ui::should_show_scrollbar(crate::ui::host_list_scroll_metrics(
                         self, area,
                     )) {
@@ -1181,8 +1181,8 @@ impl AppState {
                 }
             }
             MouseEventKind::ScrollDown if in_sidebar => {
-                if self.on_hosts_section(mouse.column, mouse.row) {
-                    let area = self.view.hosts_section_rect;
+                if self.on_host_rail(mouse.column, mouse.row) {
+                    let area = self.view.host_rail_rect;
                     if crate::ui::should_show_scrollbar(crate::ui::host_list_scroll_metrics(
                         self, area,
                     )) {
@@ -1225,8 +1225,8 @@ impl AppState {
             }
 
             MouseEventKind::Down(MouseButton::Right) if in_sidebar && !self.sidebar_collapsed => {
-                if self.on_hosts_section(mouse.column, mouse.row) {
-                    // Right-clicking the Hosts section never switches the active
+                if self.on_host_rail(mouse.column, mouse.row) {
+                    // Right-clicking the host rail never switches the active
                     // projected source (left-click is the read-model switch).
                     // A remote host row opens the copy-only remote source
                     // context menu (exact B.5d); local/header/blank rows stay

@@ -337,11 +337,11 @@ impl AppState {
         crate::ui::host_target_at(self, col, row)
     }
 
-    pub(super) fn on_hosts_section(&self, col: u16, row: u16) -> bool {
+    pub(super) fn on_host_rail(&self, col: u16, row: u16) -> bool {
         if self.sidebar_collapsed {
             return false;
         }
-        let rect = self.view.hosts_section_rect;
+        let rect = self.view.host_rail_rect;
         rect.width > 0
             && rect.height > 0
             && col >= rect.x
@@ -350,11 +350,11 @@ impl AppState {
             && row < rect.y + rect.height
     }
 
-    pub(super) fn hosts_section_rect(&self) -> Rect {
+    pub(super) fn host_rail_rect(&self) -> Rect {
         if self.sidebar_collapsed {
             return Rect::default();
         }
-        self.view.hosts_section_rect
+        self.view.host_rail_rect
     }
 
     pub(super) fn host_list_scrollbar_target_at(
@@ -362,7 +362,7 @@ impl AppState {
         col: u16,
         row: u16,
     ) -> Option<ScrollbarClickTarget> {
-        let area = self.hosts_section_rect();
+        let area = self.host_rail_rect();
         let metrics = crate::ui::host_list_scroll_metrics(self, area);
         let track = crate::ui::host_list_scrollbar_rect(self, area)?;
         if col < track.x
@@ -386,7 +386,7 @@ impl AppState {
         row: u16,
         grab_row_offset: u16,
     ) -> Option<usize> {
-        let area = self.hosts_section_rect();
+        let area = self.host_rail_rect();
         let metrics = crate::ui::host_list_scroll_metrics(self, area);
         let track = crate::ui::host_list_scrollbar_rect(self, area)?;
         Some(crate::ui::scrollbar_offset_from_drag_row(
@@ -398,7 +398,7 @@ impl AppState {
     }
 
     pub(super) fn set_host_list_offset_from_bottom(&mut self, offset_from_bottom: usize) {
-        let area = self.view.hosts_section_rect;
+        let area = self.view.host_rail_rect;
         let metrics = crate::ui::host_list_scroll_metrics(self, area);
         self.host_list_scroll = metrics
             .max_offset_from_bottom
@@ -407,7 +407,7 @@ impl AppState {
     }
 
     pub(super) fn scroll_host_list(&mut self, delta: i16) {
-        let area = self.view.hosts_section_rect;
+        let area = self.view.host_rail_rect;
         let metrics = crate::ui::host_list_scroll_metrics(self, area);
         let max_offset = metrics.max_offset_from_bottom;
         if delta.is_negative() {
@@ -1012,6 +1012,11 @@ mod tests {
         app.state.agent_panel_scroll = 1;
         app.state.session_dirty = false;
         compute_desktop_view(&mut app);
+        // Preserve-exactly contract: source selection never mutates remote
+        // state/authority (the cached `remote_sources` registry). Capture
+        // both hosts' cached status up front and reassert it is bit-for-bit
+        // unchanged after every switch below.
+        let remote_cache_before = format!("{:?}", app.state.remote_sources);
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 2));
 
@@ -1027,6 +1032,10 @@ mod tests {
         assert_eq!(app.state.agent_panel_scroll, 0);
         assert!(!app.state.session_dirty);
         assert!(app.state.terminal_runtime_shutdowns.is_empty());
+        assert_eq!(
+            format!("{:?}", app.state.remote_sources),
+            remote_cache_before
+        );
 
         app.state.selected_remote_space = Some(remote_space_key());
         app.state.selected_remote_agent = Some(remote_key());
@@ -1045,10 +1054,14 @@ mod tests {
         assert_eq!(app.state.active, Some(1));
         assert_eq!(app.state.workspaces[1].focused_pane_id(), focused_before);
         assert!(!app.state.session_dirty);
+        assert_eq!(
+            format!("{:?}", app.state.remote_sources),
+            remote_cache_before
+        );
     }
 
     #[test]
-    fn blank_hosts_section_left_click_and_drag_are_consumed() {
+    fn blank_host_rail_left_click_and_drag_are_consumed() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![
             Workspace::test_new("one"),
@@ -1073,13 +1086,11 @@ mod tests {
             .iter()
             .map(|workspace| workspace.display_name())
             .collect();
-        // The Hosts section header row is inside the section but is not a host
-        // target, so it is the canonical "blank" Hosts-section click area.
-        // (The compact side rail used to align blank cells with workspace-card
-        // rows; the full-width Hosts band sits above the panel instead.)
-        let blank_col = app.state.view.hosts_section_rect.x;
-        let blank_row = app.state.view.hosts_section_rect.y;
-        assert!(app.state.on_hosts_section(blank_col, blank_row));
+        // The host rail's header row is inside the rail but is not a host
+        // target, so it is the canonical "blank" host-rail click area.
+        let blank_col = app.state.view.host_rail_rect.x;
+        let blank_row = app.state.view.host_rail_rect.y;
+        assert!(app.state.on_host_rail(blank_col, blank_row));
         assert!(app.state.host_target_at(blank_col, blank_row).is_none());
 
         app.handle_mouse(mouse(
@@ -1130,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn blank_hosts_section_right_click_is_consumed() {
+    fn blank_host_rail_right_click_is_consumed() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("local")];
         app.state.ensure_test_terminals();
@@ -1143,12 +1154,12 @@ mod tests {
         );
         compute_desktop_view(&mut app);
 
-        // The Hosts section header row is inside the section but is not a host
+        // The host rail's header row is inside the rail but is not a host
         // target. Right-clicking it must stay consumed (no remote menu, no
-        // source switch), mirroring local/blank Hosts-section consumption.
-        let blank_col = app.state.view.hosts_section_rect.x;
-        let blank_row = app.state.view.hosts_section_rect.y;
-        assert!(app.state.on_hosts_section(blank_col, blank_row));
+        // source switch), mirroring local/blank host-rail consumption.
+        let blank_col = app.state.view.host_rail_rect.x;
+        let blank_row = app.state.view.host_rail_rect.y;
+        assert!(app.state.on_host_rail(blank_col, blank_row));
         assert!(app.state.host_target_at(blank_col, blank_row).is_none());
 
         app.handle_mouse(mouse(
@@ -1862,7 +1873,7 @@ mod tests {
             .select_sidebar_source(crate::app::state::SidebarSource::Local);
         compute_desktop_view(&mut app);
 
-        let section = app.state.view.hosts_section_rect;
+        let section = app.state.view.host_rail_rect;
         let host_row = (section.y..section.y + section.height)
             .find(|row| {
                 matches!(
@@ -1918,7 +1929,7 @@ mod tests {
         );
         compute_desktop_view(&mut app);
 
-        let section = app.state.view.hosts_section_rect;
+        let section = app.state.view.host_rail_rect;
         let local_row = (section.y..section.y + section.height)
             .find(|row| {
                 matches!(
@@ -2452,16 +2463,23 @@ mod tests {
         app.state.selected = 0;
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
         let target_row = app.state.view.workspace_card_areas[1].rect.y;
+        // Click within the panel content, not the host rail that now occupies
+        // the leading columns of the sidebar.
+        let target_col = app.state.view.workspace_card_areas[1].rect.x + 2;
 
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            2,
+            target_col,
             target_row,
         ));
         assert_eq!(app.state.active, Some(0));
         assert!(app.state.workspace_press.is_some());
 
-        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, target_row));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            target_col,
+            target_row,
+        ));
         assert_eq!(app.state.active, Some(1));
         assert_eq!(app.state.selected, 1);
         assert!(app.state.workspace_press.is_none());
@@ -2588,6 +2606,9 @@ mod tests {
         app.state.selected = 2;
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
         let source_row = app.state.view.workspace_card_areas[1].rect.y;
+        // Click within the panel content, not the host rail that now occupies
+        // the leading columns of the sidebar.
+        let source_col = app.state.view.workspace_card_areas[1].rect.x + 2;
         let target_row = crate::ui::workspace_drop_indicator_row(
             &app.state.view.workspace_card_areas,
             app.state.workspace_list_rect(),
@@ -2597,12 +2618,12 @@ mod tests {
 
         app.handle_mouse(mouse(
             MouseEventKind::Down(MouseButton::Left),
-            2,
+            source_col,
             source_row,
         ));
         app.handle_mouse(mouse(
             MouseEventKind::Drag(MouseButton::Left),
-            2,
+            source_col,
             target_row,
         ));
         assert!(matches!(
@@ -2612,7 +2633,11 @@ mod tests {
                 insert_idx: Some(0),
             })
         ));
-        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, target_row));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            source_col,
+            target_row,
+        ));
 
         let names: Vec<_> = app
             .state
@@ -2681,7 +2706,12 @@ mod tests {
         app.state.selected = 0;
         app.state.tab_scroll = usize::MAX;
         app.state.tab_scroll_follow_active = false;
-        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 65, 20));
+        // Widen by the host rail's fixed width so the tab bar/main area gets
+        // the same usable width this test was originally calibrated against.
+        crate::ui::compute_view(
+            &mut app.state,
+            Rect::new(0, 0, 65 + crate::ui::host_rail_width(), 20),
+        );
 
         let last_idx = app.state.workspaces[0].tabs.len() - 1;
         let target = app.state.view.tab_hit_areas[last_idx];
@@ -2819,12 +2849,13 @@ mod tests {
             .cwd = second_repo.clone();
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
 
-        // The expanded-desktop Hosts section (header + local) occupies the top
-        // rows of the sidebar, so the workspace drop slots sit below it.
+        // The host rail sits beside the sidebar panel, not above it, so the
+        // Spaces/Agents panel (and its workspace drop slots) starts at the
+        // top of the sidebar with no vertical offset.
+        assert_eq!(app.state.workspace_drop_index_at_row(0), Some(0));
+        assert_eq!(app.state.workspace_drop_index_at_row(1), Some(0));
         assert_eq!(app.state.workspace_drop_index_at_row(2), Some(0));
-        assert_eq!(app.state.workspace_drop_index_at_row(3), Some(0));
-        assert_eq!(app.state.workspace_drop_index_at_row(4), Some(0));
-        assert_eq!(app.state.workspace_drop_index_at_row(5), Some(1));
+        assert_eq!(app.state.workspace_drop_index_at_row(3), Some(1));
 
         let _ = fs::remove_dir_all(first_repo);
         let _ = fs::remove_dir_all(second_repo);
@@ -2838,9 +2869,7 @@ mod tests {
             Workspace::test_new("b"),
             Workspace::test_new("c"),
         ];
-        // Height 24 leaves room for the Hosts section (header + local) above a
-        // viable Spaces/Agents panel with a gap before the footer.
-        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 24));
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
 
         let cards = &app.state.view.workspace_card_areas;
         let bottom_slot = crate::ui::workspace_drop_indicator_row(
@@ -3023,7 +3052,7 @@ mod tests {
     }
 
     #[test]
-    fn wheel_over_hosts_section_moves_host_when_no_scrollbar() {
+    fn wheel_over_host_rail_moves_host_when_no_scrollbar() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("one")];
         app.state.ensure_test_terminals();
@@ -3036,9 +3065,10 @@ mod tests {
         );
         compute_desktop_view(&mut app);
 
-        // local + jafar fit the Hosts viewport, so no scrollbar is needed: wheel
-        // moves/clamps the selected host (local -> jafar), mirroring Spaces.
-        let section = app.state.view.hosts_section_rect;
+        // local + jafar fit the host rail viewport, so no scrollbar is needed:
+        // wheel moves/clamps the selected host (local -> jafar), mirroring
+        // Spaces.
+        let section = app.state.view.host_rail_rect;
         let col = section.x;
         let local_row = section.y + 1;
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, col, local_row));
@@ -3049,12 +3079,12 @@ mod tests {
                 crate::session::DEFAULT_SESSION_NAME
             ))
         );
-        // Wheel over Hosts must not leak into workspace list scrolling.
+        // Wheel over the host rail must not leak into workspace list scrolling.
         assert_eq!(app.state.workspace_scroll, 0);
     }
 
     #[test]
-    fn wheel_over_hosts_section_scrolls_list_when_scrollbar_present() {
+    fn wheel_over_host_rail_scrolls_list_when_scrollbar_present() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("one")];
         app.state.ensure_test_terminals();
@@ -3069,7 +3099,7 @@ mod tests {
         }
         compute_desktop_view(&mut app);
 
-        let section = app.state.view.hosts_section_rect;
+        let section = app.state.view.host_rail_rect;
         assert!(section.height > 0);
         let col = section.x;
         let row = section.y + 1;
@@ -3084,46 +3114,48 @@ mod tests {
     #[test]
     fn clicking_visible_host_in_scrolled_list_keeps_selection_visible() {
         // Reviewer B regression: left-clicking a visible host in an
-        // overflow-scrolled Hosts list must not jump the viewport back to the
-        // top (which would hide the just-selected host). The host list viewport
-        // is independent of the selected source, so selecting a host preserves
-        // the current scroll.
+        // overflow-scrolled host rail list must not jump the viewport back to
+        // the top (which would hide the just-selected host). The host list
+        // viewport is independent of the selected source, so selecting a host
+        // preserves the current scroll.
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("one")];
         app.state.ensure_test_terminals();
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        // 30 hosts + local = 31 entries; the desktop Hosts viewport fits 25 rows,
-        // so the list overflows and scrolls.
-        for i in 0..30 {
+        // 40 hosts + local = 41 entries; the full-height rail viewport is
+        // narrower than the list, so it overflows and scrolls.
+        for i in 0..40 {
             app.state.remote_sources.mark_status(
                 &RemoteHostKey::new(format!("host{i:02}"), crate::session::DEFAULT_SESSION_NAME),
                 crate::remote_source::RemoteConnectionStatus::Connected,
             );
         }
         compute_desktop_view(&mut app);
+        assert!(
+            crate::ui::host_list_scroll_metrics(&app.state, app.state.view.host_rail_rect)
+                .max_offset_from_bottom
+                > 0,
+            "host list must overflow the rail viewport for this regression to be meaningful"
+        );
 
-        // Scroll down so a host beyond the first viewport (host28, index 29) is
-        // the last visible row.
+        // Sanity: host34 is beyond the first viewport (no visible hit target
+        // at scroll 0).
+        let target = RemoteHostKey::new("host34", crate::session::DEFAULT_SESSION_NAME);
+        assert!(crate::ui::host_list_row_areas(&app.state)
+            .into_iter()
+            .all(|area| area.source != crate::app::state::SidebarSource::Remote(target.clone())));
+
+        // Scroll down so host34 becomes a visible row.
         app.state.host_list_scroll = 5;
-        let target = RemoteHostKey::new("host28", crate::session::DEFAULT_SESSION_NAME);
         let row = crate::ui::host_list_row_areas(&app.state)
             .into_iter()
             .find(|area| area.source == crate::app::state::SidebarSource::Remote(target.clone()))
-            .expect("host28 is visible after scrolling")
+            .expect("host34 is visible after scrolling")
             .rect;
         let scroll_before = app.state.host_list_scroll;
         assert_eq!(scroll_before, 5);
-        // Sanity: host28 is beyond the first viewport (not visible at scroll 0).
-        assert!(
-            crate::ui::host_list_entries(&app.state)
-                .iter()
-                .position(|entry| entry.source
-                    == crate::app::state::SidebarSource::Remote(target.clone()))
-                .unwrap()
-                > 25
-        );
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), row.x, row.y));
 
