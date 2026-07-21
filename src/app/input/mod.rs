@@ -27,6 +27,38 @@ fn modified_url_click_modifier() -> KeyModifiers {
     KeyModifiers::CONTROL
 }
 
+fn translate_remote_projection_mouse(
+    hit: &crate::app::state::RemoteProjectionHitArea,
+    mouse: MouseEvent,
+) -> Option<crate::protocol::ClientInputEvent> {
+    let inner_x = hit.rect.x.saturating_add(1);
+    let inner_y = hit.rect.y.saturating_add(1);
+    let inner_width = hit.rect.width.saturating_sub(2);
+    let inner_height = hit.rect.height.saturating_sub(2);
+    if inner_width == 0
+        || inner_height == 0
+        || mouse.column < inner_x
+        || mouse.row < inner_y
+        || mouse.column >= inner_x.saturating_add(inner_width)
+        || mouse.row >= inner_y.saturating_add(inner_height)
+    {
+        return None;
+    }
+    let kind = crate::protocol::ClientMouseKind::from_crossterm(mouse.kind)?;
+    Some(crate::protocol::ClientInputEvent::Mouse {
+        kind,
+        column: mouse
+            .column
+            .saturating_sub(inner_x)
+            .min(inner_width.saturating_sub(1)),
+        row: mouse
+            .row
+            .saturating_sub(inner_y)
+            .min(inner_height.saturating_sub(1)),
+        modifiers: mouse.modifiers.bits(),
+    })
+}
+
 #[cfg(test)]
 #[test]
 fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
@@ -126,9 +158,15 @@ impl App {
             return;
         }
 
-        // A projected remote space is read-only: never paste into a local
-        // terminal runtime (or any remote session) while one is selected.
-        if self.state.selected_remote_space.is_some() {
+        // A selected remote source routes paste only through the in-place
+        // controller stream. Unsupported/stale/owned states consume
+        // fail-closed and never paste into a local terminal runtime.
+        if self.state.remote_projection_surface_active() {
+            let _ = self.remote_projection_runtime.send_input(
+                &self.state,
+                crate::protocol::ClientInputEvent::Paste { text },
+                &self.event_tx,
+            );
             return;
         }
 
@@ -240,12 +278,76 @@ impl App {
         }
     }
 
+    /// Route terminal-mode mouse events inside the authoritative focused
+    /// projected pane to its controller stream. Coordinates are translated to
+    /// pane-interior space and clipped. Pane borders/tab/sidebar/global UI stay
+    /// local; clicks on a non-focused projected pane keep using the existing
+    /// capability-gated remote `pane.focus` action. Any unsupported/stale/owned
+    /// projected terminal hit is consumed fail-closed and never reaches a local
+    /// pane.
+    fn handle_remote_projection_terminal_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.state.mode != Mode::Terminal || self.state.selected_remote_space.is_none() {
+            return false;
+        }
+        let Some(hit) = self
+            .state
+            .view
+            .remote_projection_hit_areas
+            .iter()
+            .find(|hit| {
+                mouse.column >= hit.rect.x
+                    && mouse.column < hit.rect.x.saturating_add(hit.rect.width)
+                    && mouse.row >= hit.rect.y
+                    && mouse.row < hit.rect.y.saturating_add(hit.rect.height)
+            })
+            .cloned()
+        else {
+            return false;
+        };
+
+        // Right click remains local projected-pane context chrome. A left click
+        // on a non-focused leaf remains the existing remote focus mutation.
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+            || (matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) && !hit.focused)
+        {
+            return false;
+        }
+        if !hit.focused || !hit.live {
+            return true;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && mouse.modifiers.contains(modified_url_click_modifier())
+            && self
+                .state
+                .remote_projection_url_at(mouse.column, mouse.row)
+                .is_some()
+        {
+            // Let the local/global URL affordance below handle this OSC-8
+            // link; do not send the click to the remote terminal as well.
+            return false;
+        }
+
+        let Some(event) = translate_remote_projection_mouse(&hit, mouse) else {
+            // Border/title hits are local projection chrome, never terminal
+            // input and never local-pane fallthrough.
+            return true;
+        };
+        let _ = self
+            .remote_projection_runtime
+            .send_input(&self.state, event, &self.event_tx);
+        true
+    }
+
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         if self.handle_confirm_remote_attach_mouse(mouse) {
             return;
         }
 
         if self.handle_overlay_mouse(mouse) {
+            return;
+        }
+
+        if self.handle_remote_projection_terminal_mouse(mouse) {
             return;
         }
 
@@ -401,6 +503,17 @@ impl App {
             || !mouse.modifiers.contains(modified_url_click_modifier())
         {
             return false;
+        }
+
+        if self.state.selected_remote_space.is_some() {
+            let Some(url) = self.state.remote_projection_url_at(mouse.column, mouse.row) else {
+                return false;
+            };
+            self.last_pane_click = None;
+            if let Err(err) = crate::platform::open_url(&url) {
+                tracing::warn!(err = %err, url = %url, "failed to open projected remote URL");
+            }
+            return true;
         }
 
         let Some(info) = self.state.pane_at(mouse.column, mouse.row).cloned() else {
@@ -726,6 +839,51 @@ mod tests {
             tokio::sync::mpsc::unbounded_channel().1,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[test]
+    fn projected_mouse_translation_is_pane_relative_clipped_and_excludes_border() {
+        let hit = crate::app::state::RemoteProjectionHitArea {
+            rect: ratatui::layout::Rect::new(10, 5, 8, 6),
+            host: "remote-a".into(),
+            session: "default".into(),
+            pane_id: Some("pane".into()),
+            terminal_id: Some("term".into()),
+            label: "pane".into(),
+            focused: true,
+            live: true,
+        };
+        let event = translate_remote_projection_mouse(
+            &hit,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 16,
+                row: 9,
+                modifiers: KeyModifiers::CONTROL,
+            },
+        )
+        .expect("interior mouse event");
+        assert_eq!(
+            event,
+            crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Left
+                ),
+                column: 5,
+                row: 3,
+                modifiers: KeyModifiers::CONTROL.bits(),
+            }
+        );
+        assert!(translate_remote_projection_mouse(
+            &hit,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::empty(),
+            },
+        )
+        .is_none());
     }
 
     #[tokio::test]

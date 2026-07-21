@@ -732,6 +732,7 @@ fn current_server_capabilities_include_federation_methods() {
         FederationCapabilities::TAB_RENAME,
         FederationCapabilities::LAYOUT_EXPORT,
         FederationCapabilities::TERMINAL_ATTACH,
+        FederationCapabilities::TERMINAL_SESSION_STREAM,
     ]
     .into_iter()
     .map(str::to_string)

@@ -9,7 +9,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 
 use serde::{Deserialize, Serialize};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
@@ -36,6 +36,11 @@ const NONINTERACTIVE_SSH_OPTIONS: &[&str] = &[
 ];
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 pub(crate) const REMOTE_CLIENT_BRIDGE_SUBCOMMAND: &str = "remote-client-bridge";
+/// Fail-closed/no-start sibling of [`REMOTE_CLIENT_BRIDGE_SUBCOMMAND`] run on
+/// the remote host for in-place terminal-session projection streams: it
+/// never starts, stops, sets up, installs, updates, or wakes the remote
+/// Herdr server (see [`run_remote_client_bridge_no_start`]).
+pub(crate) const REMOTE_CLIENT_BRIDGE_NO_START_SUBCOMMAND: &str = "remote-client-bridge-no-start";
 pub(crate) const REMOTE_API_BRIDGE_SUBCOMMAND: &str = "remote-api-bridge";
 /// CLI flag that selects the persistent remote-API bridge loop
 /// ([`run_remote_api_bridge`]). Bare `remote-api-bridge` (no flag) keeps the
@@ -542,6 +547,48 @@ pub(crate) fn send_remote_api_request_with_prepared_state(
     )
 }
 
+/// Starts a local bridge listener for in-place terminal-session projection
+/// streams (`ObserveTerminal` / `ControlTerminal` over the render/client
+/// bridge), fail-closed and no-start.
+///
+/// This is the projection-specific sibling of [`SshStdioBridge::start`]: it
+/// reuses already-cached supervisor-prepared bridge state
+/// (`RemoteApiBridgeState`, published only from a successful supervisor ping
+/// — see `RemoteSourceCache::connected_bridge_state`) instead of running any
+/// remote binary preparation, capability probing, or server-readiness/setup
+/// step, and it dispatches the remote-side
+/// [`REMOTE_CLIENT_BRIDGE_NO_START_SUBCOMMAND`], which never calls
+/// `ensure_remote_server_running`. Selecting/projecting a host can therefore
+/// never start, stop, set up, install, update, or wake the remote Herdr
+/// server: if the remote session is not already running, every accepted
+/// connection simply fails to attach instead of starting one. Callers must
+/// only invoke this for a host with cached prepared state (a `Connected`
+/// host); there is no fallback path here that re-runs preparation.
+pub(crate) fn start_projection_bridge(
+    host: &crate::remote_target::RemoteHostConfig,
+    state: &RemoteApiBridgeState,
+    local_socket: PathBuf,
+    max_concurrent: usize,
+) -> io::Result<SshStdioBridge> {
+    let remote_ssh = remote_ssh_for_host(host);
+    let ssh_options = remote_ssh.options().cloned();
+    let bridge_command = remote_bridge_command_for_shell_path(
+        &state.shell_path,
+        &host.session,
+        REMOTE_CLIENT_BRIDGE_NO_START_SUBCOMMAND,
+    );
+    SshStdioBridge::start_with_bridge_command(
+        host.target.clone(),
+        bridge_command,
+        local_socket,
+        ssh_options.as_ref(),
+        Some(host.connect_timeout_secs),
+        max_concurrent,
+        Some(remote_ssh),
+        PathBuf::from("ssh"),
+    )
+}
+
 pub(crate) fn prepare_remote_binary_to_host_noninteractive(
     host: &crate::remote_target::RemoteHostConfig,
 ) -> io::Result<RemoteHerdr> {
@@ -974,6 +1021,18 @@ fn send_remote_api_request_with_mode(
 pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
     ensure_remote_server_running()?;
 
+    let (socket_path, description) = remote_bridge_socket_target(RemoteBridgeSocketKind::Client);
+    run_stdio_socket_bridge(&socket_path, description)
+}
+
+/// Fail-closed/no-start variant of [`run_remote_client_bridge`] for in-place
+/// terminal-session projection streams: it never calls
+/// `ensure_remote_server_running`, so merely selecting/projecting a host can
+/// never start, stop, set up, install, update, or wake the remote Herdr
+/// server. If the remote client socket for this session is not already
+/// listening (no already-running remote Herdr server/session), connecting
+/// simply fails instead of starting one.
+pub(crate) fn run_remote_client_bridge_no_start() -> io::Result<()> {
     let (socket_path, description) = remote_bridge_socket_target(RemoteBridgeSocketKind::Client);
     run_stdio_socket_bridge(&socket_path, description)
 }
@@ -3686,10 +3745,73 @@ fn command_failed(context: &str, output: &Output) -> io::Error {
     }
 }
 
-struct SshStdioBridge {
+/// Maximum simultaneous 1:1 bridge workers for one [`SshStdioBridge`]
+/// listener. Deliberately mirrors the authoritative layout pane cap
+/// (`crate::app::api::MAX_LAYOUT_PANES`) so a projection can never open more
+/// concurrent terminal-session streams than a layout could ever validly
+/// contain; a mirrored (not shared-by-reference) constant so this transport
+/// module has no dependency on the `app` layer. Kept `pub(crate)` so the
+/// `app` layer can pin the two constants equal in a test, matching the
+/// existing `REMOTE_AGENT_BRIDGE_POOL_MAX_PER_HOST` pinning pattern.
+pub(crate) const BRIDGE_MAX_CONCURRENT_STREAMS: usize = 24;
+
+/// Shared bounded teardown budget for one bridge's whole worker batch
+/// (independent of how many workers are open): local sockets are shut down
+/// first for every worker, then this is the single ceiling on how long
+/// [`SshStdioBridge::shutdown_and_join`] waits before detaching any worker
+/// that has not finished, rather than blocking indefinitely on a stalled
+/// remote EOF/child exit.
+const BRIDGE_TEARDOWN_BUDGET: Duration = Duration::from_millis(800);
+
+/// Grace window a single bridge worker gives its own `ssh` child to exit
+/// after the local accepted stream closes, before killing it. Bounds
+/// [`bridge_connection`] even when nothing external ever calls
+/// [`SshStdioBridge::shutdown_and_join`] (e.g. a natural remote-side hangup).
+const BRIDGE_CHILD_REAP_GRACE: Duration = Duration::from_millis(500);
+
+/// One tracked, cancellable per-connection bridge worker. Every worker is a
+/// plain 1:1 stdio pipe to its own `ssh` child — no custom multiplexing or
+/// shared request framing is introduced by tracking them.
+struct BridgeWorkerHandle {
+    /// A clone of the accepted local stream, kept only so external teardown
+    /// can force it closed before ever attempting to join the worker thread.
+    shutdown_stream: Option<UnixStream>,
+    /// Set by the worker itself immediately before it returns.
+    done: Arc<AtomicBool>,
+    join: JoinHandle<()>,
+}
+
+fn prune_finished_bridge_workers(workers: &Mutex<Vec<BridgeWorkerHandle>>) {
+    let mut guard = workers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut index = 0;
+    while index < guard.len() {
+        if guard[index].done.load(Ordering::Acquire) {
+            let worker = guard.remove(index);
+            // Already finished: this join returns immediately.
+            let _ = worker.join.join();
+        } else {
+            index += 1;
+        }
+    }
+}
+
+pub(crate) struct SshStdioBridge {
     local_socket: PathBuf,
     should_stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    accept_thread: Option<JoinHandle<()>>,
+    workers: Arc<Mutex<Vec<BridgeWorkerHandle>>>,
+    /// Keeps a managed SSH ControlMaster alive for the bridge's lifetime when
+    /// the caller has no other `RemoteSsh` of its own already in scope (the
+    /// projection bridge starter — see [`start_projection_bridge`]). `None`
+    /// for callers that already keep their own `RemoteSsh` alive for at least
+    /// as long as the bridge (`run_remote`, `run_remote_terminal_attach`).
+    /// Declared last so it drops after `shutdown_and_join` has already torn
+    /// down every worker (Rust drops fields in declaration order after a
+    /// type's own `Drop::drop` body returns), so the control master never
+    /// exits while a worker might still want it.
+    _ssh_keepalive: Option<RemoteSsh>,
 }
 
 impl SshStdioBridge {
@@ -3701,34 +3823,109 @@ impl SshStdioBridge {
         ssh_options: Option<&ManagedSshOptions>,
         connect_timeout_secs: Option<u32>,
     ) -> io::Result<Self> {
+        let bridge_command = remote_bridge_command(&remote_herdr, &session_name);
+        Self::start_with_bridge_command(
+            target,
+            bridge_command,
+            local_socket,
+            ssh_options,
+            connect_timeout_secs,
+            BRIDGE_MAX_CONCURRENT_STREAMS,
+            None,
+            PathBuf::from("ssh"),
+        )
+    }
+
+    /// Builds a bridge whose per-connection remote command is already fully
+    /// resolved, bounded to `max_concurrent` simultaneous 1:1 pipes. Each
+    /// accepted local connection gets its own independent tracked,
+    /// cancellable worker thread; the accept loop keeps accepting while
+    /// workers run concurrently instead of serializing behind the first
+    /// connection. No custom multiplexer is introduced: every worker is still
+    /// a plain 1:1 stdio pipe to its own `ssh` child.
+    fn start_with_bridge_command(
+        target: String,
+        bridge_command: String,
+        local_socket: PathBuf,
+        ssh_options: Option<&ManagedSshOptions>,
+        connect_timeout_secs: Option<u32>,
+        max_concurrent: usize,
+        ssh_keepalive: Option<RemoteSsh>,
+        ssh_program: PathBuf,
+    ) -> io::Result<Self> {
         let _ = std::fs::remove_file(&local_socket);
         let listener = UnixListener::bind(&local_socket)?;
         crate::ipc::restrict_socket_permissions(&local_socket, BRIDGE_SOCKET_PERMISSION_MODE)?;
         listener.set_nonblocking(true)?;
 
         let should_stop = Arc::new(AtomicBool::new(false));
+        let workers: Arc<Mutex<Vec<BridgeWorkerHandle>>> = Arc::new(Mutex::new(Vec::new()));
+        let active_count = Arc::new(AtomicUsize::new(0));
+
         let thread_stop = Arc::clone(&should_stop);
+        let thread_workers = Arc::clone(&workers);
+        let thread_active = Arc::clone(&active_count);
         let thread_ssh_options = ssh_options.cloned();
-        let thread = thread::spawn(move || {
+        let accept_thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _addr)) => {
+                        prune_finished_bridge_workers(&thread_workers);
+                        if thread_active.load(Ordering::Acquire) >= max_concurrent {
+                            // Backstop cap only: normal admission never asks for
+                            // more than `max_concurrent` streams to begin with,
+                            // so this guards a caller bug rather than doing any
+                            // real work. Refuse the connection immediately —
+                            // never queue it and never multiplex it onto an
+                            // existing worker.
+                            drop(stream);
+                            continue;
+                        }
                         if let Err(err) = stream.set_nonblocking(false) {
                             eprintln!(
                                 "herdr: remote bridge failed to prepare client socket: {err}"
                             );
                             continue;
                         }
-                        if let Err(err) = bridge_connection(
-                            stream,
-                            &target,
-                            &remote_herdr,
-                            &session_name,
-                            thread_ssh_options.as_ref(),
-                            connect_timeout_secs,
-                        ) {
-                            eprintln!("herdr: remote bridge failed: {err}");
-                        }
+                        let shutdown_stream = match stream.try_clone() {
+                            Ok(clone) => clone,
+                            Err(err) => {
+                                eprintln!(
+                                    "herdr: remote bridge failed to clone client socket: {err}"
+                                );
+                                continue;
+                            }
+                        };
+                        thread_active.fetch_add(1, Ordering::AcqRel);
+                        let done = Arc::new(AtomicBool::new(false));
+                        let worker_done = Arc::clone(&done);
+                        let worker_active = Arc::clone(&thread_active);
+                        let worker_target = target.clone();
+                        let worker_command = bridge_command.clone();
+                        let worker_ssh_options = thread_ssh_options.clone();
+                        let worker_ssh_program = ssh_program.clone();
+                        let join = thread::spawn(move || {
+                            if let Err(err) = bridge_connection(
+                                stream,
+                                &worker_ssh_program,
+                                &worker_target,
+                                &worker_command,
+                                worker_ssh_options.as_ref(),
+                                connect_timeout_secs,
+                            ) {
+                                eprintln!("herdr: remote bridge worker failed: {err}");
+                            }
+                            worker_active.fetch_sub(1, Ordering::AcqRel);
+                            worker_done.store(true, Ordering::Release);
+                        });
+                        thread_workers
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(BridgeWorkerHandle {
+                                shutdown_stream: Some(shutdown_stream),
+                                done,
+                                join,
+                            });
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(BRIDGE_ACCEPT_POLL);
@@ -3744,18 +3941,79 @@ impl SshStdioBridge {
         Ok(Self {
             local_socket,
             should_stop,
-            thread: Some(thread),
+            accept_thread: Some(accept_thread),
+            workers,
+            _ssh_keepalive: ssh_keepalive,
         })
+    }
+
+    /// Genuinely bounded teardown, in this mandatory order: (1) stop
+    /// admitting new connections, (2) force-close every still-open accepted
+    /// local socket so each worker's blocking IO unblocks (a worker never
+    /// gets joined while its local stream handle might still be live), (3)
+    /// give the whole batch one shared bounded budget to finish naturally
+    /// (each worker's own `ssh`-child reap is itself bounded — see
+    /// `bridge_connection`), then (4) join only the workers that finished in
+    /// time and detach the rest. Detaching instead of blocking further is
+    /// safe: their local socket is already shut and their internal reap is
+    /// bounded, so they still terminate promptly on their own, but this call
+    /// never blocks the caller past the shared budget regardless of pane
+    /// count — even if a remote EOF/child exit stalls.
+    fn shutdown_and_join(&mut self) {
+        self.should_stop.store(true, Ordering::Release);
+        let _ = std::fs::remove_file(&self.local_socket);
+        if let Some(accept_thread) = self.accept_thread.take() {
+            let _ = accept_thread.join();
+        }
+
+        let mut workers = {
+            let mut guard = self
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *guard)
+        };
+
+        // Local socket shutdown BEFORE any join, for every worker, whether or
+        // not it has already finished on its own.
+        for worker in &mut workers {
+            if let Some(stream) = worker.shutdown_stream.take() {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                // Drop the final manager-owned local stream handle before any
+                // worker join attempt. The worker's own accepted stream is now
+                // shutdown at the OS level and its blocking IO is unblocked.
+                drop(stream);
+            }
+        }
+
+        let deadline = Instant::now() + BRIDGE_TEARDOWN_BUDGET;
+        while !workers
+            .iter()
+            .all(|worker| worker.done.load(Ordering::Acquire))
+        {
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        for worker in workers.drain(..) {
+            if worker.done.load(Ordering::Acquire) {
+                let _ = worker.join.join();
+            } else {
+                // Never join while a live local stream handle might remain:
+                // the socket is already shut and `bridge_connection` bounds
+                // its own ssh-child reap, so the thread finishes on its own;
+                // detach it instead of blocking this call further.
+                drop(worker.join);
+            }
+        }
     }
 }
 
 impl Drop for SshStdioBridge {
     fn drop(&mut self) {
-        self.should_stop.store(true, Ordering::Release);
-        let _ = std::fs::remove_file(&self.local_socket);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.shutdown_and_join();
     }
 }
 
@@ -3856,17 +4114,15 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
 
 fn bridge_connection(
     stream: UnixStream,
+    ssh_program: &Path,
     target: &str,
-    remote_herdr: &RemoteHerdr,
-    session_name: &str,
+    bridge_command: &str,
     ssh_options: Option<&ManagedSshOptions>,
     connect_timeout_secs: Option<u32>,
 ) -> io::Result<()> {
-    let mut command = Command::new("ssh");
+    let mut command = Command::new(ssh_program);
     apply_bridge_ssh_options(&mut command, ssh_options, connect_timeout_secs);
-    command
-        .arg(target)
-        .arg(remote_bridge_command(remote_herdr, session_name));
+    command.arg(target).arg(bridge_command);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -3894,17 +4150,55 @@ fn bridge_connection(
         let _ = child_to_stream.shutdown(std::net::Shutdown::Write);
     });
 
-    let status = child.wait()?;
+    // Wait only for local->child upload first. External bridge teardown has
+    // already shut the accepted local socket, so this returns and drops child
+    // stdin. Do NOT join the child->local download yet: it can be blocked on a
+    // stalled remote EOF until the ssh child is killed below.
     let _ = upload.join();
-    let _ = download.join();
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::new(
+    // Bounded reap instead of a plain blocking `wait()`: even if the remote
+    // side's EOF/child exit stalls (e.g. a wedged network path), this worker
+    // terminates within `BRIDGE_CHILD_REAP_GRACE` by killing the ssh child.
+    // Killing/exit closes child stdout, which unblocks the download thread; only
+    // then is it safe to join that thread.
+    let status = reap_ssh_bridge_child(&mut child, BRIDGE_CHILD_REAP_GRACE)?;
+    let _ = download.join();
+    match status {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
             format!("ssh bridge exited with {status}"),
-        ))
+        )),
+        None => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "ssh bridge did not exit after local stream closed; killed after grace window",
+        )),
+    }
+}
+
+/// Waits up to `grace` for `child` to exit on its own, then kills and reaps
+/// it. Returns `Ok(Some(status))` when the child exited naturally within the
+/// grace window, or `Ok(None)` when it had to be killed. Shares the same
+/// bounded-reap shape as the persistent-bridge `reap_child` helper, but
+/// returns the exit status (when available) so the caller can still
+/// distinguish a clean exit from a nonzero one.
+fn reap_ssh_bridge_child(
+    child: &mut Child,
+    grace: Duration,
+) -> io::Result<Option<std::process::ExitStatus>> {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait()? {
+            Some(status) => return Ok(Some(status)),
+            None if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(15));
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(None);
+            }
+        }
     }
 }
 
@@ -4064,6 +4358,190 @@ mod tests {
 
         drop(bridge);
         let _ = std::fs::remove_file(socket);
+    }
+
+    fn bridge_test_program(body: &str, label: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "herdr-bridge-{label}-{}-{}.sh",
+            std::process::id(),
+            short_socket_hash(body, label)
+        ));
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake ssh");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("fake ssh metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).expect("make fake ssh executable");
+        path
+    }
+
+    #[test]
+    fn bridge_accepts_two_live_connections_concurrently() {
+        use std::io::{Read as _, Write as _};
+
+        let socket = std::env::temp_dir().join(format!(
+            "herdr-bridge-concurrent-test-{}.sock",
+            std::process::id()
+        ));
+        let program = bridge_test_program("exec cat", "concurrent");
+        let bridge = SshStdioBridge::start_with_bridge_command(
+            "ignored-target".into(),
+            "ignored-command".into(),
+            socket.clone(),
+            None,
+            None,
+            2,
+            None,
+            program.clone(),
+        )
+        .expect("start concurrent bridge");
+
+        let mut first = UnixStream::connect(&socket).expect("first local stream");
+        first
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("first timeout");
+        first.write_all(b"one\n").expect("first write");
+        let mut one = [0_u8; 4];
+        first.read_exact(&mut one).expect("first echo");
+        assert_eq!(&one, b"one\n");
+
+        // Keep `first` live while admitting/round-tripping `second`. The old
+        // serialized accept loop blocked here behind the first connection.
+        let mut second = UnixStream::connect(&socket).expect("second local stream");
+        second
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("second timeout");
+        second.write_all(b"two\n").expect("second write");
+        let mut two = [0_u8; 4];
+        second.read_exact(&mut two).expect("second echo");
+        assert_eq!(&two, b"two\n");
+        assert_eq!(
+            bridge
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            2
+        );
+
+        drop(first);
+        drop(second);
+        drop(bridge);
+        let _ = std::fs::remove_file(socket);
+        let _ = std::fs::remove_file(program);
+    }
+
+    #[test]
+    fn bridge_shutdown_releases_tracked_workers_to_zero() {
+        let socket = std::env::temp_dir().join(format!(
+            "herdr-bridge-zero-workers-test-{}.sock",
+            std::process::id()
+        ));
+        let program = bridge_test_program("exec cat", "zero-workers");
+        let mut bridge = SshStdioBridge::start_with_bridge_command(
+            "ignored-target".into(),
+            "ignored-command".into(),
+            socket.clone(),
+            None,
+            None,
+            1,
+            None,
+            program.clone(),
+        )
+        .expect("start zero-worker bridge");
+        let _stream = UnixStream::connect(&socket).expect("local stream");
+        let wait_deadline = Instant::now() + Duration::from_secs(1);
+        while bridge
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+            && Instant::now() < wait_deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !bridge
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty(),
+            "test did not admit a bridge worker"
+        );
+
+        bridge.shutdown_and_join();
+
+        assert_eq!(
+            bridge
+                .workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            0,
+            "source switch/drop teardown must leave no tracked bridge workers"
+        );
+        assert!(bridge.accept_thread.is_none());
+        let _ = std::fs::remove_file(socket);
+        let _ = std::fs::remove_file(program);
+    }
+
+    #[test]
+    fn bridge_teardown_is_bounded_when_remote_child_never_exits() {
+        let socket = std::env::temp_dir().join(format!(
+            "herdr-bridge-bounded-test-{}.sock",
+            std::process::id()
+        ));
+        let program = bridge_test_program("exec sleep 30", "bounded");
+        let bridge = SshStdioBridge::start_with_bridge_command(
+            "ignored-target".into(),
+            "ignored-command".into(),
+            socket.clone(),
+            None,
+            None,
+            1,
+            None,
+            program.clone(),
+        )
+        .expect("start bounded bridge");
+        let _stream = UnixStream::connect(&socket).expect("local stream");
+        let wait_deadline = Instant::now() + Duration::from_secs(1);
+        while bridge
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+            && Instant::now() < wait_deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!bridge
+            .workers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+
+        let started = Instant::now();
+        drop(bridge);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "bridge teardown exceeded bounded deadline: {:?}",
+            started.elapsed()
+        );
+        let _ = std::fs::remove_file(socket);
+        let _ = std::fs::remove_file(program);
+    }
+
+    #[test]
+    fn projection_bridge_command_uses_explicit_no_start_subcommand() {
+        assert_eq!(
+            remote_bridge_command_for_shell_path(
+                "/opt/herdr",
+                "default",
+                REMOTE_CLIENT_BRIDGE_NO_START_SUBCOMMAND,
+            ),
+            "exec /opt/herdr remote-client-bridge-no-start"
+        );
     }
 
     #[test]

@@ -2617,6 +2617,7 @@ impl AppState {
                 self.remote_sources
                     .apply_projection_snapshot(&host, projections);
                 self.remote_sources.apply_tab_snapshots(&host, tabs);
+                self.select_remote_focused_workspace_if_missing(&host);
                 Vec::new()
             }
             AppEvent::RemoteSourceAgentUpdated { host, agent } => {
@@ -2629,6 +2630,18 @@ impl AppState {
             }
             AppEvent::RemoteSourceDisconnected { host, status, .. } => {
                 self.remote_sources.mark_status(&host, status);
+                if self.selected_remote_space.as_ref().is_some_and(|selected| {
+                    selected.host == host.host && selected.session == host.session
+                }) {
+                    for entry in self.remote_projection_frames.values_mut() {
+                        entry.status =
+                            crate::remote_source::RemoteProjectionStreamStatus::StaleLastKnown;
+                        entry.message = Some(format!(
+                            "remote {} ; showing last-known frame read-only",
+                            status.stale_label().unwrap_or("unavailable")
+                        ));
+                    }
+                }
                 Vec::new()
             }
             AppEvent::RemoteSourceBridgeState {
@@ -2644,6 +2657,19 @@ impl AppState {
                 // sole reducer path.
                 self.remote_sources
                     .set_connected_bridge_state(&host, bridge_state);
+                Vec::new()
+            }
+            AppEvent::RemoteProjectionStream {
+                key,
+                generation,
+                role,
+                status,
+                frame,
+                message,
+            } => {
+                self.apply_remote_projection_stream_event(
+                    key, generation, role, status, frame, message,
+                );
                 Vec::new()
             }
             AppEvent::RemoteSourceRemoved { host } => {

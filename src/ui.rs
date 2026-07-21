@@ -322,11 +322,12 @@ fn compute_view_internal(
         compute_workspace_card_areas(app, sidebar_panel_rect)
     };
 
-    // A projected remote space renders read-only in the main area. Local tab/pane
-    // geometry, hit targets, split borders, and background pane resizing are all
-    // suppressed so no local terminal runtime or remote session can be touched
-    // through mouse/keyboard while the projection is active.
-    if app.selected_remote_space.is_some() {
+    // A selected remote source reserves the main area as an authority-routing
+    // boundary, even while its first authoritative workspace snapshot is still
+    // pending. Local tab/pane geometry, hit targets, split borders, and
+    // background pane resizing are all suppressed so no local terminal runtime
+    // can be touched through mouse/keyboard while the remote surface is active.
+    if app.remote_projection_surface_active() {
         let toast_hit_area = app
             .toast
             .as_ref()
@@ -571,7 +572,7 @@ pub fn render_with_runtime_registry(
             render_sidebar(app, terminal_runtimes, frame, sidebar_area);
         }
     }
-    let remote_projection_active = app.selected_remote_space.is_some();
+    let remote_projection_active = app.remote_projection_surface_active();
     if app.view.layout != ViewLayout::Mobile && !remote_projection_active {
         render_tab_bar(app, frame, tab_bar_area);
     }
@@ -579,7 +580,6 @@ pub fn render_with_runtime_registry(
         render_remote_projection(app, frame, terminal_area);
     } else {
         render_panes(app, terminal_runtimes, frame, terminal_area);
-        render_remote_source_banner(app, frame, terminal_area);
     }
 
     // Ambient notifications sit above panes, but below interactive overlays.
@@ -856,6 +856,41 @@ fn render_remote_projection(app: &AppState, frame: &mut Frame, terminal_area: Re
     use crate::remote_source::RemoteProjectionStatus;
 
     let Some(selected) = app.selected_remote_space.as_ref() else {
+        let host = match app.effective_sidebar_source() {
+            crate::app::state::SidebarSource::Remote(host) => host,
+            crate::app::state::SidebarSource::Local => return,
+        };
+        let host_label = if host.session == crate::session::DEFAULT_SESSION_NAME {
+            host.host
+        } else {
+            format!("{} / {}", host.host, host.session)
+        };
+        let header = Line::from(vec![
+            Span::raw("remote  "),
+            Span::styled(host_label, Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("   workspace <waiting>   "),
+            Span::styled("no local pane active", Style::default()),
+        ]);
+        if terminal_area.height <= 1 {
+            frame.render_widget(
+                Paragraph::new(vec![header]).alignment(Alignment::Left),
+                terminal_area,
+            );
+            return;
+        }
+        let [header_area, body_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(terminal_area);
+        frame.render_widget(
+            Paragraph::new(vec![header]).alignment(Alignment::Left),
+            header_area,
+        );
+        frame.render_widget(
+            Paragraph::new(vec![Line::from(vec![Span::raw(
+                "waiting for authoritative remote workspace snapshot",
+            )])])
+            .alignment(Alignment::Center),
+            body_area,
+        );
         return;
     };
     let projection = app.remote_sources.projection_for_space(selected);
@@ -933,6 +968,7 @@ fn render_remote_projection(app: &AppState, frame: &mut Frame, terminal_area: Re
             if layout_root.is_some() =>
         {
             render_projection_layout(
+                app,
                 frame,
                 &layout_root.expect("layout root"),
                 body_area,
@@ -989,6 +1025,7 @@ fn render_remote_projection_tab_strip(app: &AppState, frame: &mut Frame, area: R
 /// Draw projected remote layout panes using the shared geometry helper.
 /// Live panes (attachable) and the focused pane get distinct visual treatment.
 fn render_projection_layout(
+    app: &AppState,
     frame: &mut Frame,
     node: &crate::api::schema::LayoutNode,
     area: Rect,
@@ -996,39 +1033,117 @@ fn render_projection_layout(
     live: bool,
 ) {
     use ratatui::style::Color;
-    use ratatui::widgets::{Block, Borders};
+    use ratatui::widgets::{Block, Borders, Paragraph};
 
+    let Some(selected) = app.selected_remote_space.as_ref() else {
+        return;
+    };
     for (pane, rect, is_focused) in project_layout_rects(node, area, focused_pane_id) {
         let title = pane
             .label
             .clone()
             .or_else(|| pane.pane_id.clone())
             .unwrap_or_else(|| "pane".to_string());
-        let pane_live = live && pane.terminal_id.is_some();
-        let block = if is_focused && pane_live {
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green))
-                .title(Span::styled(
-                    format!(" {title} ▶ "),
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ))
-        } else if pane_live {
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(Span::styled(
-                    format!(" {title} ▶ "),
-                    Style::default().fg(Color::DarkGray),
-                ))
-        } else {
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Span::raw(format!(" {title} ")))
+        let stream = pane
+            .terminal_id
+            .as_deref()
+            .and_then(|terminal_id| app.remote_projection_frame(selected, terminal_id));
+        let status = stream.map(|entry| entry.status).unwrap_or_else(|| {
+            if live && pane.terminal_id.is_some() {
+                crate::remote_source::RemoteProjectionStreamStatus::Connecting
+            } else {
+                crate::remote_source::RemoteProjectionStreamStatus::StaleLastKnown
+            }
+        });
+        let (color, bold) = match status {
+            crate::remote_source::RemoteProjectionStreamStatus::LiveController => {
+                (Color::Green, true)
+            }
+            crate::remote_source::RemoteProjectionStreamStatus::LiveObserver => {
+                (Color::DarkGray, false)
+            }
+            crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly => {
+                (Color::Yellow, true)
+            }
+            crate::remote_source::RemoteProjectionStreamStatus::Connecting => (Color::Cyan, false),
+            crate::remote_source::RemoteProjectionStreamStatus::StaleLastKnown
+            | crate::remote_source::RemoteProjectionStreamStatus::Disconnected => {
+                (Color::DarkGray, false)
+            }
+            crate::remote_source::RemoteProjectionStreamStatus::Unsupported
+            | crate::remote_source::RemoteProjectionStreamStatus::NeedsAttention => {
+                (Color::Red, false)
+            }
         };
+        let mut title_style = Style::default().fg(color);
+        if bold || (is_focused && status.accepts_input()) {
+            title_style = title_style.add_modifier(Modifier::BOLD);
+        }
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(color))
+            .title(Span::styled(
+                format!(" {title} · {} ", status.concise_label()),
+                title_style,
+            ));
+        let inner = block.inner(rect);
         frame.render_widget(block, rect);
+
+        let Some(entry) = stream else {
+            if inner.width > 0 && inner.height > 0 {
+                frame.render_widget(
+                    Paragraph::new(status.concise_label()).style(Style::default().fg(color)),
+                    inner,
+                );
+            }
+            continue;
+        };
+        let Some(remote_frame) = entry.frame.as_ref() else {
+            if inner.width > 0 && inner.height > 0 {
+                frame.render_widget(
+                    Paragraph::new(
+                        entry
+                            .message
+                            .as_deref()
+                            .unwrap_or_else(|| status.concise_label()),
+                    )
+                    .style(Style::default().fg(color)),
+                    inner,
+                );
+            }
+            continue;
+        };
+
+        // Copy exact semantic cells/styles into this projected pane interior,
+        // clipped in both dimensions. No parser PTY/local pane exists. Kitty
+        // graphics bytes are deliberately ignored in this unit; text cells,
+        // styles and cursor remain live.
+        let copy_width = inner.width.min(remote_frame.width);
+        let copy_height = inner.height.min(remote_frame.height);
+        {
+            let buffer = frame.buffer_mut();
+            for row in 0..copy_height {
+                for col in 0..copy_width {
+                    let index = row as usize * remote_frame.width as usize + col as usize;
+                    let Some(source) = remote_frame.cells.get(index) else {
+                        continue;
+                    };
+                    let destination = &mut buffer[(inner.x + col, inner.y + row)];
+                    destination.set_symbol(&source.symbol);
+                    destination.fg = crate::protocol::u32_to_color(source.fg);
+                    destination.bg = crate::protocol::u32_to_color(source.bg);
+                    destination.modifier = crate::protocol::u16_to_modifier(source.modifier);
+                    destination.skip = source.skip;
+                }
+            }
+        }
+        if is_focused && status.accepts_input() {
+            if let Some(cursor) = remote_frame.cursor.as_ref().filter(|cursor| cursor.visible) {
+                if cursor.x < copy_width && cursor.y < copy_height {
+                    frame.set_cursor_position((inner.x + cursor.x, inner.y + cursor.y));
+                }
+            }
+        }
     }
 }
 
@@ -1129,41 +1244,6 @@ fn dim_background(frame: &mut Frame, area: Rect) {
     }
 }
 
-/// Dim informational line at the top of the terminal area when a remote source
-/// is selected but no remote space has been projected yet. The local pane
-/// remains fully active in this state; the copy makes that explicit.
-fn render_remote_source_banner(app: &AppState, frame: &mut Frame, area: Rect) {
-    use ratatui::widgets::Paragraph;
-
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let host = match app.effective_sidebar_source() {
-        crate::app::state::SidebarSource::Remote(h) => h,
-        crate::app::state::SidebarSource::Local => return,
-    };
-    let host_label = if host.session == crate::session::DEFAULT_SESSION_NAME {
-        host.host.clone()
-    } else {
-        format!("{}/{}", host.host, host.session)
-    };
-    let p = &app.palette;
-    let text = format!(
-        " {host_label} source selected - choose a remote space to project; local pane remains active"
-    );
-    let width = (text::display_width_u16(&text)).min(area.width);
-    if width == 0 {
-        return;
-    }
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            text,
-            Style::default().fg(p.overlay0).add_modifier(Modifier::DIM),
-        )),
-        Rect::new(area.x, area.y, width, 1),
-    );
-}
-
 /// Floating overlay for navigate mode — appears at bottom of terminal area.
 fn _build_hints(items: &[(&str, &str)], key_style: Style, dim_style: Style) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
@@ -1186,6 +1266,123 @@ mod tests {
     use crate::{app::state::ViewLayout, layout::PaneInfo, workspace::Workspace};
     use ratatui::style::Color;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn projected_live_and_stale_frames_render_remote_cells_without_local_fallthrough() {
+        let mut app = crate::app::state::AppState::test_new();
+        let selected = crate::remote_source::RemoteSpaceKey {
+            host: "remote-a".into(),
+            session: "default".into(),
+            workspace_id: "ws-a".into(),
+        };
+        app.selected_remote_space = Some(selected.clone());
+        let generation = app.begin_remote_projection_generation(Some(&selected), false);
+        let key = crate::remote_source::RemoteProjectionTerminalKey {
+            host: "remote-a".into(),
+            session: "default".into(),
+            workspace_id: "ws-a".into(),
+            terminal_id: "term-a".into(),
+        };
+        app.seed_remote_projection_streams(
+            generation,
+            [(
+                key.clone(),
+                crate::remote_source::RemoteProjectionStreamRole::Control,
+                crate::remote_source::RemoteProjectionStreamStatus::Connecting,
+                None,
+            )],
+        );
+        let frame_data = crate::protocol::FrameData {
+            cells: vec![crate::protocol::CellData {
+                symbol: "R".into(),
+                fg: crate::protocol::color_to_u32(Color::LightGreen),
+                bg: crate::protocol::color_to_u32(Color::Black),
+                modifier: crate::protocol::modifier_to_u16(Modifier::BOLD),
+                skip: false,
+                hyperlink: Some(0),
+            }],
+            width: 1,
+            height: 1,
+            cursor: Some(crate::protocol::CursorState {
+                x: 0,
+                y: 0,
+                visible: true,
+                shape: 2,
+            }),
+            hyperlinks: vec!["https://example.com/remote".into()],
+            graphics: Vec::new(),
+        };
+        app.apply_remote_projection_stream_event(
+            key.clone(),
+            generation,
+            crate::remote_source::RemoteProjectionStreamRole::Control,
+            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
+            Some(frame_data),
+            None,
+        );
+        app.view.remote_projection_hit_areas = vec![crate::app::state::RemoteProjectionHitArea {
+            rect: Rect::new(0, 0, 30, 5),
+            host: "remote-a".into(),
+            session: "default".into(),
+            pane_id: Some("pane-a".into()),
+            terminal_id: Some("term-a".into()),
+            label: "remote".into(),
+            focused: true,
+            live: true,
+        }];
+        assert_eq!(
+            app.remote_projection_url_at(1, 1).as_deref(),
+            Some("https://example.com/remote")
+        );
+        let node = crate::api::schema::LayoutNode::Pane {
+            pane: crate::api::schema::LayoutPane {
+                pane_id: Some("pane-a".into()),
+                terminal_id: Some("term-a".into()),
+                label: Some("remote".into()),
+                ..Default::default()
+            },
+        };
+        let backend = TestBackend::new(30, 5);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_projection_layout(
+                    &app,
+                    frame,
+                    &node,
+                    Rect::new(0, 0, 30, 5),
+                    "pane-a",
+                    true,
+                );
+            })
+            .expect("render live frame");
+        let live = terminal.backend().buffer();
+        assert_eq!(live[(1, 1)].symbol(), "R");
+        assert_eq!(live[(1, 1)].fg, Color::LightGreen);
+        assert!(live[(1, 1)].modifier.contains(Modifier::BOLD));
+
+        app.apply_remote_projection_stream_event(
+            key,
+            generation,
+            crate::remote_source::RemoteProjectionStreamRole::Control,
+            crate::remote_source::RemoteProjectionStreamStatus::StaleLastKnown,
+            None,
+            Some("disconnected".into()),
+        );
+        terminal
+            .draw(|frame| {
+                render_projection_layout(
+                    &app,
+                    frame,
+                    &node,
+                    Rect::new(0, 0, 30, 5),
+                    "pane-a",
+                    false,
+                );
+            })
+            .expect("render stale frame");
+        assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "R");
+    }
 
     #[tokio::test]
     async fn desktop_view_with_selected_remote_space_hides_local_hit_targets_and_skips_resize() {
@@ -2292,7 +2489,7 @@ switch_workspace = "ctrl+1..9"
     }
 
     #[test]
-    fn remote_source_banner_renders_when_source_is_remote_and_no_space_projected() {
+    fn remote_source_without_workspace_snapshot_hides_local_surface() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
@@ -2307,10 +2504,12 @@ switch_workspace = "ctrl+1..9"
         app.sidebar_source = crate::app::state::SidebarSource::Remote(host);
         app.selected_remote_space = None;
 
-        // Use a wide screen so the terminal area (total minus sidebar+rail) fits the
-        // full banner text (84 display chars). With a default sidebar of 26 and source
-        // rail of 10 the sidebar takes 36 cols; 140 wide gives a terminal area of 104 cols.
         compute_view(&mut app, Rect::new(0, 0, 140, 20));
+
+        assert!(app.remote_projection_surface_active());
+        assert!(app.view.pane_infos.is_empty());
+        assert!(app.view.split_borders.is_empty());
+        assert_eq!(app.view.tab_bar_rect, Rect::default());
 
         let backend = TestBackend::new(140, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2320,16 +2519,25 @@ switch_workspace = "ctrl+1..9"
         let top_row = buffer_row_text(buffer, app.view.terminal_area, app.view.terminal_area.y);
         assert!(
             top_row.contains("jafar"),
-            "banner not rendered: {top_row:?}"
+            "remote source header not rendered: {top_row:?}"
         );
         assert!(
-            top_row.contains("local pane remains active"),
-            "banner missing context: {top_row:?}"
+            top_row.contains("no local pane active"),
+            "remote source header must not leave local active: {top_row:?}"
+        );
+        let body_row = buffer_row_text(
+            buffer,
+            app.view.terminal_area,
+            app.view.terminal_area.y.saturating_add(1),
+        );
+        assert!(
+            body_row.contains("waiting for authoritative remote workspace snapshot"),
+            "waiting state missing: {body_row:?}"
         );
     }
 
     #[test]
-    fn remote_source_banner_hides_when_space_is_projected() {
+    fn remote_source_with_projected_space_does_not_show_waiting_state() {
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
@@ -2348,19 +2556,25 @@ switch_workspace = "ctrl+1..9"
             workspace_id: "remote-ws".to_string(),
         });
 
-        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        // Wide enough that the fixed 10-col host rail + 26-col sidebar panel
+        // still leave room for the full projected header line (host/session,
+        // workspace, tab, status) — mirrors the neighboring waiting-state test
+        // above, which needs the same rail+panel headroom for its own header.
+        compute_view(&mut app, Rect::new(0, 0, 140, 20));
 
-        let backend = TestBackend::new(80, 20);
+        let backend = TestBackend::new(140, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| render(&app, frame)).unwrap();
         let buffer = terminal.backend().buffer();
 
-        // When a space is projected, the remote projection branch is taken and
-        // the banner is not drawn over the terminal area.
         let top_row = buffer_row_text(buffer, app.view.terminal_area, app.view.terminal_area.y);
         assert!(
-            !top_row.contains("local pane remains active"),
-            "banner should be hidden when space is projected: {top_row:?}"
+            top_row.contains("workspace remote-ws"),
+            "selected remote workspace header missing: {top_row:?}"
+        );
+        assert!(
+            !top_row.contains("no local pane active"),
+            "waiting header should not replace a selected remote workspace: {top_row:?}"
         );
     }
 }

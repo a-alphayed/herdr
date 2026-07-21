@@ -477,6 +477,10 @@ fn main() -> io::Result<()> {
         return remote::run_remote_client_bridge();
     }
 
+    if args.get(1).map(|s| s.as_str()) == Some(remote::REMOTE_CLIENT_BRIDGE_NO_START_SUBCOMMAND) {
+        return remote::run_remote_client_bridge_no_start();
+    }
+
     if args.get(1).map(|s| s.as_str()) == Some(remote::REMOTE_API_BRIDGE_SUBCOMMAND) {
         return remote::run_remote_api_bridge(&args[2..]);
     }
@@ -690,6 +694,7 @@ fn main() -> io::Result<()> {
                 "server",
                 "client",
                 remote::REMOTE_CLIENT_BRIDGE_SUBCOMMAND,
+                remote::REMOTE_CLIENT_BRIDGE_NO_START_SUBCOMMAND,
                 remote::REMOTE_API_BRIDGE_SUBCOMMAND,
                 remote::REMOTE_FEDERATION_CAPABILITIES_SUBCOMMAND,
                 remote::REMOTE_API_STATUS_SUBCOMMAND,

@@ -14,6 +14,7 @@ mod creation;
 mod ids;
 mod input;
 mod remote_attach;
+mod remote_projection;
 mod remote_workspace;
 mod runtime;
 mod runtime_mutations;
@@ -146,6 +147,9 @@ pub struct App {
     pub(crate) remote_hosts: crate::remote_target::RemoteHostRegistry,
     pub(crate) remote_source_supervisors:
         Vec<crate::remote_supervisor::RemoteSourceSupervisorHandle>,
+    /// App-owned sockets/threads/SSH bridge for the currently selected remote
+    /// projection. Pure frame/status data alone enters `AppState`.
+    pub(crate) remote_projection_runtime: remote_projection::RemoteProjectionRuntime,
     /// Pending one-shot `respond_to` channels for in-flight local-only runtime
     /// lifecycle actions (`remote.connect`/`reconnect`/`disconnect`), keyed by
     /// the process-unique supervisor/lifecycle generation that will resolve
@@ -662,6 +666,8 @@ impl App {
             active,
             previous_pane_focus: None,
             selected_remote_space: None,
+            remote_projection_generation: 0,
+            remote_projection_frames: std::collections::BTreeMap::new(),
             selected_remote_agent: None,
             selected,
             mode,
@@ -912,6 +918,7 @@ impl App {
             config_reloaded_from_disk: false,
             remote_hosts,
             remote_source_supervisors,
+            remote_projection_runtime: remote_projection::RemoteProjectionRuntime::default(),
             pending_remote_lifecycle: std::collections::HashMap::new(),
             lifecycle_supervisor_starter:
                 crate::app::api::remotes::spawn_remote_lifecycle_supervisor,
@@ -1063,6 +1070,15 @@ impl App {
                 needs_render = true;
             }
 
+            // Reconcile source/focus changes before doing any further work so
+            // projection generation advances before Detach/socket shutdown;
+            // late predecessor frames are rejected from this point onward.
+            self.remote_projection_runtime.reconcile(
+                &mut self.state,
+                &self.remote_hosts,
+                &self.event_tx,
+            );
+
             self.sync_focus_events();
             self.sync_session_save_schedule();
 
@@ -1206,6 +1222,15 @@ impl App {
                         frame,
                     );
                 })?;
+                // `compute_view` just published exact projected pane geometry;
+                // a first-time selection that was waiting for geometry can now
+                // admit its bounded one-stream-per-leaf generation without
+                // guessing a remote PTY size.
+                self.remote_projection_runtime.reconcile(
+                    &mut self.state,
+                    &self.remote_hosts,
+                    &self.event_tx,
+                );
                 if kitty_graphics_enabled {
                     crate::kitty_graphics::paint_local_pane_graphics(
                         &self.state,
@@ -1819,8 +1844,16 @@ impl App {
                 crate::raw_input::RawInputEvent::Paste(text) => {
                     if self.state.mode != Mode::Terminal {
                         self.paste_into_active_text_input(&text);
-                    } else if self.state.selected_remote_space.is_some() {
-                        // A projected remote space is read-only; drop the paste.
+                    } else if self.state.remote_projection_surface_active() {
+                        // Structured paste is encoded by the authoritative
+                        // remote TerminalRuntime (including bracketed-paste
+                        // mode). Stale/observer/owned states consume
+                        // fail-closed and never fall through to a local pane.
+                        let _ = self.remote_projection_runtime.send_input(
+                            &self.state,
+                            crate::protocol::ClientInputEvent::Paste { text },
+                            &self.event_tx,
+                        );
                     } else {
                         if let Some(ws_idx) = self.state.active {
                             if let Some(ws) = self.state.workspaces.get(ws_idx) {

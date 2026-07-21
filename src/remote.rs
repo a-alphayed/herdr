@@ -9,6 +9,8 @@ pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
 #[cfg(windows)]
 pub(crate) const REMOTE_CLIENT_BRIDGE_SUBCOMMAND: &str = "remote-client-bridge";
 #[cfg(windows)]
+pub(crate) const REMOTE_CLIENT_BRIDGE_NO_START_SUBCOMMAND: &str = "remote-client-bridge-no-start";
+#[cfg(windows)]
 pub(crate) const REMOTE_API_BRIDGE_SUBCOMMAND: &str = "remote-api-bridge";
 #[cfg(windows)]
 pub(crate) const REMOTE_FEDERATION_CAPABILITIES_SUBCOMMAND: &str = "remote-federation-capabilities";
@@ -206,6 +208,11 @@ pub(crate) fn run_remote_client_bridge() -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
+pub(crate) fn run_remote_client_bridge_no_start() -> std::io::Result<()> {
+    Err(unsupported_remote_error("remote client bridge (no-start)"))
+}
+
+#[cfg(windows)]
 pub(crate) fn run_remote_terminal_attach(
     _host: &crate::remote_target::RemoteHostConfig,
     _terminal_id: String,
@@ -285,6 +292,49 @@ pub(crate) fn send_remote_api_request_with_prepared_state(
     _request: &crate::api::schema::Request,
 ) -> std::io::Result<String> {
     Err(unsupported_remote_error("remote API request"))
+}
+
+/// Windows stub: mirrors the unix layout-pane cap so cross-platform callers
+/// (e.g. the remote-projection admission check) can reference one constant
+/// regardless of platform; never actually consulted since no bridge exists.
+#[cfg(windows)]
+#[cfg_attr(
+    windows,
+    expect(
+        dead_code,
+        reason = "read only by the cross-platform parity test in remote_projection.rs, which is not compiled into bin-only Windows builds"
+    )
+)]
+pub(crate) const BRIDGE_MAX_CONCURRENT_STREAMS: usize = 24;
+
+/// Windows stub: opaque placeholder so cross-platform callers can hold an
+/// `Option<SshStdioBridge>` field; direct in-place terminal-session
+/// projection streaming is not supported on Windows yet (no render/client
+/// bridge over SSH stdio exists there). [`start_projection_bridge`] never
+/// actually constructs one.
+#[cfg(windows)]
+pub(crate) struct SshStdioBridge;
+
+/// Windows stub: in-place terminal-session projection streaming is not
+/// supported yet; callers must treat the projected pane as unsupported/
+/// read-only rather than claiming in-place stream support.
+#[cfg(windows)]
+#[cfg_attr(
+    windows,
+    expect(
+        dead_code,
+        reason = "kept for API parity with the Unix projection bridge starter; the Unix admission path that calls it is cfg(unix)-only"
+    )
+)]
+pub(crate) fn start_projection_bridge(
+    _host: &crate::remote_target::RemoteHostConfig,
+    _state: &RemoteApiBridgeState,
+    _local_socket: std::path::PathBuf,
+    _max_concurrent: usize,
+) -> std::io::Result<SshStdioBridge> {
+    Err(unsupported_remote_error(
+        "in-place terminal session projection streaming",
+    ))
 }
 
 /// Windows stub: pooled persistent-bridge dispatch is never reached (no remote

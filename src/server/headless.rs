@@ -307,6 +307,91 @@ fn apply_terminal_attach_input(
         .map_err(|err| format!("terminal attach input failed: {err}"))
 }
 
+/// Encode structured projected-control input against the authoritative remote
+/// `TerminalRuntime` (keyboard protocol/modes, bracketed paste, mouse protocol,
+/// alternate scroll), rather than guessing bytes on the projecting host.
+/// Observe clients are filtered before this function is reached.
+fn apply_terminal_attach_input_events(
+    runtime: &crate::terminal::TerminalRuntime,
+    events: Vec<crate::protocol::ClientInputEvent>,
+) -> Result<(), String> {
+    for event in events {
+        match event.to_raw_input_event() {
+            crate::raw_input::RawInputEvent::Key(key) => {
+                runtime.scroll_reset();
+                let bytes = runtime.encode_terminal_key(key);
+                if !bytes.is_empty() {
+                    runtime
+                        .try_send_bytes(Bytes::from(bytes))
+                        .map_err(|err| format!("terminal control key input failed: {err}"))?;
+                }
+            }
+            crate::raw_input::RawInputEvent::Paste(text) => {
+                runtime.scroll_reset();
+                let payload = paste_payload_for_runtime(runtime, &text);
+                runtime
+                    .try_send_bytes(Bytes::from(payload))
+                    .map_err(|err| format!("terminal control paste failed: {err}"))?;
+            }
+            crate::raw_input::RawInputEvent::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    let direction = if mouse.kind == MouseEventKind::ScrollUp {
+                        AttachScrollDirection::Up
+                    } else {
+                        AttachScrollDirection::Down
+                    };
+                    apply_terminal_attach_scroll(
+                        runtime,
+                        AttachScrollSource::Wheel,
+                        direction,
+                        3,
+                        Some(mouse.column),
+                        Some(mouse.row),
+                        mouse.modifiers.bits(),
+                    )?;
+                }
+                MouseEventKind::Down(_) | MouseEventKind::Up(_) => {
+                    let Some(bytes) = runtime.encode_mouse_button(
+                        mouse.kind,
+                        mouse.column,
+                        mouse.row,
+                        mouse.modifiers,
+                    ) else {
+                        continue;
+                    };
+                    runtime.scroll_reset();
+                    runtime.try_send_bytes(Bytes::from(bytes)).map_err(|err| {
+                        format!("terminal control mouse button input failed: {err}")
+                    })?;
+                }
+                MouseEventKind::Drag(_) | MouseEventKind::Moved => {
+                    let Some(bytes) = runtime.encode_mouse_motion(
+                        mouse.kind,
+                        mouse.column,
+                        mouse.row,
+                        mouse.modifiers,
+                    ) else {
+                        continue;
+                    };
+                    runtime.try_send_bytes(Bytes::from(bytes)).map_err(|err| {
+                        format!("terminal control mouse motion input failed: {err}")
+                    })?;
+                }
+                // Crossterm exposes horizontal wheel kinds, but the existing
+                // TerminalRuntime substrate has no horizontal attach-scroll
+                // route. Consume fail-closed instead of inventing bytes.
+                MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {}
+            },
+            crate::raw_input::RawInputEvent::OuterFocusGained
+            | crate::raw_input::RawInputEvent::OuterFocusLost
+            | crate::raw_input::RawInputEvent::HostDefaultColor { .. }
+            | crate::raw_input::RawInputEvent::HostColorSchemeChanged(_)
+            | crate::raw_input::RawInputEvent::Unsupported => {}
+        }
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn spawn_windows_client_accept_thread(
     listener: LocalListener,
@@ -482,6 +567,12 @@ impl HeadlessServer {
                 crate::render_prof::event("full_render_cause.api_requests");
             }
 
+            self.app.remote_projection_runtime.reconcile(
+                &mut self.app.state,
+                &self.app.remote_hosts,
+                &self.app.event_tx,
+            );
+
             self.app.sync_focus_events();
             self.app.sync_session_save_schedule();
 
@@ -537,6 +628,14 @@ impl HeadlessServer {
                     crate::render_prof::event("full_render.invoke");
                     self.render_and_stream();
                 }
+                // Full render/compute_view just published exact projected pane
+                // geometry, allowing first-time stream admission without a
+                // guessed remote PTY size.
+                self.app.remote_projection_runtime.reconcile(
+                    &mut self.app.state,
+                    &self.app.remote_hosts,
+                    &self.app.event_tx,
+                );
                 self.app.last_render_at = Some(now);
                 needs_render = false;
                 needs_full_render = false;
@@ -2598,6 +2697,18 @@ impl HeadlessServer {
                     Some(ClientConnectionMode::TerminalObserve { .. })
                 ) {
                     return false;
+                }
+                if let Some(ClientConnection {
+                    mode: ClientConnectionMode::TerminalAttach { terminal_id },
+                    ..
+                }) = self.clients.get(&client_id)
+                {
+                    if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
+                        if let Err(err) = apply_terminal_attach_input_events(runtime, events) {
+                            warn!(client_id, terminal_id = %terminal_id, err = %err);
+                        }
+                    }
+                    return true;
                 }
                 let events = events
                     .iter()
@@ -5383,6 +5494,50 @@ next_tab = ""
             Bytes::from("x")
         );
 
+        drop(runtime);
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn terminal_control_structured_key_and_paste_use_authoritative_runtime_modes() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                20,
+                5,
+                4096,
+                b"\x1b[?2004h",
+                8,
+            );
+
+        apply_terminal_attach_input_events(
+            &runtime,
+            vec![
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Enter,
+                    modifiers: 0,
+                    kind: crate::protocol::ClientKeyKind::Press,
+                },
+                crate::protocol::ClientInputEvent::Paste {
+                    text: "projected".into(),
+                },
+            ],
+        )
+        .expect("structured control input");
+
+        assert_eq!(
+            input_rx.try_recv().expect("encoded Enter"),
+            Bytes::from("\r")
+        );
+        assert_eq!(
+            input_rx.try_recv().expect("bracketed paste"),
+            Bytes::from("\x1b[200~projected\x1b[201~")
+        );
         drop(runtime);
         drop(_runtime_guard);
         rt.shutdown_timeout(Duration::from_millis(100));

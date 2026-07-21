@@ -1349,7 +1349,6 @@ impl ContextMenuState {
                 "Close pane",
             ],
             ContextMenuKind::RemoteProjectedPane { .. } => &[
-                "Attach in new split",
                 "Focus pane",
                 "Rename pane",
                 "Clear pane name",
@@ -1498,6 +1497,17 @@ pub struct AppState {
     pub active: Option<usize>,
     pub(crate) previous_pane_focus: Option<PaneFocusTarget>,
     pub(crate) selected_remote_space: Option<crate::remote_source::RemoteSpaceKey>,
+    /// Current runtime projection generation. Advanced before any stream
+    /// teardown/source/focus reconciliation so late frame/status/closure events
+    /// from a predecessor are rejected deterministically.
+    pub(crate) remote_projection_generation: u64,
+    /// Bounded pure frame/status cache for the currently selected remote space.
+    /// Stream handles, sockets, threads and SSH children live on `App`, not
+    /// here. This field is intentionally absent from session persistence.
+    pub(crate) remote_projection_frames: std::collections::BTreeMap<
+        crate::remote_source::RemoteProjectionTerminalKey,
+        crate::remote_source::RemoteProjectionFrameEntry,
+    >,
     pub(crate) selected_remote_agent: Option<crate::remote_source::RemoteAgentKey>,
     pub selected: usize,
     pub mode: Mode,
@@ -1687,8 +1697,19 @@ impl AppState {
             return;
         }
 
+        // Source selection is an authority-routing boundary. Compute the
+        // selected remote workspace BEFORE storing the new source so switching
+        // local -> remote A -> remote B replaces the projection atomically and
+        // never leaves the unchanged local workspace visible underneath. The
+        // authoritative remotely-focused workspace wins; if the remote marks
+        // none focused, choose the deterministic first workspace by its remote
+        // display number then id. Local focus/layout state is never mutated.
+        let selected_remote_space = match &source {
+            SidebarSource::Local => None,
+            SidebarSource::Remote(host) => self.focused_remote_space_for_host(host),
+        };
         self.sidebar_source = source;
-        self.selected_remote_space = None;
+        self.selected_remote_space = selected_remote_space;
         self.selected_remote_agent = None;
         self.workspace_scroll = 0;
         self.agent_panel_scroll = 0;
@@ -1700,6 +1721,194 @@ impl AppState {
         // clamps the offset.
     }
 
+    fn focused_remote_space_for_host(
+        &self,
+        host: &crate::remote_source::RemoteHostKey,
+    ) -> Option<crate::remote_source::RemoteSpaceKey> {
+        let mut workspaces = self.remote_sources.workspace_entries_for_host(host)?;
+        workspaces.sort_by(|left, right| {
+            left.workspace
+                .number
+                .cmp(&right.workspace.number)
+                .then_with(|| {
+                    left.workspace
+                        .workspace_id
+                        .cmp(&right.workspace.workspace_id)
+                })
+        });
+        let workspace = workspaces
+            .iter()
+            .find(|entry| entry.workspace.focused)
+            .or_else(|| workspaces.first())?;
+        Some(crate::remote_source::RemoteSpaceKey {
+            host: host.host.clone(),
+            session: host.session.clone(),
+            workspace_id: workspace.workspace.workspace_id.clone(),
+        })
+    }
+
+    /// If a remote source was selected before its first workspace snapshot
+    /// arrived, select its authoritative focused workspace as soon as that
+    /// snapshot becomes available. Never replaces a deliberate existing
+    /// selection and never touches local workspace focus/layout.
+    pub(crate) fn select_remote_focused_workspace_if_missing(
+        &mut self,
+        host: &crate::remote_source::RemoteHostKey,
+    ) {
+        if self.selected_remote_space.is_some()
+            || self.sidebar_source != SidebarSource::Remote(host.clone())
+        {
+            return;
+        }
+        self.selected_remote_space = self.focused_remote_space_for_host(host);
+    }
+
+    /// Advance projection generation before runtime teardown/reconciliation.
+    /// A true source/space replacement clears all old frames for strict source
+    /// isolation. A same-source lifecycle transition (e.g. disconnect) can
+    /// preserve last-known frames by retagging them stale to the new generation.
+    pub(crate) fn begin_remote_projection_generation(
+        &mut self,
+        source: Option<&crate::remote_source::RemoteSpaceKey>,
+        preserve_last_known: bool,
+    ) -> u64 {
+        self.remote_projection_generation = self.remote_projection_generation.wrapping_add(1);
+        if self.remote_projection_generation == 0 {
+            self.remote_projection_generation = 1;
+        }
+        let generation = self.remote_projection_generation;
+        if preserve_last_known {
+            self.remote_projection_frames.retain(|key, entry| {
+                let keep = source.is_some_and(|source| key.belongs_to(source));
+                if keep {
+                    entry.generation = generation;
+                    entry.status =
+                        crate::remote_source::RemoteProjectionStreamStatus::StaleLastKnown;
+                    entry.message =
+                        Some("remote stream unavailable; showing last-known frame".into());
+                }
+                keep
+            });
+        } else {
+            self.remote_projection_frames.clear();
+        }
+        generation
+    }
+
+    pub(crate) fn seed_remote_projection_streams(
+        &mut self,
+        generation: u64,
+        entries: impl IntoIterator<
+            Item = (
+                crate::remote_source::RemoteProjectionTerminalKey,
+                crate::remote_source::RemoteProjectionStreamRole,
+                crate::remote_source::RemoteProjectionStreamStatus,
+                Option<String>,
+            ),
+        >,
+    ) {
+        if generation != self.remote_projection_generation {
+            return;
+        }
+        for (key, role, status, message) in entries {
+            if !self
+                .selected_remote_space
+                .as_ref()
+                .is_some_and(|selected| key.belongs_to(selected))
+            {
+                continue;
+            }
+            let previous_frame = self
+                .remote_projection_frames
+                .get(&key)
+                .and_then(|entry| entry.frame.clone());
+            self.remote_projection_frames.insert(
+                key,
+                crate::remote_source::RemoteProjectionFrameEntry {
+                    generation,
+                    role,
+                    status,
+                    frame: previous_frame,
+                    message,
+                },
+            );
+        }
+    }
+
+    pub(crate) fn apply_remote_projection_stream_event(
+        &mut self,
+        key: crate::remote_source::RemoteProjectionTerminalKey,
+        generation: u64,
+        role: crate::remote_source::RemoteProjectionStreamRole,
+        status: crate::remote_source::RemoteProjectionStreamStatus,
+        frame: Option<crate::protocol::FrameData>,
+        message: Option<String>,
+    ) {
+        if generation != self.remote_projection_generation
+            || !self
+                .selected_remote_space
+                .as_ref()
+                .is_some_and(|selected| key.belongs_to(selected))
+        {
+            return;
+        }
+        let Some(entry) = self.remote_projection_frames.get_mut(&key) else {
+            return;
+        };
+        if entry.generation != generation {
+            return;
+        }
+        entry.role = role;
+        entry.status = status;
+        if let Some(frame) = frame {
+            entry.frame = Some(frame);
+        }
+        entry.message = message;
+    }
+
+    pub(crate) fn remote_projection_frame(
+        &self,
+        selected: &crate::remote_source::RemoteSpaceKey,
+        terminal_id: &str,
+    ) -> Option<&crate::remote_source::RemoteProjectionFrameEntry> {
+        self.remote_projection_frames
+            .get(&crate::remote_source::RemoteProjectionTerminalKey {
+                host: selected.host.clone(),
+                session: selected.session.clone(),
+                workspace_id: selected.workspace_id.clone(),
+                terminal_id: terminal_id.to_owned(),
+            })
+    }
+
+    /// Resolve an OSC-8 hyperlink from the exact selected remote semantic
+    /// frame/hit area. Coordinates are translated into the bordered pane
+    /// interior; stale frames remain copy/open-readable while terminal input
+    /// stays disabled by their stream status.
+    pub(crate) fn remote_projection_url_at(&self, column: u16, row: u16) -> Option<String> {
+        let selected = self.selected_remote_space.as_ref()?;
+        let hit = self.view.remote_projection_hit_areas.iter().find(|hit| {
+            column >= hit.rect.x
+                && column < hit.rect.x.saturating_add(hit.rect.width)
+                && row >= hit.rect.y
+                && row < hit.rect.y.saturating_add(hit.rect.height)
+        })?;
+        let terminal_id = hit.terminal_id.as_deref()?;
+        let frame = self
+            .remote_projection_frame(selected, terminal_id)?
+            .frame
+            .as_ref()?;
+        let col = column.checked_sub(hit.rect.x.saturating_add(1))?;
+        let frame_row = row.checked_sub(hit.rect.y.saturating_add(1))?;
+        if col >= frame.width || frame_row >= frame.height {
+            return None;
+        }
+        let cell = frame
+            .cells
+            .get(frame_row as usize * frame.width as usize + col as usize)?;
+        let hyperlink = cell.hyperlink? as usize;
+        frame.hyperlinks.get(hyperlink).cloned()
+    }
+
     pub(crate) fn effective_sidebar_source(&self) -> SidebarSource {
         if self.view.layout != ViewLayout::Desktop
             || self.sidebar_collapsed
@@ -1709,6 +1918,16 @@ impl AppState {
         }
 
         self.sidebar_source.clone()
+    }
+
+    /// Whether the main workspace control surface is currently reserved for a
+    /// remote source. This remains true even while a selected remote host is
+    /// waiting for its first authoritative workspace snapshot, so local panes,
+    /// hit targets, and terminal input never bleed through the remote source
+    /// boundary.
+    pub(crate) fn remote_projection_surface_active(&self) -> bool {
+        self.selected_remote_space.is_some()
+            || matches!(self.effective_sidebar_source(), SidebarSource::Remote(_))
     }
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
@@ -1907,6 +2126,8 @@ impl AppState {
             active: None,
             previous_pane_focus: None,
             selected_remote_space: None,
+            remote_projection_generation: 0,
+            remote_projection_frames: std::collections::BTreeMap::new(),
             selected_remote_agent: None,
             selected: 0,
             mode: Mode::Navigate,
@@ -2545,6 +2766,97 @@ mod tests {
             menu.items(),
             &["Rename", "Close", "New worktree", "Open worktree..."]
         );
+    }
+
+    #[test]
+    fn projected_pane_menu_has_no_takeover_or_new_split_affordance() {
+        let menu = ContextMenuState {
+            kind: ContextMenuKind::RemoteProjectedPane {
+                target: RemoteProjectedPaneTarget {
+                    host: "remote-a".into(),
+                    session: "default".into(),
+                    terminal_id: "term-a".into(),
+                    label: "pane".into(),
+                },
+            },
+            x: 0,
+            y: 0,
+            list: MenuListState::new(0),
+        };
+        assert!(!menu.items().contains(&"Attach in new split"));
+        assert!(!menu.items().iter().any(|item| item.contains("takeover")));
+        assert!(menu.items().contains(&"Focus pane"));
+    }
+
+    fn remote_workspace_info(
+        id: &str,
+        number: usize,
+        focused: bool,
+    ) -> crate::api::schema::WorkspaceInfo {
+        crate::api::schema::WorkspaceInfo {
+            workspace_id: id.into(),
+            number,
+            label: id.into(),
+            focused,
+            pane_count: 1,
+            tab_count: 1,
+            active_tab_id: format!("tab-{id}"),
+            agent_status: crate::api::schema::AgentStatus::Unknown,
+            worktree: None,
+        }
+    }
+
+    #[test]
+    fn source_switch_auto_projects_focused_remote_and_restores_unchanged_local_workspace() {
+        let mut state = AppState::test_new();
+        let local = crate::workspace::Workspace::test_new("local");
+        let local_focus = local.focused_pane_id();
+        state.workspaces = vec![local];
+        state.active = Some(0);
+        let remote_a = crate::remote_source::RemoteHostKey::new("remote-a", "default");
+        let remote_b = crate::remote_source::RemoteHostKey::new("remote-b", "default");
+        state.remote_sources.replace_workspace_snapshot(
+            remote_a.clone(),
+            vec![
+                remote_workspace_info("a-first", 1, false),
+                remote_workspace_info("a-focused", 2, true),
+            ],
+        );
+        state.remote_sources.replace_workspace_snapshot(
+            remote_b.clone(),
+            vec![
+                remote_workspace_info("b-second", 2, false),
+                remote_workspace_info("b-first", 1, false),
+            ],
+        );
+
+        state.select_sidebar_source(SidebarSource::Remote(remote_a));
+        assert_eq!(
+            state
+                .selected_remote_space
+                .as_ref()
+                .map(|space| space.workspace_id.as_str()),
+            Some("a-focused")
+        );
+        assert_eq!(state.active, Some(0));
+        assert_eq!(state.workspaces[0].focused_pane_id(), local_focus);
+
+        state.select_sidebar_source(SidebarSource::Remote(remote_b));
+        assert_eq!(
+            state
+                .selected_remote_space
+                .as_ref()
+                .map(|space| space.workspace_id.as_str()),
+            Some("b-first"),
+            "no authoritative focus uses deterministic number/id fallback"
+        );
+        assert_eq!(state.active, Some(0));
+        assert_eq!(state.workspaces[0].focused_pane_id(), local_focus);
+
+        state.select_sidebar_source(SidebarSource::Local);
+        assert!(state.selected_remote_space.is_none());
+        assert_eq!(state.active, Some(0));
+        assert_eq!(state.workspaces[0].focused_pane_id(), local_focus);
     }
 
     #[test]

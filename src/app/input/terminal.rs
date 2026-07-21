@@ -34,38 +34,23 @@ impl App {
 
         let key_event = key.as_key_event();
 
-        // A projected remote space is read-only: never forward keys, trigger
-        // navigation, launch custom commands, or enter prefix mode while one is
-        // selected. This guard must precede all direct-navigation,
-        // custom-command, and prefix-key checks so none of those handlers fire
-        // while a projection is active.
-        if self.state.selected_remote_space.is_some() {
-            debug!(
-                code = ?key_event.code,
-                "dropping terminal key event while projected remote space is selected"
-            );
-            // Narrow exception: plain Enter (no modifiers) on the focused live
-            // projection pane schedules a runtime-only attach split and clears the
-            // selection. Modified Enter, and every other key, remain dropped.
-            if key_event.code == KeyCode::Enter && key_event.modifiers.is_empty() {
-                if let Some(target) = self
-                    .state
-                    .view
-                    .remote_projection_hit_areas
-                    .iter()
-                    .find(|h| h.focused && h.live)
-                    .and_then(|h| {
-                        Some(crate::remote_source::RemoteAttachTarget {
-                            host: h.host.clone(),
-                            session: h.session.clone(),
-                            terminal_id: h.terminal_id.clone()?,
-                            label: h.label.clone(),
-                        })
-                    })
-                {
-                    self.state.request_remote_attach_in_new_split = Some(target);
-                    self.state.selected_remote_space = None;
-                }
+        // A projected remote space is an authority-routing boundary. Terminal
+        // keys go only to the current live controller stream as STRUCTURED
+        // input; the authoritative remote TerminalRuntime encodes its keyboard
+        // protocol/modes. Unsupported/stale/owned states consume fail-closed and
+        // never fall through to a local pane. The old plain-Enter
+        // `request_remote_attach_in_new_split` path is deliberately removed.
+        if self.state.remote_projection_surface_active() {
+            if let Some(code) = crate::protocol::ClientKeyCode::from_crossterm(key_event.code) {
+                let _ = self.remote_projection_runtime.send_input(
+                    &self.state,
+                    crate::protocol::ClientInputEvent::Key {
+                        code,
+                        modifiers: key_event.modifiers.bits(),
+                        kind: crate::protocol::ClientKeyKind::from_crossterm(key_event.kind),
+                    },
+                    &self.event_tx,
+                );
             }
             return None;
         }
@@ -1254,8 +1239,9 @@ mod tests {
             workspace_id: "ws-remote".to_string(),
         });
 
-        // A plain char key that would otherwise resolve the focused pane runtime
-        // and forward to it; the projection guard must drop it before lookup.
+        // A plain char key that would otherwise resolve the local focused pane
+        // runtime. With no live controller registry in this pure test it is
+        // consumed fail-closed before local lookup.
         let prepared = app.prepare_terminal_key_forward(TerminalKey::new(
             KeyCode::Char('a'),
             KeyModifiers::empty(),
@@ -1267,7 +1253,7 @@ mod tests {
         // Projection selection must remain: the key was dropped, not an attach.
         assert!(
             app.state.selected_remote_space.is_some(),
-            "projection selection must remain after non-Enter key drop"
+            "projection selection must remain after projected input"
         );
         assert!(
             app.state.request_remote_attach_in_new_split.is_none(),
@@ -1311,24 +1297,24 @@ mod tests {
     }
 
     #[test]
-    fn plain_enter_on_live_focused_projection_pane_schedules_attach() {
+    fn plain_enter_on_live_focused_projection_pane_never_schedules_new_split() {
         let mut app = app_projected_with_live_pane(true, true, true);
 
         let result = app
             .prepare_terminal_key_forward(TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()));
 
-        assert!(result.is_none(), "Enter must not forward bytes");
         assert!(
-            app.state.selected_remote_space.is_none(),
-            "projection must be cleared after Enter attach"
+            result.is_none(),
+            "projected Enter must not reach a local pane"
         );
-        let attach = app
-            .state
-            .request_remote_attach_in_new_split
-            .as_ref()
-            .expect("attach must be scheduled");
-        assert_eq!(attach.host, "jafar");
-        assert_eq!(attach.terminal_id, "term-99");
+        assert!(
+            app.state.selected_remote_space.is_some(),
+            "in-place projection remains selected"
+        );
+        assert!(
+            app.state.request_remote_attach_in_new_split.is_none(),
+            "projected Enter must never create a local split/PTY"
+        );
     }
 
     #[test]

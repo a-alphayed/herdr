@@ -71,6 +71,18 @@ impl FederationCapabilities {
     pub const TAB_CLOSE: &'static str = "tab_close";
     pub const LAYOUT_EXPORT: &'static str = "layout_export";
     pub const TERMINAL_ATTACH: &'static str = "terminal_attach";
+    /// Optional additive capability for in-place terminal session projection
+    /// streams (`ObserveTerminal` / `ControlTerminal` over the existing render
+    /// bridge, reused for projected-pane rendering/control rather than a
+    /// separate full remote attach). Advertised independently of
+    /// [`Self::TERMINAL_ATTACH`]: a remote that advertises `terminal_attach`
+    /// but not this method still fails closed for in-place projection
+    /// streaming (needs-update guidance), and this method is never a
+    /// supervisor-ping prerequisite (see [`Self::REMOTE_API_BRIDGE`] /
+    /// [`Self::AGENT_LIST_LOCAL`], the only two required ping methods). It
+    /// changes no render-wire message shape and does not bump the render
+    /// protocol version.
+    pub const TERMINAL_SESSION_STREAM: &'static str = "terminal_session_stream";
 
     pub fn current() -> Self {
         Self {
@@ -101,6 +113,7 @@ impl FederationCapabilities {
                 Self::TAB_RENAME,
                 Self::LAYOUT_EXPORT,
                 Self::TERMINAL_ATTACH,
+                Self::TERMINAL_SESSION_STREAM,
             ]
             .into_iter()
             .map(str::to_string)

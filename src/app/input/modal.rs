@@ -1501,16 +1501,6 @@ impl App {
                 // mode, so unconditional leave_modal is correct here.
                 leave_modal(&mut self.state);
             }
-            (ContextMenuKind::RemoteProjectedPane { target }, Some("Attach in new split")) => {
-                self.state.request_remote_attach_in_new_split =
-                    Some(crate::remote_source::RemoteAttachTarget {
-                        host: target.host,
-                        session: target.session,
-                        terminal_id: target.terminal_id,
-                        label: target.label,
-                    });
-                leave_modal(&mut self.state);
-            }
             (ContextMenuKind::RemoteProjectedPane { target }, Some("Focus pane")) => {
                 self.focus_remote_projected_pane_via_api(target);
                 leave_modal(&mut self.state);
@@ -2464,7 +2454,7 @@ mod tests {
         assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
         assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
 
-        for idx in [0, 1] {
+        for idx in [3, 4] {
             app.state.mode = Mode::ContextMenu;
             let menu = ContextMenuState {
                 kind: ContextMenuKind::RemoteProjectedPane {

@@ -203,6 +203,25 @@ pub enum AppEvent {
         host: RemoteHostKey,
         generation: u64,
     },
+    /// One in-place remote terminal-session stream published a new lifecycle
+    /// state and optionally a full semantic frame. Tagged with the exact
+    /// projection generation/source/terminal identity; the pure reducer rejects
+    /// every late event that no longer matches the selected source/generation.
+    #[cfg_attr(
+        windows,
+        expect(
+            dead_code,
+            reason = "projection runtime is Unix-only; state/render parity remains cross-platform"
+        )
+    )]
+    RemoteProjectionStream {
+        key: crate::remote_source::RemoteProjectionTerminalKey,
+        generation: u64,
+        role: crate::remote_source::RemoteProjectionStreamRole,
+        status: crate::remote_source::RemoteProjectionStreamStatus,
+        frame: Option<crate::protocol::FrameData>,
+        message: Option<String>,
+    },
     /// A remote workspace create request succeeded on the authoritative host.
     RemoteWorkspaceCreateSucceeded {
         host: RemoteHostKey,

@@ -711,14 +711,14 @@ impl AppState {
                         }
                         return None;
                     }
-                } else if self.selected_remote_space.is_some() {
+                } else if self.remote_projection_surface_active() {
                     // Left-click in the projection body area. Projection hit
                     // areas take precedence: a click on a live pane dispatches
-                    // remote focus and keeps the projection selected (attach is
-                    // Enter or context menu); a click on a stale/read-only pane
+                    // remote focus and keeps the projection selected (the
+                    // focused pane is controlled in place); a click on a stale/read-only pane
                     // is silently consumed; a miss is a no-op — the else-if
                     // chain disables local pane hit-testing while a remote
-                    // projection is selected.
+                    // source owns the control surface.
                     let col = mouse.column;
                     let row = mouse.row;
                     if let Some(hit) = self
@@ -1342,7 +1342,7 @@ impl AppState {
             }
 
             MouseEventKind::Down(MouseButton::Right)
-                if self.selected_remote_space.is_some() && !in_sidebar =>
+                if self.remote_projection_surface_active() && !in_sidebar =>
             {
                 self.workspace_press = None;
                 self.tab_press = None;
@@ -1877,7 +1877,7 @@ impl AppState {
         mouse: MouseEvent,
         in_sidebar: bool,
     ) -> bool {
-        if self.selected_remote_space.is_some() {
+        if self.remote_projection_surface_active() {
             self.right_click_passthrough = None;
             return false;
         }
@@ -3663,7 +3663,6 @@ mod tests {
         assert_eq!(
             menu.items(),
             &[
-                "Attach in new split",
                 "Focus pane",
                 "Rename pane",
                 "Clear pane name",

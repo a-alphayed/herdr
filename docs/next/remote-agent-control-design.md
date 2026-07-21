@@ -3,27 +3,66 @@
 Status: draft proposal  
 Owner: TBD  
 Created: 2026-05-31  
-Updated: 2026-07-05
+Updated: 2026-07-21
 
 ## Summary
 
-This document records Herdr's federated remote-agent control design and the next sidebar presentation direction.
+This document records Herdr's federated remote-agent control design and the
+current source/machine projection control-surface direction.
 
-The current shipped federated MVP adds first-class multi-host agent control to Herdr: agents running on configured remote machines can be aggregated with local agents in the normal local Herdr sidebar/API surfaces and controlled through the same Herdr agent APIs as local agents.
+The shipped federation substrate gives Herdr first-class multi-host agent
+control: agents running on configured remote machines are represented as
+structured remote entries and controlled through capability-gated routes to the
+authoritative remote Herdr node. The local node aggregates metadata, caches
+state, and proxies allowed commands; it does not own remote PTYs, panes, hooks,
+child processes, focus/layout state, or persistence.
 
-The forward UI direction is source/machine projection. The local Herdr node still aggregates configured remote sources, but the proposed next sidebar presentation selects one source at a time (`local`, `jafar`, `work-mini`) and renders that source through the vanilla Herdr `Spaces` and `Agents` panel chrome plus a source rail. This is a presentation/read-model layer, not a change in remote authority and not current shipped behavior.
+Source/machine projection is now the presentation/control boundary. The
+dedicated host-selection rail shipped at
+`ca7c4fc93da9dcdd9edeadb18762c3c2c6b876af` (`feat: add dedicated host selection
+rail`): selecting `local` shows only local Spaces/Agents and the unchanged local
+workspace; selecting a connected remote source shows only that host's Spaces/
+Agents and projects that host's authoritative focused workspace (with a
+deterministic first-space fallback when none is marked focused).
 
-The design is **authoritative remote Herdr nodes with local aggregation and proxying**:
+The current control-surface direction is in-place remote projection, not a
+local-owned remote pane and not the old attach-in-new-split primary path. A
+projected remote layout renders live terminal-session frames from the remote
+Herdr server. The focused projected pane attempts `ControlTerminal { takeover:
+false }`; every other pane uses `ObserveTerminal`. Input, paste, mouse, resize,
+and scroll events inside the controlled pane are sent as structured
+`InputEvents`/`Resize` over that terminal-session stream and are encoded by the
+authoritative remote `TerminalRuntime`. If another controller already owns the
+focused terminal, the local node remains an observer and surfaces owned/
+read-only state; there is no projected takeover affordance. Explicit CLI direct
+attach, including `--takeover`, remains a separate escape hatch.
+
+Local app-global controls remain local: host rail selection, settings/config,
+launcher/global overlays, local client detach, and diagnostics/copy-only
+B.5d affordances are not routed to remote panes. Workspace/tab/pane controls
+that already have federation routes are routed only when the selected remote
+host is connected, fresh, and advertises the required capability. Stale,
+disconnected, unsupported, or capability-mismatched projections are
+remote-scoped read-only and never fall through to local mutations. Projection
+streams and frames are runtime/cache state only and are not persisted.
+
+The design remains **authoritative remote Herdr nodes with local aggregation,
+projection, and proxying**:
 
 ```text
 Every host runs its own authoritative Herdr server.
-The local Herdr server aggregates remote AgentInfo and proxies agent control over SSH.
+The local Herdr server aggregates remote AgentInfo and proxies allowed control over SSH.
 Remote hooks report to their own host's local Herdr socket, unchanged.
-Clicking a remote agent focuses/attaches to the exact remote session/tab/pane where it lives.
+Selecting a machine routes the workspace control surface to that machine.
 Durability remains per authoritative Herdr server.
 ```
 
-This is **not** a "local server owns a remote PTY" design. Remote panes and agents are owned by the Herdr server on the machine where they run. The local Herdr instance acts as an aggregation/control plane: it displays remote metadata, routes allowed commands, and opens direct attach/proxy views for interaction. The current MVP can show local and remote agents together; the next presentation layer should project one selected source at a time without changing ownership.
+This is **not** a "local server owns a remote PTY" design. Remote panes and
+agents are owned by the Herdr server on the machine where they run. The local
+Herdr instance displays remote metadata, renders selected remote terminal
+frames, and routes allowed commands/input to the owning host without creating a
+local pane, local split, local PTY, remote-hook relay, or projection persistence
+record.
 
 ## Headless prompt submit and teardown
 
@@ -45,27 +84,73 @@ Remote submit is federation-routed like `agent.send`: the controller resolves a 
 
 The controller-only headless orchestration path is `place -> submit prompt -> agent reacts -> controller reads reaction`, with no SSH/manual attach step. `agent.submit` provides the submit primitive; full end-to-end controller-only runtime proof for composer-style agents is the E.0 validation step.
 
-### Interactive projected pane attach (Phase E.1)
+### In-place projected terminal observe/control (Phase E.1 successor)
 
-Phase E.1 makes remote workspace projection interactive: a projected pane that has a live `terminal_id` can be clicked or focused-and-Enter'd to open a local attach split, replacing the previous read-only view.
+The current projected-pane primary path is in-place observe/control through the
+existing render/client terminal-session protocol. A selected remote workspace no
+longer opens a local attach split on click or plain Enter.
 
 Mechanism:
 
-- `layout.export` pane nodes now carry `terminal_id` (the server-assigned transient id; omitted by older remotes).
-- `compute_view_internal` computes `RemoteProjectionHitArea` geometry for each projected pane, carrying `host`, `session`, `terminal_id`, `focused`, and `live` state.
-- Mouse click on a live hit area, or plain Enter on the focused live pane, sets `request_remote_attach_in_new_split` to a `RemoteAttachTarget { host, session, terminal_id, label }` and clears `selected_remote_space`.
-- `precheck_remote_attach_target` validates host connectivity via `host_status()` only; it does not require the `terminal_id` to be in the local agent cache — the remote server validates it.
-- Paste and all non-Enter keys continue to be swallowed while a remote projection is selected. The plain-Enter exception is narrow: plain Enter (no modifiers) only, and only when the hit area is both focused and live with a `terminal_id`.
-- Stale projections (last-known snapshots from a disconnected host) remain fully read-only; their panes render without the live border style and do not respond to click or Enter.
-- `<host>/terminal:<id>` is also exposed as a CLI target form: `herdr agent attach <host>/terminal:<id> [--takeover]`.
+- `layout.export` pane nodes carry remote `pane_id`/`terminal_id` values (the
+  server-assigned transient ids; omitted by older remotes).
+- Source selection chooses the selected host's authoritative focused workspace
+  immediately, falling back deterministically to the first remote workspace by
+  display number/id when no workspace is marked focused. Selecting `local`
+  restores the unchanged local workspace.
+- `compute_view` computes `RemoteProjectionHitArea` geometry for each projected
+  pane, carrying exact `host`, `session`, `workspace_id`, `pane_id`,
+  `terminal_id`, `focused`, and live/read-only state. Local pane hit targets,
+  tab hit targets, split borders, and resizing are suppressed while a remote
+  source owns the control surface.
+- A connected/fresh remote that advertises the additive
+  `terminal_session_stream` capability may open one terminal-session stream per
+  projected layout leaf, bounded by the authoritative 24-pane layout cap. The
+  focused leaf requests `ControlTerminal { takeover: false }`; every other leaf
+  requests `ObserveTerminal`.
+- A remote advertising `terminal_attach` but not `terminal_session_stream` fails
+  closed for in-place projection with needs-update guidance. The new capability
+  is optional/additive and not a supervisor-ping prerequisite; it changes no
+  render-wire shape and does not bump `PROTOCOL_VERSION`.
+- Terminal-session streams use the prepared no-start bridge path. Selecting or
+  projecting a host never starts/stops/setup/installs/updates/wakes the remote
+  Herdr server. If the remote session/socket is not already available, streaming
+  fails closed/read-only.
+- Key, paste, mouse, resize, and scroll events inside the focused controlled
+  pane are sent as structured `ClientMessage::InputEvents` / `Resize` over the
+  controller stream. The remote `TerminalRuntime` encodes keyboard protocol,
+  bracketed paste, mouse protocol/encoding, alternate scroll behavior, and PTY
+  resize semantics. The projecting host does not guess raw terminal bytes.
+- Mouse coordinates are clipped and translated into pane-interior coordinates.
+  Pane borders, source rail, sidebar, tab strip, overlays, and global app
+  shortcuts remain local UI controls.
+- Observer streams never acquire ownership and ignore input. If
+  `ControlTerminal { takeover: false }` is refused because another controller
+  owns the terminal, the pane falls back to observe, is marked owned/read-only,
+  and no projected UI offers takeover. CLI `herdr agent attach
+  <host>/terminal:<id> [--takeover]` remains the explicit separate escape hatch.
+- Source, workspace, tab, focus, or generation changes release prior streams by
+  sending `Detach`/terminal release, closing local stream sockets, and tearing
+  down bridge workers before admitting the next generation. Late frames or
+  closures must carry the old generation/source/terminal identity and are
+  rejected.
+- Stale/disconnected projections may keep clearly marked last-known remote
+  frames for orientation, but they are read-only. Unsupported/capability-
+  mismatched projections never fall through to local input or mutation.
+- Projection frames/streams are runtime/cache state only. They are excluded from
+  session snapshots and persistence.
 
 Invariants preserved:
 
-- `RemoteSpaceKey { host, session, workspace_id }` is SELECTION-ONLY — it is not a `RemoteAttachTarget`.
+- `RemoteSpaceKey { host, session, workspace_id }` is a projection source key,
+  not a local `RemoteAttachTarget` and not globally unique without its host/
+  session.
 - No-takeover default; `--takeover` is CLI-only.
-- The runtime-only attach split is not persisted.
-- Projection hit areas take precedence in mouse routing when a projection is selected.
-- Remote source authority, hook relay, and PTY ownership are unchanged.
+- No local pane, split, PTY, hook relay, or persistence record is created by
+  in-place projection.
+- Existing explicit direct attach remains available outside the projected UI.
+- Remote source authority, remote hook reporting, stale/read-only safety,
+  capability gates, and no uncertain non-idempotent retry are unchanged.
 
 ### Teardown (first narrow path)
 
@@ -138,47 +223,52 @@ Projected remote tabs are now federation-routed to the authoritative remote Herd
 - Target resolution: resolves the host-qualified terminal id against live active-tab projections from `layout.export`. Stale, unavailable, or disconnected projections are rejected before forwarding.
 - Remote authority: the forwarded request carries the resolved authoritative remote `pane_id`. The local node does not create a local-owned remote PTY or relay any remote hooks.
 - Projection reconciliation: successful projected-pane mutations refresh bounded metadata (`tab.list` and, when advertised, `layout.export`) for the affected workspace so the active projection reflects remote focus/layout/name changes promptly. Refresh failures only mark the local cache stale or unavailable through normal projection-cache semantics; they do not retry uncertain delivery or turn an already-successful remote mutation into an error.
-- UI: left-clicking a live projected pane dispatches `tui.remote_projection.pane.focus` (`pane.focus { pane_id: "<host>/terminal:<terminal_id>" }`) instead of opening a local attach split. The existing left-click attach path is preserved as **Attach in new split** in the context menu (right-click). The context menu also exposes **Focus pane** to reach the same remote focus action from the context menu.
-- Non-goals remain: no embedded remote pane proxy, no local-owned remote PTY, no broad workspace/tab management, no arbitrary SSH command, no transitive routing, and no uncertain-delivery retry.
+- UI: left-clicking a live non-focused projected pane dispatches `tui.remote_projection.pane.focus` (`pane.focus { pane_id: "<host>/terminal:<terminal_id>" }`) to move authoritative remote focus. The focused pane is controlled in place through `ControlTerminal { takeover: false }`; **Attach in new split** is not exposed in the projected-pane context menu. The context menu still exposes **Focus pane** to reach the same remote focus action from the context menu, plus the existing routed rename/clear/close affordances when capabilities allow them.
+- Non-goals remain: no projected takeover affordance, no local-owned remote PTY, no broad workspace/tab management, no arbitrary SSH command, no transitive routing, and no uncertain-delivery retry.
 
 ## Core Invariants
 
 - A host owns the PTYs and child processes it runs.
-- A Herdr server owns the workspaces, tabs, panes, terminals, hooks, and persistence inside its own session.
-- Other Herdr servers may aggregate, route commands to, and proxy views of those panes, but they do not own the remote PTYs.
+- A Herdr server owns the workspaces, tabs, panes, terminals, hooks, focus/layout state, and persistence inside its own session.
+- Other Herdr servers may aggregate, cache, route commands to, and render/proxy views of those panes, but they do not own the remote PTYs or persistence.
 - Remote hooks report to the remote host's local Herdr socket. They do not relay to the aggregating host.
 - Remote targets are always host-qualified in MVP.
-- Existing `herdr --remote <target>` remains a remote TUI attach mode. Federated agents use a remote API bridge, not the render/client bridge.
-- Source/machine projection is a UI/read-model selection. Selecting a source must not change local workspace ownership, focused PTY ownership, remote PTY lifecycle, or hook authority.
-- The source-projection direction described here does not require a protocol bump by itself. Protocol/version changes are required only when server/client wire or API contracts change.
+- Existing `herdr --remote <target>` and CLI terminal attach remain explicit direct remote-client/attach modes. They are separate from the projected in-place control surface.
+- Selecting a source is an authority-routing boundary for the workspace control surface. It must not mutate local workspace ownership/focus/layout, remote PTY lifecycle, hook authority, or persistence by itself.
+- Local app-global controls remain local. Remote workspace/tab/pane controls route only through existing capability-gated federation routes or terminal-session streams for the selected host; unsupported/stale/owned/disconnected targets fail closed and never fall through locally.
+- In-place terminal projection reuses existing render/client messages (`ObserveTerminal`, `ControlTerminal { takeover }`, `InputEvents`, `Resize`, `Detach`, `FrameData`) and the additive `terminal_session_stream` capability. It does not require a render-wire shape change or `PROTOCOL_VERSION` bump.
 
 ## Goals
 
-- Current MVP: remote agents can appear in the normal Herdr sidebar/API surfaces alongside local agents.
-- Next presentation layer: one selected source (`local`, `jafar`, `work-mini`) is projected through vanilla Herdr `Spaces` and `Agents` sidebar chrome.
-- Clicking a remote agent focuses the exact remote session/tab/pane where that agent lives.
-- `herdr agent list/read/send/focus/wait/start` can target local and remote agents.
+- Remote agents can appear in structured sidebar/API surfaces and can be controlled through host-qualified, capability-gated routes.
+- Source/machine projection presents one selected source (`local`, `jafar`, `work-mini`) through Herdr's normal Spaces/Agents/sidebar chrome plus the shipped dedicated host rail.
+- Selecting `local` shows/controls only local state and restores the unchanged local workspace.
+- Selecting a connected remote host shows/controls only that host's spaces/agents, immediately selects/projects its authoritative focused workspace (or deterministic first-space fallback), and renders live projected terminal frames in the authoritative remote layout.
+- The focused projected remote pane is controlled in place with no-takeover semantics; non-focused panes are observed read-only.
+- Existing capability-gated remote controls (workspace create, tab create/focus/close, pane focus/directional focus/split/rename/clear/close, terminal input/resize/scroll, copy-only diagnostics) route to the selected host and never fall through to local.
 - Agents running in any Herdr pane can use one local API surface to inspect/control agents across configured hosts.
 - Remote agent hooks stay local to the remote host and continue using normal Herdr integration semantics.
 - Durability inherits existing Herdr semantics:
   - local agents persist/restore through the local Herdr server;
   - remote agents persist/restore through their own remote Herdr server;
-  - the aggregating local server persists remote host configuration and reconnects/re-aggregates on startup.
-- Reuse the existing `src/remote.rs` SSH/bootstrap/version machinery where it fits.
+  - the aggregating local server persists remote host configuration and reconnects/re-aggregates on startup, but not projection stream/frame placement.
+- Reuse the existing `src/remote.rs` SSH/bootstrap/version machinery where it fits, without automatic setup/update/start from source selection.
 
 ## Non-goals
 
 - Plain `ssh host` panes automatically exposing remote agents.
 - Adopting externally-started remote processes into Herdr. `ssh jafar && codex` is unmanaged unless Codex is started inside a Herdr-managed pane on Jafar.
-- Local Herdr owning remote PTYs in the MVP.
+- Local Herdr owning remote PTYs, panes, hooks, or persistence.
 - Relaying remote hooks back to the local Herdr socket.
 - Replacing each remote host's Herdr server with a dumb remote helper.
-- Browser proxying or remote webview support.
+- Browser proxying, remote webview support, or Kitty graphics support in the first in-place projection unit.
 - Transitive federation/mesh routing in MVP. A node routes only to local agents and explicitly configured remote hosts.
-- Embedded splittable remote panes in the local layout as an MVP. Direct remote terminal attach/proxy is the MVP focus behavior; embedded proxy panes remain an optional later phase.
-- Persisting remote proxy placement in MVP. The aggregator persists remote config only and re-aggregates on restart.
-- Treating a flat unified local+remote sidebar list as the required final UI. It remains valid current aggregation behavior, but source/machine projection is the forward presentation direction.
-- Claiming source projection is shipped before the corresponding UI slice lands.
+- Broad destructive remote workspace/server/process/host management; only the already-scoped capability-gated routes are exposed.
+- Projected takeover UI. `--takeover` remains an explicit CLI direct-attach escape hatch.
+- Creating local splits/local PTYs/local persistence records for projected terminal control.
+- Persisting remote projection stream placement or terminal frames. The aggregator persists remote config and may cache metadata; it does not persist projection streams.
+- Treating a flat unified local+remote sidebar list as the required final UI. It remains valid for API/list surfaces, but the interactive workspace control surface is selected-source projection.
+- Claiming unreleased future graphics/broad embedded-pane behavior as shipped.
 
 ## Terminology
 
@@ -186,14 +276,15 @@ Projected remote tabs are now federation-routed to the authoritative remote Herd
 - **Remote node**: a configured remote Herdr server/session, e.g. Jafar's default Herdr session.
 - **Remote host alias**: local configured name used in targets such as `jafar/codex`.
 - **Source / machine source**: a selectable authority whose state can be projected into the local Herdr UI, e.g. `local`, `jafar`, or `work-mini`.
-- **Source projection**: a UI/read-model selection that renders one source's spaces and agents through normal local Herdr chrome while that source remains authoritative for its own state.
-- **Source rail**: the sidebar affordance for switching the active source projection.
+- **Source projection / projected control surface**: the selected-source Herdr workspace control surface. Local projection shows local state; remote projection shows that remote host's spaces/agents/layout and routes supported controls/input to that authoritative host while it remains the owner of PTYs, panes, hooks, focus/layout, child processes, and persistence.
+- **Source rail / host rail**: the shipped left sidebar affordance for switching the active source projection (`ca7c4fc`).
+- **Terminal-session stream**: an in-place remote render/client stream over `ObserveTerminal` or `ControlTerminal { takeover: false }`, gated by `terminal_session_stream` and backed by the no-start SSH stdio bridge.
 - **All-machines pseudo-projection**: a possible future overview that intentionally shows multiple sources together; it is deferred and is not the default projection model.
 - **SSH target**: the value passed to `ssh`, e.g. `jafar`, `afayed@host`, or a Tailscale DNS name.
 - **Herdr session**: the named Herdr server/socket context on a host. This is not a workspace/space.
 - **Workspace/space**: a workspace inside one Herdr session.
 - **Remote API bridge**: an SSH-backed bridge from the local node to the remote node's Herdr API socket.
-- **Remote render/attach bridge**: a separate bridge used for interactive terminal attach/focus. This is distinct from the API bridge.
+- **Remote render/terminal-session bridge**: a separate no-start bridge used for in-place `ObserveTerminal`/`ControlTerminal` projection streams and explicit direct terminal attach; it is distinct from the JSON API bridge.
 
 ## User Workflows
 
@@ -243,15 +334,28 @@ herdr agent wait jafar/codex --status done
 
 The local Herdr server parses the host-qualified target and proxies the API request to the owning remote node. `agent send` reaches the remote pane and writes text to a composer-style agent, but it does not submit the prompt. Use `agent submit` (`agent.submit`) for headless controller-only prompt submission; `agent send` stays literal text injection.
 
-### 4. Click/focus a remote agent
+### 4. Select a machine and control a remote workspace in place
 
-Clicking `jafar/codex` in the local sidebar should:
+Selecting the host rail row for `local` shows only local Spaces/Agents and the
+unchanged local workspace. Selecting `jafar` shows only Jafar's Spaces/Agents,
+selects Jafar's authoritative focused workspace (or deterministic first-space
+fallback), and renders Jafar's active-tab layout in the main area.
 
-1. route `agent.focus` to Jafar's API socket so Jafar's own session focuses the correct workspace/tab/pane;
-2. open a direct remote terminal attach/proxy to that exact remote terminal;
-3. return to the local Herdr UI on detach.
+For a live projected Jafar workspace:
 
-This is a direct remote terminal attach/proxy, not an embedded local split pane in MVP.
+1. non-focused pane clicks route `pane.focus` to Jafar so Jafar's own session moves focus;
+2. the focused projected pane opens `ControlTerminal { takeover: false }` over the remote terminal-session stream;
+3. every other pane opens `ObserveTerminal` read-only;
+4. key/paste/mouse/resize/scroll inside the focused pane are sent as structured terminal-session events and encoded by Jafar's `TerminalRuntime`;
+5. selecting `local` or another host releases the prior streams and restores the unchanged local workspace when `local` is selected.
+
+If another writable attach already owns the focused Jafar terminal, projection
+falls back to observe and marks that pane owned/read-only. The projected UI does
+not offer takeover. Explicit CLI direct attach remains separate:
+
+```bash
+herdr agent attach jafar/terminal:<id> [--takeover]
+```
 
 ### 5. Agent-to-agent control
 
@@ -306,7 +410,7 @@ AppState.workspaces
   -> AgentPanelEntry
 ```
 
-The current MVP adds a second agent entry source for remote authoritative nodes rather than pretending remote agents are local panes or building a separate dashboard outside the sidebar. Source projection keeps that structured substrate but changes the presentation: the sidebar read model is filtered to one selected source instead of requiring local and remote rows to stay visible side by side.
+The federation substrate adds a second agent entry source for remote authoritative nodes rather than pretending remote agents are local panes or building a separate dashboard outside the sidebar. Source projection keeps that structured substrate but changes the active workspace control surface: one selected source owns the Spaces/Agents/sidebar and main layout projection, while API/list surfaces can still expose host-qualified aggregate data where appropriate.
 
 The existing `herdr --remote <host>` mode is related but not sufficient. It runs a local thin client connected to a full remote Herdr server; the remote server owns the whole UI and the local side blits rendered frames. It cannot merge local and remote agents into one sidebar because the render stream is opaque rendered cells, not structured `AgentInfo`.
 
@@ -350,7 +454,7 @@ Aggregated agent view
   work-mini/pi
 ```
 
-The proposed next sidebar presentation keeps the same aggregation substrate but projects one selected source at a time:
+The shipped host rail and current projection model keep the same aggregation substrate but route the interactive workspace control surface to one selected source at a time:
 
 ```text
 Source rail
@@ -386,7 +490,8 @@ SteamDeck Herdr server
   fetches/subscribes to remote AgentInfo
   displays remote agents in local sidebar
   proxies allowed agent/pane commands to owning node
-  focuses remote agents by attaching/proxying to their remote terminal
+  projects selected remote layouts through observe/control terminal-session streams
+  keeps explicit direct attach/proxy as a separate CLI escape hatch
 ```
 
 ## Components
@@ -477,7 +582,7 @@ Contract:
 - No custom multiplexing protocol is part of MVP.
 - The implementation should work without user SSH multiplexing configuration.
 - It may use a Herdr-owned SSH `ControlMaster`/`ControlPath`/`ControlPersist` optimization internally to amortize authentication and TCP setup, but correctness must not depend on it.
-- The implementation must bound per-host bridge/process count. MVP should assume a small configured fleet (single-digit remote hosts, not dozens) and enforce a per-host concurrent request/wait cap (for example 4 active short-lived/wait bridges), queueing or rejecting excess work instead of spawning unbounded SSH processes. A normally connected idle host should use roughly one long-lived subscription bridge plus occasional heartbeat/request bridges; a focused remote terminal uses a separate attach/render bridge.
+- The implementation must bound per-host bridge/process count. MVP should assume a small configured fleet (single-digit remote hosts, not dozens) and enforce a per-host concurrent request/wait cap (for example 4 active short-lived/wait bridges), queueing or rejecting excess work instead of spawning unbounded SSH processes. A normally connected idle host should use roughly one long-lived subscription bridge plus occasional heartbeat/request bridges. In-place terminal projection uses a separate prepared no-start render/client bridge with one tracked 1:1 worker per projected layout leaf, capped by the 24-pane layout limit; it is not a custom multiplexer and does not share JSON API request framing.
 
 Implementation direction:
 
@@ -503,7 +608,7 @@ Existing API support:
 
 - `ResponseResult::Pong` already carries `version`, `protocol`, and optional `ServerCapabilities`.
 - `ServerCapabilities` now enumerates the federation method set (`FederationCapabilities`) the local node uses as the durable JSON API federation compatibility contract: it is the authoritative per-method gate for hidden bridge use and routed agent/pane/tab/workspace methods, not just `live_handoff`.
-- The supervisor ping requires only `remote_api_bridge` and `agent_list_local` to succeed; every other advertised method (workspace/tab/pane rename, tab/pane focus, tab create/close, workspace create/list, layout export, projected pane split/close, terminal attach, agent read/send/submit/focus/start/teardown) is an optional cached capability that stays false when a remote does not advertise it. New cached fields must never become ping prerequisites.
+- The supervisor ping requires only `remote_api_bridge` and `agent_list_local` to succeed; every other advertised method (workspace/tab/pane rename, tab/pane focus, tab create/close, workspace create/list, layout export, projected pane split/close, terminal attach, `terminal_session_stream`, agent read/send/submit/focus/start/teardown) is an optional cached capability that stays false when a remote does not advertise it. New cached fields must never become ping prerequisites. `terminal_session_stream` gates in-place observe/control streams only; a remote can advertise `terminal_attach` without supporting this projected stream path.
 - Phase 0 may rely on `Pong.version` and `Pong.protocol` for compatibility checks.
 
 Required checks:
@@ -672,20 +777,22 @@ Rules:
 
 ### 8. Sidebar aggregation and source projection
 
-Current shipped behavior: Herdr aggregates local and configured remote agent metadata, so sidebar/API surfaces can show local and remote agents together. Remote entries are native structured entries, not local pane impostors and not a static dashboard.
+API/list surfaces may still aggregate local and configured remote metadata as
+host-qualified entries. Remote entries are native structured entries, not local
+pane impostors and not a static dashboard.
 
-Current local path:
+Local entry source:
 
 ```text
 agent_panel_entries_with_runtimes(app, runtimes)
   -> local Workspace.pane_details(...)
 ```
 
-Current aggregation path:
+Remote entry source:
 
 ```text
-local entries
-+ remote entries from RemoteSource cache
+RemoteSource / RemoteSourceCache snapshots
+  -> host/session-qualified workspace, tab, pane, terminal, agent entries
 ```
 
 Remote entries must carry location data, not just display text:
@@ -697,26 +804,16 @@ enum AgentPanelEntryLocation {
 }
 ```
 
-This lets click-to-focus route precisely to the owning remote node.
-
-Display examples:
-
-```text
-Agents
-  pi                 working
-  codex              blocked
-  jafar/codex        working
-  jafar/claude       idle
-  work-mini/pi       disconnected
-```
-
-Forward presentation direction: source/machine projection. The same cached local/remote entry sources should feed a projected sidebar read model:
+The interactive TUI uses source/machine projection as an authority-routing
+boundary. The dedicated host rail selects exactly one source for the workspace
+control surface:
 
 ```text
-Source rail
-  local
-  jafar
-  work-mini
+Host rail
+  hosts
+  local   ●
+  jafar   connected
+  work-mini disconnected
 
 Active source: local
 
@@ -728,37 +825,53 @@ Spaces
 Agents
   pi
   codex
+
+Main area
+  local active workspace/layout/terminal contents
 ```
 
 ```text
-Source rail
+Host rail
+  hosts
   local
-  jafar
-  work-mini
+  jafar   ● connected
+  work-mini disconnected
 
 Active source: jafar
 
 Spaces
   herdr
   fleet-api
-  footer: new / menu
+  footer: new / menu (capability-gated remote workspace.create)
 
 Agents
   codex
   claude
+
+Main area
+  Jafar authoritative focused workspace/layout
+  pane A: ObserveTerminal live frame
+  pane B: ControlTerminal { takeover: false } live frame/input
 ```
 
 Projection rules:
 
-- `local` projection preserves vanilla Herdr sidebar layout/navigation.
-- Only one source projection is expanded at a time.
-- Switching projected source changes the UI/read model only; it must not change active local workspace, focused PTY, or remote PTY lifecycle.
-- Remote projection uses cached metadata from `RemoteSource`/`RemoteSourceCache` and routes only capability-gated commands to the authoritative remote host.
+- `local` projection preserves vanilla Herdr sidebar layout/navigation and the unchanged local active workspace.
+- Only one source projection owns the workspace control surface at a time.
+- Selecting a remote source chooses that host's authoritative focused workspace immediately, with deterministic first-space fallback only when no remote workspace is marked focused.
+- Switching sources replaces the projected source and releases prior terminal-session streams. It must not mutate local workspace ownership/focus/layout, remote PTY lifecycle, hook authority, or persistence.
+- Remote projection uses cached metadata from `RemoteSource`/`RemoteSourceCache` and routes only capability-gated commands/input to the authoritative remote host.
 - The Spaces footer `new` action operates on the active projection: local creates local; remote creates remote only when connected and capable.
-- Adding/provisioning a machine is a remote config/provisioning action, not the Spaces `new` action.
-- A future all-machines/unified overview may be added as an explicit pseudo-projection; it is deferred and should not be confused with the default projected-source model.
+- Adding/provisioning a machine is a remote config/provisioning action, not the Spaces `new` action. Selecting/projecting a host never starts/stops/setup/installs/updates/wakes the remote Herdr server.
+- Terminal-session streaming is gated by `terminal_session_stream` and prepared no-start bridge state. A remote with `terminal_attach` but without `terminal_session_stream` fails closed for in-place projection; explicit CLI direct attach remains separate.
+- Stale, unavailable, disconnected, owned, or capability-mismatched projections stay remote-scoped read-only and never fall through to local pane/tab/workspace mutation or local terminal input.
+- A future all-machines/unified overview may be added as an explicit pseudo-projection; it is deferred and should not be confused with the default selected-source control surface.
 
-This is a presentation-layer direction. It does not remove the current ability for API/list surfaces to aggregate local and configured remote agents, and it does not require a protocol bump unless the implementation changes wire/API contracts.
+This presentation/control layer does not remove the current ability for API/list
+surfaces to aggregate local and configured remote agents. It does not require a
+protocol bump unless the implementation changes wire/API contracts; the
+in-place terminal stream path reuses existing render/client messages plus the
+additive capability string.
 
 ### 9. Cross-host command routing
 
@@ -899,33 +1012,48 @@ Placement flags, when present with `--host`, refer to remote workspace/tab/pane 
 
 Connection policy gate: `agent.start --host` respects the host's `connection_policy`. A host with `connection_policy = "manual"` (e.g. a sleeping/roaming remote) fails locally before dispatch with a distinct policy error, so it is never woken implicitly. An `on_demand` host with no cached non-connected status may still dispatch on demand; a cached disconnected/unreachable/needs-update status fails fast before forwarding for any host.
 
-### 11. Cross-node focus / direct remote terminal attach
+### 11. Cross-node focus / in-place terminal projection
 
-Click-to-focus is two operations:
+Remote focus/control is split by authority:
 
-1. API operation: proxy `agent.focus` to the remote node so the remote session's own focus is consistent.
-2. Render/terminal operation: open a direct remote terminal attach/proxy to the remote terminal.
+1. API operation: proxy `agent.focus`, `pane.focus`, or `pane.focus_direction` to the remote node so the remote session's own focus/layout is authoritative.
+2. Render/terminal operation: project terminal frames through per-pane terminal-session streams. The focused pane requests `ControlTerminal { takeover: false }`; other panes request `ObserveTerminal`.
 
-MVP attach behavior:
+Primary projected behavior:
 
 ```text
-focus jafar/codex
-  -> remote API bridge: agent.focus codex on Jafar
-  -> remote render/terminal attach bridge: attach to Jafar terminal_id
-  -> user interacts with remote terminal
-  -> detach returns to local Herdr UI
+select source jafar
+  -> local source rail/sidebar switches to Jafar-only spaces/agents
+  -> selected remote focused workspace is projected
+  -> no-start render/terminal bridge opens bounded terminal-session streams
+  -> focused pane: ControlTerminal { takeover: false }
+  -> other panes: ObserveTerminal
+  -> structured InputEvents/Resize route to the focused controller only
+  -> select local/another source: Detach/release, close local stream sockets, tear down bridge workers
 ```
 
-The attach/proxy path rides the remote render/client/terminal attach machinery, not the remote API bridge.
+The in-place terminal-session path rides the remote render/client machinery, not
+the JSON API bridge. It is still remote-authoritative: the remote server owns
+terminal modes, keyboard/mouse encoding, PTY resize, child process lifecycle,
+focus/layout, hooks, and persistence. The local node copies semantic frames into
+the projected geometry and sends structured events; it does not create a local
+PTY or local persistent split.
 
-Open decisions for implementation:
+Ownership/takeover policy is settled for the projected UI: control uses
+`takeover: false`. If the remote terminal already has a writable owner, the
+projected focused pane falls back to observe and is marked owned/read-only. The
+projected UI exposes no takeover action. Explicit direct terminal attach remains
+separate and may expose CLI `--takeover`:
 
-- Whether attach temporarily replaces the local UI or opens a special local proxy surface.
-- How duplicate attaches are shown.
-- How writable ownership/takeover works if the remote terminal already has a writable attach owner. The protocol primitive already exists — `ClientMessage::AttachTerminal { terminal_id, takeover }` (`src/protocol/wire.rs`) carries a `takeover` flag — so this is a policy/UX decision, not new protocol.
-- How resize is forwarded and how detach returns to previous local focus.
+```bash
+herdr agent attach <host>/terminal:<id> [--takeover]
+herdr --remote <target> --session <session>
+```
 
-MVP should prefer direct terminal attach over nested full remote Herdr UI. Embedded split-pane proxy views are deferred.
+Open/future items are limited to polish, not authority changes: richer owned/
+read-only copy, graphics support, and optional future overview/embedded surfaces.
+They must preserve no local-owned remote PTY, no hook relay, no transitive
+routing, and no projection persistence.
 
 ### 12. Remote hooks and integrations
 
@@ -969,7 +1097,7 @@ If SteamDeck Herdr restarts:
 3. SteamDeck reconnects remote API bridges non-interactively — but only for hosts whose `connection_policy = "auto"`. `on_demand` and `manual` hosts (e.g. sleeping/roaming remotes) are not probed or seeded as sources at startup; they are reached only through explicit commands (`manual` refuses implicit mutating dispatch entirely).
 4. SteamDeck resyncs each auto host/session using subscribe/buffer/snapshot/replay.
 5. Sidebar remote entries reappear with current state (auto hosts only).
-6. Any active remote attach/proxy view is not auto-restored in MVP; the user can click the remote agent again.
+6. Projection stream placement and terminal frames are not persisted. Any active in-place projection stream or explicit direct attach is released by the restart; after reconnection the user/source selection can re-open fresh streams from authoritative remote state.
 
 ### Remote node restart
 
@@ -1096,10 +1224,11 @@ means:
 
 ```text
 Keep using the local Herdr UI.
-Connect to Jafar's Herdr API socket over SSH.
-Aggregate Jafar agents into the local sidebar.
+Connect to Jafar's Herdr API socket over SSH for metadata/control routes.
+Aggregate/cache Jafar agents, spaces, tabs, panes, and projection metadata.
 Route host-qualified commands to Jafar.
-Open a direct remote terminal attach/proxy when focusing a Jafar agent.
+When Jafar is selected in the host rail, render/control Jafar's focused workspace in place through no-start terminal-session observe/control streams.
+Keep direct remote terminal attach/proxy as a separate explicit CLI/manual mode.
 ```
 
 Both can reuse SSH/bootstrap/version code. They are different UX modes and should remain distinct.
@@ -1156,11 +1285,12 @@ remote render/terminal attach bridge reuse for focus
 - If connected and event/snapshot confirms absence, remove entry or mark done/closed according to remote state.
 - If disconnected, keep stale until reconnect confirms absence.
 
-### Active proxy attach disconnects
+### Active projection stream or explicit attach disconnects
 
-- Detach/proxy view shows disconnected.
+- In-place projected panes show disconnected/stale/read-only state and keep only clearly marked last-known frames when available.
+- Explicit direct attach/proxy views show disconnected.
 - Remote process remains owned by remote Herdr.
-- User can retry focus after reconnect.
+- User can reselect the source/focus or retry explicit attach after reconnect; uncertain terminal input is not retried automatically.
 
 ### Command in flight when bridge drops
 
@@ -1178,8 +1308,10 @@ Recommended test layers:
 1. Unit tests for target grammar and host-qualified resolution.
 2. Unit tests for cache merge/revision/stale behavior.
 3. Unit tests for RemoteSource supervisor state transitions with a mock remote API.
-4. Integration tests using a second local Herdr named session as a stand-in remote.
-5. Optional SSH integration tests for real remote bridge behavior.
+4. Pure source-projection tests for local/remote source isolation, focused-workspace fallback, no local hit-target/input fallback, stale/read-only rendering, and persistence exclusion.
+5. Bridge/stream lifecycle tests for one worker per projected pane, 24-stream cap, zero workers after source switch, no-start bridge startup, generation/source/terminal rejection, ownership conflict fallback, and bounded teardown under stalled children.
+6. Integration tests using a second local Herdr named session as a stand-in remote.
+7. Optional SSH integration tests for real remote bridge behavior.
 
 Example local test topology:
 
@@ -1409,19 +1541,25 @@ Tests:
 - denied methods are rejected;
 - Docker/local SSH smoke proves configured remote -> supervisor cache -> API list/get -> host-qualified send/read -> disconnect stale -> reconnect without duplicates.
 
-### Phase 3 — Cross-node focus / direct remote terminal attach
+### Phase 3 — Cross-node focus / in-place terminal projection
 
-Goal: clicking/focusing a remote agent takes the user to the exact remote terminal.
+Goal: selecting/focusing a remote source takes the user to that source's
+authoritative workspace control surface without creating local-owned remote
+panes.
 
 Non-goals:
 
-- embedded splittable local proxy pane;
-- persistent proxy placement.
+- local-owned remote PTY or persistent local proxy placement;
+- projected takeover UI;
+- broad remote workspace/server/process management;
+- automatic remote setup/update/start from source selection.
 
 Expected modules/files:
 
 ```text
 src/ui/sidebar.rs
+src/ui.rs
+src/app/remote_projection.rs
 src/client/mod.rs
 src/remote.rs
 src/app/api.rs
@@ -1431,24 +1569,28 @@ src/cli/agent.rs
 Control flow:
 
 ```text
-click jafar/codex
-  -> route remote agent.focus to Jafar API
-  -> open remote render/terminal attach bridge to Jafar terminal_id
-  -> user interacts
-  -> detach returns to local UI
+select source jafar
+  -> local host rail/sidebar scopes to Jafar only
+  -> select Jafar authoritative focused workspace/fallback
+  -> open prepared no-start terminal-session bridge
+  -> focused pane: ControlTerminal { takeover: false }
+  -> other panes: ObserveTerminal
+  -> structured input/resize route only to focused controller
+  -> select local/another source: Detach/release and bounded teardown
 ```
 
 Acceptance criteria:
 
-- Clicking a remote sidebar agent opens an interactive view of the exact remote terminal.
-- Detach returns to local Herdr.
-- If bridge drops, view reports disconnected and remote process remains running.
+- Selecting `local` shows/controls only local and restores unchanged local workspace state.
+- Selecting a connected remote source shows only that host's spaces/agents and immediately projects its authoritative focused workspace/fallback.
+- Every projected pane renders live semantic terminal frames when streaming is supported; stale/disconnected/unsupported frames are visibly read-only.
+- The focused pane attempts no-takeover control immediately; ownership conflict falls back to observe/read-only and never evicts the owner.
+- Key, paste, mouse, resize, and scroll are routed as structured events to the authoritative remote runtime; observers ignore input.
+- Unsupported or stale controls never fall through to local panes/tabs/workspaces.
+- Stream admission and teardown are bounded: one 1:1 worker per layout leaf up to 24, generation-first release, Detach/socket shutdown, and bounded worker/child teardown.
+- Projection frame/stream state is not persisted.
 
-Open decisions to resolve before implementation:
-
-- writable ownership/takeover if remote terminal already has an attach owner (the `AttachTerminal { takeover }` primitive already exists in `src/protocol/wire.rs`; this is a policy/UX choice, not new protocol);
-- exact detach key/path;
-- whether attach replaces the local TUI temporarily or opens a special local proxy surface.
+Explicit direct remote terminal attach remains available separately for CLI/manual escape-hatch use, including `--takeover`; it is not the projected primary path.
 
 ### Phase 4 — Remote agent start
 
@@ -1486,7 +1628,7 @@ Implemented in this spike:
 - remote API bridge and configured remote host/target grammar;
 - `RemoteSource` cache, supervisors, and sidebar/list aggregation;
 - host-qualified `agent get/read/send/focus`;
-- CLI direct remote terminal attach via the existing remote client/render bridge;
+- CLI direct remote terminal attach via the existing remote client/render bridge (explicit escape hatch, not the projected primary path);
 - CLI/API remote `agent.start`, defaulting to a new remote workspace when no remote workspace/tab placement is supplied;
 - federation capability/method negotiation for the hidden remote API bridge and routed agent methods;
 - read-only `herdr remote status [HOST]` and `herdr remote check [HOST]` diagnostics;
@@ -1494,13 +1636,15 @@ Implemented in this spike:
 - explicit live setup/update orchestration `herdr remote setup <HOST> [--handoff]` (resolves exactly one configured host before SSH, then reuses the existing interactive remote preparation pipeline — SSH target/session/timeout validation, remote platform detection, find/install/update of a compatible Herdr binary via existing confirmation prompts, `ensure_remote_server_ready` over the existing confirmed-stop/live-handoff path, and a capability-gated federation `ping`; it does not edit local config and adds no new SSH shapes, protocol, or JSON schema);
 - live remote source failure reasons (`disconnected`, `needs update`, `unreachable`) shared between the supervisor, CLI status, and sidebar labels;
 - sidebar host-state rows for configured auto-connect remotes when no cached agents exist;
+- dedicated source/host rail shipped at `ca7c4fc` (`feat: add dedicated host selection rail`), selecting one source for the Spaces/Agents/control surface;
+- current in-place projected terminal observe/control direction: live projected frames through `ObserveTerminal` / `ControlTerminal { takeover: false }`, gated by additive `terminal_session_stream`, no local pane/split/PTY/persistence and no projected takeover affordance;
 - Docker smoke coverage for the configured one-hop path: get/read/send/focus/start, disconnect, and reconnect;
 - real-host Jafar smoke for capability/status commands and isolated `fed-*` host-qualified control after updating the remote binary;
 - verified real-host gap (0.7.1/protocol 15): `agent send` writes text into a composer-style remote agent but does not submit the prompt. Phase E.0 adds the submit-capable `agent.submit` route (`herdr agent submit`), capability-gated by `agent_submit`; full controller-only runtime proof is the E.0 validation step. Phase F adds the first narrow federation-placed teardown route (`agent.teardown` / `herdr agent teardown <host>/<target> --confirm`), capability-gated by `agent_teardown`; Phase F.2 adds capability-gated remote `pane.split` and confirmed projected-pane `pane.close` for projection-resolved pane/terminal/workspace selectors. Full controller-only runtime proof is the F validation step.
 
 Still intentionally out of MVP scope:
 
-- embedded remote panes or local-owned remote PTYs;
+- local-owned embedded remote PTY panes or persistent proxy placement;
 - broad destructive remote operations (broad pane/workspace/server/process teardown remains out of scope; only the narrow federation-placed agent/lane `agent.teardown` path and the confirmed projection-resolved single-pane `pane.close` carve-out are supported);
 - transitive remote-of-remote routing;
 - automatic/background remote update/setup orchestration for configured hosts (explicit `herdr remote setup <HOST>` is now shipped, but the supervisor never installs/updates automatically; reconnects that find a missing/incompatible remote mark it `incompatible`/`needs_setup` and surface the error instead);
@@ -1528,7 +1672,7 @@ Remaining non-MVP or later polish:
 - automatic/background remote update/setup orchestration (explicit `herdr remote setup` is now shipped; the supervisor never installs/updates automatically);
 - optional internal SSH ControlMaster optimization;
 - broader multi-host and sleep/offline/wake soak testing.
-- source/machine projection sidebar presentation; current MVP aggregation remains the shipped behavior until that UI layer lands.
+- future all-machines overview, richer graphics, or broader embedded/local-owned remote pane designs beyond the selected-source projection control surface.
 
 Production validation should go beyond the Docker/localhost SSH smoke. Before wider release, test multiple configured hosts, slow/unreachable SSH, sleep/offline/wake reconnect behavior, and a Tailscale/MagicDNS target if that is a supported deployment path. The Docker smoke proves the controlled one-hop federation path, and the Jafar smoke proves one real SSH-reachable host, but neither is a multi-host soak.
 
@@ -1540,24 +1684,42 @@ Acceptance criteria for the MVP hardening slice:
 - `herdr remote status` clearly explains disconnected/auth/incompatible states.
 - The sidebar clearly shows stale remote agents and host-level failure state even when no cached agents exist.
 
-### Next presentation layer — Source/machine projection
+### Current presentation layer — Source/machine projection
 
-Goal: keep the current aggregation/control substrate while changing the sidebar presentation from mixed local/remote sections to one selected source rendered through vanilla Herdr chrome.
+The source/machine presentation layer is no longer only a future direction. The
+dedicated host rail and selected-source Spaces/Agents scoping shipped at
+`ca7c4fc` (`feat: add dedicated host selection rail`). The current work builds
+on that shipped rail by making selected remote workspaces controllable in place.
 
-Recommended slice order:
+Current source-projection contract:
 
-1. Restore vanilla local projection so `local` uses the normal `Spaces` and `Agents` panel layout, footer actions, and navigation semantics.
-2. Introduce source rail/projected source state for `local`, `jafar`, `work-mini` style machine selection. Switching sources changes only the sidebar read model.
-3. Render a selected remote source through the same panel shape using existing `RemoteSourceCache`, `RemoteHostKey`, workspace snapshots, remote agent rows, and workspace-create capability gating.
-4. Defer keyboard source cycling, projection persistence fallback, and an all-machines/unified overview until the base projection is stable.
+1. `local` uses the normal local Spaces/Agents panel layout, footer actions,
+   navigation semantics, and unchanged local workspace/main area.
+2. The source/host rail selects `local`, `jafar`, `work-mini` style machine
+   sources. Switching sources is an authority-routing boundary for the
+   workspace control surface, not a background setup/provisioning action.
+3. A selected connected remote source renders only that host's Spaces/Agents,
+   immediately selects its authoritative focused workspace/fallback, and renders
+   the authoritative remote layout in the main area.
+4. Existing capability-gated remote routes stay scoped to the selected host.
+   Missing capability/stale/disconnected/owned targets fail closed and never
+   fall through to local.
+5. In-place terminal projection uses `ObserveTerminal` / `ControlTerminal {
+   takeover: false }` streams over the prepared no-start bridge. Explicit CLI
+   direct attach remains separate.
+6. Keyboard source cycling, projection persistence fallback, all-machines/
+   unified overview, graphics support, and broad embedded/local-owned remote
+   pane designs remain future work and require separate approval/design.
 
 Constraints:
 
 - no local-owned remote PTYs;
 - no remote hook relay;
 - no transitive routing;
+- no projected takeover affordance;
+- no remote setup/start/update/stop triggered by selecting a source;
 - no protocol bump unless implementation changes a wire/API contract;
-- no claim that source projection is current shipped behavior until the UI slice lands.
+- no projection frame/stream persistence.
 
 #### B.5d — Projected source/space diagnostic and full-remote command-copy affordance
 
@@ -1588,9 +1750,10 @@ projected UX without folding either into a primary click path.
   resolves a matching config.
 - Right-clicking a remote source rail row or a remote space row opens the
   copy-only menu; it does **not** change source selection. Primary
-  left-click source selection remains a read-model switch only — it never
-  runs full remote Herdr or diagnostics automatically. Local and blank rail
-  rows keep their existing right-click consume/no-op behavior.
+  left-click source selection changes the selected authority for the workspace
+  control surface, but it never runs full remote Herdr, diagnostics, setup,
+  install/update, or remote server start/stop automatically. Local and blank
+  rail rows keep their existing right-click consume/no-op behavior.
 
 ### Phase 6 — Optional embedded remote panes
 
@@ -1609,7 +1772,7 @@ It would require:
 - a hook authority strategy that still avoids relaying remote hooks to the local node;
 - handoff/persistence special cases.
 
-This is intentionally not part of the MVP because authoritative remote nodes satisfy the current click-to-focus and agent-to-agent control requirements with far less architectural risk.
+This is intentionally not part of the MVP because authoritative remote nodes plus selected-source in-place observe/control satisfy the current remote control-surface and agent-to-agent requirements with far less architectural risk.
 
 ## Why Not Local-Owned Remote PTYs?
 
@@ -1632,10 +1795,13 @@ Authoritative remote nodes satisfy these directly. Local-owned remote PTYs would
 
 ## Recommended Next Step
 
-Implement the source/machine projection presentation layer in narrow UI slices:
+Finish the current remote machine projection control-surface unit behind the
+shipped host rail: audit the in-place observe/control implementation, validate
+source isolation and no-local-fallback behavior, and review the diff. Do not
+start a new roadmap unit from this document alone; the operational ROADMAP
+records no approved next unit after this manually Ahmed-sourced work.
 
-1. restore the vanilla local sidebar projection;
-2. add source rail/projected source state;
-3. render one selected remote source through the same `Spaces` and `Agents` chrome using the existing remote cache and capability gates.
-
-Keep the shipped aggregation/API behavior intact while doing this. Source projection is the forward UI direction, not an already-shipped behavior claim.
+Keep the shipped aggregation/API behavior intact while validating projection.
+Any future expansion — all-machines overview, graphics support, broad embedded
+remote panes, takeover UI, release/public-doc changes, or real-host setup/update
+behavior — needs a separate approved plan.
