@@ -1067,6 +1067,7 @@ impl AppState {
             let previous_focus = self.current_pane_focus_target();
             self.selection = None;
             self.selection_autoscroll = None;
+            self.projected_selection = None;
             self.selected_remote_space = None;
             self.selected_remote_agent = None;
             self.active = Some(idx);
@@ -1104,6 +1105,7 @@ impl AppState {
         let workspace_changed = self.active != Some(ws_idx);
         self.selection = None;
         self.selection_autoscroll = None;
+        self.projected_selection = None;
         self.selected_remote_space = None;
         self.selected_remote_agent = None;
         self.active = Some(ws_idx);
@@ -2087,6 +2089,22 @@ impl AppState {
     pub fn clear_selection(&mut self) {
         self.selection = None;
         self.selection_autoscroll = None;
+        self.projected_selection = None;
+    }
+
+    /// Start a projected remote-frame selection overlay, enforcing mutual
+    /// exclusion: any local pane selection and its autoscroll are cleared.
+    /// Pure controller overlay state — no runtime, PTY, or remote mutation.
+    /// The gesture owns its remaining left drag/up locally until mouse-up,
+    /// independent of whether the overlay survives mid-gesture transitions.
+    pub(crate) fn start_projected_selection(
+        &mut self,
+        selection: crate::selection::ProjectedSelection,
+    ) {
+        self.selection = None;
+        self.selection_autoscroll = None;
+        self.projected_selection = Some(selection);
+        self.projected_selection_gesture_active = true;
     }
 
     pub(crate) fn stop_selection_autoscroll_state(&mut self) {
@@ -2159,6 +2177,7 @@ impl AppState {
         self.request_clipboard_write = Some(text.into_bytes());
         self.selection = Some(selection);
         self.selection_autoscroll = None;
+        self.projected_selection = None;
         info!("copied double-clicked token to clipboard");
         true
     }
@@ -2680,6 +2699,7 @@ impl AppState {
                     selected.host == host.host && selected.session == host.session
                 }) {
                     self.selected_remote_space = None;
+                    self.projected_selection = None;
                 }
                 if self.selected_remote_agent.as_ref().is_some_and(|selected| {
                     selected.host == host.host && selected.session == host.session
@@ -5070,6 +5090,85 @@ mod tests {
         assert!(state.selection_autoscroll.is_none());
         assert_eq!(state.workspaces[0].panes.len(), 1);
         assert_eq!(state.workspaces[0].panes.keys().next().unwrap(), &first_id);
+        state.assert_invariants_for_test();
+    }
+
+    fn projected_selection_for_test(terminal_id: &str) -> crate::selection::ProjectedSelection {
+        let mut selection = crate::selection::ProjectedSelection::anchor(
+            crate::remote_source::RemoteProjectionTerminalKey {
+                host: "remote-a".into(),
+                session: "default".into(),
+                workspace_id: "ws-a".into(),
+                terminal_id: terminal_id.into(),
+            },
+            0,
+            1,
+        );
+        selection.drag(0, 3, 80, 24);
+        selection
+    }
+
+    fn selection_autoscroll_for_test() -> crate::app::state::SelectionAutoscroll {
+        crate::app::state::SelectionAutoscroll {
+            direction: crate::app::state::SelectionAutoscrollDirection::Down,
+            last_mouse_screen_col: 0,
+            last_mouse_screen_row: 23,
+            inner_rect: ratatui::layout::Rect::new(0, 0, 80, 24),
+        }
+    }
+
+    #[test]
+    fn start_projected_selection_clears_local_selection_and_autoscroll() {
+        let mut state = app_with_workspaces(&["test"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        state.selection = Some(crate::selection::Selection::anchor(pane_id, 0, 0, None));
+        state.selection_autoscroll = Some(selection_autoscroll_for_test());
+
+        state.start_projected_selection(projected_selection_for_test("term-a"));
+
+        assert!(state.selection.is_none());
+        assert!(state.selection_autoscroll.is_none());
+        assert!(state.projected_selection.is_some());
+        assert!(
+            state.projected_selection_gesture_active,
+            "starting a projected selection takes local gesture ownership"
+        );
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    fn clear_selection_clears_local_and_projected_selection() {
+        let mut state = app_with_workspaces(&["test"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        // Seed every selection flavor directly; clear_selection must drop all
+        // of them regardless of how the state was reached.
+        state.selection = Some(crate::selection::Selection::anchor(pane_id, 0, 0, None));
+        state.selection_autoscroll = Some(selection_autoscroll_for_test());
+        state.projected_selection = Some(projected_selection_for_test("term-a"));
+        state.projected_selection_gesture_active = true;
+
+        state.clear_selection();
+
+        assert!(state.selection.is_none());
+        assert!(state.selection_autoscroll.is_none());
+        assert!(state.projected_selection.is_none());
+        assert!(
+            state.projected_selection_gesture_active,
+            "clearing overlays mid-gesture must not release gesture ownership; \
+             only the gesture's mouse-up does"
+        );
+        state.projected_selection_gesture_active = false;
+        state.assert_invariants_for_test();
+    }
+
+    #[test]
+    #[should_panic(expected = "local and projected selections must not coexist")]
+    fn invariants_reject_coexisting_local_and_projected_selection() {
+        let mut state = app_with_workspaces(&["test"]);
+        let pane_id = state.workspaces[0].tabs[0].root_pane;
+        state.selection = Some(crate::selection::Selection::anchor(pane_id, 0, 0, None));
+        state.projected_selection = Some(projected_selection_for_test("term-a"));
+
         state.assert_invariants_for_test();
     }
 

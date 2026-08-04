@@ -646,7 +646,10 @@ fn render_selection_highlight(
 
 type Rgb = (u8, u8, u8);
 
-fn automatic_selection_style(
+/// Uniform automatic-selection style shared by local pane highlights and the
+/// projected remote-frame highlight overlay (crate-visible so `ui.rs` reuses
+/// the exact same colors instead of duplicating them).
+pub(crate) fn automatic_selection_style(
     p: &Palette,
     host_theme: crate::terminal_theme::TerminalTheme,
 ) -> Style {

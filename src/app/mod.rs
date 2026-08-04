@@ -751,6 +751,8 @@ impl App {
             workspace_press: None,
             tab_press: None,
             selection: None,
+            projected_selection: None,
+            projected_selection_gesture_active: false,
             selection_autoscroll: None,
             context_menu: None,
             update_available,
@@ -1304,10 +1306,23 @@ impl App {
         Ok(())
     }
 
+    /// Local outer-host mouse capture decision: the existing config/local-
+    /// runtime decision, OR an explicit capture-enabled report from the
+    /// focused selected projected `Control` stream (so remote mouse
+    /// applications keep working under `ui.mouse_capture = false`).
+    /// `Some(false)`/unknown projected state never forces host capture, which
+    /// preserves ordinary `ui.mouse_capture = false` selection semantics.
+    pub(crate) fn desired_host_mouse_capture(&self) -> bool {
+        self.state
+            .should_capture_host_mouse_from(&self.terminal_runtimes)
+            || self
+                .remote_projection_runtime
+                .focused_projected_control_mouse_capture(&self.state)
+                .unwrap_or(false)
+    }
+
     fn sync_host_mouse_capture(&self, active: &mut bool) -> io::Result<()> {
-        let desired = self
-            .state
-            .should_capture_host_mouse_from(&self.terminal_runtimes);
+        let desired = self.desired_host_mouse_capture();
         if desired == *active {
             return Ok(());
         }
@@ -2058,6 +2073,62 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desired_host_mouse_capture_ors_focused_projected_control_enabled_only() {
+        let mut app = test_app();
+        app.state.mouse_capture = false;
+        assert!(!app.desired_host_mouse_capture());
+
+        app.state.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
+            host: "remote-a".into(),
+            session: "default".into(),
+            workspace_id: "ws".into(),
+        });
+        app.state.view.remote_projection_hit_areas = vec![state::RemoteProjectionHitArea {
+            rect: Rect::new(1, 1, 40, 12),
+            host: "remote-a".into(),
+            session: "default".into(),
+            pane_id: Some("pane-1".into()),
+            terminal_id: Some("term-1".into()),
+            label: "remote pane".into(),
+            focused: true,
+            live: true,
+        }];
+
+        // Unknown and explicit-disabled projected state never force capture,
+        // preserving ordinary `ui.mouse_capture = false` selection semantics.
+        app.remote_projection_runtime.test_insert_stream_handle(
+            "term-1",
+            crate::remote_source::RemoteProjectionStreamRole::Control,
+            None,
+        );
+        assert!(!app.desired_host_mouse_capture());
+        app.remote_projection_runtime.test_insert_stream_handle(
+            "term-1",
+            crate::remote_source::RemoteProjectionStreamRole::Control,
+            Some(false),
+        );
+        assert!(!app.desired_host_mouse_capture());
+
+        // Explicit enabled forces host capture even under the disabled config.
+        app.remote_projection_runtime.test_insert_stream_handle(
+            "term-1",
+            crate::remote_source::RemoteProjectionStreamRole::Control,
+            Some(true),
+        );
+        assert!(app.desired_host_mouse_capture());
+
+        // The config/local decision still dominates on its own.
+        app.state.mouse_capture = true;
+        app.remote_projection_runtime.test_insert_stream_handle(
+            "term-1",
+            crate::remote_source::RemoteProjectionStreamRole::Control,
+            Some(false),
+        );
+        assert!(app.desired_host_mouse_capture());
     }
 
     /// Register an inert stub supervisor handle (no worker thread) for `host`

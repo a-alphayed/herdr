@@ -54,6 +54,12 @@ pub(crate) struct ClientConnection {
     pub(crate) render_pending: bool,
     /// Last host mouse capture mode sent to this client.
     pub(crate) host_mouse_capture_active: Option<bool>,
+    /// Runtime-only provenance: true when this writable terminal stream entered
+    /// through `ClientMessage::ControlTerminal`, making it eligible for exact
+    /// per-runtime `MouseCapture` updates. Explicit direct `AttachTerminal`
+    /// and `ObserveTerminal` connections stay false and keep their existing
+    /// capture lifecycle. Never serialized; no wire-shape change.
+    pub(crate) terminal_session_control: bool,
     /// Temporary files staged from this client's local clipboard image pastes.
     pub(crate) staged_clipboard_files: Vec<PathBuf>,
     /// Channels for sending framed ServerMessage data to the client writer thread.
@@ -116,8 +122,22 @@ impl ClientConnection {
             graphics_surface_reset_pending: false,
             render_pending: false,
             host_mouse_capture_active: None,
+            terminal_session_control: false,
             staged_clipboard_files: Vec::new(),
             writer,
+        }
+    }
+
+    /// Returns the attached terminal id only when this connection is a
+    /// writable terminal stream that entered via `ControlTerminal`. Direct
+    /// attach and observe connections return `None`.
+    pub(crate) fn control_stream_terminal_id(&self) -> Option<&str> {
+        if !self.terminal_session_control {
+            return None;
+        }
+        match &self.mode {
+            ClientConnectionMode::TerminalAttach { terminal_id } => Some(terminal_id),
+            _ => None,
         }
     }
 

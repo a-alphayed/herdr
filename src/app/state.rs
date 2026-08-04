@@ -1578,6 +1578,24 @@ pub struct AppState {
     pub(crate) tab_press: Option<TabPressState>,
     pub selection: Option<Selection>,
     pub selection_autoscroll: Option<SelectionAutoscroll>,
+    /// Ephemeral controller-owned selection over one projected remote
+    /// terminal frame, keyed by exact (host, session, workspace_id,
+    /// terminal_id). Never persisted and never owned by the remote host: it
+    /// lives only as a render/copy overlay over the already-cached projected
+    /// frame. Cleared by `clear_selection`, by projection generation
+    /// advances, and by source/space changes so no highlight or extracted
+    /// text can cross an authority boundary. Mutually exclusive with the
+    /// local pane `selection`.
+    pub(crate) projected_selection: Option<crate::selection::ProjectedSelection>,
+    /// Ephemeral local ownership of an in-progress projected selection
+    /// gesture: set when a projected left selection starts and released only
+    /// by its left mouse-up. Deliberately separate from the
+    /// `projected_selection` overlay — a generation, source, space, or
+    /// target change clears the overlay mid-gesture, but the gesture's
+    /// remaining left drag/up events must still be consumed locally (never
+    /// forwarded to a replacement remote stream) until the button releases.
+    /// Never persisted.
+    pub(crate) projected_selection_gesture_active: bool,
     pub context_menu: Option<ContextMenuState>,
     // Notifications
     pub update_available: Option<String>,
@@ -1711,6 +1729,9 @@ impl AppState {
         self.sidebar_source = source;
         self.selected_remote_space = selected_remote_space;
         self.selected_remote_agent = None;
+        // Source selection is an authority boundary: a projected selection
+        // keyed to the old source must not survive it.
+        self.projected_selection = None;
         self.workspace_scroll = 0;
         self.agent_panel_scroll = 0;
         // The host list viewport is intentionally NOT reset here: its content
@@ -1761,6 +1782,9 @@ impl AppState {
             return;
         }
         self.selected_remote_space = self.focused_remote_space_for_host(host);
+        // The selected space just changed: no projected selection keyed to a
+        // prior source may remain visible.
+        self.projected_selection = None;
     }
 
     /// Advance projection generation before runtime teardown/reconciliation.
@@ -1777,6 +1801,11 @@ impl AppState {
             self.remote_projection_generation = 1;
         }
         let generation = self.remote_projection_generation;
+        // A projected selection is authority/generation-scoped: any advance
+        // or replacement clears it so a key/highlight can never cross
+        // generations, even when last-known frames are preserved for
+        // read-only display.
+        self.projected_selection = None;
         if preserve_last_known {
             self.remote_projection_frames.retain(|key, entry| {
                 let keep = source.is_some_and(|source| key.belongs_to(source));
@@ -2202,6 +2231,8 @@ impl AppState {
             workspace_press: None,
             tab_press: None,
             selection: None,
+            projected_selection: None,
+            projected_selection_gesture_active: false,
             selection_autoscroll: None,
             context_menu: None,
             update_available: None,
@@ -2368,6 +2399,14 @@ impl AppState {
                 self.selection_autoscroll.is_none(),
                 "empty app state must not keep selection autoscroll"
             );
+            assert!(
+                self.projected_selection.is_none(),
+                "empty app state must not keep projected selection"
+            );
+            assert!(
+                !self.projected_selection_gesture_active,
+                "empty app state must not keep projected selection gesture ownership"
+            );
             if let Some(toast) = &self.toast {
                 assert!(
                     toast.target.is_none(),
@@ -2529,6 +2568,10 @@ impl AppState {
                 "selection autoscroll must not remain without an active text selection"
             );
         }
+        assert!(
+            self.selection.is_none() || self.projected_selection.is_none(),
+            "local and projected selections must not coexist"
+        );
         if let Some(gesture) = &self.right_click_passthrough {
             assert_live_pane(gesture.pane_info.id, "right-click passthrough gesture");
         }
@@ -2857,6 +2900,131 @@ mod tests {
         assert!(state.selected_remote_space.is_none());
         assert_eq!(state.active, Some(0));
         assert_eq!(state.workspaces[0].focused_pane_id(), local_focus);
+    }
+
+    fn projected_selection_for_authority_test(
+        host: &str,
+        workspace_id: &str,
+        terminal_id: &str,
+    ) -> crate::selection::ProjectedSelection {
+        let mut selection = crate::selection::ProjectedSelection::anchor(
+            crate::remote_source::RemoteProjectionTerminalKey {
+                host: host.into(),
+                session: "default".into(),
+                workspace_id: workspace_id.into(),
+                terminal_id: terminal_id.into(),
+            },
+            0,
+            1,
+        );
+        selection.drag(0, 3, 80, 24);
+        selection
+    }
+
+    #[test]
+    fn select_sidebar_source_clears_projected_selection() {
+        let mut state = AppState::test_new();
+        let remote_a = crate::remote_source::RemoteHostKey::new("remote-a", "default");
+        let remote_b = crate::remote_source::RemoteHostKey::new("remote-b", "default");
+        state.remote_sources.replace_workspace_snapshot(
+            remote_a.clone(),
+            vec![remote_workspace_info("ws-a", 1, true)],
+        );
+        state.remote_sources.replace_workspace_snapshot(
+            remote_b.clone(),
+            vec![remote_workspace_info("ws-b", 1, true)],
+        );
+        state.select_sidebar_source(SidebarSource::Remote(remote_a.clone()));
+        state.projected_selection = Some(projected_selection_for_authority_test(
+            "remote-a", "ws-a", "term-a",
+        ));
+
+        // Remote -> local is an authority boundary.
+        state.select_sidebar_source(SidebarSource::Local);
+        assert!(state.projected_selection.is_none());
+
+        // Remote -> remote replaces the projected source atomically.
+        state.select_sidebar_source(SidebarSource::Remote(remote_a));
+        state.projected_selection = Some(projected_selection_for_authority_test(
+            "remote-a", "ws-a", "term-a",
+        ));
+        state.select_sidebar_source(SidebarSource::Remote(remote_b));
+        assert!(state.projected_selection.is_none());
+        assert_eq!(
+            state
+                .selected_remote_space
+                .as_ref()
+                .map(|space| space.workspace_id.as_str()),
+            Some("ws-b")
+        );
+    }
+
+    #[test]
+    fn begin_remote_projection_generation_clears_projected_selection() {
+        let mut state = AppState::test_new();
+        let selected = crate::remote_source::RemoteSpaceKey {
+            host: "remote-a".into(),
+            session: "default".into(),
+            workspace_id: "ws-a".into(),
+        };
+        state.selected_remote_space = Some(selected.clone());
+        let generation = state.begin_remote_projection_generation(Some(&selected), false);
+        let key = crate::remote_source::RemoteProjectionTerminalKey {
+            host: "remote-a".into(),
+            session: "default".into(),
+            workspace_id: "ws-a".into(),
+            terminal_id: "term-a".into(),
+        };
+        state.seed_remote_projection_streams(
+            generation,
+            [(
+                key.clone(),
+                crate::remote_source::RemoteProjectionStreamRole::Control,
+                crate::remote_source::RemoteProjectionStreamStatus::Connecting,
+                None,
+            )],
+        );
+        state.apply_remote_projection_stream_event(
+            key,
+            generation,
+            crate::remote_source::RemoteProjectionStreamRole::Control,
+            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
+            Some(crate::protocol::FrameData {
+                cells: vec![crate::protocol::CellData {
+                    symbol: "R".into(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                }],
+                width: 1,
+                height: 1,
+                cursor: None,
+                hyperlinks: Vec::new(),
+                graphics: Vec::new(),
+            }),
+            None,
+        );
+        state.projected_selection = Some(projected_selection_for_authority_test(
+            "remote-a", "ws-a", "term-a",
+        ));
+
+        // A same-source lifecycle advance preserves last-known frames for
+        // read-only display but must still clear the authority/generation-
+        // scoped selection so no key/highlight can cross generations.
+        let next = state.begin_remote_projection_generation(Some(&selected), true);
+
+        assert_eq!(next, generation + 1);
+        assert!(state.projected_selection.is_none());
+        let entry = state
+            .remote_projection_frame(&selected, "term-a")
+            .expect("last-known frame entry preserved");
+        assert!(entry.frame.is_some());
+        assert_eq!(
+            entry.status,
+            crate::remote_source::RemoteProjectionStreamStatus::StaleLastKnown
+        );
     }
 
     #[test]

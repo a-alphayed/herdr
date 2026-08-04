@@ -59,6 +59,32 @@ fn translate_remote_projection_mouse(
     })
 }
 
+/// Translate screen coordinates into the exact visible copy grid of one
+/// projected hit area — the `min(pane interior, frame)` rectangle the render
+/// loop actually draws. Returns None when the point is on the pane
+/// border/title, in blank pane interior outside a smaller frame, on a pane
+/// region beyond a clipped larger frame, or the grid is degenerate. Points
+/// outside the rendered grid never clamp onto an unseen edge cell.
+fn projected_frame_cell(
+    hit: &crate::app::state::RemoteProjectionHitArea,
+    frame: &crate::protocol::FrameData,
+    column: u16,
+    row: u16,
+) -> Option<(u16, u16)> {
+    let (inner_x, inner_y, copy_width, copy_height) =
+        crate::selection::projected_visible_grid(hit.rect, frame.width, frame.height);
+    if copy_width == 0
+        || copy_height == 0
+        || column < inner_x
+        || row < inner_y
+        || column >= inner_x.saturating_add(copy_width)
+        || row >= inner_y.saturating_add(copy_height)
+    {
+        return None;
+    }
+    Some((row - inner_y, column - inner_x))
+}
+
 #[cfg(test)]
 #[test]
 fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
@@ -285,10 +311,44 @@ impl App {
     /// capability-gated remote `pane.focus` action. Any unsupported/stale/owned
     /// projected terminal hit is consumed fail-closed and never reaches a local
     /// pane.
+    ///
+    /// A left-drag over an exact cached frame starts a local projected
+    /// selection instead of remote forwarding when the pane can accept the
+    /// gesture locally: read-only/owned/stale streams always can; a writable
+    /// live control stream can only after the authoritative runtime explicitly
+    /// reported no application mouse tracking. Enabled or not-yet-known keeps
+    /// the existing structured remote mouse forwarding. Once a projected
+    /// selection begins, its drag/up lifecycle stays local even if the
+    /// stream's mouse mode changes mid-gesture, and a completed drag copies
+    /// through the existing local clipboard event path exactly once.
     fn handle_remote_projection_terminal_mouse(&mut self, mouse: MouseEvent) -> bool {
+        // An in-progress projected selection gesture owns the rest of its
+        // lifecycle locally: once a projected left selection starts, its
+        // remaining left Drag/Up are consumed until Up even when a
+        // generation/source/space/target/mouse-mode change cleared the
+        // selection overlay mid-gesture. Up always releases ownership; with
+        // the exact selection/frame gone it copies nothing and sends nothing
+        // remote. Ownership is deliberately tracked apart from the overlay
+        // so a live replacement stream can never receive the tail of a
+        // locally-started gesture.
+        if self.state.projected_selection_gesture_active {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    self.update_projected_selection_drag(mouse.column, mouse.row);
+                    return true;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.finish_projected_selection();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+
         if self.state.mode != Mode::Terminal || self.state.selected_remote_space.is_none() {
             return false;
         }
+
         let Some(hit) = self
             .state
             .view
@@ -312,7 +372,18 @@ impl App {
         {
             return false;
         }
-        if !hit.focused || !hit.live {
+        if !hit.focused {
+            return true;
+        }
+        if !hit.live {
+            // A stale/read-only projection has no remote input route, but its
+            // last-known cached frame stays locally selectable and copyable
+            // when Herdr receives the gesture.
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && self.state.mouse_capture
+            {
+                let _ = self.start_projected_selection_at(&hit, mouse.column, mouse.row);
+            }
             return true;
         }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
@@ -327,6 +398,16 @@ impl App {
             return false;
         }
 
+        // A left press starts a local projected selection only when the exact
+        // cached frame is selectable; otherwise the gesture keeps the existing
+        // structured remote mouse forwarding below.
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.state.mouse_capture
+            && self.start_projected_selection_at(&hit, mouse.column, mouse.row)
+        {
+            return true;
+        }
+
         let Some(event) = translate_remote_projection_mouse(&hit, mouse) else {
             // Border/title hits are local projection chrome, never terminal
             // input and never local-pane fallthrough.
@@ -336,6 +417,179 @@ impl App {
             .remote_projection_runtime
             .send_input(&self.state, event, &self.event_tx);
         true
+    }
+
+    /// Start a local projected-frame selection for an exact terminal hit.
+    /// Returns true when the gesture was claimed for local selection; false
+    /// preserves the existing structured remote forwarding / fail-closed
+    /// consumption. Selection requires `ui.mouse_capture`, an exact cached
+    /// frame for the hit's terminal, and — for a writable live control
+    /// stream — an explicit authoritative report that application mouse
+    /// tracking is off. Read-only/owned/stale streams are selectable without
+    /// any remote input route.
+    fn start_projected_selection_at(
+        &mut self,
+        hit: &crate::app::state::RemoteProjectionHitArea,
+        column: u16,
+        row: u16,
+    ) -> bool {
+        let Some(selected) = self.state.selected_remote_space.as_ref() else {
+            return false;
+        };
+        let Some(terminal_id) = hit.terminal_id.as_deref() else {
+            return false;
+        };
+        let Some(entry) = self.state.remote_projection_frame(selected, terminal_id) else {
+            return false;
+        };
+        let Some(frame) = entry.frame.as_ref() else {
+            return false;
+        };
+        // A writable live controller defers to the authoritative mouse-capture
+        // report; enabled or not-yet-known keeps structured remote forwarding.
+        if entry.status.accepts_input()
+            && entry.role == crate::remote_source::RemoteProjectionStreamRole::Control
+            && self
+                .remote_projection_runtime
+                .focused_projected_control_mouse_capture(&self.state)
+                != Some(false)
+        {
+            return false;
+        }
+        let Some((frame_row, frame_col)) = projected_frame_cell(hit, frame, column, row) else {
+            return false;
+        };
+        let key = crate::remote_source::RemoteProjectionTerminalKey {
+            host: selected.host.clone(),
+            session: selected.session.clone(),
+            workspace_id: selected.workspace_id.clone(),
+            terminal_id: terminal_id.to_owned(),
+        };
+        let selection = crate::selection::ProjectedSelection::anchor(key, frame_row, frame_col);
+        self.state.start_projected_selection(selection);
+        true
+    }
+
+    /// Extend the in-progress projected selection, clamped to the exact
+    /// visible copy grid (`min(pane interior, frame)`) of the terminal that
+    /// owns it, so only rendered cells can be highlighted or copied. The
+    /// drag may leave the copied grid/pane; clamping is symmetric — explicit
+    /// top/left/right/bottom out-of-bounds detection, never
+    /// `saturating_sub` asymmetry. A missing/replaced hit or frame fails
+    /// closed by leaving the selection untouched; the gesture itself stays
+    /// locally consumed.
+    fn update_projected_selection_drag(&mut self, column: u16, row: u16) {
+        let Some(key) = self
+            .state
+            .projected_selection
+            .as_ref()
+            .map(|selection| selection.key.clone())
+        else {
+            return;
+        };
+        let Some(hit) = self
+            .state
+            .view
+            .remote_projection_hit_areas
+            .iter()
+            .find(|hit| {
+                hit.terminal_id.as_deref() == Some(key.terminal_id.as_str())
+                    && hit.host == key.host
+                    && hit.session == key.session
+            })
+            .cloned()
+        else {
+            return;
+        };
+        let Some((inner_x, inner_y, copy_width, copy_height)) = self
+            .state
+            .remote_projection_frames
+            .get(&key)
+            .and_then(|entry| entry.frame.as_ref())
+            .map(|frame| {
+                crate::selection::projected_visible_grid(hit.rect, frame.width, frame.height)
+            })
+        else {
+            return;
+        };
+        if copy_width == 0 || copy_height == 0 {
+            return;
+        }
+        let out_left = column < inner_x;
+        let out_top = row < inner_y;
+        let out_right = column >= inner_x.saturating_add(copy_width);
+        let out_bottom = row >= inner_y.saturating_add(copy_height);
+        let raw_row = row.saturating_sub(inner_y).min(copy_height - 1);
+        let raw_col = column.saturating_sub(inner_x).min(copy_width - 1);
+        if let Some(selection) = self.state.projected_selection.as_mut() {
+            selection.drag(raw_row, raw_col, copy_width, copy_height);
+            // The pointer left the anchor cell but clamping pinned the cursor
+            // back onto it (any visible grid edge): the gesture still counts
+            // as a drag.
+            if selection.was_just_click() && (out_left || out_top || out_right || out_bottom) {
+                selection.force_dragging();
+            }
+        }
+    }
+
+    /// Release the in-progress projected selection. Mouse-up always
+    /// releases local gesture ownership, whether or not the selection
+    /// overlay survived the gesture. A plain click just clears the overlay;
+    /// a real drag extracts visible text from the exact current cached frame
+    /// and queues one local `ClipboardWrite`, but only while the whole
+    /// selected range still fits the pane's rendered copy grid. Malformed,
+    /// stale, mismatched, cleared, resized-out, or empty content fails
+    /// closed with no copy and no remote input. The selection overlay is
+    /// cleared either way.
+    fn finish_projected_selection(&mut self) {
+        self.state.projected_selection_gesture_active = false;
+        let Some(mut selection) = self.state.projected_selection.take() else {
+            // The exact selection/frame was cleared mid-gesture (generation,
+            // source, or target change): copy nothing, send nothing remote.
+            return;
+        };
+        if !selection.finish() {
+            return;
+        }
+        let Some(text) = self.projected_selection_visible_text(&selection) else {
+            return;
+        };
+        self.state.request_clipboard_write = Some(text.into_bytes());
+        // This handler consumed the gesture before `handle_mouse` reached its
+        // common queue, so the event is queued here — exactly once, and the
+        // drained request cannot be queued a second time.
+        self.queue_pending_clipboard_write();
+        tracing::info!("copied projected selection to local clipboard");
+    }
+
+    /// Extract the selection's text from its exact current cached frame,
+    /// keyed by exact terminal identity and clipped to the pane's rendered
+    /// copy grid, so extraction always matches the rendered highlight: cells
+    /// outside the rendered grid (a larger frame clipped by the pane, or a
+    /// mid-gesture resize/relayout) are never copied.
+    fn projected_selection_visible_text(
+        &self,
+        selection: &crate::selection::ProjectedSelection,
+    ) -> Option<String> {
+        let hit = self
+            .state
+            .view
+            .remote_projection_hit_areas
+            .iter()
+            .find(|hit| {
+                hit.terminal_id.as_deref() == Some(selection.key.terminal_id.as_str())
+                    && hit.host == selection.key.host
+                    && hit.session == selection.key.session
+            })?;
+        let frame = self
+            .state
+            .remote_projection_frames
+            .get(&selection.key)?
+            .frame
+            .as_ref()?;
+        let (_, _, copy_width, copy_height) =
+            crate::selection::projected_visible_grid(hit.rect, frame.width, frame.height);
+        selection.extract_visible(frame, copy_width, copy_height)
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -999,5 +1253,1034 @@ mod tests {
 
         state.mode = Mode::ConfirmClose;
         assert!(!modal_paste_target_active(&state));
+    }
+
+    // ------------------------------------------------------------------
+    // Projected remote-frame selection gesture routing
+    // ------------------------------------------------------------------
+
+    /// The projected test pane is a 22x8 bordered box at (30, 2), so its
+    /// 20x6 frame interior starts at screen (31, 3).
+    const PROJECTED_TEST_RECT: ratatui::layout::Rect = ratatui::layout::Rect::new(30, 2, 22, 8);
+
+    fn projected_screen(frame_row: u16, frame_col: u16) -> (u16, u16) {
+        (31 + frame_col, 3 + frame_row)
+    }
+
+    fn projected_frame(lines: &[&str]) -> crate::protocol::FrameData {
+        let height = lines.len() as u16;
+        let width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .max()
+            .unwrap_or(0) as u16;
+        let mut cells = Vec::with_capacity(usize::from(width) * usize::from(height));
+        for line in lines {
+            let mut col = 0usize;
+            for ch in line.chars() {
+                cells.push(crate::protocol::CellData {
+                    symbol: ch.to_string(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                });
+                col += 1;
+            }
+            while col < usize::from(width) {
+                cells.push(crate::protocol::CellData {
+                    symbol: " ".into(),
+                    fg: 0,
+                    bg: 0,
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                });
+                col += 1;
+            }
+        }
+        crate::protocol::FrameData {
+            cells,
+            width,
+            height,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        }
+    }
+
+    /// A 20x6 frame whose first two rows carry copyable text.
+    fn projected_text_frame() -> crate::protocol::FrameData {
+        projected_frame(&[
+            "first line content  ",
+            " hello world        ",
+            "                    ",
+            "                    ",
+            "                    ",
+            "                    ",
+        ])
+    }
+
+    /// Build an app with one selected projected remote space, one terminal
+    /// (`term-1`) seeded at the given stream status/frame, and one matching
+    /// hit area. No stream handle is inserted; unix tests that exercise the
+    /// writable-control path add one explicitly.
+    fn projected_selection_app(
+        status: crate::remote_source::RemoteProjectionStreamStatus,
+        frame: Option<crate::protocol::FrameData>,
+        focused: bool,
+        live: bool,
+    ) -> App {
+        let mut app = test_app();
+        app.state.mode = Mode::Terminal;
+        app.state.mouse_capture = true;
+        let selected = crate::remote_source::RemoteSpaceKey {
+            host: "remote-a".into(),
+            session: "default".into(),
+            workspace_id: "ws-a".into(),
+        };
+        app.state.selected_remote_space = Some(selected.clone());
+        let generation = app
+            .state
+            .begin_remote_projection_generation(Some(&selected), false);
+        let key = crate::remote_source::RemoteProjectionTerminalKey {
+            host: "remote-a".into(),
+            session: "default".into(),
+            workspace_id: "ws-a".into(),
+            terminal_id: "term-1".into(),
+        };
+        app.state.seed_remote_projection_streams(
+            generation,
+            [(
+                key.clone(),
+                crate::remote_source::RemoteProjectionStreamRole::Control,
+                crate::remote_source::RemoteProjectionStreamStatus::Connecting,
+                None,
+            )],
+        );
+        app.state.apply_remote_projection_stream_event(
+            key,
+            generation,
+            crate::remote_source::RemoteProjectionStreamRole::Control,
+            status,
+            frame,
+            None,
+        );
+        app.state.view.remote_projection_hit_areas =
+            vec![crate::app::state::RemoteProjectionHitArea {
+                rect: PROJECTED_TEST_RECT,
+                host: "remote-a".into(),
+                session: "default".into(),
+                pane_id: Some("pane-1".into()),
+                terminal_id: Some("term-1".into()),
+                label: "pane".into(),
+                focused,
+                live,
+            }];
+        app
+    }
+
+    /// Pop the next event, requiring exactly one clipboard write with the
+    /// expected bytes and nothing else queued.
+    fn assert_single_clipboard_write(app: &mut App, expected: &[u8]) {
+        match app.event_rx.try_recv() {
+            Ok(crate::events::AppEvent::ClipboardWrite { content }) => {
+                assert_eq!(content, expected);
+            }
+            other => panic!("expected one ClipboardWrite event, got {other:?}"),
+        }
+        assert!(
+            app.event_rx.try_recv().is_err(),
+            "clipboard write must be queued exactly once"
+        );
+        assert!(
+            app.state.request_clipboard_write.is_none(),
+            "the queued request must be drained so it cannot double queue"
+        );
+    }
+
+    fn assert_no_clipboard_write(app: &mut App) {
+        assert!(
+            app.state.projected_selection.is_none(),
+            "selection must be cleared"
+        );
+        assert!(app.state.request_clipboard_write.is_none());
+        while let Ok(event) = app.event_rx.try_recv() {
+            assert!(
+                !matches!(event, crate::events::AppEvent::ClipboardWrite { .. }),
+                "no ClipboardWrite event may be queued"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projected_selection_copies_dragged_text_exactly_once_without_remote_forwarding() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
+            Some(projected_text_frame()),
+            true,
+            true,
+        );
+        app.remote_projection_runtime
+            .test_insert_writable_stream_handle("term-1", Some(false));
+
+        let (down_col, down_row) = projected_screen(0, 0);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+        let selection = app
+            .state
+            .projected_selection
+            .as_ref()
+            .expect("mouse-capture-disabled control stream starts a local selection");
+        assert_eq!(selection.key.terminal_id, "term-1");
+        assert!(selection.is_in_progress());
+
+        let (drag_col, drag_row) = projected_screen(1, 11);
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            drag_col,
+            drag_row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            drag_col,
+            drag_row,
+        ));
+
+        assert_single_clipboard_write(&mut app, b"first line content\n hello world");
+        assert!(app.state.projected_selection.is_none());
+        assert!(
+            !app.remote_projection_runtime
+                .test_stream_input_sent("term-1"),
+            "a locally selected gesture must never reach the remote stream"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projected_selection_mouse_capture_enabled_forwards_without_selecting() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
+            Some(projected_text_frame()),
+            true,
+            true,
+        );
+        app.remote_projection_runtime
+            .test_insert_writable_stream_handle("term-1", Some(true));
+
+        let (down_col, down_row) = projected_screen(0, 0);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+
+        assert!(app.state.projected_selection.is_none());
+        assert!(
+            app.remote_projection_runtime
+                .test_stream_input_sent("term-1"),
+            "enabled application mouse tracking keeps structured remote forwarding"
+        );
+        assert!(app.state.request_clipboard_write.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projected_selection_mouse_capture_unknown_forwards_without_selecting() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
+            Some(projected_text_frame()),
+            true,
+            true,
+        );
+        app.remote_projection_runtime
+            .test_insert_writable_stream_handle("term-1", None);
+
+        let (down_col, down_row) = projected_screen(0, 0);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+
+        assert!(app.state.projected_selection.is_none());
+        assert!(
+            app.remote_projection_runtime
+                .test_stream_input_sent("term-1"),
+            "not-yet-known mouse tracking keeps structured remote forwarding"
+        );
+        assert!(app.state.request_clipboard_write.is_none());
+    }
+
+    #[test]
+    fn projected_selection_owned_read_only_copies_without_remote_input() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly,
+            Some(projected_text_frame()),
+            true,
+            true,
+        );
+
+        let (down_col, down_row) = projected_screen(1, 1);
+        let (up_col, up_row) = projected_screen(1, 11);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+        assert!(app.state.projected_selection.is_some());
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            up_col,
+            up_row,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), up_col, up_row));
+
+        assert_single_clipboard_write(&mut app, b"hello world");
+    }
+
+    #[test]
+    fn projected_selection_stale_cached_frame_copies_without_remote_input() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::StaleLastKnown,
+            Some(projected_text_frame()),
+            true,
+            false,
+        );
+
+        let (down_col, down_row) = projected_screen(0, 0);
+        let (up_col, up_row) = projected_screen(1, 5);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+        assert!(app.state.projected_selection.is_some());
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            up_col,
+            up_row,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), up_col, up_row));
+
+        assert_single_clipboard_write(&mut app, b"first line content\n hello");
+    }
+
+    #[test]
+    fn projected_selection_non_focused_down_keeps_remote_focus_behavior() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
+            Some(projected_text_frame()),
+            false,
+            true,
+        );
+
+        let (down_col, down_row) = projected_screen(0, 0);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+
+        assert!(
+            app.state.projected_selection.is_none(),
+            "a non-focused projected pane keeps the remote focus mutation route"
+        );
+        assert!(app.state.request_clipboard_write.is_none());
+        assert!(app.state.selected_remote_space.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projected_selection_requires_mouse_capture_config() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
+            Some(projected_text_frame()),
+            true,
+            true,
+        );
+        app.remote_projection_runtime
+            .test_insert_writable_stream_handle("term-1", Some(false));
+        app.state.mouse_capture = false;
+
+        let (down_col, down_row) = projected_screen(0, 0);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+
+        assert!(
+            app.state.projected_selection.is_none(),
+            "ui.mouse_capture = false keeps Herdr's own selection UI off"
+        );
+        assert!(
+            app.remote_projection_runtime
+                .test_stream_input_sent("term-1"),
+            "the gesture keeps its existing remote forwarding"
+        );
+        assert!(app.state.request_clipboard_write.is_none());
+
+        // A stale cached frame is likewise not captured for local selection.
+        let mut stale = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::StaleLastKnown,
+            Some(projected_text_frame()),
+            true,
+            false,
+        );
+        stale.state.mouse_capture = false;
+        stale.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+        assert!(stale.state.projected_selection.is_none());
+        assert!(stale.state.request_clipboard_write.is_none());
+    }
+
+    #[test]
+    fn projected_selection_plain_click_clears_without_copy() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly,
+            Some(projected_text_frame()),
+            true,
+            true,
+        );
+
+        let (col, row) = projected_screen(1, 3);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+        assert!(app.state.projected_selection.is_some());
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row));
+
+        assert_no_clipboard_write(&mut app);
+    }
+
+    #[test]
+    fn projected_selection_empty_frame_copies_nothing() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly,
+            Some(projected_frame(&["          ", "          "])),
+            true,
+            true,
+        );
+
+        let (down_col, down_row) = projected_screen(0, 0);
+        let (up_col, up_row) = projected_screen(1, 9);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            up_col,
+            up_row,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), up_col, up_row));
+
+        assert_no_clipboard_write(&mut app);
+    }
+
+    #[test]
+    fn projected_selection_malformed_frame_fails_closed() {
+        let mut malformed = projected_text_frame();
+        malformed.cells.truncate(7);
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly,
+            Some(malformed),
+            true,
+            true,
+        );
+
+        let (down_col, down_row) = projected_screen(0, 0);
+        let (up_col, up_row) = projected_screen(1, 5);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            up_col,
+            up_row,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), up_col, up_row));
+
+        assert_no_clipboard_write(&mut app);
+    }
+
+    #[test]
+    fn projected_selection_mismatched_key_copies_nothing() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly,
+            Some(projected_text_frame()),
+            true,
+            true,
+        );
+        // A selection keyed to a terminal that has no matching hit area or
+        // cached frame must fail closed instead of copying unrelated data.
+        // The synthetic overlay seeds the gesture marker directly so its
+        // mouse-up routes through the gesture release path.
+        let mut selection = crate::selection::ProjectedSelection::anchor(
+            crate::remote_source::RemoteProjectionTerminalKey {
+                host: "remote-a".into(),
+                session: "default".into(),
+                workspace_id: "ws-a".into(),
+                terminal_id: "term-other".into(),
+            },
+            0,
+            0,
+        );
+        selection.drag(1, 5, 20, 6);
+        app.state.projected_selection = Some(selection);
+        app.state.projected_selection_gesture_active = true;
+
+        let (up_col, up_row) = projected_screen(1, 5);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), up_col, up_row));
+
+        assert_no_clipboard_write(&mut app);
+        assert!(
+            !app.state.projected_selection_gesture_active,
+            "mouse-up always releases local gesture ownership"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projected_selection_stays_local_when_mouse_mode_changes_mid_gesture() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
+            Some(projected_text_frame()),
+            true,
+            true,
+        );
+        app.remote_projection_runtime
+            .test_insert_writable_stream_handle("term-1", Some(false));
+
+        let (down_col, down_row) = projected_screen(0, 0);
+        let (drag_col, drag_row) = projected_screen(1, 4);
+        let (up_col, up_row) = projected_screen(1, 11);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            drag_col,
+            drag_row,
+        ));
+        assert!(app.state.projected_selection.is_some());
+
+        // The authoritative runtime enables application mouse tracking
+        // mid-gesture; the in-progress selection still owns drag/up locally.
+        app.remote_projection_runtime
+            .test_set_stream_mouse_capture("term-1", Some(true));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            up_col,
+            up_row,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), up_col, up_row));
+
+        assert_single_clipboard_write(&mut app, b"first line content\n hello world");
+        assert!(
+            !app.remote_projection_runtime
+                .test_stream_input_sent("term-1"),
+            "a mid-gesture mode change must not reroute the selection remotely"
+        );
+    }
+
+    #[test]
+    fn projected_selection_new_down_reanchors_to_exact_focused_key() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly,
+            Some(projected_text_frame()),
+            true,
+            true,
+        );
+        // Seed a second projected terminal with distinct content.
+        let selected = app.state.selected_remote_space.clone().expect("selected");
+        let key2 = crate::remote_source::RemoteProjectionTerminalKey {
+            host: "remote-a".into(),
+            session: "default".into(),
+            workspace_id: "ws-a".into(),
+            terminal_id: "term-2".into(),
+        };
+        let generation = app.state.remote_projection_generation;
+        app.state.seed_remote_projection_streams(
+            generation,
+            [(
+                key2.clone(),
+                crate::remote_source::RemoteProjectionStreamRole::Observe,
+                crate::remote_source::RemoteProjectionStreamStatus::Connecting,
+                None,
+            )],
+        );
+        app.state.apply_remote_projection_stream_event(
+            key2,
+            generation,
+            crate::remote_source::RemoteProjectionStreamRole::Observe,
+            crate::remote_source::RemoteProjectionStreamStatus::LiveObserver,
+            Some(projected_frame(&[
+                "second pane text    ",
+                "                    ",
+            ])),
+            None,
+        );
+        app.state.view.remote_projection_hit_areas = vec![
+            crate::app::state::RemoteProjectionHitArea {
+                rect: PROJECTED_TEST_RECT,
+                host: "remote-a".into(),
+                session: "default".into(),
+                pane_id: Some("pane-1".into()),
+                terminal_id: Some("term-1".into()),
+                label: "pane-1".into(),
+                focused: true,
+                live: true,
+            },
+            crate::app::state::RemoteProjectionHitArea {
+                rect: ratatui::layout::Rect::new(52, 2, 22, 8),
+                host: "remote-a".into(),
+                session: "default".into(),
+                pane_id: Some("pane-2".into()),
+                terminal_id: Some("term-2".into()),
+                label: "pane-2".into(),
+                focused: false,
+                live: true,
+            },
+        ];
+
+        // Anchor on term-1, then the focus flips to term-2 and a new press
+        // replaces the in-progress selection with the exact new key.
+        let (first_col, first_row) = projected_screen(0, 0);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            first_col,
+            first_row,
+        ));
+        assert_eq!(
+            app.state
+                .projected_selection
+                .as_ref()
+                .map(|selection| selection.key.terminal_id.as_str()),
+            Some("term-1")
+        );
+        for hit in &mut app.state.view.remote_projection_hit_areas {
+            hit.focused = hit.terminal_id.as_deref() == Some("term-2");
+        }
+        let (second_col, second_row) = (53, 3);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            second_col,
+            second_row,
+        ));
+        assert_eq!(
+            app.state
+                .projected_selection
+                .as_ref()
+                .map(|selection| selection.key.terminal_id.as_str()),
+            Some("term-2")
+        );
+        let (up_col, up_row) = (53 + 16, 3);
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            up_col,
+            up_row,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), up_col, up_row));
+
+        assert_single_clipboard_write(&mut app, b"second pane text");
+        drop(selected);
+    }
+
+    #[test]
+    fn projected_selection_generation_advance_clears_in_progress_selection() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly,
+            Some(projected_text_frame()),
+            true,
+            true,
+        );
+
+        let (down_col, down_row) = projected_screen(0, 0);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+        assert!(app.state.projected_selection.is_some());
+
+        let selected = app.state.selected_remote_space.clone().expect("selected");
+        app.state
+            .begin_remote_projection_generation(Some(&selected), true);
+        assert!(app.state.projected_selection.is_none());
+
+        let (up_col, up_row) = projected_screen(1, 5);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), up_col, up_row));
+        assert_no_clipboard_write(&mut app);
+    }
+
+    #[test]
+    fn projected_selection_start_rejects_blank_interior_outside_smaller_frame() {
+        // An 8x3 frame inside the 20x6 pane interior: a down in the blank
+        // pane interior right of or below the rendered frame must not clamp
+        // onto an unseen edge cell and must not start a selection.
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly,
+            Some(projected_frame(&["12345678", "abcdefgh", "ABCDEFGH"])),
+            true,
+            true,
+        );
+
+        // Right of the rendered frame but inside the pane interior.
+        let (right_col, right_row) = projected_screen(0, 15);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            right_col,
+            right_row,
+        ));
+        assert!(app.state.projected_selection.is_none());
+        assert!(!app.state.projected_selection_gesture_active);
+
+        // Below the rendered frame but inside the pane interior.
+        let (below_col, below_row) = projected_screen(4, 2);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            below_col,
+            below_row,
+        ));
+        assert!(app.state.projected_selection.is_none());
+        assert!(!app.state.projected_selection_gesture_active);
+
+        // A following drag/up highlights and copies nothing.
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            below_col,
+            below_row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            below_col,
+            below_row,
+        ));
+        assert_no_clipboard_write(&mut app);
+
+        // The rendered frame cells themselves remain selectable.
+        let (down_col, down_row) = projected_screen(1, 1);
+        let (up_col, up_row) = projected_screen(1, 6);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+        assert!(app.state.projected_selection.is_some());
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            up_col,
+            up_row,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), up_col, up_row));
+        assert_single_clipboard_write(&mut app, b"bcdefg");
+    }
+
+    #[test]
+    fn projected_selection_larger_frame_never_selects_clipped_cells() {
+        // A 30x10 frame clipped by the 20x6 pane interior: only the rendered
+        // 20x6 region can ever be highlighted, extracted, or copied.
+        let rows: Vec<String> = (0..10u16)
+            .map(|r| {
+                (0..30u16)
+                    .map(|c| char::from(b'a' + ((r * 30 + c) % 26) as u8))
+                    .collect()
+            })
+            .collect();
+        let row_refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly,
+            Some(projected_frame(&row_refs)),
+            true,
+            true,
+        );
+
+        let (down_col, down_row) = projected_screen(0, 0);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+        // Drag far past the pane's bottom-right corner: the cursor clamps to
+        // the last rendered cell, never into clipped frame rows/columns.
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 55, 15));
+        {
+            let selection = app.state.projected_selection.as_ref().expect("selection");
+            assert!(selection.contains(5, 19));
+            assert!(
+                !selection.contains(5, 20),
+                "a clipped column must not be selectable"
+            );
+            assert!(
+                !selection.contains(6, 0),
+                "a clipped row must not be selectable"
+            );
+        }
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 55, 15));
+
+        let expected = rows[..6]
+            .iter()
+            .map(|row| row[..20].trim_end())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_single_clipboard_write(&mut app, expected.as_bytes());
+    }
+
+    #[test]
+    fn projected_selection_out_of_bounds_drag_clamps_to_visible_grid() {
+        let rows = [
+            "alpha beta gamma    ",
+            "delta epsilon zeta  ",
+            "eta theta iota      ",
+            "kappa lambda mu     ",
+            "nu xi omicron pi    ",
+            "rho sigma tau upsil ",
+        ];
+        for row in rows {
+            assert_eq!(row.chars().count(), 20);
+        }
+
+        let run = |anchor_screen: (u16, u16), drag_screen: (u16, u16), expected: &str| {
+            let mut app = projected_selection_app(
+                crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly,
+                Some(projected_frame(&rows)),
+                true,
+                true,
+            );
+            app.handle_mouse(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                anchor_screen.0,
+                anchor_screen.1,
+            ));
+            app.handle_mouse(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                drag_screen.0,
+                drag_screen.1,
+            ));
+            app.handle_mouse(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                drag_screen.0,
+                drag_screen.1,
+            ));
+            assert_single_clipboard_write(&mut app, expected.as_bytes());
+        };
+
+        // Anchor at frame cell (2, 8) = screen (39, 5); each direction clamps
+        // to the visible grid edge and copies only rendered cells.
+        run(
+            (39, 5),
+            (39, 0),
+            &format!(
+                "{}\n{}\n{}",
+                rows[0][8..].trim_end(),
+                rows[1].trim_end(),
+                rows[2][..=8].trim_end()
+            ),
+        );
+        run((39, 5), (10, 5), rows[2][..=8].trim_end());
+        run((39, 5), (70, 5), rows[2][8..].trim_end());
+        run(
+            (39, 5),
+            (39, 30),
+            &format!(
+                "{}\n{}\n{}\n{}",
+                rows[2][8..].trim_end(),
+                rows[3].trim_end(),
+                rows[4].trim_end(),
+                rows[5][..=8].trim_end()
+            ),
+        );
+
+        // Top/left out-of-bounds is not collapsed into a plain click: the
+        // pointer left the anchor cell, clamping pinned the cursor back onto
+        // it, and the gesture still counts as a drag that copies the anchor
+        // cell — symmetric with right/bottom force-dragging.
+        run((31, 3), (10, 0), rows[0][..=0].trim_end());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projected_selection_generation_replacement_keeps_gesture_local() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
+            Some(projected_text_frame()),
+            true,
+            true,
+        );
+        app.remote_projection_runtime
+            .test_insert_writable_stream_handle("term-1", Some(false));
+
+        let (down_col, down_row) = projected_screen(0, 0);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+        assert!(app.state.projected_selection.is_some());
+        assert!(app.state.projected_selection_gesture_active);
+
+        // A generation advance clears the selection overlay/key mid-gesture...
+        let selected = app.state.selected_remote_space.clone().expect("selected");
+        app.state
+            .begin_remote_projection_generation(Some(&selected), true);
+        assert!(app.state.projected_selection.is_none());
+        assert!(
+            app.state.projected_selection_gesture_active,
+            "clearing the overlay must not release local gesture ownership"
+        );
+
+        // ...and a replacement control stream goes live with application
+        // mouse tracking enabled: without gesture ownership, the remaining
+        // drag/up would be forwarded to the remote runtime.
+        let key = crate::remote_source::RemoteProjectionTerminalKey {
+            host: "remote-a".into(),
+            session: "default".into(),
+            workspace_id: "ws-a".into(),
+            terminal_id: "term-1".into(),
+        };
+        let generation = app.state.remote_projection_generation;
+        app.state.seed_remote_projection_streams(
+            generation,
+            [(
+                key.clone(),
+                crate::remote_source::RemoteProjectionStreamRole::Control,
+                crate::remote_source::RemoteProjectionStreamStatus::Connecting,
+                None,
+            )],
+        );
+        app.state.apply_remote_projection_stream_event(
+            key,
+            generation,
+            crate::remote_source::RemoteProjectionStreamRole::Control,
+            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
+            Some(projected_text_frame()),
+            None,
+        );
+        app.remote_projection_runtime
+            .test_insert_writable_stream_handle("term-1", Some(true));
+
+        let (drag_col, drag_row) = projected_screen(1, 5);
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            drag_col,
+            drag_row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            drag_col,
+            drag_row,
+        ));
+
+        assert!(
+            !app.remote_projection_runtime
+                .test_stream_input_sent("term-1"),
+            "the tail of a locally-started gesture must never reach a replacement stream"
+        );
+        assert_no_clipboard_write(&mut app);
+        assert!(
+            !app.state.projected_selection_gesture_active,
+            "mouse-up always releases local gesture ownership"
+        );
+    }
+
+    #[test]
+    fn projected_selection_source_switch_mid_gesture_stays_local() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly,
+            Some(projected_text_frame()),
+            true,
+            true,
+        );
+
+        let (down_col, down_row) = projected_screen(0, 0);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+        assert!(app.state.projected_selection.is_some());
+
+        // Switching back to the local source mid-gesture clears the selected
+        // space and the overlay; the gesture's remaining drag/up are still
+        // consumed locally and never leak into a local pane selection.
+        app.state.sidebar_source = crate::app::state::SidebarSource::Remote(
+            crate::remote_source::RemoteHostKey::new("remote-a", "default"),
+        );
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Local);
+        assert!(app.state.selected_remote_space.is_none());
+        assert!(app.state.projected_selection.is_none());
+        assert!(app.state.projected_selection_gesture_active);
+
+        let (drag_col, drag_row) = projected_screen(1, 5);
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            drag_col,
+            drag_row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            drag_col,
+            drag_row,
+        ));
+
+        assert!(
+            app.state.selection.is_none(),
+            "no local pane selection may start from a projected gesture"
+        );
+        assert_no_clipboard_write(&mut app);
+        assert!(!app.state.projected_selection_gesture_active);
+    }
+
+    #[test]
+    fn projected_selection_target_cleared_mid_gesture_releases_without_copy() {
+        let mut app = projected_selection_app(
+            crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly,
+            Some(projected_text_frame()),
+            true,
+            true,
+        );
+
+        let (down_col, down_row) = projected_screen(0, 0);
+        let (drag_col, drag_row) = projected_screen(1, 5);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            down_col,
+            down_row,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            drag_col,
+            drag_row,
+        ));
+        assert!(app.state.projected_selection.is_some());
+
+        // The exact target frame is replaced/cleared mid-gesture: mouse-up
+        // copies nothing, sends nothing remote, and still releases ownership.
+        app.state.remote_projection_frames.clear();
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            drag_col,
+            drag_row,
+        ));
+
+        assert_no_clipboard_write(&mut app);
+        assert!(
+            !app.state.projected_selection_gesture_active,
+            "mouse-up always releases local gesture ownership"
+        );
     }
 }

@@ -124,6 +124,24 @@ Mechanism:
 - Mouse coordinates are clipped and translated into pane-interior coordinates.
   Pane borders, source rail, sidebar, tab strip, overlays, and global app
   shortcuts remain local UI controls.
+- The remote runtime remains authoritative for application mouse mode. The
+  controller tracks the `MouseCapture` state the remote server streams on the
+  focused control stream: an explicit mouse-reporting-on report (or a
+  not-yet-known report) keeps forwarding structured mouse events to the
+  remote; only an explicit mouse-reporting-off report permits a
+  controller-local drag selection, and only when local `ui.mouse_capture` is
+  enabled.
+- Projected drag selection is ephemeral controller-only overlay state over the
+  bounded cached visible semantic frame the controller already renders:
+  frame-grid coordinates pinned to the exact host/session/workspace/terminal
+  key, with no projected scrollback, viewport, or autoscroll. It owns no
+  runtime, socket, PTY, or remote state, and it is cleared on source, space,
+  focus, and generation changes.
+- Clipboard delivery follows the existing controller
+  `AppEvent::ClipboardWrite` path to the foreground local client
+  (`ServerMessage::Clipboard`), the native clipboard, or OSC52, exactly as a
+  local selection copy does. A projected-selection copy never runs on the
+  remote host and never sends remote input.
 - Observer streams never acquire ownership and ignore input. If
   `ControlTerminal { takeover: false }` is refused because another controller
   owns the terminal, the pane falls back to observe, is marked owned/read-only,
@@ -135,8 +153,11 @@ Mechanism:
   closures must carry the old generation/source/terminal identity and are
   rejected.
 - Stale/disconnected projections may keep clearly marked last-known remote
-  frames for orientation, but they are read-only. Unsupported/capability-
-  mismatched projections never fall through to local input or mutation.
+  frames for orientation, but they are read-only. Owned/read-only and stale
+  cached frames remain locally selectable and copy-readable from the exact
+  cached frame when `ui.mouse_capture` is enabled, without any remote input
+  route. Unsupported/capability-mismatched projections never fall through to
+  local input or mutation.
 - Projection frames/streams are runtime/cache state only. They are excluded from
   session snapshots and persistence.
 
@@ -148,6 +169,9 @@ Invariants preserved:
 - No-takeover default; `--takeover` is CLI-only.
 - No local pane, split, PTY, hook relay, or persistence record is created by
   in-place projection.
+- Projected selection/copy creates no local PTY, scrollback, persistence
+  record, or hook relay, and opens no takeover or transitive-routing path; it
+  is a read-only overlay over the already-cached visible frame.
 - Existing explicit direct attach remains available outside the projected UI.
 - Remote source authority, remote hook reporting, stale/read-only safety,
   capability gates, and no uncertain non-idempotent retry are unchanged.
@@ -1638,6 +1662,7 @@ Implemented in this spike:
 - sidebar host-state rows for configured auto-connect remotes when no cached agents exist;
 - dedicated source/host rail shipped at `ca7c4fc` (`feat: add dedicated host selection rail`), selecting one source for the Spaces/Agents/control surface;
 - current in-place projected terminal observe/control direction: live projected frames through `ObserveTerminal` / `ControlTerminal { takeover: false }`, gated by additive `terminal_session_stream`, no local pane/split/PTY/persistence and no projected takeover affordance;
+- controller-local projected drag selection and copy over the bounded cached visible frame: the remote runtime stays authoritative for application mouse mode (explicit mouse-reporting-on keeps structured event forwarding; explicit mouse-reporting-off plus local `ui.mouse_capture` permits controller-local selection), owned/read-only/stale cached frames stay locally copy-readable without remote input, and clipboard delivery follows the existing controller `AppEvent::ClipboardWrite` path to the foreground local client/native/OSC52 and never runs remote;
 - Docker smoke coverage for the configured one-hop path: get/read/send/focus/start, disconnect, and reconnect;
 - real-host Jafar smoke for capability/status commands and isolated `fed-*` host-qualified control after updating the remote binary;
 - verified real-host gap (0.7.1/protocol 15): `agent send` writes text into a composer-style remote agent but does not submit the prompt. Phase E.0 adds the submit-capable `agent.submit` route (`herdr agent submit`), capability-gated by `agent_submit`; full controller-only runtime proof is the E.0 validation step. Phase F adds the first narrow federation-placed teardown route (`agent.teardown` / `herdr agent teardown <host>/<target> --confirm`), capability-gated by `agent_teardown`; Phase F.2 adds capability-gated remote `pane.split` and confirmed projected-pane `pane.close` for projection-resolved pane/terminal/workspace selectors. Full controller-only runtime proof is the F validation step.

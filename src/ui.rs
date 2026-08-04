@@ -1117,9 +1117,12 @@ fn render_projection_layout(
         // Copy exact semantic cells/styles into this projected pane interior,
         // clipped in both dimensions. No parser PTY/local pane exists. Kitty
         // graphics bytes are deliberately ignored in this unit; text cells,
-        // styles and cursor remain live.
-        let copy_width = inner.width.min(remote_frame.width);
-        let copy_height = inner.height.min(remote_frame.height);
+        // styles and cursor remain live. The copied dimensions come from the
+        // shared visible-grid helper so the render copy/clip path and the
+        // projected-selection input bounds agree on exactly which frame
+        // cells are visible.
+        let (_, _, copy_width, copy_height) =
+            crate::selection::projected_visible_grid(rect, remote_frame.width, remote_frame.height);
         {
             let buffer = frame.buffer_mut();
             for row in 0..copy_height {
@@ -1134,6 +1137,36 @@ fn render_projection_layout(
                     destination.bg = crate::protocol::u32_to_color(source.bg);
                     destination.modifier = crate::protocol::u16_to_modifier(source.modifier);
                     destination.skip = source.skip;
+                }
+            }
+        }
+        // Projected selection overlay: repaint the uniform automatic-selection
+        // style only for cells inside a visible projected selection whose
+        // exact (host, session, workspace_id, terminal_id) key matches this
+        // pane. The validated row ranges are clipped to the exact copied
+        // frame interior and fail closed — no highlight at all — on a
+        // malformed frame, impossible `skip` topology, a selection exceeding
+        // the visible grid (a mid-gesture shrink), or a visible edge cutting
+        // a wide grapheme from its required continuation, exactly matching
+        // clipboard extraction; valid wide-grapheme tails are included so
+        // the whole displayed grapheme is highlighted. Local panes and
+        // non-matching projected panes are never touched.
+        if let Some(selection) = app.projected_selection.as_ref().filter(|selection| {
+            selection.is_visible()
+                && selection.key.host == selected.host
+                && selection.key.session == selected.session
+                && selection.key.workspace_id == selected.workspace_id
+                && Some(selection.key.terminal_id.as_str()) == pane.terminal_id.as_deref()
+        }) {
+            if let Some(ranges) =
+                selection.highlighted_row_ranges(remote_frame, copy_width, copy_height)
+            {
+                let style = panes::automatic_selection_style(&app.palette, app.host_terminal_theme);
+                let buffer = frame.buffer_mut();
+                for (row, start, end) in ranges {
+                    for col in start..=end {
+                        buffer[(inner.x + col, inner.y + row)].set_style(style);
+                    }
                 }
             }
         }
@@ -1382,6 +1415,412 @@ mod tests {
             })
             .expect("render stale frame");
         assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "R");
+    }
+
+    fn projected_overlay_app(
+        frame_data: crate::protocol::FrameData,
+    ) -> (
+        AppState,
+        crate::remote_source::RemoteProjectionTerminalKey,
+        u64,
+    ) {
+        let mut app = crate::app::state::AppState::test_new();
+        let selected = crate::remote_source::RemoteSpaceKey {
+            host: "remote-a".into(),
+            session: "default".into(),
+            workspace_id: "ws-a".into(),
+        };
+        app.selected_remote_space = Some(selected.clone());
+        let generation = app.begin_remote_projection_generation(Some(&selected), false);
+        let key = crate::remote_source::RemoteProjectionTerminalKey {
+            host: "remote-a".into(),
+            session: "default".into(),
+            workspace_id: "ws-a".into(),
+            terminal_id: "term-a".into(),
+        };
+        app.seed_remote_projection_streams(
+            generation,
+            [(
+                key.clone(),
+                crate::remote_source::RemoteProjectionStreamRole::Control,
+                crate::remote_source::RemoteProjectionStreamStatus::Connecting,
+                None,
+            )],
+        );
+        app.apply_remote_projection_stream_event(
+            key.clone(),
+            generation,
+            crate::remote_source::RemoteProjectionStreamRole::Control,
+            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
+            Some(frame_data),
+            None,
+        );
+        (app, key, generation)
+    }
+
+    /// Build a projected frame from exact-width ASCII rows in a fixed color.
+    fn projected_overlay_frame(width: u16, rows: &[&str]) -> crate::protocol::FrameData {
+        let mut cells = Vec::new();
+        for row in rows {
+            assert_eq!(row.chars().count(), usize::from(width));
+            for ch in row.chars() {
+                cells.push(crate::protocol::CellData {
+                    symbol: ch.to_string(),
+                    fg: crate::protocol::color_to_u32(Color::LightGreen),
+                    bg: crate::protocol::color_to_u32(Color::Black),
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                });
+            }
+        }
+        crate::protocol::FrameData {
+            cells,
+            width,
+            height: rows.len() as u16,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        }
+    }
+
+    fn projected_overlay_node(terminal_id: &str) -> crate::api::schema::LayoutNode {
+        crate::api::schema::LayoutNode::Pane {
+            pane: crate::api::schema::LayoutPane {
+                pane_id: Some("pane-a".into()),
+                terminal_id: Some(terminal_id.into()),
+                label: Some("remote".into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A finalized (mouse-released) visible projected selection, the state the
+    /// render overlay draws.
+    fn visible_projected_selection(
+        key: crate::remote_source::RemoteProjectionTerminalKey,
+        anchor: (u16, u16),
+        cursor: (u16, u16),
+        width: u16,
+        height: u16,
+    ) -> crate::selection::ProjectedSelection {
+        let mut selection = crate::selection::ProjectedSelection::anchor(key, anchor.0, anchor.1);
+        selection.drag(cursor.0, cursor.1, width, height);
+        assert!(selection.finish());
+        selection
+    }
+
+    fn render_projected_node(app: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let node = projected_overlay_node("term-a");
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| {
+                render_projection_layout(
+                    app,
+                    frame,
+                    &node,
+                    Rect::new(0, 0, width, height),
+                    "pane-a",
+                    true,
+                );
+            })
+            .expect("render projection");
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn projected_selection_overlay_styles_only_matching_key_with_shared_style() {
+        let (mut app, key, _generation) =
+            projected_overlay_app(projected_overlay_frame(6, &["abcdef", "ghijkl"]));
+        app.projected_selection = Some(visible_projected_selection(
+            key.clone(),
+            (0, 1),
+            (0, 3),
+            6,
+            2,
+        ));
+        let expected = panes::automatic_selection_style(&app.palette, app.host_terminal_theme);
+
+        let buffer = render_projected_node(&app, 10, 5);
+
+        // Bordered interior is (1,1,8,3); the 6x2 frame copies to x 1..=6, y 1..=2.
+        for col in 1..=3u16 {
+            let style = buffer[(1 + col, 1)].style();
+            assert_eq!(style.fg, expected.fg, "selected col {col} fg");
+            assert_eq!(style.bg, expected.bg, "selected col {col} bg");
+        }
+        // Cells outside the selection keep the copied frame style: no bleed.
+        for (x, y) in [(1u16, 1u16), (5, 1), (6, 1), (2, 2), (4, 2)] {
+            let cell = &buffer[(x, y)];
+            assert_eq!(cell.fg, Color::LightGreen, "unselected cell ({x},{y}) fg");
+            assert_eq!(cell.bg, Color::Black, "unselected cell ({x},{y}) bg");
+        }
+
+        // A selection keyed to a different terminal id must paint nowhere in
+        // this pane (a local pane never enters this render path at all).
+        let mut mismatched = key.clone();
+        mismatched.terminal_id = "term-b".into();
+        app.projected_selection = Some(visible_projected_selection(
+            mismatched,
+            (0, 1),
+            (0, 3),
+            6,
+            2,
+        ));
+        let buffer = render_projected_node(&app, 10, 5);
+        for y in 0..5u16 {
+            for x in 0..10u16 {
+                let style = buffer[(x, y)].style();
+                assert_ne!(style.bg, expected.bg, "mismatched key styled ({x},{y})");
+            }
+        }
+    }
+
+    #[test]
+    fn projected_selection_overlay_fails_closed_when_selection_exceeds_visible_grid() {
+        // Frame (10x4) is larger than the bordered interior (6x2 of an 8x4
+        // area). A selection reaching outside the copied interior can only
+        // come from a mid-gesture shrink; it must fail closed with no
+        // highlight at all, exactly like clipboard extraction — never a
+        // silently clipped partial subset.
+        let (mut app, key, _generation) = projected_overlay_app(projected_overlay_frame(
+            10,
+            &["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd"],
+        ));
+        app.projected_selection = Some(visible_projected_selection(
+            key.clone(),
+            (0, 0),
+            (3, 9),
+            10,
+            4,
+        ));
+        let expected = panes::automatic_selection_style(&app.palette, app.host_terminal_theme);
+
+        let buffer = render_projected_node(&app, 8, 4);
+
+        for y in 0..4u16 {
+            for x in 0..8u16 {
+                let style = buffer[(x, y)].style();
+                assert_ne!(style.bg, expected.bg, "fail-closed styled ({x},{y})");
+            }
+        }
+
+        // A selection fully inside the copied 6x2 interior still highlights.
+        app.projected_selection = Some(visible_projected_selection(
+            key.clone(),
+            (0, 0),
+            (1, 5),
+            10,
+            4,
+        ));
+        let buffer = render_projected_node(&app, 8, 4);
+        for y in [1u16, 2] {
+            for x in 1..=6u16 {
+                let style = buffer[(x, y)].style();
+                assert_eq!(style.bg, expected.bg, "in-grid cell ({x},{y}) highlighted");
+            }
+        }
+        // Right/bottom border cells stay untouched.
+        for (x, y) in [(7u16, 1u16), (7, 2), (1, 3), (6, 3)] {
+            let style = buffer[(x, y)].style();
+            assert_ne!(style.bg, expected.bg, "outside copied interior ({x},{y})");
+        }
+    }
+
+    #[test]
+    fn projected_selection_overlay_never_paints_a_partial_wide_grapheme() {
+        // Frame row [a][好][skip]: the wide grapheme needs columns 1..=2.
+        let cell = |symbol: &str, skip: bool| crate::protocol::CellData {
+            symbol: symbol.into(),
+            fg: crate::protocol::color_to_u32(Color::LightGreen),
+            bg: crate::protocol::color_to_u32(Color::Black),
+            modifier: 0,
+            skip,
+            hyperlink: None,
+        };
+        let (mut app, key, _generation) = projected_overlay_app(crate::protocol::FrameData {
+            cells: vec![cell("a", false), cell("好", false), cell("", true)],
+            width: 3,
+            height: 1,
+            cursor: None,
+            hyperlinks: Vec::new(),
+            graphics: Vec::new(),
+        });
+        app.projected_selection = Some(visible_projected_selection(
+            key.clone(),
+            (0, 0),
+            (0, 1),
+            3,
+            1,
+        ));
+        let expected = panes::automatic_selection_style(&app.palette, app.host_terminal_theme);
+
+        // A 4x3 area leaves a 2x1 bordered interior: the visible edge cuts
+        // the wide grapheme's required continuation, so nothing is painted.
+        let buffer = render_projected_node(&app, 4, 3);
+        for y in 0..3u16 {
+            for x in 0..4u16 {
+                let style = buffer[(x, y)].style();
+                assert_ne!(style.bg, expected.bg, "partial-wide styled ({x},{y})");
+            }
+        }
+
+        // A 5x3 area leaves a 3x1 interior covering the whole grapheme: lead
+        // and continuation are both highlighted. The continuation cell is
+        // marked `skip`, so ratatui's backend diff never flushes it — assert
+        // against the frame buffer the overlay actually painted.
+        let node = projected_overlay_node("term-a");
+        let mut terminal = Terminal::new(TestBackend::new(5, 3)).expect("terminal");
+        let completed = terminal
+            .draw(|frame| {
+                render_projection_layout(&app, frame, &node, Rect::new(0, 0, 5, 3), "pane-a", true);
+            })
+            .expect("render projection");
+        for x in 1..=3u16 {
+            let cell = &completed.buffer[(x, 1)];
+            assert_eq!(
+                Some(cell.bg),
+                expected.bg,
+                "full wide grapheme col {x} highlighted"
+            );
+        }
+        assert!(
+            completed.buffer[(3, 1)].skip,
+            "the highlighted range must cover the continuation cell, not just the lead"
+        );
+    }
+
+    #[test]
+    fn projected_selection_overlay_highlights_cached_read_only_and_stale_frames() {
+        let (mut app, key, generation) =
+            projected_overlay_app(projected_overlay_frame(6, &["abcdef", "ghijkl"]));
+        let expected = panes::automatic_selection_style(&app.palette, app.host_terminal_theme);
+
+        for status in [
+            crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly,
+            crate::remote_source::RemoteProjectionStreamStatus::StaleLastKnown,
+        ] {
+            // Keep the cached frame (None frame) while the stream degrades.
+            app.apply_remote_projection_stream_event(
+                key.clone(),
+                generation,
+                crate::remote_source::RemoteProjectionStreamRole::Control,
+                status,
+                None,
+                Some("remote stream unavailable".into()),
+            );
+            app.projected_selection = Some(visible_projected_selection(
+                key.clone(),
+                (0, 1),
+                (0, 3),
+                6,
+                2,
+            ));
+
+            let buffer = render_projected_node(&app, 10, 5);
+
+            for col in 1..=3u16 {
+                let style = buffer[(1 + col, 1)].style();
+                assert_eq!(
+                    style.bg, expected.bg,
+                    "{status:?} cached frame col {col} stays highlightable"
+                );
+            }
+            app.projected_selection = None;
+        }
+    }
+
+    #[test]
+    fn projected_selection_overlay_fails_closed_on_malformed_frame_or_skip_topology() {
+        let (mut app, key, generation) =
+            projected_overlay_app(projected_overlay_frame(6, &["abcdef", "ghijkl"]));
+        let expected = panes::automatic_selection_style(&app.palette, app.host_terminal_theme);
+        app.projected_selection = Some(visible_projected_selection(
+            key.clone(),
+            (0, 0),
+            (0, 5),
+            6,
+            2,
+        ));
+
+        let assert_no_highlight = |app: &AppState| {
+            let buffer = render_projected_node(app, 10, 5);
+            for y in 0..5u16 {
+                for x in 0..10u16 {
+                    let style = buffer[(x, y)].style();
+                    assert_ne!(style.bg, expected.bg, "fail-closed styled ({x},{y})");
+                }
+            }
+        };
+
+        // Malformed frame: cell count does not match width * height.
+        app.apply_remote_projection_stream_event(
+            key.clone(),
+            generation,
+            crate::remote_source::RemoteProjectionStreamRole::Control,
+            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
+            Some(crate::protocol::FrameData {
+                cells: vec![crate::protocol::CellData {
+                    symbol: "z".into(),
+                    fg: crate::protocol::color_to_u32(Color::LightGreen),
+                    bg: crate::protocol::color_to_u32(Color::Black),
+                    modifier: 0,
+                    skip: false,
+                    hyperlink: None,
+                }],
+                width: 3,
+                height: 2,
+                cursor: None,
+                hyperlinks: Vec::new(),
+                graphics: Vec::new(),
+            }),
+            None,
+        );
+        assert_no_highlight(&app);
+
+        // Impossible skip topology inside the selection: a continuation cell
+        // after a width-1 grapheme.
+        app.apply_remote_projection_stream_event(
+            key.clone(),
+            generation,
+            crate::remote_source::RemoteProjectionStreamRole::Control,
+            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
+            Some(crate::protocol::FrameData {
+                cells: vec![
+                    crate::protocol::CellData {
+                        symbol: "a".into(),
+                        fg: crate::protocol::color_to_u32(Color::LightGreen),
+                        bg: crate::protocol::color_to_u32(Color::Black),
+                        modifier: 0,
+                        skip: false,
+                        hyperlink: None,
+                    },
+                    crate::protocol::CellData {
+                        symbol: String::new(),
+                        fg: 0,
+                        bg: 0,
+                        modifier: 0,
+                        skip: true,
+                        hyperlink: None,
+                    },
+                ],
+                width: 2,
+                height: 1,
+                cursor: None,
+                hyperlinks: Vec::new(),
+                graphics: Vec::new(),
+            }),
+            None,
+        );
+        app.projected_selection = Some(visible_projected_selection(
+            key.clone(),
+            (0, 0),
+            (0, 1),
+            2,
+            1,
+        ));
+        assert_no_highlight(&app);
     }
 
     #[tokio::test]

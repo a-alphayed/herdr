@@ -192,10 +192,6 @@ impl CursorTrackingBackend {
         }
     }
 
-    fn buffer(&self) -> &ratatui::buffer::Buffer {
-        self.inner.buffer()
-    }
-
     fn rendered_cursor(&self) -> Option<CursorState> {
         self.rendered_cursor.map(|pos| CursorState {
             x: pos.x,
@@ -303,13 +299,18 @@ pub(crate) fn render_virtual_with_runtime_registry(
     let backend = CursorTrackingBackend::new(area.width, area.height);
     let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
 
-    terminal
+    // The semantic buffer must come from the completed pre-diff frame:
+    // `Buffer::diff` deliberately omits skipped cells, so the backend's
+    // post-diff buffer never carries `skip` (wide-glyph continuation
+    // topology). Clone the `CompletedFrame` buffer and end the terminal
+    // borrow immediately so cursor/backend queries below still compile.
+    let buffer = terminal
         .draw(|frame| {
             crate::ui::render_with_runtime_registry(app_state, terminal_runtimes, frame);
         })
-        .expect("render to TestBackend should never fail");
-
-    let buffer = terminal.backend().buffer().clone();
+        .expect("render to TestBackend should never fail")
+        .buffer
+        .clone();
     let cursor = if suppress_focused_terminal_cursor {
         None
     } else {
@@ -332,13 +333,16 @@ pub(crate) fn render_terminal_virtual(
     let backend = CursorTrackingBackend::new(area.width, area.height);
     let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
 
-    terminal
+    // Same pre-diff requirement as `render_virtual_with_runtime_registry`:
+    // the `CompletedFrame` buffer retains `skip`; the backend buffer does
+    // not. Clone it and end the borrow before the backend cursor queries.
+    let buffer = terminal
         .draw(|frame| {
             runtime.render(frame, area, true);
         })
-        .expect("render to TestBackend should never fail");
-
-    let buffer = terminal.backend().buffer().clone();
+        .expect("render to TestBackend should never fail")
+        .buffer
+        .clone();
     let cursor = (!suppress_cursor)
         .then(|| runtime.cursor_state(area, true))
         .flatten()
@@ -510,4 +514,78 @@ fn focused_terminal_suppresses_host_cursor(
     app_state
         .runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
         .is_some_and(crate::terminal::TerminalRuntime::synchronized_output_active)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The semantic buffer returned by the virtual render seam must be the
+    /// completed pre-diff frame: wide-glyph continuation (`skip`) topology
+    /// only survives there, never in the backend's post-diff buffer. A real
+    /// Ghostty `a好b` must serialize with exactly one skipped continuation
+    /// cell and project-extract each grapheme exactly once.
+    #[tokio::test]
+    async fn render_terminal_virtual_preserves_real_wide_skip_topology() {
+        let runtime =
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, "a好b".as_bytes());
+        let area = Rect::new(0, 0, 20, 5);
+
+        let (buffer, cursor) = render_terminal_virtual(&runtime, area);
+
+        // Raw completed-frame buffer: the wide lead keeps skip=false,
+        // exactly its single SpacerTail continuation is skipped, neighbors
+        // stay false.
+        let cell = |x: u16| buffer.cell((x, 0)).expect("cell within bounds");
+        assert_eq!(cell(0).symbol(), "a");
+        assert!(!cell(0).skip, "narrow lead must not be skipped");
+        assert_eq!(cell(1).symbol(), "好");
+        assert!(!cell(1).skip, "wide lead must not be skipped");
+        assert!(
+            cell(2).skip,
+            "wide lead 好 must be followed by exactly one skip cell"
+        );
+        assert_eq!(cell(3).symbol(), "b");
+        assert!(!cell(3).skip, "skip run must end after one continuation");
+        assert_eq!(
+            buffer.content.iter().filter(|cell| cell.skip).count(),
+            1,
+            "the whole buffer carries exactly one skipped continuation cell"
+        );
+
+        // Serialized semantic frame: the same topology survives into
+        // FrameData exactly as headless.rs builds it.
+        let frame = FrameData::from_ratatui_buffer(&buffer, cursor);
+        let row = &frame.cells[..20];
+        assert_eq!(row[0].symbol, "a");
+        assert!(!row[0].skip, "narrow lead must not be skipped");
+        assert_eq!(row[1].symbol, "好");
+        assert!(!row[1].skip, "wide lead must not be skipped");
+        assert!(
+            row[2].skip,
+            "wide lead 好 must be followed by exactly one skip cell: {row:?}"
+        );
+        assert!(
+            !row[3].skip,
+            "skip run must end after exactly one continuation: {row:?}"
+        );
+        assert_eq!(row[3].symbol, "b");
+        assert!(
+            row[4..].iter().all(|cell| !cell.skip),
+            "blank cells must not be skipped: {row:?}"
+        );
+
+        // Projected extraction over the produced frame satisfies the
+        // fail-closed wide-topology validator and yields each grapheme once.
+        let key = crate::remote_source::RemoteProjectionTerminalKey {
+            host: "remote-a".into(),
+            session: "default".into(),
+            workspace_id: "ws-a".into(),
+            terminal_id: "term-a".into(),
+        };
+        let mut selection = crate::selection::ProjectedSelection::anchor(key, 0, 0);
+        selection.drag(0, 3, frame.width, frame.height);
+        assert!(selection.finish());
+        assert_eq!(selection.extract(&frame).as_deref(), Some("a好b"));
+    }
 }

@@ -1613,7 +1613,16 @@ impl HeadlessServer {
             return false;
         };
 
-        self.attach_terminal_client(client_id, terminal_id, takeover)
+        let attached = self.attach_terminal_client(client_id, terminal_id, takeover);
+        if attached {
+            // Provenance: only a writable stream that entered via
+            // `ControlTerminal` is eligible for exact per-runtime
+            // `MouseCapture` updates; explicit direct attach stays ineligible.
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.terminal_session_control = true;
+            }
+        }
+        attached
     }
 
     fn handle_terminal_attach_scroll(
@@ -3183,10 +3192,7 @@ impl HeadlessServer {
     }
 
     fn stream_host_mouse_capture_mode(&mut self) {
-        let enabled = self
-            .app
-            .state
-            .should_capture_host_mouse_from(&self.app.terminal_runtimes);
+        let enabled = self.app.desired_host_mouse_capture();
         let serialized = match Self::frame_server_message(&ServerMessage::MouseCapture { enabled })
         {
             Ok(framed) => framed,
@@ -3195,6 +3201,24 @@ impl HeadlessServer {
                 return;
             }
         };
+
+        // Eligible `ControlTerminal` streams receive exact per-runtime capture
+        // state derived from that terminal's own authoritative runtime, never
+        // the app aggregate. Direct attach receives no new disabling update
+        // here and observe streams receive nothing.
+        let control_updates: Vec<(u64, bool)> = self
+            .clients
+            .iter()
+            .filter_map(|(&client_id, client)| {
+                let terminal_id = client.control_stream_terminal_id()?;
+                let control_enabled = self
+                    .runtime_for_terminal_id_string(terminal_id)
+                    .and_then(crate::terminal::TerminalRuntime::input_state)
+                    .is_some_and(crate::pane::InputState::mouse_reporting_enabled);
+                (client.host_mouse_capture_active != Some(control_enabled))
+                    .then_some((client_id, control_enabled))
+            })
+            .collect();
 
         let mut broken_clients: Vec<u64> = Vec::new();
         for (&client_id, client) in &mut self.clients {
@@ -3216,6 +3240,47 @@ impl HeadlessServer {
                 continue;
             }
             client.host_mouse_capture_active = Some(enabled);
+        }
+
+        let mut control_serialized: Option<Vec<u8>> = None;
+        for (client_id, control_enabled) in control_updates {
+            let framed = if control_enabled == enabled {
+                serialized.clone()
+            } else {
+                match control_serialized.as_ref() {
+                    Some(framed) => framed.clone(),
+                    None => {
+                        let framed = match Self::frame_server_message(
+                            &ServerMessage::MouseCapture {
+                                enabled: control_enabled,
+                            },
+                        ) {
+                            Ok(framed) => framed,
+                            Err(err) => {
+                                warn!(err = %err, "failed to serialize control mouse capture update");
+                                continue;
+                            }
+                        };
+                        control_serialized = Some(framed.clone());
+                        framed
+                    }
+                }
+            };
+            let Some(client) = self.clients.get_mut(&client_id) else {
+                continue;
+            };
+            let Some(writer) = &client.writer else {
+                continue;
+            };
+            if writer.control.send(framed).is_err() {
+                debug!(
+                    client_id,
+                    "client writer channel closed during control mouse capture update"
+                );
+                broken_clients.push(client_id);
+                continue;
+            }
+            client.host_mouse_capture_active = Some(control_enabled);
         }
 
         for client_id in broken_clients {
@@ -5103,6 +5168,246 @@ next_tab = ""
                 server.terminal_attach_owners.get(&terminal_id_string),
                 Some(&7)
             );
+        });
+    }
+
+    fn drain_mouse_capture_messages(control_rx: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<bool> {
+        let mut values = Vec::new();
+        while let Ok(bytes) = control_rx.try_recv() {
+            if let ServerMessage::MouseCapture { enabled } = read_server_message(bytes) {
+                values.push(enabled);
+            }
+        }
+        values
+    }
+
+    #[test]
+    fn terminal_control_stream_receives_exact_per_runtime_mouse_capture() {
+        with_terminal_session_test_server(|server, terminal_id, terminal_id_string, _| {
+            server.app.state.mouse_capture = false;
+            let control_rx = connect_pending_terminal_client_with_control_rx(server, 7);
+            assert!(
+                server.handle_server_event(ServerEvent::ClientControlTerminal {
+                    client_id: 7,
+                    target: terminal_id_string.clone(),
+                    takeover: false,
+                })
+            );
+            assert!(server.clients.get(&7).unwrap().terminal_session_control);
+
+            // Initial exact state: this runtime has no mouse reporting.
+            server.stream_host_mouse_capture_mode();
+            assert_eq!(drain_mouse_capture_messages(&control_rx), vec![false]);
+            assert_eq!(
+                server.clients.get(&7).unwrap().host_mouse_capture_active,
+                Some(false)
+            );
+
+            // Transition: the authoritative runtime enables mouse reporting.
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("runtime")
+                .test_process_pty_bytes(b"\x1b[?1002h");
+            server.stream_host_mouse_capture_mode();
+            assert_eq!(drain_mouse_capture_messages(&control_rx), vec![true]);
+
+            // No duplicate update while the runtime state is unchanged.
+            server.stream_host_mouse_capture_mode();
+            assert!(drain_mouse_capture_messages(&control_rx).is_empty());
+
+            // Transition back to disabled.
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("runtime")
+                .test_process_pty_bytes(b"\x1b[?1002l");
+            server.stream_host_mouse_capture_mode();
+            assert_eq!(drain_mouse_capture_messages(&control_rx), vec![false]);
+        });
+    }
+
+    #[test]
+    fn direct_attach_terminal_receives_no_per_runtime_mouse_capture_update() {
+        with_terminal_session_test_server(|server, terminal_id, terminal_id_string, _| {
+            server.app.state.mouse_capture = false;
+            let control_rx = connect_pending_terminal_client_with_control_rx(server, 7);
+            assert!(
+                server.handle_server_event(ServerEvent::ClientAttachTerminal {
+                    client_id: 7,
+                    terminal_id: terminal_id_string.clone(),
+                    takeover: false,
+                })
+            );
+            assert!(!server.clients.get(&7).unwrap().terminal_session_control);
+
+            server.stream_host_mouse_capture_mode();
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("runtime")
+                .test_process_pty_bytes(b"\x1b[?1002h");
+            server.stream_host_mouse_capture_mode();
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("runtime")
+                .test_process_pty_bytes(b"\x1b[?1002l");
+            server.stream_host_mouse_capture_mode();
+
+            assert!(drain_mouse_capture_messages(&control_rx).is_empty());
+            assert_eq!(
+                server.clients.get(&7).unwrap().host_mouse_capture_active,
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn terminal_observe_receives_no_mouse_capture_updates() {
+        with_terminal_session_test_server(|server, terminal_id, terminal_id_string, _| {
+            server.app.state.mouse_capture = false;
+            let control_rx = connect_pending_terminal_client_with_control_rx(server, 7);
+            assert!(
+                server.handle_server_event(ServerEvent::ClientObserveTerminal {
+                    client_id: 7,
+                    target: terminal_id_string.clone(),
+                })
+            );
+
+            server.stream_host_mouse_capture_mode();
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("runtime")
+                .test_process_pty_bytes(b"\x1b[?1002h");
+            server.stream_host_mouse_capture_mode();
+
+            assert!(drain_mouse_capture_messages(&control_rx).is_empty());
+            assert_eq!(
+                server.clients.get(&7).unwrap().host_mouse_capture_active,
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn full_app_client_keeps_app_level_capture_while_control_stream_gets_per_runtime() {
+        with_terminal_session_test_server(|server, terminal_id, terminal_id_string, _| {
+            // App-level decision is false: config capture off and the default
+            // Navigate mode never reports focused-pane capture.
+            server.app.state.mouse_capture = false;
+            let (writer, app_control_rx, _render_rx) = test_client_writer();
+            assert!(server.handle_server_event(ServerEvent::ClientConnected {
+                client_id: 1,
+                cols: 80,
+                rows: 24,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                render_encoding: RenderEncoding::SemanticFrame,
+                keybindings: None,
+                direct_attach_requested: false,
+                writer,
+            }));
+
+            // The control stream's exact runtime reports mouse reporting on.
+            server
+                .app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .expect("runtime")
+                .test_process_pty_bytes(b"\x1b[?1002h");
+            let control_rx = connect_pending_terminal_client_with_control_rx(server, 7);
+            assert!(
+                server.handle_server_event(ServerEvent::ClientControlTerminal {
+                    client_id: 7,
+                    target: terminal_id_string.clone(),
+                    takeover: false,
+                })
+            );
+
+            server.stream_host_mouse_capture_mode();
+            assert_eq!(drain_mouse_capture_messages(&app_control_rx), vec![false]);
+            assert_eq!(drain_mouse_capture_messages(&control_rx), vec![true]);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projected_control_enabled_folds_into_full_app_capture_under_disabled_config() {
+        with_terminal_session_test_server(|server, _terminal_id, _terminal_id_string, _| {
+            server.app.state.mouse_capture = false;
+            let (writer, app_control_rx, _render_rx) = test_client_writer();
+            assert!(server.handle_server_event(ServerEvent::ClientConnected {
+                client_id: 1,
+                cols: 80,
+                rows: 24,
+                cell_width_px: 0,
+                cell_height_px: 0,
+                render_encoding: RenderEncoding::SemanticFrame,
+                keybindings: None,
+                direct_attach_requested: false,
+                writer,
+            }));
+
+            // Seed a focused selected projected control stream reporting
+            // enabled: host capture is forced on for the full-app client even
+            // though `ui.mouse_capture = false` and no local runtime asks.
+            server.app.state.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
+                host: "remote-a".into(),
+                session: "default".into(),
+                workspace_id: "ws".into(),
+            });
+            server.app.state.view.remote_projection_hit_areas =
+                vec![crate::app::state::RemoteProjectionHitArea {
+                    rect: ratatui::layout::Rect::new(1, 1, 40, 12),
+                    host: "remote-a".into(),
+                    session: "default".into(),
+                    pane_id: Some("pane-1".into()),
+                    terminal_id: Some("term-1".into()),
+                    label: "remote pane".into(),
+                    focused: true,
+                    live: true,
+                }];
+            server
+                .app
+                .remote_projection_runtime
+                .test_insert_stream_handle(
+                    "term-1",
+                    crate::remote_source::RemoteProjectionStreamRole::Control,
+                    Some(true),
+                );
+            server.stream_host_mouse_capture_mode();
+            assert_eq!(drain_mouse_capture_messages(&app_control_rx), vec![true]);
+
+            // Explicit disabled returns capture to the config/local decision.
+            server
+                .app
+                .remote_projection_runtime
+                .test_insert_stream_handle(
+                    "term-1",
+                    crate::remote_source::RemoteProjectionStreamRole::Control,
+                    Some(false),
+                );
+            server.stream_host_mouse_capture_mode();
+            assert_eq!(drain_mouse_capture_messages(&app_control_rx), vec![false]);
+
+            // Unknown projected state never forces capture.
+            server
+                .app
+                .remote_projection_runtime
+                .test_insert_stream_handle(
+                    "term-1",
+                    crate::remote_source::RemoteProjectionStreamRole::Control,
+                    None,
+                );
+            server.stream_host_mouse_capture_mode();
+            assert!(drain_mouse_capture_messages(&app_control_rx).is_empty());
         });
     }
 

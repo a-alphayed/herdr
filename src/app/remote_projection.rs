@@ -15,7 +15,7 @@ use std::path::Path;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
     Arc, Mutex,
 };
 #[cfg(unix)]
@@ -255,11 +255,23 @@ fn plan_projection_admission(state: &AppState) -> ProjectionAdmission {
 }
 
 #[cfg(unix)]
+const MOUSE_CAPTURE_UNKNOWN: u8 = 0;
+#[cfg(unix)]
+const MOUSE_CAPTURE_DISABLED: u8 = 1;
+#[cfg(unix)]
+const MOUSE_CAPTURE_ENABLED: u8 = 2;
+
+#[cfg(unix)]
 struct ProjectionStreamHandle {
     role: RemoteProjectionStreamRole,
     writer: Arc<Mutex<Option<std::os::unix::net::UnixStream>>>,
     writable: Arc<AtomicBool>,
     input_sent: Arc<AtomicBool>,
+    /// Latest `ServerMessage::MouseCapture` state the server streamed to THIS
+    /// stream: unknown until the first report, then disabled/enabled. Owned
+    /// per handle/generation; a late predecessor-stream message can only
+    /// write its own handle's atomic, never a replacement handle's.
+    mouse_capture: Arc<AtomicU8>,
     done: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -558,6 +570,118 @@ impl RemoteProjectionRuntime {
         state.selected_remote_space.is_some()
     }
 
+    /// Latest authoritative mouse-capture state of the focused selected
+    /// projected `Control` stream. `None` when no projection is selected, the
+    /// focused hit/terminal/handle is missing or not a control stream, or the
+    /// server has not reported yet (unknown). Observers and background panes
+    /// are never consulted; their state is never OR-ed in.
+    #[cfg(unix)]
+    pub(crate) fn focused_projected_control_mouse_capture(&self, state: &AppState) -> Option<bool> {
+        let selected = state.selected_remote_space.as_ref()?;
+        let hit = state.view.remote_projection_hit_areas.iter().find(|hit| {
+            hit.focused && hit.live && hit.host == selected.host && hit.session == selected.session
+        })?;
+        let terminal_id = hit.terminal_id.as_deref()?;
+        let handle = self.streams.get(terminal_id)?;
+        if handle.role != RemoteProjectionStreamRole::Control {
+            return None;
+        }
+        match handle.mouse_capture.load(Ordering::Acquire) {
+            MOUSE_CAPTURE_DISABLED => Some(false),
+            MOUSE_CAPTURE_ENABLED => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Non-Unix projection is read-only/unsupported: no projected capture.
+    #[cfg(not(unix))]
+    pub(crate) fn focused_projected_control_mouse_capture(
+        &self,
+        _state: &AppState,
+    ) -> Option<bool> {
+        None
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_insert_stream_handle(
+        &mut self,
+        terminal_id: &str,
+        role: RemoteProjectionStreamRole,
+        mouse_capture: Option<bool>,
+    ) {
+        let value = match mouse_capture {
+            None => MOUSE_CAPTURE_UNKNOWN,
+            Some(false) => MOUSE_CAPTURE_DISABLED,
+            Some(true) => MOUSE_CAPTURE_ENABLED,
+        };
+        self.streams.insert(
+            terminal_id.to_owned(),
+            ProjectionStreamHandle {
+                role,
+                writer: Arc::new(Mutex::new(None)),
+                writable: Arc::new(AtomicBool::new(false)),
+                input_sent: Arc::new(AtomicBool::new(false)),
+                mouse_capture: Arc::new(AtomicU8::new(value)),
+                done: Arc::new(AtomicBool::new(false)),
+                join: None,
+            },
+        );
+    }
+
+    /// Insert a writable control-stream handle whose writer is absent, so a
+    /// forwarded gesture marks `input_sent` and then fails closed with the
+    /// existing uncertainty feedback instead of reaching any remote host.
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_insert_writable_stream_handle(
+        &mut self,
+        terminal_id: &str,
+        mouse_capture: Option<bool>,
+    ) {
+        let value = match mouse_capture {
+            None => MOUSE_CAPTURE_UNKNOWN,
+            Some(false) => MOUSE_CAPTURE_DISABLED,
+            Some(true) => MOUSE_CAPTURE_ENABLED,
+        };
+        self.streams.insert(
+            terminal_id.to_owned(),
+            ProjectionStreamHandle {
+                role: RemoteProjectionStreamRole::Control,
+                writer: Arc::new(Mutex::new(None)),
+                writable: Arc::new(AtomicBool::new(true)),
+                input_sent: Arc::new(AtomicBool::new(false)),
+                mouse_capture: Arc::new(AtomicU8::new(value)),
+                done: Arc::new(AtomicBool::new(false)),
+                join: None,
+            },
+        );
+    }
+
+    /// Whether a projected input event was handed to the exact stream.
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_stream_input_sent(&self, terminal_id: &str) -> bool {
+        self.streams
+            .get(terminal_id)
+            .is_some_and(|handle| handle.input_sent.load(Ordering::Acquire))
+    }
+
+    /// Flip the exact stream's authoritative mouse-capture state in place,
+    /// simulating a mid-gesture mode transition from the remote runtime.
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_set_stream_mouse_capture(
+        &mut self,
+        terminal_id: &str,
+        capture: Option<bool>,
+    ) {
+        let value = match capture {
+            None => MOUSE_CAPTURE_UNKNOWN,
+            Some(false) => MOUSE_CAPTURE_DISABLED,
+            Some(true) => MOUSE_CAPTURE_ENABLED,
+        };
+        if let Some(handle) = self.streams.get(terminal_id) {
+            handle.mouse_capture.store(value, Ordering::Release);
+        }
+    }
+
     #[cfg(unix)]
     fn resize_streams(&mut self, desired: &[DesiredStream]) {
         for stream in desired {
@@ -700,10 +824,12 @@ fn spawn_projection_stream(
     let writer = Arc::new(Mutex::new(None));
     let writable = Arc::new(AtomicBool::new(false));
     let input_sent = Arc::new(AtomicBool::new(false));
+    let mouse_capture = Arc::new(AtomicU8::new(MOUSE_CAPTURE_UNKNOWN));
     let done = Arc::new(AtomicBool::new(false));
     let worker_writer = Arc::clone(&writer);
     let worker_writable = Arc::clone(&writable);
     let worker_input_sent = Arc::clone(&input_sent);
+    let worker_mouse_capture = Arc::clone(&mouse_capture);
     let worker_done = Arc::clone(&done);
     let socket = socket.to_owned();
     let worker_desired = desired.clone();
@@ -715,6 +841,7 @@ fn spawn_projection_stream(
             &event_tx,
             &worker_writer,
             &worker_writable,
+            &worker_mouse_capture,
             worker_desired.role,
             worker_desired.role,
         );
@@ -722,6 +849,9 @@ fn spawn_projection_stream(
             // No takeover affordance: a no-takeover ownership conflict falls
             // back to a fresh observer connection for this same generation.
             worker_writable.store(false, Ordering::Release);
+            // The fallback observer carries no authoritative control capture
+            // state; observers never receive `MouseCapture` updates.
+            worker_mouse_capture.store(MOUSE_CAPTURE_UNKNOWN, Ordering::Release);
             emit_stream_event(
                 &event_tx,
                 &worker_desired,
@@ -737,6 +867,7 @@ fn spawn_projection_stream(
                 &event_tx,
                 &worker_writer,
                 &worker_writable,
+                &worker_mouse_capture,
                 RemoteProjectionStreamRole::Observe,
                 RemoteProjectionStreamRole::Control,
             );
@@ -764,6 +895,7 @@ fn spawn_projection_stream(
         writer,
         writable,
         input_sent,
+        mouse_capture,
         done,
         join: Some(join),
     }
@@ -793,6 +925,7 @@ fn run_projection_stream_once(
     event_tx: &tokio::sync::mpsc::Sender<AppEvent>,
     shared_writer: &Arc<Mutex<Option<std::os::unix::net::UnixStream>>>,
     writable: &Arc<AtomicBool>,
+    mouse_capture: &Arc<AtomicU8>,
     actual_role: RemoteProjectionStreamRole,
     reported_role: RemoteProjectionStreamRole,
 ) -> Result<(), StreamEnd> {
@@ -894,6 +1027,18 @@ fn run_projection_stream_once(
                     return Err(StreamEnd::OwnershipConflict(reason));
                 }
                 return Err(StreamEnd::Closed(reason));
+            }
+            Ok(ServerMessage::MouseCapture { enabled }) => {
+                // Consume into THIS handle only; the server streams exact
+                // per-runtime state to eligible control streams.
+                mouse_capture.store(
+                    if enabled {
+                        MOUSE_CAPTURE_ENABLED
+                    } else {
+                        MOUSE_CAPTURE_DISABLED
+                    },
+                    Ordering::Release,
+                );
             }
             Ok(ServerMessage::Graphics { .. }) => {
                 // Kitty graphics are deliberately out of scope for the first
@@ -1126,5 +1271,276 @@ mod tests {
             state.remote_projection_frames.is_empty(),
             "only admitted/seeded terminal streams may enter the frame cache"
         );
+    }
+
+    #[cfg(unix)]
+    fn projected_query_state(focused: bool, live: bool, terminal_id: Option<&str>) -> AppState {
+        let mut state = AppState::test_new();
+        state.selected_remote_space = Some(RemoteSpaceKey {
+            host: "remote-a".into(),
+            session: "default".into(),
+            workspace_id: "ws".into(),
+        });
+        state.view.remote_projection_hit_areas = vec![crate::app::state::RemoteProjectionHitArea {
+            rect: ratatui::layout::Rect::new(1, 1, 40, 12),
+            host: "remote-a".into(),
+            session: "default".into(),
+            pane_id: Some("pane-1".into()),
+            terminal_id: terminal_id.map(str::to_string),
+            label: "remote pane".into(),
+            focused,
+            live,
+        }];
+        state
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn focused_control_mouse_capture_query_is_focused_control_only() {
+        use crate::remote_source::RemoteProjectionStreamRole::{Control, Observe};
+        let mut runtime = RemoteProjectionRuntime::default();
+
+        // No selected projection at all.
+        let state = AppState::test_new();
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&state),
+            None
+        );
+
+        // Focused live hit but no stream handle.
+        let state = projected_query_state(true, true, Some("term-1"));
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&state),
+            None
+        );
+
+        // Unknown (handle exists, server has not reported) maps to None.
+        runtime.test_insert_stream_handle("term-1", Control, None);
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&state),
+            None
+        );
+
+        // Explicit disabled/enabled map to Some(false)/Some(true).
+        runtime.test_insert_stream_handle("term-1", Control, Some(false));
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&state),
+            Some(false)
+        );
+        runtime.test_insert_stream_handle("term-1", Control, Some(true));
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&state),
+            Some(true)
+        );
+
+        // An observer handle is never consulted, even when it claims enabled.
+        runtime.test_insert_stream_handle("term-1", Observe, Some(true));
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&state),
+            None
+        );
+
+        // Non-focused or non-live hits are not the focused control stream.
+        runtime.test_insert_stream_handle("term-1", Control, Some(true));
+        let unfocused = projected_query_state(false, true, Some("term-1"));
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&unfocused),
+            None
+        );
+        let not_live = projected_query_state(true, false, Some("term-1"));
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&not_live),
+            None
+        );
+
+        // A focused hit for another host/session never matches.
+        let mut other_host = projected_query_state(true, true, Some("term-1"));
+        other_host.view.remote_projection_hit_areas[0].host = "remote-b".into();
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&other_host),
+            None
+        );
+        let mut other_session = projected_query_state(true, true, Some("term-1"));
+        other_session.view.remote_projection_hit_areas[0].session = "work".into();
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&other_session),
+            None
+        );
+
+        // A hit without a terminal id cannot resolve a stream.
+        let no_terminal = projected_query_state(true, true, None);
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&no_terminal),
+            None
+        );
+
+        // A background control stream's state is never OR-ed into the
+        // focused query.
+        let mut two_panes = projected_query_state(true, true, Some("term-1"));
+        two_panes.view.remote_projection_hit_areas.push(
+            crate::app::state::RemoteProjectionHitArea {
+                rect: ratatui::layout::Rect::new(41, 1, 40, 12),
+                host: "remote-a".into(),
+                session: "default".into(),
+                pane_id: Some("pane-2".into()),
+                terminal_id: Some("term-2".into()),
+                label: "background pane".into(),
+                focused: false,
+                live: true,
+            },
+        );
+        runtime.test_insert_stream_handle("term-1", Control, None);
+        runtime.test_insert_stream_handle("term-2", Control, Some(true));
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&two_panes),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_handle_starts_unknown_and_ignores_late_predecessor_state() {
+        use crate::remote_source::RemoteProjectionStreamRole::Control;
+        let mut runtime = RemoteProjectionRuntime::default();
+        let state = projected_query_state(true, true, Some("term-1"));
+
+        runtime.test_insert_stream_handle("term-1", Control, Some(true));
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&state),
+            Some(true)
+        );
+
+        // Replacement: keep the predecessor handle alive (a late predecessor
+        // worker still running) while the new-generation handle starts
+        // unknown.
+        let predecessor = runtime.streams.remove("term-1").expect("predecessor");
+        runtime.test_insert_stream_handle("term-1", Control, None);
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&state),
+            None
+        );
+
+        // A late predecessor report mutates only its own atomic.
+        predecessor
+            .mouse_capture
+            .store(MOUSE_CAPTURE_ENABLED, Ordering::Release);
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&state),
+            None
+        );
+
+        // The replacement transitions only on its own reports.
+        runtime
+            .streams
+            .get("term-1")
+            .expect("replacement")
+            .mouse_capture
+            .store(MOUSE_CAPTURE_DISABLED, Ordering::Release);
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&state),
+            Some(false)
+        );
+        predecessor
+            .mouse_capture
+            .store(MOUSE_CAPTURE_DISABLED, Ordering::Release);
+        assert_eq!(
+            runtime.focused_projected_control_mouse_capture(&state),
+            Some(false)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_stream_consumes_mouse_capture_reports_into_own_handle() {
+        use crate::protocol::{
+            ClientMessage, RenderEncoding, ServerMessage, MAX_FRAME_SIZE, PROTOCOL_VERSION,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-projection-mouse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create test socket dir");
+        let socket = dir.join("stream.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind listener");
+
+        let desired = DesiredStream {
+            key: RemoteProjectionTerminalKey {
+                host: "remote-a".into(),
+                session: "default".into(),
+                workspace_id: "ws".into(),
+                terminal_id: "term-1".into(),
+            },
+            role: RemoteProjectionStreamRole::Control,
+            cols: 80,
+            rows: 24,
+        };
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let mut handle = spawn_projection_stream(&socket, desired, 7, event_tx);
+        assert_eq!(
+            handle.mouse_capture.load(Ordering::Acquire),
+            MOUSE_CAPTURE_UNKNOWN,
+            "new handles start unknown"
+        );
+
+        let (mut server, _) = listener.accept().expect("accept projection stream");
+        let hello = crate::protocol::read_message::<_, ClientMessage>(&mut server, MAX_FRAME_SIZE)
+            .expect("read hello");
+        assert!(matches!(hello, ClientMessage::Hello { .. }));
+        crate::protocol::write_message(
+            &mut server,
+            &ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                encoding: RenderEncoding::SemanticFrame,
+                error: None,
+            },
+        )
+        .expect("write welcome");
+        let request =
+            crate::protocol::read_message::<_, ClientMessage>(&mut server, MAX_FRAME_SIZE)
+                .expect("read request");
+        assert!(matches!(
+            request,
+            ClientMessage::ControlTerminal { ref target, takeover: false } if target == "term-1"
+        ));
+        assert_eq!(
+            handle.mouse_capture.load(Ordering::Acquire),
+            MOUSE_CAPTURE_UNKNOWN,
+            "no report consumed before the server streams one"
+        );
+
+        let wait_for = |expected: u8| {
+            for _ in 0..400 {
+                if handle.mouse_capture.load(Ordering::Acquire) == expected {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            false
+        };
+
+        crate::protocol::write_message(&mut server, &ServerMessage::MouseCapture { enabled: true })
+            .expect("write enabled");
+        assert!(wait_for(MOUSE_CAPTURE_ENABLED), "enabled report consumed");
+        crate::protocol::write_message(
+            &mut server,
+            &ServerMessage::MouseCapture { enabled: false },
+        )
+        .expect("write disabled");
+        assert!(
+            wait_for(MOUSE_CAPTURE_DISABLED),
+            "disabled transition consumed"
+        );
+
+        drop(server);
+        if let Some(join) = handle.join.take() {
+            let _ = join.join();
+        }
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_dir(&dir);
     }
 }

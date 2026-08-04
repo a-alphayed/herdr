@@ -1265,6 +1265,11 @@ impl GhosttyPaneTerminal {
                     cell.reset();
                     cell.set_symbol(symbol);
                     cell.set_style(style);
+                    // Mark exactly the wide-glyph continuation cells (Ghostty
+                    // `SpacerTail`) as skipped so the serialized `FrameData`
+                    // carries the real wide topology; reset/blank cells stay
+                    // skip=false. Symbol and style behavior is unchanged.
+                    cell.set_skip(basic.wide == crate::ghostty::CellWide::SpacerTail);
                     x += 1;
                 }
                 while x < area.width {
@@ -1526,7 +1531,11 @@ fn ghostty_collect_dirty_patch(
                     Ok(symbol) => symbol.to_owned(),
                     Err(_) => ghostty_blank_symbol_for_width(basic.wide).to_owned(),
                 };
-                patch_cells.push(cell_data_from_style(symbol, style));
+                patch_cells.push(cell_data_from_style(
+                    symbol,
+                    style,
+                    basic.wide == crate::ghostty::CellWide::SpacerTail,
+                ));
                 x += 1;
             }
             while x < area_width {
@@ -1918,12 +1927,20 @@ fn blank_cell_data(default_fg: Option<Color>, default_bg: Option<Color>) -> Cell
     cell_data_from_style(
         " ".to_string(),
         ghostty_default_style(default_fg, default_bg),
+        false,
     )
 }
 
-fn cell_data_from_style(symbol: String, style: Style) -> CellData {
+/// Builds one wire cell from a rendered symbol/style. `skip` marks exactly
+/// the wide-glyph continuation cells (Ghostty `SpacerTail`) so retained
+/// patches carry the same wide topology as a full frame; it is derived from
+/// the cell's wide kind, never inferred from an empty symbol. An ordinary
+/// (non-skip) cell normalizes an empty symbol to a single space, matching a
+/// full render's blank cell; a skip cell preserves its empty symbol, matching
+/// the SpacerTail symbol a full render sets.
+fn cell_data_from_style(symbol: String, style: Style, skip: bool) -> CellData {
     CellData {
-        symbol: if symbol.is_empty() {
+        symbol: if symbol.is_empty() && !skip {
             " ".to_string()
         } else {
             symbol
@@ -1931,7 +1948,7 @@ fn cell_data_from_style(symbol: String, style: Style) -> CellData {
         fg: crate::protocol::color_to_u32(style.fg.unwrap_or(Color::Reset)),
         bg: crate::protocol::color_to_u32(style.bg.unwrap_or(Color::Reset)),
         modifier: crate::protocol::modifier_to_u16(style.add_modifier),
-        skip: false,
+        skip,
         hyperlink: None,
     }
 }
@@ -3893,6 +3910,121 @@ mod tests {
     }
 
     #[test]
+    fn full_frame_marks_only_wide_spacer_tail_cells_skip() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        {
+            let mut core = pane.core.lock().unwrap();
+            core.terminal.write("a好b".as_bytes());
+        }
+
+        let backend = ratatui::backend::TestBackend::new(20, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        // Serialize the completed pre-diff frame buffer exactly like the
+        // production render_stream seam: the backend's post-diff buffer
+        // never receives skipped cells, so it cannot carry wide topology.
+        let completed = terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 5), false))
+            .unwrap();
+
+        let frame = crate::protocol::FrameData::from_ratatui_buffer(completed.buffer, None);
+        let row = &frame.cells[..20];
+        assert_eq!(row[0].symbol, "a");
+        assert!(!row[0].skip, "narrow lead must not be skipped");
+        assert_eq!(row[1].symbol, "好");
+        assert!(!row[1].skip, "wide lead must not be skipped");
+        assert!(
+            row[2].skip,
+            "wide lead 好 must be followed by exactly one skip cell: {row:?}"
+        );
+        assert!(
+            !row[3].skip,
+            "skip run must end after exactly one continuation: {row:?}"
+        );
+        assert_eq!(row[3].symbol, "b");
+        assert!(
+            row[4..].iter().all(|cell| !cell.skip),
+            "blank cells must not be skipped: {row:?}"
+        );
+    }
+
+    #[test]
+    fn dirty_patch_marks_only_wide_spacer_tail_cells_skip() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        let backend = ratatui::backend::TestBackend::new(20, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 5), false))
+            .unwrap();
+        {
+            let mut core = pane.core.lock().unwrap();
+            core.terminal.write("a好b".as_bytes());
+        }
+
+        let patch = match pane.collect_dirty_patch(20, 5) {
+            TerminalDirtyPatchOutcome::Patch(patch) => patch,
+            other => panic!("expected dirty patch, got {other:?}"),
+        };
+
+        assert_eq!(patch.rows.len(), 1, "only row 0 is dirty: {:?}", patch.rows);
+        let (row_y, row) = &patch.rows[0];
+        assert_eq!(*row_y, 0);
+        assert_eq!(row[0].symbol, "a");
+        assert!(!row[0].skip, "narrow lead must not be skipped");
+        assert_eq!(row[1].symbol, "好");
+        assert!(!row[1].skip, "wide lead must not be skipped");
+        assert!(
+            row[2].skip,
+            "wide lead 好 must be followed by exactly one skip cell: {row:?}"
+        );
+        assert!(
+            !row[3].skip,
+            "skip run must end after exactly one continuation: {row:?}"
+        );
+        assert_eq!(row[3].symbol, "b");
+        assert!(
+            row[4..].iter().all(|cell| !cell.skip),
+            "blank cells must not be skipped: {row:?}"
+        );
+    }
+
+    #[test]
+    fn projected_selection_extracts_real_full_frame_wide_topology() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        {
+            let mut core = pane.core.lock().unwrap();
+            core.terminal.write("a好b".as_bytes());
+        }
+
+        let backend = ratatui::backend::TestBackend::new(20, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        // Same pre-diff capture as the production render_stream seam.
+        let completed = terminal
+            .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 5), false))
+            .unwrap();
+
+        let frame = crate::protocol::FrameData::from_ratatui_buffer(completed.buffer, None);
+        let key = crate::remote_source::RemoteProjectionTerminalKey {
+            host: "remote-a".into(),
+            session: "default".into(),
+            workspace_id: "ws-a".into(),
+            terminal_id: "term-a".into(),
+        };
+        let mut selection = crate::selection::ProjectedSelection::anchor(key, 0, 0);
+        selection.drag(0, 3, frame.width, frame.height);
+        assert!(selection.finish());
+
+        // End-to-end in-process: the real produced frame must satisfy the
+        // fail-closed wide-topology validator and extract each grapheme once.
+        assert_eq!(selection.extract(&frame).as_deref(), Some("a好b"));
+    }
+
+    #[test]
     fn process_pty_bytes_orders_default_color_reply_before_following_device_attribute_reply() {
         let (tx, mut rx) = mpsc::channel(4);
         let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
@@ -4382,5 +4514,21 @@ mod tests {
         let mut rows = vec!["hello".to_string(), "".to_string(), "   ".to_string()];
         trim_trailing_blank_rows(&mut rows);
         assert_eq!(rows, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn cell_data_from_style_preserves_empty_symbol_for_skip_cell() {
+        // A SpacerTail wide-glyph continuation cell carries an empty symbol so
+        // the retained dirty patch matches the full render frame exactly. A
+        // non-skip ordinary cell still normalizes an empty symbol to a space.
+        let style = Style::default();
+
+        let skip_cell = cell_data_from_style(String::new(), style, true);
+        assert_eq!(skip_cell.symbol, "");
+        assert!(skip_cell.skip);
+
+        let ordinary_cell = cell_data_from_style(String::new(), style, false);
+        assert_eq!(ordinary_cell.symbol, " ");
+        assert!(!ordinary_cell.skip);
     }
 }
