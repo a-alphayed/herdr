@@ -2,9 +2,10 @@ name: CI
 
 on:
   pull_request:
+    branches: [dev]
     types: [opened, synchronize, reopened]
   push:
-    branches: [master, windows]
+    branches: [dev, windows]
     paths-ignore:
       - "website/**"
       - ".github/APPROVED_CONTRIBUTORS"
@@ -18,7 +19,7 @@ concurrency:
 
 jobs:
   conventional-commits:
-    if: github.event_name != 'push' || github.ref_name == 'master'
+    if: github.event_name != 'push' || github.ref_name == 'dev'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

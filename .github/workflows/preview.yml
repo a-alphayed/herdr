@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       commit:
-        description: Optional master commit SHA to publish
+        description: Optional dev commit SHA to publish
         required: false
         type: string
 
@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          ref: master
+          ref: dev
           fetch-depth: 0
           persist-credentials: false
 
@@ -44,16 +44,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git fetch origin master --tags
+          git fetch origin '+refs/heads/dev:refs/remotes/origin/dev' --tags
           requested="${{ github.event.inputs.commit || '' }}"
           if [ -n "$requested" ]; then
             commit="$(git rev-parse "$requested^{commit}")"
-            if ! git merge-base --is-ancestor "$commit" origin/master; then
-              echo "error: requested commit $commit is not reachable from origin/master" >&2
+            if ! git merge-base --is-ancestor "$commit" origin/dev; then
+              echo "error: requested commit $commit is not reachable from origin/dev" >&2
               exit 1
             fi
           else
-            commit="$(python3 scripts/preview.py select-commit --ref origin/master)"
+            commit="$(python3 scripts/preview.py select-commit --ref origin/dev)"
           fi
           current_preview="$(python3 scripts/preview.py current-commit --manifest website/preview.json || true)"
           if [ "$current_preview" = "$commit" ]; then
@@ -260,9 +260,21 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
-          ref: master
+          ref: dev
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Load production preview metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin \
+            '+refs/heads/master:refs/remotes/origin/master' \
+            '+refs/heads/dev:refs/remotes/origin/dev' \
+            --tags
+          manifest="$RUNNER_TEMP/preview.json"
+          git show origin/master:website/preview.json > "$manifest"
+          echo "PREVIEW_MANIFEST=$manifest" >> "$GITHUB_ENV"
 
       - name: Download all artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -274,7 +286,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          previous="$(python3 scripts/preview.py current-commit --manifest website/preview.json || true)"
+          previous="$(python3 scripts/preview.py current-commit --manifest "$PREVIEW_MANIFEST" || true)"
           if [ -z "$previous" ]; then
             previous="$(git describe --tags --match 'v[0-9]*' --abbrev=0)"
           fi
@@ -324,7 +336,7 @@ jobs:
       - name: Update preview manifest
         run: |
           python3 scripts/preview.py manifest \
-            --output website/preview.json \
+            --output "$PREVIEW_MANIFEST" \
             --tag '${{ needs.preflight.outputs.tag }}' \
             --build-id '${{ needs.preflight.outputs.build_id }}' \
             --commit '${{ needs.preflight.outputs.commit }}' \
@@ -335,14 +347,25 @@ jobs:
             --sha-file preview-sha256.json \
             --retain 30
 
+      - name: Prepare production metadata commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout --detach origin/master
+          cp "$PREVIEW_MANIFEST" website/preview.json
+
       - name: Commit preview manifest
         env:
           KANGAL_GITHUB_TOKEN: ${{ secrets.KANGAL_GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           git config user.name "kangal-bot"
           git config user.email "285672167+kangal-bot@users.noreply.github.com"
           git add website/preview.json
-          git diff --cached --quiet || git commit -m "docs: update preview manifest"
+          if ! git diff --cached --quiet; then
+            test "$(git diff --cached --name-only)" = "website/preview.json"
+            git commit -m "docs: update preview manifest"
+          fi
           git push "https://x-access-token:${KANGAL_GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:master
 
       - name: Mark preview-released issues

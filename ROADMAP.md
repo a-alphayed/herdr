@@ -17,77 +17,48 @@ read-set policy).
 
 ## Current state
 
-- `origin/master` tip: `ca7c4fc93da9dcdd9edeadb18762c3c2c6b876af`
-  (`feat: add dedicated host selection rail`).
-- `origin/roadmap/herdr-follow-on-roadmap` tip:
-  `ca7c4fc93da9dcdd9edeadb18762c3c2c6b876af` (same commit). The prior
-  follow-on roadmap is complete at this tip. The older
-  `herdr-follow-on-roadmap` token is **not active for the current manually
-  sourced unit**, and this file records no valid roadmap-push/succession token
-  for the in-progress branch. Do not reuse or invent a roadmap token from this
-  task branch's own diff.
-- Lane workflow default: on; lane mode default: non-interactive. No standing
-  project trunk/shared auto-land opt-in. Runtime `lane auto-continue on/off`
-  state is tracked in `.local/agent-lanes.md` per global/project policy and is
-  re-checked at every boundary, but this ROADMAP records **no approved next
-  unit**; auto-continue therefore holds at this unit's future closeout unless
-  Ahmed supplies a separate accepted queue/token.
-- Current manually sourced work unit (in progress on
-  `feat/remote-projection-control-surface`): **remote machine projection
-  control surface**, sourced from Ahmed's explicit 2026-07-21 manual handoff
-  goal and clarification. Selecting a machine is now an authority-routing
-  boundary for the same Herdr workspace control surface: `local` shows/controls
-  only local state; a connected remote host shows only that host's spaces/
-  agents, immediately projects that host's authoritative focused workspace (or
-  deterministic first-space fallback), renders live terminal-session frames in
-  the projected layout, and routes supported controls/input to the selected
-  host in place. Remote hosts remain authoritative for PTYs, panes, hooks,
-  focus/layout, child processes, and persistence; stale/disconnected/
-  capability-mismatched projections remain remote-scoped read-only; no local
-  pane, split, PTY, hook relay, takeover affordance, or persistence record is
-  created by projection.
+- Local `master` and `origin/master` are clean and equal at
+  `b3694186d51a7a26d689d5e49ae5973c3e76c24a` (`feat: copy projected
+  selections to local clipboard`). This is the exact source commit used for
+  Ahmed's current fork release candidate on Steam Deck and forge.
+- Origin has no `dev` branch yet. Ahmed selected the durable branch model:
+  `dev` is development integration and preview source; `master` is production/
+  release-only, with a narrow generated release-channel metadata exception.
+  The decision and activation gates are in `BRANCHING.md`.
+- The current Ahmed-sourced unit is the branch/worktree/CI/release transition
+  plus isolated stable/dev launcher proof and later Omarchy-package retirement.
+  Its policy implementation is on local task branch
+  `chore/dev-integration-policy`, based exactly on `master@b3694186`.
+  Committing, local/shared `dev` activation, remote `dev` creation/push,
+  GitHub settings, launcher/install changes, default-server replacement,
+  package removal, and cleanup are distinct gates.
+- Nine pre-existing worktrees were inventoried clean and must be preserved.
+  Three local-only/unlanded tips remain intentionally untouched:
+  `fix/remote-claude-selection@29d02c9a`,
+  `feat/hide-projection-role-labels@c026e674`, and
+  `feat/r6-2-hosts-section@e983eb61`.
+- The prior `herdr-follow-on-roadmap` is complete. Its remote roadmap ref is
+  historical and not an active token. This ROADMAP records no approved
+  successor after the current manually sourced transition; do not reuse or
+  invent a roadmap token.
+- The global lane-workflow default remains on. Ahmed set lane workflow off,
+  non-interactive mode, and auto-continue off for this unit; that runtime state
+  is recorded in `.local/agent-lanes.md`, and this committed history does not
+  set a future session's controls. There is no standing trunk/shared auto-land,
+  remote-branch creation, live-install, package, or cleanup authorization.
+- Steam Deck currently runs the explicitly installed Omarchy fork package
+  `/usr/bin/herdr` at version 0.8.0/protocol 20. Ahmed's clean fork build at
+  `master@b3694186` is version 0.7.1/protocol 15. The stable local command
+  `$HOME/.local/bin/herdr` is missing, while the dev launcher already points to
+  the fork debug binary. The packaged default server remains running and must
+  not be stopped or replaced until isolated old-to-new handoff and rollback
+  proof pass and Ahmed approves the exact live/package phase.
 
-The remote-agent control sequence that lets a local Herdr controller reach an
-authoritative remote host's agents/spaces/panes over an SSH-bridged JSON API is
-landed and exercised end to end:
-
-- Source projection foundation and status markers (`62e6346`, `de19f89`):
-  the source rail and one-source sidebar projection model, plus source rail
-  status markers.
-- Legacy projected read-only view and direct attach (`541baba`, `8cbf6c3`):
-  this shipped the first active-tab geometry projection and explicit direct
-  terminal attach escape hatch. It is superseded as the projected primary path
-  by the current manually sourced in-place observe/control unit; explicit CLI
-  direct attach remains separate.
-- Headless prompt submission (`5fce1f7`): explicit `agent.submit` /
-  `herdr agent submit` over federation, so a controller can place a remote
-  agent, submit a prompt, and read the reaction without manual SSH or attach.
-- Teardown and projected pane/tab/workspace editing
-  (`6025132`, `067bec2`, `41f39f3`, `8b1611a`, `79bd4a2`, `4d398a2`):
-  controller-side federation teardown plus routed remote `pane.split` /
-  `pane.close` / tab create-focus-close / rename and inter-pane/inter-tab
-  focus, all resolved against the projection cache.
-- Resilience G.1-G.10 (`1cda856`, `fdda7e9`, `30f2788`, `b0640b8`,
-  `5cad839`, `5d6fc71`, `c65f318`, `e422cbd`, `8e68e33`, `780f892`):
-  stale/non-connected mutation fail-fast, bounded configured-host SSH connect
-  timeout, bounded transient backoff + deterministic jitter for source probes,
-  per-host connection policy (`auto`/`on_demand`/`manual`), remote-agent bridge
-  dispatch off the App/headless loops, bounded per-host bridge dispatch
-  concurrency, structured `remote.route.*` tracing of configured routed
-  agent actions, G.9 supervisor-state reuse that keeps routed agent
-  bridge dispatch from redoing per-request remote binary prep/probes, and
-  G.10 bounded persistent remote-API bridge pool that reuses bridges across
-  requests.
-- Dedicated host rail (`ca7c4fc`, `feat: add dedicated host selection rail`):
-  the Ahmed-sourced 2026-07-20 correction is complete and landed. It restored
-  the narrow left host rail with an explicit `hosts` header, selectable local/
-  remote rows, status markers, persistent divider, and selected-host-scoped
-  adjacent spaces/agents sidebar. The prior full-width Hosts-section direction
-  remains historical/superseded.
-
-Remote hosts remain authoritative for PTYs, panes, hooks, persistence, and
-child processes; the local node only aggregates, caches, routes/proxies allowed
-commands, and renders the selected source's control surface.
+The remote-agent control sequence through `b3694186` remains landed and
+exercised end to end. Remote hosts retain authority for PTYs, panes, hooks,
+persistence, and child processes; the local node only aggregates, caches,
+routes/proxies allowed commands, and renders the selected source's control
+surface.
 
 ## Completed history (remote roadmap)
 
@@ -254,12 +225,12 @@ been run yet.
 
 No approved next unit is recorded in this ROADMAP.
 
-The only active work described here is the **current in-progress** remote
-machine projection control-surface unit, manually sourced from Ahmed's explicit
-2026-07-21 handoff/clarification and implemented on
-`feat/remote-projection-control-surface`. It is not a queued successor and its
-own diff does not authorize a future unit, roadmap token, roadmap-push, trunk
-landing, cleanup, or auto-continue succession.
+The only active work described here is the **current in-progress** Steam Deck
+production-`master`/development-`dev` transition, manually sourced from Ahmed's
+direct instruction and implemented first on `chore/dev-integration-policy`.
+It is not a queued successor and its own diff does not authorize a future unit,
+roadmap token, roadmap-push, shared/remote branch mutation, cleanup, or
+auto-continue succession.
 
 If Ahmed wants more work after this unit, he must provide a separate accepted
 source/queue/token. Until then, the correct boundary state is: no approved next
@@ -273,23 +244,24 @@ itself authorize anything; the global auto-continue policy and preconditions
 still govern.
 
 - **Prior roadmap complete.** The earlier `herdr-follow-on-roadmap` queue is
-  complete at `origin/master@ca7c4fc93da9dcdd9edeadb18762c3c2c6b876af` and
-  `origin/roadmap/herdr-follow-on-roadmap@ca7c4fc93da9dcdd9edeadb18762c3c2c6b876af`.
-  Its old token is not active for the current manually sourced projection
-  control-surface unit.
+  complete; its retained remote roadmap ref points to historical
+  `ca7c4fc93da9dcdd9edeadb18762c3c2c6b876af`, behind current
+  `origin/master@b3694186d51a7a26d689d5e49ae5973c3e76c24a`. Its old token is
+  not active for the current manually sourced branch-policy transition.
 - **No active roadmap-push authority for this unit.** This ROADMAP records no
   valid active roadmap ref token or successor base for
-  `feat/remote-projection-control-surface`. Do not reuse the prior completed
-  token, do not invent a token from this task branch's diff, and do not push a
-  reviewed result to `refs/heads/roadmap/*` unless Ahmed separately supplies an
-  accepted queue/token and every global precondition passes.
+  `chore/dev-integration-policy`. Do not reuse the prior completed token, do
+  not invent a token from this task branch's diff, and do not push a reviewed
+  result to `refs/heads/roadmap/*` unless Ahmed separately supplies an accepted
+  queue/token and every global precondition passes.
 - **No approved next unit.** A next unit that exists only in this unit's own
   diff does not count as provenance. With no accepted next-unit source here,
   auto-continue holds at closeout.
-- **Standing constraints.** No `master`/shared/trunk mutation without the
-  active global/project authorization; no force-push; no release/publish; no
-  broad destructive remote ops, PID kill, server stop, real-host setup/update,
-  or host management beyond separately approved scope. Local remote projection
-  work must preserve remote authority, capability gates, no-takeover, stale/
-  disconnected read-only behavior, no transitive routing, no local-owned remote
-  PTY, and no projection frame/stream persistence.
+- **Standing constraints.** No `dev`, `master`, or other shared/origin ref
+  mutation without the active global/project authorization; no force-push; no
+  release/publish; no launcher/install/default-server/package/sudo action before
+  its exact gate; no broad destructive remote ops, PID kill, real-host setup/
+  update, or host management beyond separately approved scope. Remote
+  projection work continues to preserve remote authority, capability gates,
+  no-takeover, stale/disconnected read-only behavior, no transitive routing,
+  no local-owned remote PTY, and no projection frame/stream persistence.

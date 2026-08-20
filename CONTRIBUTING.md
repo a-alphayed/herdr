@@ -77,6 +77,8 @@ If you are unsure whether docs are needed, mention it in the PR.
 
 ## Before submitting a PR
 
+Open normal pull requests against `dev`, the development integration branch. `master` is reserved for reviewed production releases and generated release-channel metadata.
+
 Install the repo hook once in your clone.
 
 ```bash
@@ -107,7 +109,7 @@ fix: handle pane focus
 refs #128
 ```
 
-Do not use GitHub closing keywords like `fixes #128`, `closes #128`, or `resolves #128` in normal PR commits. Herdr closes released issues after a release is published, not when unreleased commits land on `master`.
+Do not use GitHub closing keywords like `fixes #128`, `closes #128`, or `resolves #128` in normal PR commits. Herdr marks referenced work as pending when it lands on `dev` and closes released issues only after a release is published.
 
 ## PR scope
 

@@ -2,6 +2,7 @@ name: Nix
 
 on:
   pull_request:
+    branches: [dev]
     types: [opened, synchronize, reopened]
     paths:
       - ".github/workflows/nix.yml"
@@ -14,7 +15,7 @@ on:
       - "nix/**"
       - "vendor/**"
   push:
-    branches: [master]
+    branches: [dev]
     paths:
       - ".github/workflows/nix.yml"
       - "assets/**"

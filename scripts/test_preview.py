@@ -70,7 +70,7 @@ class PreviewNotesTests(unittest.TestCase):
             ]
         )
         with mock.patch.object(preview, "run_git", return_value=output):
-            self.assertEqual(preview.latest_publishable_commit("origin/master"), "release")
+            self.assertEqual(preview.latest_publishable_commit("origin/dev"), "release")
 
     def test_preview_range_base_advances_to_stable_tag(self):
         with (
@@ -135,6 +135,19 @@ class PreviewNotesTests(unittest.TestCase):
                 )
             finally:
                 os.chdir(original_cwd)
+
+    def test_preview_notes_name_dev_as_the_source_branch(self):
+        with mock.patch.object(preview, "commit_subjects", return_value=[]):
+            notes = preview.build_notes(
+                "previous",
+                "abcdef1234567890",
+                "2026-08-20-abcdef123456",
+                "0.7.1",
+                "ogulcancelik/herdr",
+            )
+        self.assertIn("Built from `abcdef123456` on `dev`.", notes)
+        self.assertIn("Rebuilt preview from the current dev branch.", notes)
+        self.assertNotIn("on `master`", notes)
 
     def test_preview_docs_rewrite_links_to_preview_namespace(self):
         source = """---

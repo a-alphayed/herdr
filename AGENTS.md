@@ -21,11 +21,13 @@ This project has no standing opt-in for routine trunk/shared auto-land, default 
 
 When Ahmed turns `lane auto-continue on` for a committed Herdr roadmap, the global roadmap-push regime applies exactly as written: the reviewed task commit may be pushed only to `refs/heads/roadmap/<name>` fast-forward/create-only with no force; `master`/shared refs remain unreachable by that regime; the successor branches from `origin/roadmap/<name>`; and reviewed task worktree/branch cleanup is allowed only after the roadmap-push is verified, using safe cleanup (`git branch -d`, never `-D`). There is no project hop cap; continuation is bounded by the committed-roadmap provenance guard and the global stop model (roadmap complete, substantive Ahmed-needed boundary, validation/review failure, all models consumed, dirty/unverified state, or another protected stop).
 
-## Ahmed's production and dev Herdr installs
+## Branch authority and Ahmed's production/dev installs
+
+Herdr uses `dev` as its development integration branch and `master` as its production/release branch. Normal task branches start from and land on `dev`; pull requests target `dev`; development CI and preview selection use `dev`. Normal feature/fix work never lands directly on `master`. Stable releases promote a reviewed `release/<version>` branch containing current `origin/dev` and `origin/master` to `master`, then tag that exact production commit. The durable decision and activation gates are in `BRANCHING.md`.
 
 Ahmed's daily Herdr is this fork, not vanilla/upstream Herdr. Do not reinstall or switch him back to a package-managed vanilla Herdr unless he explicitly asks.
 
-- Linux main workflow command: `/home/amf/.local/bin/herdr`, installed from this fork's release build.
+- Linux main workflow command: `/home/amf/.local/bin/herdr`, installed from an exact `master` or stable-tag release build of this fork -- never from the shared `dev` checkout's release artifact.
 - Linux main launcher/shortcut: `SUPER+Return` runs `/home/amf/.local/bin/ghostty-herdr`, which opens Ghostty around `/home/amf/.local/bin/herdr`.
 - Linux dev launcher: `herdr-dev` / `/home/amf/.local/bin/ghostty-herdr-dev`, which opens Ghostty around `/home/amf/Projects/herdr/target/debug/herdr`.
 - Main config/state: `~/.config/herdr` and `~/.local/state/herdr`.
@@ -34,25 +36,26 @@ Ahmed's daily Herdr is this fork, not vanilla/upstream Herdr. Do not reinstall o
 
 Use the main install for Ahmed's real workflow. Use the dev launcher or explicit source-built dev binary for runtime validation. Keep main and dev servers/config/state separate; do not run dev tests in the main workflow server.
 
-Small changes or small tasks are fine in the default main worktree. If you find unrelated implementation changes already in progress in the main worktree, use a dedicated worktree instead. Use a dedicated worktree for bigger features too.
+The shared integration checkout at `../herdr` tracks `dev` after the branch transition is activated. Small changes or small tasks may use that shared `dev` checkout only when the Orchestrator records a same-checkout exception and there is no overlapping writable work. Use a dedicated worktree for normal features, fixes, larger work, and every release.
 
 Use this layout:
 
-- shared integration checkout: `../herdr`
-- task worktrees: `../herdr-worktrees/<task-slug>`
+- shared development integration checkout: `../herdr` on `dev`
+- task worktrees: `../herdr-worktrees/<task-slug>` from current `dev`
 - task branches: `issue/<id>-<slug>` when an issue exists
+- release worktrees: `../herdr-worktrees/release-<version>` on `release/<version>`, created from current `dev`
 
-For normal Herdr work units, do code edits, tests, and validation inside the task worktree. Small doc/policy fixes may stay in the shared checkout when the Orchestrator records the same-checkout exception and there is no overlapping writable work.
+For normal Herdr work units, do code edits, tests, and validation inside the task worktree. Retained historical worktrees and unlanded refs are not rebased, retargeted, landed, or deleted merely because the branch model changed.
 
 Commit reviewed work on the task branch in that worktree. Do not add a project-specific per-commit human closeout gate on top of the Agent Lane Workflow: in lane workflow on, the global plan/diff/validation gates are the commit authority; in lane workflow off, follow the global per-commit approval rule.
 
-Trunk/shared landing remains Ahmed/opt-in controlled. When Ahmed explicitly approves the specific current landing, or when a future effective project trunk/shared auto-land opt-in exists on the Ahmed-landed base branch and all global checks pass, fast-forward the shared checkout at `../herdr` to the task branch commit, then push `origin/master` from `../herdr`. Otherwise closeout stops at the reviewed local task branch and receipt; do not treat the task branch as the final landing branch.
+Shared integration landing remains Ahmed/opt-in controlled. When Ahmed explicitly approves the specific current landing, or when a future effective project trunk/shared auto-land opt-in exists on the Ahmed-landed base branch and all global checks pass, fast-forward the shared `dev` checkout at `../herdr` to the reviewed task commit, then push `origin/dev` from `../herdr`. Otherwise closeout stops at the reviewed local task branch and receipt; do not treat the task branch as landed. Normal task work must not push or fast-forward `master`.
 
-The active auto-continue roadmap regime is separate and narrower: it never fast-forwards or pushes `master`/shared refs. When `lane auto-continue on` is recorded, a committed roadmap and valid roadmap ref token are recorded, and all global preconditions pass, push only the exact reviewed task commit to `refs/heads/roadmap/<name>` fast-forward/create-only with no force. After the roadmap-push is verified, cleanup the task worktree/branch only through the global roadmap cleanup sequence (safe branch deletion via `git branch -d`; keep/report if refused; never `-D`).
+The active auto-continue roadmap regime is separate and narrower: it never fast-forwards or pushes `dev`, `master`, or another shared ref. When `lane auto-continue on` is recorded, a committed roadmap and valid roadmap ref token are recorded, and all global preconditions pass, push only the exact reviewed task commit to `refs/heads/roadmap/<name>` fast-forward/create-only with no force. After the roadmap-push is verified, cleanup the task worktree/branch only through the global roadmap cleanup sequence (safe branch deletion via `git branch -d`; keep/report if refused; never `-D`).
 
 If the current session is already inside an isolated task worktree, keep using it. Do not create nested worktrees.
 
-After a non-roadmap shared/trunk integration, remove the clean task worktree and delete the merged task branch locally/remotely only if Ahmed explicitly approves that specific cleanup, or if cleanup is covered by a future effective trunk/shared opt-in and all global checks pass. Otherwise leave cleanup for Ahmed.
+After a non-roadmap shared `dev` integration, remove the clean task worktree and delete the merged task branch locally/remotely only if Ahmed explicitly approves that specific cleanup, or if cleanup is covered by a future effective trunk/shared opt-in and all global checks pass. Otherwise leave cleanup for Ahmed. Release promotion, stable tagging, post-release `dev` synchronization, and release-worktree cleanup follow the separately gated release flow below.
 
 ## Federated remote agents spike workflow
 
@@ -115,30 +118,32 @@ Unit tests live next to the code (`#[cfg(test)] mod tests`). If you add behavior
 - Treat `docs/next/README.md` and `docs/next/CHANGELOG.md` as next-release staging for the root README and changelog. Treat `docs/next/website/src/content/docs/` as a full next-release mirror of `website/src/content/docs/`; these staged MDX files are the source for the next herdr.dev docs.
 - During normal work, update `docs/next/website/src/content/docs/` for unreleased website doc changes, not `website/src/content/docs/`. Before release, copy the approved mirror back to `website/src/content/docs/`. `just release-docs-check` verifies README/changelog sync, the website docs mirror is 1:1 with released website docs, and the removed root docs stay removed.
 - Put local PRDs, planning notes, and exploratory specs under `.local/prd/`; `.local/` is ignored and locally controlled.
-- Integration asset versions (`HERDR_INTEGRATION_VERSION` markers and matching `*_INTEGRATION_VERSION` constants) are migration versions relative to the latest released tag, not per-commit counters on `master`. If an integration asset changes multiple times between releases, bump it once from the version in the latest release. Before changing one, compare against the latest release tag and keep the asset marker and Rust expected constant aligned.
+- Integration asset versions (`HERDR_INTEGRATION_VERSION` markers and matching `*_INTEGRATION_VERSION` constants) are migration versions relative to the latest released tag, not per-commit counters on `dev`. If an integration asset changes multiple times between releases, bump it once from the version in the latest release. Before changing one, compare against the latest release tag and keep the asset marker and Rust expected constant aligned.
 - When a normal feature or fix commit relates to a GitHub issue, add a commit body line `refs #<issue-number>` after the subject. Use this shape:
   ```text
   fix: handle pane focus
 
   refs #82
   ```
-  Do not use GitHub closing keywords like `fixes #<issue-number>`, `closes #<issue-number>`, or `resolves #<issue-number>` in normal commits, because `master` contains unreleased work and those keywords close issues before release. Release CI scans `refs #<issue-number>` body lines between release tags and closes the referenced issues after the GitHub Release is created.
+  Do not use GitHub closing keywords like `fixes #<issue-number>`, `closes #<issue-number>`, or `resolves #<issue-number>` in normal commits, because normal work lands on `dev` before release. Release CI scans `refs #<issue-number>` body lines between release tags and closes the referenced issues only after the GitHub Release is created.
 - Rust: no `unwrap()` in production code. `tracing` for logging. `#[allow]` only with a comment explaining why.
 - Don't bypass checks. If tests fail, fix them before committing.
 - Don't add dependencies without a reason. Check if the existing deps cover it first.
 
 ## Releases
 
-Before cutting a release, run `/pre-release-audit` to compare commits since the last tag against `docs/next/CHANGELOG.md` and `docs/next/`, then copy approved next-release docs into `README.md`, `CHANGELOG.md`, and the matching website docs. The release script promotes the root changelog's `## Unreleased` section into the versioned entry and copies the prepared changelog back to `docs/next/CHANGELOG.md` so the next cycle starts clean.
+Before cutting a release, run `/pre-release-audit` against current `dev` to compare commits since the last tag with `docs/next/CHANGELOG.md` and `docs/next/`, then copy approved next-release docs into `README.md`, `CHANGELOG.md`, and the matching website docs. The release script promotes the root changelog's `## Unreleased` section into the versioned entry and copies the prepared changelog back to `docs/next/CHANGELOG.md` so the next cycle starts clean.
 
-Default release flow:
+Create `release/<version>` from current `dev` in a dedicated worktree, bring current `origin/master` release-channel metadata into that branch, and verify both `origin/dev` and `origin/master` are ancestors. The two release commands intentionally have an inspection/approval boundary:
 
 ```bash
 just check
-just release 0.x.y
+just release-prepare 0.x.y
+# review the exact release commit and obtain Ahmed's publication approval
+just release-publish 0.x.y
 ```
 
-`just release 0.x.y` prepares the changelog entry, bumps `Cargo.toml`, updates `Cargo.lock`, runs tests, commits the release, pushes `master`, tags, and pushes the tag. GitHub Actions builds the binaries after the tag is pushed, creates the GitHub release, uploads all four binary assets, then updates `website/latest.json` on `master` automatically.
+`just release-prepare` only runs on the exact `release/<version>` branch and creates the local release commit after ancestry/docs/tests pass. `just release-publish` rechecks clean state, exact branch, both remote ancestries, version, docs, and tag absence before pushing the reviewed release branch to `master`, tagging that production commit, and pushing the tag. The combined `just release` shortcut is disabled. GitHub Actions accepts a stable tag only when its commit is reachable from `origin/master`, then builds the binaries, creates the GitHub release, uploads all four assets, and updates `website/latest.json` on `master` automatically. After that generated metadata commit, synchronize `dev` from released `master` only through the active shared-ref approval path.
 
 `nix/package.nix` imports `Cargo.lock` directly with `cargoLock.lockFile`, so release version bumps do not require a separate Nix cargo hash update. If Cargo git dependencies are added later, add the required `cargoLock.outputHashes` entries as part of that dependency change.
 

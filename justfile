@@ -3,7 +3,7 @@
 # Run tests
 test:
     cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never
-    python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
+    python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_branch_policy scripts.test_changelog scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
     just plugin-marketplace-test
 
 # Run one nextest filter, e.g. `just test-one codex_stale_working`
@@ -18,6 +18,7 @@ lint:
 # Run PR CI checks
 ci filter='all()': lint
     cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
+    python3 -m unittest scripts.test_branch_policy
     just plugin-marketplace-test
 
 # Run Windows target lint from Unix/macOS to catch cfg(windows) compile and clippy failures before CI
@@ -27,7 +28,7 @@ windows-lint:
 
 # Check formatting + run unit tests + Windows target lint + maintenance script tests
 check: ci windows-lint
-    python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_changelog scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
+    python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_branch_policy scripts.test_changelog scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
     @echo "docs reminder: if this changes user-facing behavior, make sure the relevant release docs are updated or called out before release."
 
 # Install repo-local git hooks
@@ -94,11 +95,24 @@ release-prepare version:
         echo "error: version must look like 0.6.6 without a v prefix"; \
         exit 1; \
     }
+    @branch="$(git branch --show-current)"; \
+    if [ "$branch" != "release/{{version}}" ]; then \
+        echo "error: release-prepare must run from release/{{version}}, got $branch"; \
+        exit 1; \
+    fi
     @if [ -n "$(git status --porcelain)" ]; then \
         echo "error: commit your changes first"; \
         exit 1; \
     fi
-    @git fetch origin master --tags
+    @git fetch origin '+refs/heads/master:refs/remotes/origin/master' '+refs/heads/dev:refs/remotes/origin/dev' --tags
+    @if ! git merge-base --is-ancestor origin/master HEAD; then \
+        echo "error: release/{{version}} does not contain current origin/master release metadata"; \
+        exit 1; \
+    fi
+    @if ! git merge-base --is-ancestor origin/dev HEAD; then \
+        echo "error: release/{{version}} does not contain current origin/dev"; \
+        exit 1; \
+    fi
     @if git rev-parse "v{{version}}" >/dev/null 2>&1; then \
         echo "error: tag v{{version}} already exists"; \
         exit 1; \
@@ -124,11 +138,11 @@ release-publish version:
         exit 1; \
     fi
     @branch="$(git branch --show-current)"; \
-    if [ "$branch" != "master" ]; then \
-        echo "error: release-publish must run from master, got $branch"; \
+    if [ "$branch" != "release/{{version}}" ]; then \
+        echo "error: release-publish must run from release/{{version}}, got $branch"; \
         exit 1; \
     fi
-    @git fetch origin master --tags
+    @git fetch origin '+refs/heads/master:refs/remotes/origin/master' '+refs/heads/dev:refs/remotes/origin/dev' --tags
     @if git rev-parse "v{{version}}" >/dev/null 2>&1; then \
         echo "error: tag v{{version}} already exists"; \
         exit 1; \
@@ -142,23 +156,28 @@ release-publish version:
     python3 scripts/changelog.py extract --version {{version}} --output /tmp/herdr-release-notes-check.md
     rm -f /tmp/herdr-release-notes-check.md
     @local_head="$(git rev-parse HEAD)"; \
-    remote_head="$(git rev-parse origin/master)"; \
-    if ! git merge-base --is-ancestor "$remote_head" "$local_head"; then \
-        echo "error: origin/master is not an ancestor of HEAD; pull or rebase before publishing"; \
+    master_head="$(git rev-parse origin/master)"; \
+    dev_head="$(git rev-parse origin/dev)"; \
+    if ! git merge-base --is-ancestor "$master_head" "$local_head"; then \
+        echo "error: origin/master is not an ancestor of the release commit"; \
         exit 1; \
     fi; \
-    if [ "$local_head" != "$remote_head" ]; then \
-        echo "pushing release commit to origin/master"; \
+    if ! git merge-base --is-ancestor "$dev_head" "$local_head"; then \
+        echo "error: origin/dev is not an ancestor of the release commit"; \
+        exit 1; \
+    fi; \
+    if [ "$local_head" != "$master_head" ]; then \
+        echo "promoting reviewed release commit to origin/master"; \
         git push origin HEAD:master; \
     fi
     git tag -a v{{version}} -m "v{{version}}"
     git push origin v{{version}}
     @echo "v{{version}} released — GitHub Actions building binaries and updating website/latest.json"
 
-# Prepare, verify, tag, push, and trigger the GitHub Release workflow (usage: just release 0.1.1)
+# The release flow is deliberately two-step so review/approval separates preparation from publication.
 release version:
-    just release-prepare {{version}}
-    just release-publish {{version}}
+    @echo "error: combined release is disabled; run 'just release-prepare {{version}}', review/approve, then 'just release-publish {{version}}'" >&2
+    @exit 1
 
 # Print default config
 default-config:
