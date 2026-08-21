@@ -849,7 +849,7 @@ mod tests {
         let original_pane = request.pane.pane_id;
         let original_terminal_id = request.pane.terminal_id.clone();
 
-        app.apply_remote_attach_in_new_split_with_exe(target(), Path::new("/bin/true"))
+        app.apply_remote_attach_in_new_split_with_exe(target(), Path::new("/usr/bin/true"))
             .expect("remote attach split should spawn argv child");
 
         let ws = &app.state.workspaces[0];
@@ -887,7 +887,7 @@ mod tests {
         let request = pane_request(&mut app);
         let original_pane = request.pane.pane_id;
 
-        app.apply_remote_attach_in_new_split_with_exe(target(), Path::new("/bin/true"))
+        app.apply_remote_attach_in_new_split_with_exe(target(), Path::new("/usr/bin/true"))
             .expect("remote attach split should spawn argv child");
         let attach_pane = app.state.workspaces[0]
             .focused_pane_id()
