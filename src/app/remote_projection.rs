@@ -1456,8 +1456,10 @@ mod tests {
             ClientMessage, RenderEncoding, ServerMessage, MAX_FRAME_SIZE, PROTOCOL_VERSION,
         };
 
-        let dir = std::env::temp_dir().join(format!(
-            "herdr-projection-mouse-{}-{}",
+        // macOS temp roots can already approach SUN_LEN; keep the socket path
+        // short while retaining per-process/test uniqueness.
+        let dir = std::path::PathBuf::from("/tmp").join(format!(
+            "hp-mouse-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
