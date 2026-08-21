@@ -1794,6 +1794,7 @@ mod tests {
         assert!(remote_response_error_code(r#"{"id":"r","error":{}}"#).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_bridge_pool_cap_equals_app_layer_limiter() {
         // Phase G.10 cross-layer invariant: the remote-layer pool cap
