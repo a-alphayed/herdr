@@ -1,6 +1,6 @@
 # Development and release branches
 
-Status: local development branch/live-dev runtime activated and Omarchy package retired; remote gate remains
+Status: activated locally and on Ahmed's fork; live-dev runtime active; Omarchy package retired
 Date: 2026-08-20
 
 ## Decision
@@ -106,16 +106,17 @@ default branch or branch protection, move a shared checkout, publish a release,
 change a launcher, install a binary, stop a server, remove a package, or use
 `sudo`.
 
-Activation is ordered and fail-closed. Local gates 1, 2, 4, 5, and 6 are
-complete with verified proof; remote authority remains separate:
+Activation is ordered and fail-closed. All six activation gates are complete
+with verified proof. Future branch-protection changes remain separate:
 
 1. validate, stage, approve, and commit this policy/CI/release transition on its
    task branch;
 2. after exact approval, create/advance local `dev` to the reviewed commit and
    switch the shared checkout to it without changing any other worktree or ref;
 3. after separate exact approval, create `origin/dev` with a fully qualified,
-   no-force push and verify it; GitHub default-branch/protection changes remain
-   separate external actions;
+   no-force push and verify it, then set Ahmed's fork default branch to `dev`.
+   Complete: local/origin `dev@3ad066a8408f41d36ee66e8e00747936fff35566`
+   and `origin/HEAD -> origin/dev`; branch-protection changes remain separate;
 4. prove fork debug/stable binaries and both live-handoff directions before
    touching the default server;
 5. install the exact stable fork rollback binary and repair stable/dev launch

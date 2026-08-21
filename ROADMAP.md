@@ -19,17 +19,19 @@ read-set policy).
 
 - Local `master` and `origin/master` are clean and equal at
   `b3694186d51a7a26d689d5e49ae5973c3e76c24a` (`feat: copy projected
-  selections to local clipboard`). Clean local `dev` is active at approved
-  policy commit `7e811279731e68851b8130fa8cd693e911798bc3`; origin still has no
-  `dev` branch.
+  selections to local clipboard`). Clean local `dev` and `origin/dev` are equal
+  at `3ad066a8408f41d36ee66e8e00747936fff35566`; local `dev` tracks
+  `origin/dev`, `origin/HEAD` points to it, and Ahmed's fork default branch is
+  `dev`. No force was used.
 - Ahmed selected the durable branch model: `dev` is development integration
   and preview source; `master` is production/release-only, with a narrow
   generated release-channel metadata exception. The decision, live-dev
   profile, and remaining activation gates are in `BRANCHING.md`.
-- The current Ahmed-sourced unit has completed local branch activation,
-  stable/dev launcher repair, live dev-server replacement, and Omarchy-package
-  retirement. Remote `dev` creation/push, GitHub settings, and the follow-up
-  policy amendment commit remain distinct gates.
+- The Ahmed-sourced production-`master`/development-`dev` transition is
+  complete: branch/CI/release policy, local and remote `dev`, fork default
+  branch, stable/dev launchers, all-agent live dev-server replacement, test
+  isolation hardening, and Omarchy-package retirement all pass. Future branch
+  protection, release promotion, and project onboarding are separate units.
 - Nine pre-existing worktrees were inventoried clean and must be preserved.
   Three local-only/unlanded tips remain intentionally untouched:
   `fix/remote-claude-selection@29d02c9a`,
@@ -228,16 +230,14 @@ been run yet.
 
 No approved next unit is recorded in this ROADMAP.
 
-The only active work described here is the **current in-progress** Steam Deck
-production-`master`/development-`dev` transition, manually sourced from Ahmed's
-direct instruction and implemented first on `chore/dev-integration-policy`.
-It is not a queued successor and its own diff does not authorize a future unit,
-roadmap token, roadmap-push, shared/remote branch mutation, cleanup, or
-auto-continue succession.
+The Steam Deck production-`master`/development-`dev` transition is complete.
+No successor is self-authorized by its diff. Ahmed's stated next direction is to
+onboard the rest of his projects into Herdr, but each repository remains a
+separately governed work unit: read its root policy, inventory its worktrees and
+refs, and obtain any required migration/live-action gates before mutation.
 
-If Ahmed wants more work after this unit, he must provide a separate accepted
-source/queue/token. Until then, the correct boundary state is: no approved next
-unit; auto-continue held.
+No committed project-by-project queue or roadmap token is recorded here.
+Auto-continue remains off.
 
 ## Auto-continue provenance guidance
 
@@ -251,12 +251,11 @@ still govern.
   `ca7c4fc93da9dcdd9edeadb18762c3c2c6b876af`, behind current
   `origin/master@b3694186d51a7a26d689d5e49ae5973c3e76c24a`. Its old token is
   not active for the current manually sourced branch-policy transition.
-- **No active roadmap-push authority for this unit.** This ROADMAP records no
-  valid active roadmap ref token or successor base for
-  `chore/dev-integration-policy`. Do not reuse the prior completed token, do
-  not invent a token from this task branch's diff, and do not push a reviewed
-  result to `refs/heads/roadmap/*` unless Ahmed separately supplies an accepted
-  queue/token and every global precondition passes.
+- **No active roadmap-push authority.** The branch transition is complete and
+  records no valid active roadmap ref token or successor base. Do not reuse the
+  prior completed token, invent a token from this unit's diff, or push a result
+  to `refs/heads/roadmap/*` unless Ahmed separately supplies an accepted queue/
+  token and every global precondition passes.
 - **No approved next unit.** A next unit that exists only in this unit's own
   diff does not count as provenance. With no accepted next-unit source here,
   auto-continue holds at closeout.
