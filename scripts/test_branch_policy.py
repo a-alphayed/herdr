@@ -49,6 +49,11 @@ class BranchPolicyTests(unittest.TestCase):
         self.assertGreaterEqual(justfile.count("merge-base --is-ancestor origin/dev"), 1)
         self.assertIn('dev_head="$(git rev-parse origin/dev)"', justfile)
         self.assertIn("combined release is disabled", justfile)
+        self.assertIn("herdr-test-env :=", justfile)
+        self.assertEqual(justfile.count("{{herdr-test-env}} cargo nextest run"), 3)
+        self.assertIn("-u HERDR_SOCKET_PATH", justfile)
+        self.assertIn("-u HERDR_CONFIG_PATH", justfile)
+        self.assertIn("-u HERDR_STARTUP_CWD", justfile)
 
         release = self.read(".github/workflows/release.yml")
         self.assertIn("Verify tagged commit is on production master", release)
@@ -72,6 +77,10 @@ class BranchPolicyTests(unittest.TestCase):
         self.assertIn("Release-channel metadata exception", decision)
         self.assertIn("Normal task branches start from", decision)
         self.assertIn("reviewed work lands on `dev`", decision)
+        self.assertIn("Steam Deck live-dev profile", decision)
+        self.assertIn("Require exact normalized pre/post identity equality", decision)
+        self.assertIn("Linux live-dev command", agents)
+        self.assertIn("do not start an empty parallel dev server", agents.lower())
         self.assertIn("Open normal pull requests against `dev`", contributing)
 
 

@@ -1,6 +1,6 @@
 # Development and release branches
 
-Status: accepted direction from Ahmed; activation remains gated
+Status: local development branch/live-dev runtime activated and Omarchy package retired; remote gate remains
 Date: 2026-08-20
 
 ## Decision
@@ -44,11 +44,40 @@ publication. The release recipes enforce both ancestry checks.
 3. Land reviewed task commits on `dev` only through Ahmed's explicit shared-ref
    approval or an effective global authorization. Do not push task work to
    `master`.
-4. Build and runtime-test development work through the debug binary in the
-   shared `dev` checkout and the isolated `herdr-dev` config/state.
+4. Build development work through the debug binary in the shared `dev`
+   checkout. Run mutating feature/runtime tests only with task-scoped temporary
+   config/state and a separate socket/session; the live-dev server is Ahmed's
+   real local workflow, not disposable test state.
 
 Retained historical worktrees and unlanded refs are not rebased, retargeted,
 landed, or deleted merely because the branch model changed.
+
+## Steam Deck live-dev profile
+
+The Steam Deck's active local server may run the exact debug binary from the
+shared `dev` checkout while `master` remains the stable production/release
+source. The live-dev command deliberately uses the main live socket and config
+so local and federated agents remain one control surface; the debug build keeps
+its persistence/log roots under `herdr-dev`. The exact stable `master` release
+binary remains installed as the rollback path.
+
+A live-dev cutover is fail-closed:
+
+1. Capture normalized identities for every agent, pane, workspace, and tab,
+   plus the current Orchestrator process/session.
+2. Prove the stable-to-dev and dev-to-stable live-handoff paths in isolation.
+3. Live-handoff to the exact debug binary; never stop the server first and
+   never start an empty parallel dev server.
+4. Wait boundedly for configured federated hosts to reconnect.
+5. Require exact normalized pre/post identity equality and one live copy of the
+   current Orchestrator session. Any mismatch rolls back live to the stable
+   release binary.
+6. Verify an actual Ghostty dev client runs the debug binary and captures
+   screenshot proof before treating the launcher path as active.
+
+This profile does not authorize arbitrary live-state testing. Mutating runtime
+tests still use isolated task-scoped roots/sockets/sessions unless Ahmed
+explicitly approves a live behavior test.
 
 ## Stable release flow
 
@@ -77,7 +106,8 @@ default branch or branch protection, move a shared checkout, publish a release,
 change a launcher, install a binary, stop a server, remove a package, or use
 `sudo`.
 
-Activation is ordered and fail-closed:
+Activation is ordered and fail-closed. Local gates 1, 2, 4, 5, and 6 are
+complete with verified proof; remote authority remains separate:
 
 1. validate, stage, approve, and commit this policy/CI/release transition on its
    task branch;
@@ -86,10 +116,11 @@ Activation is ordered and fail-closed:
 3. after separate exact approval, create `origin/dev` with a fully qualified,
    no-force push and verify it; GitHub default-branch/protection changes remain
    separate external actions;
-4. prove fork debug and stable binaries through isolated config/state and an
-   actual old-server-to-fork live-handoff smoke before touching the default
-   server;
-5. install the exact stable fork binary and repair the stable launcher only
-   through the approved local-install phase;
-6. replace the default server and remove the explicitly installed Omarchy
-   package only after rollback/reconnect proof and Ahmed's package/`sudo` gate.
+4. prove fork debug/stable binaries and both live-handoff directions before
+   touching the default server;
+5. install the exact stable fork rollback binary and repair stable/dev launch
+   paths through the approved local-install phase;
+6. replace the default server only after exact all-agent equality/reconnect
+   proof; remove the inactive Omarchy package only after Ahmed's separate
+   package/`sudo` gate. Both actions are complete locally; package removal did
+   not stop the dev server or any resumed agent.

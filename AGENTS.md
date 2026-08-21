@@ -29,12 +29,15 @@ Ahmed's daily Herdr is this fork, not vanilla/upstream Herdr. Do not reinstall o
 
 - Linux main workflow command: `/home/amf/.local/bin/herdr`, installed from an exact `master` or stable-tag release build of this fork -- never from the shared `dev` checkout's release artifact.
 - Linux main launcher/shortcut: `SUPER+Return` runs `/home/amf/.local/bin/ghostty-herdr`, which opens Ghostty around `/home/amf/.local/bin/herdr`.
-- Linux dev launcher: `herdr-dev` / `/home/amf/.local/bin/ghostty-herdr-dev`, which opens Ghostty around `/home/amf/Projects/herdr/target/debug/herdr`.
-- Main config/state: `~/.config/herdr` and `~/.local/state/herdr`.
-- Dev config/state: `~/.config/herdr-dev` and `~/.local/state/herdr-dev`.
+- Linux live-dev command: `/home/amf/.local/bin/herdr-dev`, which executes `/home/amf/Projects/herdr/target/debug/herdr` with the live main socket and config (`~/.config/herdr/herdr.sock`, `~/.config/herdr/config.toml`) while the debug build persists its own state/logs under `~/.local/state/herdr-dev` and `~/.config/herdr-dev`.
+- Linux dev launcher: `/home/amf/.local/bin/ghostty-herdr-dev`, which opens Ghostty around the live-dev command above.
+- Main stable config/state: `~/.config/herdr` and `~/.local/state/herdr`; the stable release binary remains the rollback path.
+- Live-dev state/logs: `~/.config/herdr-dev` and `~/.local/state/herdr-dev`; live socket/config sharing is deliberate so the debug server can take over every local and federated agent.
 - `brain` main command: `/opt/homebrew/bin/herdr -> /Users/afayed/.local/bin/herdr`, installed from the same fork build shape. The source checkout lives at `/Users/afayed/Projects/herdr`.
 
-Use the main install for Ahmed's real workflow. Use the dev launcher or explicit source-built dev binary for runtime validation. Keep main and dev servers/config/state separate; do not run dev tests in the main workflow server.
+Ahmed's Steam Deck currently uses the live-dev server for the real local workflow. A live-dev cutover is valid only through an exact live handoff that snapshots every agent/pane/workspace/tab, waits boundedly for federated agents to reconnect, proves normalized pre/post identity equality, and explicitly proves the current Orchestrator session is present once. Any missing/duplicate identity or liveness failure rolls back to the stable release binary. Do not start an empty parallel dev server or blindly stop the live server.
+
+The live-dev profile deliberately shares the main socket/config but keeps debug state/logs under `herdr-dev`; this is narrower than treating all dev tests as production-safe. Feature/runtime tests that create, mutate, or destroy panes/workspaces must still use task-scoped temporary `XDG_CONFIG_HOME`/`XDG_STATE_HOME` and a separate socket/session. The live-dev Ghostty window may be used for read-only launch/current-state proof and only for explicitly approved live behavior.
 
 The shared integration checkout at `../herdr` tracks `dev` after the branch transition is activated. Small changes or small tasks may use that shared `dev` checkout only when the Orchestrator records a same-checkout exception and there is no overlapping writable work. Use a dedicated worktree for normal features, fixes, larger work, and every release.
 
@@ -102,9 +105,9 @@ Default flow: run `just check` before committing. Do not commit until `just chec
 
 For any feature, slice, or work unit with user-visible UI or runtime behavior, do end-to-end testing in **Ghostty Herdr Dev** before asking Ahmed to approve a commit, merge, or push. Be satisfied the feature actually works in the dev app, not only in unit tests.
 
-- Use the dedicated Ghostty Herdr Dev launcher (`ghostty-herdr-dev.desktop` / `~/.local/bin/ghostty-herdr-dev`) and the source-built dev binary it launches. Rebuild that explicit dev binary before testing when needed.
-- Do not launch dev runtime tests inside Ahmed's main workflow Herdr panes, workspaces, default session, or normal named sessions. Ahmed uses this fork in production for work; do not touch or mutate the main workflow server for validation.
-- Keep dev runtime state isolated with `herdr-dev` config/state or task-scoped temp `XDG_CONFIG_HOME` and `XDG_STATE_HOME`. If running from an existing Herdr environment, the dev config must intentionally allow nesting with `[experimental] allow_nested = true`.
+- Rebuild the explicit source debug binary before live-dev launch/current-state proof. The dedicated Ghostty launcher (`ghostty-herdr-dev.desktop` / `~/.local/bin/ghostty-herdr-dev`) attaches to the live-dev server and therefore is not an isolation boundary by itself.
+- Do not run mutating feature/runtime tests inside Ahmed's live workflow panes, workspaces, default session, or normal named sessions. The debug executable does not make live state disposable.
+- Run mutating tests with task-scoped temporary `XDG_CONFIG_HOME` and `XDG_STATE_HOME`, a separate socket/session, and `[experimental] allow_nested = true` when launched from an existing Herdr environment. Use the live-dev Ghostty window only for read-only launch/current-state proof or an explicitly approved live behavior test.
 - Capture screenshot proof through the Omarchy/Ghostty desktop path after the end-to-end test. Inspect the screenshot and report the screenshot path plus what was verified before the commit gate.
 - If the dev launcher, screenshot, or runtime validation fails or is ambiguous, treat the work unit as not ready. Fix it or report the blocker before asking for commit or push approval.
 

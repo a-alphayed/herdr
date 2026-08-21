@@ -1,14 +1,18 @@
 # herdr task runner
 
+# Prevent tests launched from a live Herdr pane from inheriting that server's
+# socket/session authority and accidentally mutating the live workflow.
+herdr-test-env := "env -u HERDR_ENV -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH -u HERDR_CONFIG_PATH -u HERDR_STARTUP_CWD -u HERDR_SESSION -u HERDR_BIN_PATH -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID"
+
 # Run tests
 test:
-    cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never
+    {{herdr-test-env}} cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never
     python3 -m unittest scripts.test_agent_detection_manifest_check scripts.test_branch_policy scripts.test_changelog scripts.test_preview scripts.test_vendor_libghostty_vt scripts.test_vendor_portable_pty
     just plugin-marketplace-test
 
 # Run one nextest filter, e.g. `just test-one codex_stale_working`
 test-one filter:
-    cargo nextest run --locked "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
+    {{herdr-test-env}} cargo nextest run --locked "{{filter}}" --status-level fail --final-status-level fail --failure-output final --success-output never
 
 # Run fast local lint checks
 lint:
@@ -17,7 +21,7 @@ lint:
 
 # Run PR CI checks
 ci filter='all()': lint
-    cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
+    {{herdr-test-env}} cargo nextest run --locked -E "{{filter}}" --status-level fail --final-status-level slow --failure-output final --success-output never
     python3 -m unittest scripts.test_branch_policy
     just plugin-marketplace-test
 

@@ -19,19 +19,17 @@ read-set policy).
 
 - Local `master` and `origin/master` are clean and equal at
   `b3694186d51a7a26d689d5e49ae5973c3e76c24a` (`feat: copy projected
-  selections to local clipboard`). This is the exact source commit used for
-  Ahmed's current fork release candidate on Steam Deck and forge.
-- Origin has no `dev` branch yet. Ahmed selected the durable branch model:
-  `dev` is development integration and preview source; `master` is production/
-  release-only, with a narrow generated release-channel metadata exception.
-  The decision and activation gates are in `BRANCHING.md`.
-- The current Ahmed-sourced unit is the branch/worktree/CI/release transition
-  plus isolated stable/dev launcher proof and later Omarchy-package retirement.
-  Its policy implementation is on local task branch
-  `chore/dev-integration-policy`, based exactly on `master@b3694186`.
-  Committing, local/shared `dev` activation, remote `dev` creation/push,
-  GitHub settings, launcher/install changes, default-server replacement,
-  package removal, and cleanup are distinct gates.
+  selections to local clipboard`). Clean local `dev` is active at approved
+  policy commit `7e811279731e68851b8130fa8cd693e911798bc3`; origin still has no
+  `dev` branch.
+- Ahmed selected the durable branch model: `dev` is development integration
+  and preview source; `master` is production/release-only, with a narrow
+  generated release-channel metadata exception. The decision, live-dev
+  profile, and remaining activation gates are in `BRANCHING.md`.
+- The current Ahmed-sourced unit has completed local branch activation,
+  stable/dev launcher repair, live dev-server replacement, and Omarchy-package
+  retirement. Remote `dev` creation/push, GitHub settings, and the follow-up
+  policy amendment commit remain distinct gates.
 - Nine pre-existing worktrees were inventoried clean and must be preserved.
   Three local-only/unlanded tips remain intentionally untouched:
   `fix/remote-claude-selection@29d02c9a`,
@@ -46,13 +44,18 @@ read-set policy).
   is recorded in `.local/agent-lanes.md`, and this committed history does not
   set a future session's controls. There is no standing trunk/shared auto-land,
   remote-branch creation, live-install, package, or cleanup authorization.
-- Steam Deck currently runs the explicitly installed Omarchy fork package
-  `/usr/bin/herdr` at version 0.8.0/protocol 20. Ahmed's clean fork build at
-  `master@b3694186` is version 0.7.1/protocol 15. The stable local command
-  `$HOME/.local/bin/herdr` is missing, while the dev launcher already points to
-  the fork debug binary. The packaged default server remains running and must
-  not be stopped or replaced until isolated old-to-new handoff and rollback
-  proof pass and Ahmed approves the exact live/package phase.
+- Steam Deck now runs the exact source debug binary from local `dev` as the
+  live server/client: SHA-256 `e83aa23a...`, version 0.7.1, protocol 15. The
+  live-dev profile shares the main socket/config and keeps debug state/logs
+  under `herdr-dev`. Immediate pre/post normalized identity hash
+  `caee36f3...` matches exactly for 15 agents, 14 panes, 10 workspaces, and 10
+  tabs after all five federated agents reconnected; the active Orchestrator
+  session is present once. Actual Ghostty dev-client and screenshot proof pass.
+- `$HOME/.local/bin/herdr` is the exact stable `master@b3694186` rollback
+  binary (`a008d799...`). The explicitly installed Omarchy package
+  `herdr 0.8.0.r13-1` was removed through Ahmed's visible sudo gate only after
+  the live-dev equality/launcher/rollback proofs passed. `/usr/bin/herdr` is
+  absent; the dev server and all agents remained live through removal.
 
 The remote-agent control sequence through `b3694186` remains landed and
 exercised end to end. Remote hosts retain authority for PTYs, panes, hooks,
