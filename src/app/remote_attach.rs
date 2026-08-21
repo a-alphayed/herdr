@@ -938,7 +938,7 @@ mod tests {
         let request = pane_request(&mut app);
         let terminal_id = request.pane.terminal_id.clone();
 
-        app.apply_remote_attach_with_exe(request, Path::new("/bin/true"))
+        app.apply_remote_attach_with_exe(request, Path::new("/usr/bin/true"))
             .expect("remote attach should spawn argv child");
 
         let terminal = app.state.terminals.get(&terminal_id).unwrap();
