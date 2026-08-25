@@ -11,6 +11,8 @@ pub(crate) mod plugins;
 mod remote_helpers;
 pub(crate) mod remotes;
 mod responses;
+#[cfg(unix)]
+pub(crate) mod routed_exec;
 mod session;
 mod tabs;
 mod workspaces;
@@ -264,6 +266,43 @@ impl App {
             };
         let terminal_cwd_reported = matches!(ev, AppEvent::TerminalCwdReported { .. });
         let previous_toast = self.state.toast.clone();
+        // Routed-executor escalation: a primary-leg failure at or after the
+        // first write attempt (an ordinary transport error, or a primary
+        // response that failed to parse — FIX-2) with no authoritative
+        // result asks the supervisor to reconnect (retire + fresh generated
+        // supervisor through the `remote.reconnect` path). There is no
+        // timeout anywhere in this executor (v11) driving this; it only
+        // fires on a genuine transport/protocol failure. Force-reconnect-
+        // and-resync is the whole recovery contract — there is no separate
+        // mutation-quarantine gate to lift.
+        let routed_recovery = match &ev {
+            AppEvent::RemoteRoutedRecoveryNeeded { host, generation } => {
+                tracing::warn!(
+                    event = "remote.route.recovery",
+                    subsystem = "remote",
+                    host = %host.host,
+                    session = %host.session,
+                    generation,
+                    "routed sequence outcome unknown; starting the recovery transition"
+                );
+                Some(host.clone())
+            }
+            _ => None,
+        };
+        if let Some(host) = routed_recovery {
+            self.start_remote_routed_recovery(host);
+            return;
+        }
+        // H6 (plan v6/v8): a generation-retiring disconnect cancels every
+        // STILL-QUEUED descriptor for that host as cancelled-before-write —
+        // synchronously, before the reducer below marks the host disconnected.
+        // The already-EXECUTING descriptor (if any) is untouched: it runs to
+        // completion (there is no deadline to bound it — see
+        // `crate::remote::routed`'s module contract).
+        #[cfg(unix)]
+        if let AppEvent::RemoteSourceDisconnected { host, .. } = &ev {
+            self.cancel_queued_routed_for_reconnect(host);
+        }
         let pane_updates = self.state.handle_app_event(ev);
         if let Some(agents) = manifest_update_agents {
             self.reset_agent_detection_for_agents(&agents);
@@ -348,6 +387,26 @@ impl App {
                 host, generation, ..
             }
             | AppEvent::RemoteSourceBridgeState {
+                host, generation, ..
+            }
+            // A routed sequence's completion carries the SOURCE generation
+            // captured at plan time (see `RoutedSequenceDescriptor`); admit it
+            // only when that generation is still the active supervisor's, so
+            // a completion superseded by a disconnect/reconnect/config-reload
+            // in the meantime never stamps reconciliation or applies stale
+            // refresh data (plan v8/v9: stale-completion rejection).
+            | AppEvent::RemoteRoutedSequenceCompleted {
+                host, generation, ..
+            }
+            // A routed sequence's recovery escalation likewise carries the
+            // SOURCE generation. Without this gate an escalation that fires
+            // AFTER the host already recovered through another path (a
+            // concurrent reconnect, config reload, or a prior recovery
+            // escalation) would still retire the already-healthy fresh
+            // supervisor and start a redundant reconnect. Admit only when
+            // that generation is still the active supervisor's, exactly like
+            // the completion event.
+            | AppEvent::RemoteRoutedRecoveryNeeded {
                 host, generation, ..
             } => {
                 !self.remote_host_session_is_configured(host)
@@ -874,6 +933,72 @@ impl App {
         self.handle_api_request_after_internal_events_drained(request)
     }
 
+    /// Named recovery transition for a routed-sequence primary-leg failure at
+    /// or after the first write attempt, with no authoritative result: an
+    /// explicit `remote.reconnect` through the generation-retiring path
+    /// (retire the supervisor handle, mark cached state disconnected
+    /// dropping prepared state, start exactly one fresh generated
+    /// supervisor). The responder is a dropped-receiver channel (the
+    /// escalation is internal; its lifecycle response is discarded).
+    /// `start_remote_lifecycle_reconnect` (REQ-2) also cancels every
+    /// still-queued routed descriptor for the host, so this path and an
+    /// explicit user-issued `remote.reconnect` both get that cancellation.
+    fn start_remote_routed_recovery(&mut self, host: crate::remote_source::RemoteHostKey) {
+        let (respond_to, _receiver) = std::sync::mpsc::channel();
+        self.start_remote_lifecycle_reconnect(
+            "remote-routed-recovery".to_string(),
+            crate::api::schema::RemoteLifecycleHostParams {
+                host: host.host.clone(),
+            },
+            respond_to,
+        );
+    }
+
+    /// REQ-2 (round-3 blocker 2): cancel every STILL-QUEUED routed descriptor
+    /// for `host` and resolve each sink with the standard "generation
+    /// changed, safe to retry" cancellation. Shared by both places a
+    /// generation-retiring recovery can begin: an explicit
+    /// `RemoteSourceDisconnected` event (existing caller, kept) and
+    /// `start_remote_lifecycle_reconnect` itself (new caller), which is
+    /// reached both by an explicit user-issued `remote.reconnect` and by the
+    /// internal `RemoteRoutedRecoveryNeeded` escalation
+    /// (`start_remote_routed_recovery` above) — so a stale descriptor can
+    /// never execute around either recovery path. The already-EXECUTING
+    /// descriptor (if any) is untouched: it runs to completion (there is no
+    /// deadline to bound it).
+    #[cfg(unix)]
+    pub(crate) fn cancel_queued_routed_for_reconnect(
+        &mut self,
+        host: &crate::remote_source::RemoteHostKey,
+    ) {
+        for descriptor in self.routed_executor.cancel_all_queued(host) {
+            match descriptor.sink {
+                Some(crate::app::api::routed_exec::CompletionSink::UiCreate { token }) => {
+                    let _ = self
+                        .event_tx
+                        .blocking_send(AppEvent::RemoteWorkspaceCreateFailed {
+                            host: host.clone(),
+                            token,
+                            message:
+                                "remote host generation changed before this request executed; safe to retry"
+                                    .to_string(),
+                        });
+                }
+                Some(crate::app::api::routed_exec::CompletionSink::ApiResponder {
+                    respond_to,
+                    request_id,
+                }) => {
+                    let _ = respond_to.send(responses::encode_error(
+                        request_id,
+                        "remote_request_cancelled",
+                        "remote host generation changed before this request executed; safe to retry",
+                    ));
+                }
+                None => {}
+            }
+        }
+    }
+
     pub(crate) fn handle_api_request_after_internal_events_drained(
         &mut self,
         request: crate::api::schema::Request,
@@ -881,6 +1006,18 @@ impl App {
         use crate::api::schema::{
             ErrorBody, ErrorResponse, Method, ResponseResult, SuccessResponse,
         };
+
+        // Routed remote mutations are planned and enqueued here for
+        // TUI-internal dispatches (the API-request seams in
+        // `handle_api_request_message` / headless dispatch already handled
+        // them with a real responder). Fire-and-forget: the result arrives
+        // through the remote source cache. Unix-only: the routed executor
+        // (`api::routed_exec`) does not exist on Windows, so nothing is
+        // deferred there and the normal synchronous handling below applies.
+        #[cfg(unix)]
+        if let Some(response) = self.try_defer_remote_routed_internal(&request) {
+            return response;
+        }
 
         let response = match request.method {
             Method::ServerStop(_) => {

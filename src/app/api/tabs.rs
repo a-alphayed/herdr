@@ -17,7 +17,7 @@ use crate::remote_target::{
     RemoteTabResolveError, RemoteTargetSelector, RemoteWorkspaceResolveError, TargetRoute,
 };
 
-fn remote_tab_create_request(
+pub(super) fn remote_tab_create_request(
     id: String,
     mut params: TabCreateParams,
     workspace_id: &str,
@@ -29,7 +29,7 @@ fn remote_tab_create_request(
     }
 }
 
-fn remote_tab_focus_request(id: String, tab_id: &str) -> Request {
+pub(super) fn remote_tab_focus_request(id: String, tab_id: &str) -> Request {
     Request {
         id,
         method: Method::TabFocus(TabTarget {
@@ -38,7 +38,7 @@ fn remote_tab_focus_request(id: String, tab_id: &str) -> Request {
     }
 }
 
-fn remote_tab_close_request(id: String, tab_id: &str) -> Request {
+pub(super) fn remote_tab_close_request(id: String, tab_id: &str) -> Request {
     Request {
         id,
         method: Method::TabClose(TabCloseParams {
@@ -48,7 +48,7 @@ fn remote_tab_close_request(id: String, tab_id: &str) -> Request {
     }
 }
 
-fn remote_workspace_resolve_error_body(err: RemoteWorkspaceResolveError) -> ErrorBody {
+pub(super) fn remote_workspace_resolve_error_body(err: RemoteWorkspaceResolveError) -> ErrorBody {
     let code = match &err {
         RemoteWorkspaceResolveError::NotFound { .. } => "remote_workspace_not_found",
         RemoteWorkspaceResolveError::MetadataUnavailable { .. } => "remote_workspace_unavailable",
@@ -60,7 +60,7 @@ fn remote_workspace_resolve_error_body(err: RemoteWorkspaceResolveError) -> Erro
     }
 }
 
-fn remote_tab_resolve_error_body(err: RemoteTabResolveError) -> ErrorBody {
+pub(super) fn remote_tab_resolve_error_body(err: RemoteTabResolveError) -> ErrorBody {
     let code = match &err {
         RemoteTabResolveError::NotFound { .. } => "remote_tab_not_found",
         RemoteTabResolveError::MetadataUnavailable { .. } => "remote_tab_metadata_unavailable",
@@ -105,7 +105,7 @@ impl App {
         }
     }
 
-    fn plan_tab_create_remote_route(
+    pub(super) fn plan_tab_create_remote_route(
         &self,
         params: &TabCreateParams,
     ) -> Result<
@@ -118,7 +118,7 @@ impl App {
         self.configured_remote_route_for_target(workspace_id)
     }
 
-    fn plan_tab_target_remote_route(
+    pub(super) fn plan_tab_target_remote_route(
         &self,
         tab_id: &str,
     ) -> Result<
@@ -128,7 +128,7 @@ impl App {
         self.configured_remote_route_for_target(tab_id)
     }
 
-    fn remote_host_connected_or_error(
+    pub(super) fn remote_host_connected_or_error(
         &self,
         host: &crate::remote_target::RemoteHostConfig,
         noun: &str,

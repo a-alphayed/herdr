@@ -544,6 +544,7 @@ pub(crate) fn send_remote_api_request_with_prepared_state(
         &bridge_command,
         request,
         SshInvocationMode::Noninteractive,
+        None,
     )
 }
 
@@ -722,7 +723,8 @@ fn send_remote_api_request_to_host_with_mode(
 
     let bridge_command = remote_api_bridge_command_for_host(remote_herdr, host);
     if matches!(request.method, crate::api::schema::Method::Ping(_)) {
-        let response = send_remote_api_request_with_mode(ssh, &bridge_command, request, mode)?;
+        let response =
+            send_remote_api_request_with_mode(ssh, &bridge_command, request, mode, None)?;
         validate_remote_api_ping_capabilities(host, &response, &required_methods)?;
         return Ok((response, capabilities));
     }
@@ -734,7 +736,7 @@ fn send_remote_api_request_to_host_with_mode(
         mode,
         &required_methods,
     )?;
-    let response = send_remote_api_request_with_mode(ssh, &bridge_command, request, mode)?;
+    let response = send_remote_api_request_with_mode(ssh, &bridge_command, request, mode, None)?;
     Ok((response, capabilities))
 }
 
@@ -808,8 +810,13 @@ fn validate_remote_api_capabilities_with_mode(
     mode: SshInvocationMode,
     required_methods: &[&'static str],
 ) -> io::Result<()> {
-    let response =
-        send_remote_api_request_with_mode(ssh, bridge_command, &remote_api_ping_request(), mode)?;
+    let response = send_remote_api_request_with_mode(
+        ssh,
+        bridge_command,
+        &remote_api_ping_request(),
+        mode,
+        None,
+    )?;
     validate_remote_api_ping_capabilities(host, &response, required_methods)
 }
 
@@ -975,11 +982,57 @@ fn command_output_detail(output: &Output) -> Option<String> {
     }
 }
 
+/// FIX-2 (post-v11 correction): when `wrote` is supplied, it is set to
+/// `true` immediately BEFORE the first write call — never inferred from
+/// spawn/stdin/stdout acquisition, which are still pre-write (a
+/// connect/spawn/stdin failure leaves it `false`). Once the write is
+/// attempted, the conservative direction from round-3 finding 6 still
+/// applies: a partial write, a flush failure, or any later failure (read,
+/// child wait) all count as written — never reset back to `false`. Plain
+/// `Option<&mut bool>`, no atomics: this runs entirely on the calling
+/// (worker) thread and never crosses a thread boundary. `None` for every
+/// caller that does not need the pre-write/post-write distinction (this
+/// function's other, non-routed callers are unaffected).
+/// FIX-4 (diff review round 4, high 4 — round-3 finding 6 only partially
+/// resolved): reaps the wrapped one-shot ssh child on drop, on EVERY exit
+/// path from `send_remote_api_request_with_mode` — normal completion or any
+/// early `?` return (stdin/stdout acquisition, write). Without this, those
+/// early-return sites left the spawned child unreaped, contradicting the
+/// routed one-shot contract that the worker owns and reaps its own child;
+/// this could leave an ssh process or a zombie behind. `Deref`/`DerefMut` let
+/// callers use the wrapped `Child` exactly as before (`child.stdin.take()`,
+/// `child.wait()`, ...); the explicit `child.wait()` call on the normal exit
+/// path already reaps the process, so `reap_child`'s own `try_wait()` on
+/// drop is a cheap no-op then (idempotent — waiting on an already-reaped
+/// child just returns the cached exit status). No atomics, no CAS: this is
+/// plain RAII on the calling thread.
+struct ReapOnDrop(Child);
+
+impl std::ops::Deref for ReapOnDrop {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ReapOnDrop {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        let _ = reap_child(&mut self.0);
+    }
+}
+
 fn send_remote_api_request_with_mode(
     ssh: &RemoteSsh,
     bridge_command: &str,
     request: &crate::api::schema::Request,
     mode: SshInvocationMode,
+    wrote: Option<&mut bool>,
 ) -> io::Result<String> {
     let mut command = ssh.command_with_mode(mode);
     command
@@ -988,9 +1041,10 @@ fn send_remote_api_request_with_mode(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
 
-    let mut child = command
-        .spawn()
-        .map_err(|err| io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}")))?;
+    let mut child =
+        ReapOnDrop(command.spawn().map_err(|err| {
+            io::Error::new(err.kind(), format!("failed to start ssh bridge: {err}"))
+        })?);
     let mut child_stdin = child
         .stdin
         .take()
@@ -1000,6 +1054,11 @@ fn send_remote_api_request_with_mode(
         .take()
         .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "ssh bridge stdout missing"))?;
 
+    // Past this point a failure is no longer "nothing was sent": the write
+    // is about to be attempted.
+    if let Some(wrote) = wrote {
+        *wrote = true;
+    }
     write_remote_api_request(&mut child_stdin, request)?;
     drop(child_stdin);
 
@@ -1016,6 +1075,66 @@ fn send_remote_api_request_with_mode(
     }
 
     response
+}
+
+/// One-shot prepared-state request leg for routed IO workers: like
+/// [`send_remote_api_request_with_prepared_state`], running entirely on the
+/// calling (worker) thread, which owns and reaps the child. `wrote` (FIX-2)
+/// is set `true` immediately before the first write call; a capability
+/// validation failure here never touches it (a local check, no network I/O),
+/// so it correctly stays a pre-write failure.
+pub(crate) fn one_shot_prepared_request(
+    host: &crate::remote_target::RemoteHostConfig,
+    state: &RemoteApiBridgeState,
+    request: &crate::api::schema::Request,
+    wrote: &mut bool,
+) -> io::Result<String> {
+    let required_methods = required_federation_methods_for_request(request);
+    validate_federation_capabilities(host, &state.capabilities, &required_methods)?;
+
+    let remote_ssh = remote_ssh_for_host(host);
+    let bridge_command = remote_bridge_command_for_shell_path(
+        &state.shell_path,
+        &host.session,
+        REMOTE_API_BRIDGE_SUBCOMMAND,
+    );
+    send_remote_api_request_with_mode(
+        &remote_ssh,
+        &bridge_command,
+        request,
+        SshInvocationMode::Noninteractive,
+        Some(wrote),
+    )
+}
+
+/// One-shot full-preparation request leg for routed IO workers: like
+/// [`send_remote_api_request_to_host_noninteractive`] (remote binary
+/// preparation + capability probes + request, one ssh child per step). Used
+/// when no cached prepared state exists; the existing supervisor generation
+/// path repopulates prepared state independently. `wrote` (FIX-2) is set
+/// `true` immediately before the first write call for THIS request; a
+/// failure during remote binary preparation (a separate ssh round trip) never
+/// touches it, so it correctly stays a pre-write failure — none of this
+/// request's own bytes were ever sent.
+pub(crate) fn one_shot_full_request(
+    host: &crate::remote_target::RemoteHostConfig,
+    request: &crate::api::schema::Request,
+    wrote: &mut bool,
+) -> io::Result<String> {
+    let remote_ssh = remote_ssh_for_host(host);
+    let remote_herdr = prepare_remote_herdr_noninteractive(&remote_ssh)?;
+    let bridge_command = remote_bridge_command_for_shell_path(
+        remote_herdr.shell_path(),
+        &host.session,
+        REMOTE_API_BRIDGE_SUBCOMMAND,
+    );
+    send_remote_api_request_with_mode(
+        &remote_ssh,
+        &bridge_command,
+        request,
+        SshInvocationMode::Noninteractive,
+        Some(wrote),
+    )
 }
 
 pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
@@ -1444,14 +1563,23 @@ impl Drop for SshPersistentBridge {
         drop(self.stdin.take());
         // Reap with a short grace window; kill only if it refuses to exit so a
         // wedged remote loop cannot leak an ssh process indefinitely.
-        let _ = reap_child(&mut self.child);
+        if let Err(err) = reap_child(&mut self.child) {
+            tracing::warn!(
+                event = "remote.route.bridge_teardown_reap_failed",
+                subsystem = "remote",
+                pid = self.child.id(),
+                err = %err,
+                "persistent bridge teardown reap failed"
+            );
+        }
     }
 }
 
 /// Reap a child process: wait briefly for it to exit on its own, then escalate
-/// to `kill` + wait so teardown never leaks a process. Best-effort: errors are
-/// swallowed because this runs on `Drop` paths where there is no caller to
-/// surface them.
+/// to `kill` + wait so teardown never leaks a process. Runs on `Drop` paths
+/// where there is no caller to propagate a `Result` to, so kill/wait failures
+/// are not returned as an error — but they ARE surfaced via `tracing::warn!`
+/// rather than silently swallowed (H1: "surfaced reap/join failures").
 fn reap_child(child: &mut Child) -> io::Result<()> {
     let deadline = Instant::now() + PERSISTENT_BRIDGE_REAP_GRACE;
     loop {
@@ -1461,8 +1589,24 @@ fn reap_child(child: &mut Child) -> io::Result<()> {
                 std::thread::sleep(Duration::from_millis(25));
             }
             None => {
-                let _ = child.kill();
-                let _ = child.wait();
+                if let Err(err) = child.kill() {
+                    tracing::warn!(
+                        event = "remote.route.bridge_teardown_kill_failed",
+                        subsystem = "remote",
+                        pid = child.id(),
+                        err = %err,
+                        "persistent bridge teardown kill failed (child may already be dead)"
+                    );
+                }
+                if let Err(err) = child.wait() {
+                    tracing::warn!(
+                        event = "remote.route.bridge_teardown_wait_failed",
+                        subsystem = "remote",
+                        pid = child.id(),
+                        err = %err,
+                        "persistent bridge teardown wait failed after kill"
+                    );
+                }
                 return Ok(());
             }
         }
@@ -1672,6 +1816,14 @@ impl RemoteAgentBridgePool {
             .get(key)
             .map(|h| h.idle.len())
             .unwrap_or(0)
+    }
+
+    /// Seed an active reservation directly, bypassing real checkout/start, so
+    /// tests can exercise a release-side fix (e.g. `release_persistent_bridge_active`)
+    /// against the real pool counter without real SSH. Test only.
+    #[cfg(test)]
+    pub(crate) fn seed_active_for_test(&self, key: &crate::remote_source::RemoteHostKey) {
+        self.lock().hosts.entry(key.clone()).or_default().active += 1;
     }
 
     /// Active (checked-out) connection count for one (host, session). Test only.
@@ -2203,6 +2355,140 @@ pub(crate) fn try_pooled_remote_api_request(
         request,
         start_persistent_remote_api_bridge,
     )
+}
+
+/// One checked-out (or freshly started) pooled persistent bridge, moved out of
+/// the pool and owned exclusively by one routed IO worker for the duration of
+/// its sequence. `checked_out_generation` is the pool generation captured at
+/// checkout/start; [`return_persistent_bridge`] refuses to park the connection
+/// if the host was invalidated while it was active.
+pub(crate) struct PooledHandle {
+    key: crate::remote_source::RemoteHostKey,
+    identity: PersistentBridgeIdentity,
+    pub(crate) connection: Box<dyn PersistentRemoteBridgeConnection>,
+    checked_out_generation: u64,
+}
+
+impl PooledHandle {
+    /// Stable per-connection identity for route-selection telemetry (pooled
+    /// route + connection id). Derived from the connection object's address:
+    /// unique per live connection, never dereferenced.
+    pub(crate) fn connection_id(&self) -> usize {
+        let pointer: *const dyn PersistentRemoteBridgeConnection = self.connection.as_ref();
+        pointer as *const () as usize
+    }
+
+    /// Test-only constructor: wraps an injected fake connection in a pooled
+    /// handle so the routed executor tests exercise the checkout/return/
+    /// release bookkeeping (against a local pool) without real SSH.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        connection: Box<dyn PersistentRemoteBridgeConnection>,
+        key: crate::remote_source::RemoteHostKey,
+    ) -> Self {
+        Self {
+            key,
+            identity: PersistentBridgeIdentity {
+                shell_path: "test-shell".to_string(),
+                capabilities: crate::api::schema::FederationCapabilities {
+                    methods: Vec::new(),
+                },
+                ssh_target: "test-target".to_string(),
+                session: "test-session".to_string(),
+                manage_ssh_config: false,
+                connect_timeout_secs: 1,
+            },
+            connection,
+            checked_out_generation: 0,
+        }
+    }
+}
+
+/// Try to check out or start one pooled persistent bridge for `host` reusing
+/// cached prepared `state` (Slice A pooled-first routing for routed sequences).
+/// All failure modes here are PRE-WRITE: `Ok(None)` means the caller falls
+/// back to the one-shot prepared path (pool full or persistent capability not
+/// advertised); `Err` is a capability/start failure that must surface as a
+/// request failure (the start failure slot is released first). No request byte
+/// is written by this call. `primary_request` drives the required-method
+/// validation (the same mapping as the one-shot bridge path).
+pub(crate) fn try_checkout_persistent_bridge(
+    pool: &RemoteAgentBridgePool,
+    host: &crate::remote_target::RemoteHostConfig,
+    state: &RemoteApiBridgeState,
+    primary_request: &crate::api::schema::Request,
+) -> io::Result<Option<PooledHandle>> {
+    let key = crate::remote_source::RemoteHostKey::new(&host.name, &host.session);
+    let identity = PersistentBridgeIdentity::from_host_state(host, state);
+
+    // Capability validation (pre-write, safe): the primary request's required
+    // methods plus the persistent capability. Failure surfaces exactly like the
+    // one-shot prepared path (it becomes `remote_request_failed` at the
+    // worker).
+    let mut required = required_federation_methods_for_request(primary_request);
+    required.push(crate::api::schema::FederationCapabilities::REMOTE_API_BRIDGE_PERSISTENT);
+    validate_federation_capabilities(host, &state.capabilities, &required)?;
+    if let Some((connection, generation)) = pool.checkout_reusable(&key, &identity) {
+        return Ok(Some(PooledHandle {
+            key,
+            identity,
+            connection,
+            checked_out_generation: generation,
+        }));
+    }
+    let Some(generation) = pool.reserve_new(&key) else {
+        return Ok(None);
+    };
+    match start_persistent_remote_api_bridge(host, state) {
+        Ok(connection) => Ok(Some(PooledHandle {
+            key,
+            identity,
+            connection,
+            checked_out_generation: generation,
+        })),
+        Err(err) => {
+            // Start failure is PRE-WRITE: release the reservation and let the
+            // caller fall back to the one-shot prepared path (never a retry
+            // after any byte, which has not been written yet).
+            pool.release_active(&key);
+            tracing::debug!(
+                err = %err,
+                event = "remote.route.bridge_pool",
+                subsystem = "remote",
+                outcome = "start_failed",
+                host = %host.name,
+                session = %host.session,
+                "persistent bridge start failed; routed sequence falls back to one-shot"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Return a pooled bridge checked out by [`try_checkout_persistent_bridge`] to
+/// the pool (normal completion path; called by the executor, never by the
+/// worker). Decrements `active` exactly once and parks the connection only
+/// when it is still reusable and its captured generation is current.
+pub(crate) fn return_persistent_bridge(pool: &RemoteAgentBridgePool, handle: PooledHandle) {
+    let PooledHandle {
+        key,
+        identity,
+        connection,
+        checked_out_generation,
+    } = handle;
+    pool.return_connection(&key, identity, connection, true, checked_out_generation);
+}
+
+/// Decrement-only active-slot release for a pooled connection that must
+/// never be parked (a timeout or post-write transport/protocol error): the
+/// pool must never count or park a connection the caller is about to drop.
+/// The caller owns the actual drop; this call only corrects `active`
+/// accounting.
+pub(crate) fn release_persistent_bridge_active(
+    pool: &RemoteAgentBridgePool,
+    key: &crate::remote_source::RemoteHostKey,
+) {
+    pool.release_active(key);
 }
 
 impl RemoteHerdr {
@@ -7906,6 +8192,58 @@ mod tests {
         match child.try_wait() {
             Ok(Some(_)) => {}
             other => panic!("expected a reaped child, got {other:?}"),
+        }
+    }
+
+    /// FIX-4 (diff review round 4, high 4 — round-3 finding 6 only partially
+    /// resolved): a `ReapOnDrop`-wrapped child that is dropped WITHOUT ever
+    /// having `.wait()` called on it (exactly what happens on
+    /// `send_remote_api_request_with_mode`'s early `?` return sites for
+    /// stdin/stdout acquisition and write failures) must still be reaped —
+    /// no leaked live process, no zombie left behind. Verified via
+    /// `/proc/<pid>`: a leaked-but-still-running child keeps its `/proc`
+    /// entry, and so does a leaked ZOMBIE (killed/exited but never
+    /// `wait()`ed, State `Z`) — only a genuinely reaped child's entry is
+    /// removed by the kernel, so this test catches both failure modes a bare
+    /// `kill(pid, 0)` liveness check would miss (`kill(pid, 0)` returns
+    /// success for a zombie too, so it cannot distinguish "still running"
+    /// from "killed but never reaped"). Linux-only (diff review round 5,
+    /// blocker 2): `ReapOnDrop`/`reap_child` themselves are genuinely
+    /// cross-platform Unix code (exercised on macOS in production, and
+    /// indirectly by `g10_reap_child_*` above, which use the portable
+    /// `try_wait()`/`wait()` API), but `/proc` itself does not exist on
+    /// macOS — gated here rather than replacing the check with a weaker
+    /// portable one that could not tell "leaked" from "reaped".
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reap_on_drop_reaps_a_real_child_dropped_before_an_explicit_wait() {
+        let child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn real child");
+        let pid = child.id();
+        assert!(
+            std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "sanity: the child must be alive before the guard drops"
+        );
+
+        {
+            // Constructed exactly like `send_remote_api_request_with_mode`'s
+            // early exit paths: the guard is dropped here, at the end of
+            // this scope, without ever calling `.wait()` on it directly.
+            let _guard = ReapOnDrop(child);
+        }
+
+        let deadline = Instant::now() + PERSISTENT_BRIDGE_REAP_GRACE + Duration::from_secs(3);
+        loop {
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ReapOnDrop must reap the child on an early-return exit path (pid {pid} leaked or zombied)"
+            );
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 }

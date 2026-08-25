@@ -36,7 +36,11 @@ const METADATA_SOURCE_MAX_CHARS: usize = 80;
 const METADATA_TTL_MIN_MS: u64 = 1;
 const METADATA_TTL_MAX_MS: u64 = 86_400_000;
 
-fn remote_pane_rename_request(id: String, pane_id: &str, label: Option<String>) -> Request {
+pub(super) fn remote_pane_rename_request(
+    id: String,
+    pane_id: &str,
+    label: Option<String>,
+) -> Request {
     Request {
         id,
         method: Method::PaneRename(PaneRenameParams {
@@ -46,7 +50,7 @@ fn remote_pane_rename_request(id: String, pane_id: &str, label: Option<String>) 
     }
 }
 
-fn remote_pane_focus_request(id: String, pane_id: &str) -> Request {
+pub(super) fn remote_pane_focus_request(id: String, pane_id: &str) -> Request {
     Request {
         id,
         method: Method::PaneFocus(PaneTarget {
@@ -55,7 +59,7 @@ fn remote_pane_focus_request(id: String, pane_id: &str) -> Request {
     }
 }
 
-fn remote_pane_focus_direction_request(
+pub(super) fn remote_pane_focus_direction_request(
     id: String,
     pane_id: &str,
     direction: PaneDirection,
@@ -69,7 +73,7 @@ fn remote_pane_focus_direction_request(
     }
 }
 
-fn remote_pane_split_request(
+pub(super) fn remote_pane_split_request(
     id: String,
     mut params: PaneSplitParams,
     workspace_id: &str,
@@ -83,7 +87,7 @@ fn remote_pane_split_request(
     }
 }
 
-fn remote_pane_close_request(id: String, pane_id: &str) -> Request {
+pub(super) fn remote_pane_close_request(id: String, pane_id: &str) -> Request {
     Request {
         id,
         method: Method::PaneClose(PaneCloseParams {
@@ -93,7 +97,7 @@ fn remote_pane_close_request(id: String, pane_id: &str) -> Request {
     }
 }
 
-fn remote_pane_resolve_error_body(err: RemotePaneResolveError) -> ErrorBody {
+pub(super) fn remote_pane_resolve_error_body(err: RemotePaneResolveError) -> ErrorBody {
     let code = match &err {
         RemotePaneResolveError::NotFound { .. } => "remote_pane_not_found",
         RemotePaneResolveError::ProjectionStale { .. } => "remote_projection_stale",
@@ -209,7 +213,7 @@ impl App {
         encode_success(id, ResponseResult::PaneInfo { pane })
     }
 
-    fn plan_pane_split_remote_route(
+    pub(super) fn plan_pane_split_remote_route(
         &self,
         params: &PaneSplitParams,
     ) -> Result<
@@ -236,7 +240,7 @@ impl App {
         Ok(None)
     }
 
-    fn plan_pane_close_remote_route(
+    pub(super) fn plan_pane_close_remote_route(
         &self,
         params: &PaneCloseParams,
     ) -> Result<
@@ -435,7 +439,7 @@ impl App {
             .unwrap_or_else(|err| encode_error(id, "remote_request_failed", err.to_string()))
     }
 
-    fn remote_pane_host_connected_or_error(
+    pub(super) fn remote_pane_host_connected_or_error(
         &self,
         host: &crate::remote_target::RemoteHostConfig,
     ) -> Result<crate::remote_source::RemoteHostKey, ErrorBody> {
@@ -459,7 +463,7 @@ impl App {
         }
     }
 
-    fn plan_pane_target_remote_route(
+    pub(super) fn plan_pane_target_remote_route(
         &self,
         pane_id: &str,
     ) -> Result<

@@ -2742,6 +2742,33 @@ impl AppState {
                 self.handle_remote_workspace_create_timed_out(host, token);
                 Vec::new()
             }
+            // REQ-1 (round-3 blocker 1, both reviewers): `apply_routed_completion`
+            // is defined only inside the `#[cfg(unix)]` `api::routed_exec`
+            // module (federation transport is Unix-only by design), but
+            // these two `AppEvent` variants and their payloads are
+            // cross-platform (events.rs, remote.rs) — this match runs on
+            // every target, so the arm itself must be split per platform
+            // rather than calling a Unix-only method unconditionally.
+            #[cfg(unix)]
+            AppEvent::RemoteRoutedSequenceCompleted {
+                host,
+                generation,
+                outcome,
+            } => {
+                self.apply_routed_completion(&host, generation, *outcome);
+                Vec::new()
+            }
+            #[cfg(windows)]
+            AppEvent::RemoteRoutedSequenceCompleted { .. } => Vec::new(),
+            #[cfg(unix)]
+            AppEvent::RemoteRoutedRecoveryNeeded { .. } => {
+                // Handled at App level (it drives the lifecycle reconnect
+                // path, which needs supervisor handles); the pure reducer is
+                // a no-op.
+                Vec::new()
+            }
+            #[cfg(windows)]
+            AppEvent::RemoteRoutedRecoveryNeeded { .. } => Vec::new(),
             AppEvent::StateChanged {
                 pane_id,
                 agent,

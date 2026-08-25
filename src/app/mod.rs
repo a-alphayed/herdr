@@ -145,6 +145,13 @@ pub struct App {
     pub(crate) local_terminal_notifications: bool,
     pub(crate) config_reloaded_from_disk: bool,
     pub(crate) remote_hosts: crate::remote_target::RemoteHostRegistry,
+    /// Per-host serial mutation executor for routed remote requests (see
+    /// `api::routed_exec`). Constructed with the production environment;
+    /// tests replace it with a local-env pool (no real SSH). Unix-only:
+    /// federation transport is Unix-only by design, so routed execution is
+    /// simply absent on Windows.
+    #[cfg(unix)]
+    pub(crate) routed_executor: std::sync::Arc<api::routed_exec::RoutedExecutorPool>,
     pub(crate) remote_source_supervisors:
         Vec<crate::remote_supervisor::RemoteSourceSupervisorHandle>,
     /// App-owned sockets/threads/SSH bridge for the currently selected remote
@@ -695,6 +702,7 @@ impl App {
             pending_remote_projected_tab_close: None,
             rename_remote_pane_target: None,
             pending_remote_workspace_creates: std::collections::BTreeMap::new(),
+            remote_routed_reconciled: std::collections::BTreeMap::new(),
             next_remote_workspace_create_token: 1,
             creating_new_tab: false,
             requested_new_tab_name: None,
@@ -870,6 +878,10 @@ impl App {
 
         let remote_source_supervisors =
             start_remote_source_supervisors_if_enabled(no_session, &remote_hosts, event_tx.clone());
+        #[cfg(unix)]
+        let routed_executor = api::routed_exec::RoutedExecutorPool::new(
+            api::routed_exec::RoutedEnv::production(event_tx.clone()),
+        );
 
         Self {
             config_diagnostic_deadline: None,
@@ -919,6 +931,8 @@ impl App {
             local_terminal_notifications: true,
             config_reloaded_from_disk: false,
             remote_hosts,
+            #[cfg(unix)]
+            routed_executor,
             remote_source_supervisors,
             remote_projection_runtime: remote_projection::RemoteProjectionRuntime::default(),
             pending_remote_lifecycle: std::collections::HashMap::new(),
@@ -2007,6 +2021,9 @@ impl App {
         self.handle_mouse(mouse);
     }
 }
+
+#[cfg(unix)]
+pub(crate) use api::routed_exec::DeferredRoutedOutcome;
 
 #[cfg(test)]
 mod tests {

@@ -236,6 +236,35 @@ pub enum AppEvent {
     },
     /// A remote workspace create request exceeded the local pending deadline.
     RemoteWorkspaceCreateTimedOut { host: RemoteHostKey, token: u64 },
+    /// A routed remote request sequence (primary + refresh legs) completed on
+    /// its IO worker — there is no deadline anywhere in this executor (v11;
+    /// see `app::api::routed_exec`'s module contract), so "completed" here
+    /// means the transport genuinely returned a result or an error, not that
+    /// a bound expired. Generation-stamped with the descriptor's source
+    /// generation; the reducer applies refresh data / stale marking
+    /// atomically in one step and records the reconciliation. The legacy
+    /// create-success event (`RemoteWorkspaceCreateSucceeded`) keeps its
+    /// UI-notify role and is untouched by this path.
+    RemoteRoutedSequenceCompleted {
+        host: RemoteHostKey,
+        generation: u64,
+        // Boxed: `RoutedCompletion` is large (refresh-leg tab/layout data),
+        // and every `AppEvent` value sizes to its largest variant — boxing
+        // here keeps the common, frequent event variants small.
+        outcome: Box<crate::remote::RoutedCompletion>,
+    },
+    /// A routed sequence's primary leg failed at or after the first write
+    /// attempt — an ordinary transport error, or (FIX-2) a primary response
+    /// that failed to parse even though the transport itself reported `Ok` —
+    /// with no authoritative result: escalate to the named recovery
+    /// transition (the `remote.reconnect` generation-retiring path), which
+    /// force-reconnects and re-syncs full state. There is no timeout
+    /// anywhere in this executor (v11); this event fires only on a genuine
+    /// transport/protocol failure, never on an elapsed bound.
+    RemoteRoutedRecoveryNeeded {
+        host: RemoteHostKey,
+        generation: u64,
+    },
     /// Remote agent detection manifest update check finished.
     AgentDetectionManifestsUpdated {
         updated: Vec<crate::detect::manifest_update::ManifestUpdateCommit>,

@@ -103,10 +103,34 @@ impl App {
                 request,
                 respond_to,
             } => {
+                // Routed remote mutations (pane/tab/workspace ops): deferred
+                // through the per-host serial mutation executor so a slow
+                // remote host never blocks the App loop and mutations never
+                // reorder per host. Unix-only: the routed executor
+                // (`api::routed_exec`) does not exist on Windows (federation
+                // transport is Unix-only by design), so Windows falls
+                // straight through to the lifecycle seam below.
+                #[cfg(unix)]
+                let (request, respond_to) =
+                    match self.handle_deferred_remote_routed_api_request(*request, respond_to) {
+                        crate::app::DeferredRoutedOutcome::Handled => {
+                            if !skip_default_workspace {
+                                changed |= self.ensure_default_workspace();
+                            }
+                            self.sync_prefix_input_source(previous_mode);
+                            return changed;
+                        }
+                        crate::app::DeferredRoutedOutcome::NotHandled {
+                            request,
+                            respond_to,
+                        } => (*request, respond_to),
+                    };
+                #[cfg(windows)]
+                let (request, respond_to) = (*request, respond_to);
                 // Try the local lifecycle seam (connect/reconnect/disconnect)
                 // before the synchronous fallback: it is a deferred, off-loop
                 // action that must not block the App loop on remote SSH/reap.
-                match self.handle_deferred_remote_lifecycle_api_request(*request, respond_to) {
+                match self.handle_deferred_remote_lifecycle_api_request(request, respond_to) {
                     crate::app::DeferredRemoteLifecycleOutcome::Handled => {
                         if !skip_default_workspace {
                             changed |= self.ensure_default_workspace();

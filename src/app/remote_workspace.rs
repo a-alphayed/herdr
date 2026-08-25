@@ -106,7 +106,56 @@ impl App {
         self.begin_remote_workspace_create_request(host, Instant::now());
     }
 
-    fn begin_remote_workspace_create_request(&mut self, host: RemoteHostKey, now: Instant) {
+    #[cfg(unix)]
+    pub(crate) fn begin_remote_workspace_create_request(
+        &mut self,
+        host: RemoteHostKey,
+        now: Instant,
+    ) {
+        // Production dispatch: the per-host serial mutation executor with the
+        // prepared-state/pooled routing (see `api::routed_exec`). There is no
+        // deadline anywhere in this executor (v11); on a post-write
+        // transport/protocol error the sequence resolves with a single
+        // "outcome unknown" error and the host force-reconnects; see
+        // `dispatch_remote_workspace_create_via_executor`.
+        let executor = std::sync::Arc::clone(&self.routed_executor);
+        let source_generation = self
+            .remote_source_supervisors
+            .iter()
+            .find(|handle| handle.host_key == host)
+            .map(|handle| handle.generation);
+        let bridge_state = self.state.remote_sources.connected_bridge_state(&host);
+        let capabilities = self.state.remote_sources.host_capabilities(&host);
+        self.begin_remote_workspace_create_request_with_dispatch(
+            host,
+            now,
+            move |config, host_key, token, request, event_tx| {
+                dispatch_remote_workspace_create_via_executor(
+                    executor,
+                    source_generation,
+                    bridge_state,
+                    capabilities,
+                    config,
+                    host_key,
+                    token,
+                    request,
+                    event_tx,
+                )
+            },
+        );
+    }
+
+    /// Windows stub: the routed per-host serial executor (`api::routed_exec`)
+    /// is Unix-only (federation transport is Unix-only by design). Windows
+    /// keeps the pre-existing direct dispatch, which always resolves through
+    /// the cross-platform `send_remote_api_request_to_host_noninteractive`
+    /// stub (`remote.rs`) that reports remote support as unavailable.
+    #[cfg(windows)]
+    pub(crate) fn begin_remote_workspace_create_request(
+        &mut self,
+        host: RemoteHostKey,
+        now: Instant,
+    ) {
         self.begin_remote_workspace_create_request_with_dispatch(
             host,
             now,
@@ -123,6 +172,16 @@ impl App {
         D: FnOnce(RemoteHostConfig, RemoteHostKey, u64, Request, mpsc::Sender<AppEvent>),
     {
         let host_label = remote_host_label(&host);
+        // The duplicate gate is the pending-spinner map: a create still
+        // in flight (by UI token/deadline — the UI's own pending-create
+        // timeout, unrelated to the routed executor, which has no deadline
+        // of its own) rejects a new one outright. There is no separate
+        // reducer-domain claim/uncertain-retry tracking — on a post-write
+        // transport/protocol error the sequence resolves with a single
+        // "outcome unknown" error (see
+        // `dispatch_remote_workspace_create_via_executor`) and a plain retry
+        // is allowed once the spinner clears, exactly like any other routed
+        // mutation.
         if self
             .state
             .pending_remote_workspace_creates
@@ -131,8 +190,8 @@ impl App {
             show_toast(
                 self,
                 ToastKind::NeedsAttention,
-                format!("Create already pending on {host_label}"),
-                "Wait for the current remote create request to finish".to_string(),
+                format!("Create already in flight on {host_label}"),
+                "Wait for the current remote create to finish".to_string(),
             );
             return;
         }
@@ -231,12 +290,74 @@ impl App {
         }
 
         for event in events {
+            let AppEvent::RemoteWorkspaceCreateTimedOut { ref host, token } = event else {
+                continue;
+            };
+            // UI token expiry clears the spinner AND cancels a STILL-QUEUED
+            // descriptor (it will never execute late). An EXECUTING
+            // descriptor cannot be retracted: it runs to completion (there is
+            // no deadline anywhere in this executor — v11) and, on a
+            // post-write transport/protocol error, resolves through the same
+            // "outcome unknown, host reconnecting" path as any other routed
+            // mutation.
+            #[cfg(unix)]
+            let _ = self.routed_executor.cancel_queued_create(host, token);
             self.state.handle_app_event(event);
         }
         true
     }
 }
 
+/// Production create dispatch: enqueue the create as a mutating sequence on
+/// the per-host serial executor (pooled routing). Enqueue rejection resolves
+/// the create immediately through its terminal event so the pending spinner
+/// never hangs.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn dispatch_remote_workspace_create_via_executor(
+    executor: std::sync::Arc<super::api::routed_exec::RoutedExecutorPool>,
+    source_generation: Option<u64>,
+    bridge_state: Option<crate::remote::RemoteApiBridgeState>,
+    capabilities: crate::remote_source::RemoteSourceCapabilities,
+    config: RemoteHostConfig,
+    host_key: RemoteHostKey,
+    token: u64,
+    request: Request,
+    event_tx: mpsc::Sender<AppEvent>,
+) {
+    let descriptor = super::api::routed_exec::RoutedSequenceDescriptor {
+        host_key: host_key.clone(),
+        host: config,
+        source_generation,
+        bridge_state,
+        spec: crate::remote::RoutedSequenceSpec {
+            primary: request,
+            refresh: None,
+            tab_list_capable: capabilities.tab_list,
+            layout_export_capable: capabilities.layout_export,
+            apply: crate::remote::RoutedApply::WorkspaceCreate { token },
+        },
+        sink: Some(super::api::routed_exec::CompletionSink::UiCreate { token }),
+    };
+    if let Err(error) = executor.enqueue(descriptor) {
+        let message = match error {
+            super::api::routed_exec::RoutedEnqueueError::Busy => {
+                "remote host mutation queue is saturated".to_string()
+            }
+        };
+        let _ = event_tx.blocking_send(AppEvent::RemoteWorkspaceCreateFailed {
+            host: host_key,
+            token,
+            message,
+        });
+    }
+}
+
+/// Windows stub dispatch: no persistent-bridge/routed-executor pool exists,
+/// so this always resolves through the cross-platform noninteractive request
+/// helper, which reports remote support as unavailable on Windows
+/// (`send_remote_api_request_to_host_noninteractive`, `remote.rs`).
+#[cfg(windows)]
 fn spawn_remote_workspace_create_worker(
     config: RemoteHostConfig,
     host: RemoteHostKey,
@@ -538,7 +659,7 @@ mod tests {
         );
         assert_eq!(
             app.state.toast.as_ref().map(|toast| toast.title.as_str()),
-            Some("Create already pending on jafar")
+            Some("Create already in flight on jafar")
         );
     }
 

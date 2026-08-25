@@ -2,7 +2,111 @@
 mod unix;
 
 #[cfg(unix)]
+mod routed;
+
+#[cfg(unix)]
 pub(crate) use unix::*;
+
+#[cfg(unix)]
+pub(crate) use routed::*;
+
+// ---- routed remote-sequence outcome payloads (cross-platform data) ----
+//
+// Pure data shared between the unix-only routed-sequence executor
+// (`remote::routed`), the `AppEvent` payloads that carry completions back to
+// the reducer, and the reducer-side application handlers. Defined here so
+// `events.rs` and the reducer compile unchanged on Windows (no transport
+// types are referenced).
+
+/// Terminal outcome taxonomy for one routed remote request sequence.
+///
+/// The response semantics are chosen by write/primary progress, never by
+/// generation: a known primary success is never converted to "cancelled", and
+/// an outcome that cannot be known is reported as indeterminate (never
+/// auto-retried).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RoutedTaxonomy {
+    /// Authoritative primary result (success or remote error response) plus
+    /// refresh-leg data when the sequence had refresh legs.
+    Completed,
+    /// Request bytes were written but no authoritative primary result was
+    /// read. Affected caches are marked stale; callers must refresh before
+    /// retrying. Never auto-retried.
+    IndeterminateAfterWrite,
+    /// The primary mutation returned authoritative success, but a refresh leg
+    /// failed or the sequence was interrupted mid-refresh. The success is
+    /// preserved in the response; affected caches are marked stale.
+    PrimarySuccessPreserved,
+}
+
+/// One routed refresh leg's active-tab selection plus `layout.export` result
+/// (pure data produced off-loop; the reducer applies it on the loop).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RoutedActiveTabFetch {
+    pub(crate) tab_id: Option<String>,
+    pub(crate) tab_label: Option<String>,
+    /// `None` = layout fetch failed or `layout.export` is not advertised.
+    pub(crate) layout: Option<crate::api::schema::LayoutDescription>,
+}
+
+/// Refresh-leg results for one workspace (pure data; produced off-loop by the
+/// IO worker, applied on-loop by the reducer). Mirrors the tab/projection
+/// application shape of `refresh_remote_workspace_tabs_and_projection`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RoutedRefreshData {
+    pub(crate) workspace_id: String,
+    /// `tab.list` results; `None` = fetch failed or not advertised (the
+    /// reducer marks the workspace's cached tabs unavailable/stale).
+    pub(crate) tabs: Option<Vec<crate::api::schema::TabInfo>>,
+    /// Active-tab selection plus `layout.export` result. `None` = no
+    /// selection or fetch failed (the reducer marks the projection stale).
+    pub(crate) active_tab: Option<RoutedActiveTabFetch>,
+}
+
+/// How the reducer applies a routed sequence's completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RoutedApply {
+    /// Apply refresh data to the cached tabs/projection only.
+    RefreshOnly,
+    /// The primary response is a tab result (`TabCreated`/`TabInfo`): upsert
+    /// the cached tab, then apply refresh data.
+    TabUpsert,
+    /// The primary response closed a tab: remove the cached tab and mark its
+    /// workspace's tab snapshot unavailable, then apply refresh data.
+    TabRemove { tab_id: String },
+    /// The primary response is a `workspace.rename` result: upsert the cached
+    /// workspace from it.
+    WorkspaceUpsert,
+    /// The primary response is a remote workspace-create result for the given
+    /// UI token: identifies the sequence for `CompletionSink::UiCreate`
+    /// routing. No extra reducer-side cache application beyond the generic
+    /// reconciliation stamp — the create's own terminal events
+    /// (`RemoteWorkspaceCreateSucceeded`/`Failed`) apply the workspace.
+    WorkspaceCreate { token: u64 },
+}
+
+/// Completion payload for [`crate::events::AppEvent::RemoteRoutedSequenceCompleted`].
+/// Carries the taxonomy, the authoritative primary response (when one was
+/// obtained), refresh data (when the refresh legs produced it), and the
+/// workspace whose caches must be marked stale when refresh data is absent.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RoutedCompletion {
+    pub(crate) taxonomy: RoutedTaxonomy,
+    /// Raw authoritative primary response JSON (`None` when no authoritative
+    /// result was read).
+    pub(crate) primary: Option<String>,
+    /// Refresh-leg results; `None` when no refresh data is available (mark
+    /// stale per `stale_workspace_id`).
+    pub(crate) refresh: Option<RoutedRefreshData>,
+    /// Workspace whose cached tabs/projection must be marked stale when no
+    /// refresh data is present.
+    pub(crate) stale_workspace_id: Option<String>,
+    /// How the reducer applies the primary/refresh payloads.
+    pub(crate) apply: RoutedApply,
+    /// Route that served the primary request (telemetry mirror of the
+    /// route-selection tracing event).
+    pub(crate) route: &'static str,
+}
 
 #[cfg(windows)]
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";

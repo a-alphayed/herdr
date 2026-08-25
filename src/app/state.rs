@@ -1544,6 +1544,12 @@ pub struct AppState {
         crate::remote_source::RemoteHostKey,
         PendingRemoteWorkspaceCreate,
     >,
+    /// Reducer-side reconciliation record (test-observability only — see
+    /// `apply_routed_completion` in `app::api::routed_exec`): the last
+    /// generation of a routed-sequence completion event the reducer has
+    /// applied per host.
+    pub(crate) remote_routed_reconciled:
+        std::collections::BTreeMap<crate::remote_source::RemoteHostKey, u64>,
     pub(crate) next_remote_workspace_create_token: u64,
     pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
@@ -2183,6 +2189,7 @@ impl AppState {
             pending_remote_projected_pane_close: None,
             pending_remote_projected_tab_close: None,
             pending_remote_workspace_creates: std::collections::BTreeMap::new(),
+            remote_routed_reconciled: std::collections::BTreeMap::new(),
             next_remote_workspace_create_token: 1,
             creating_new_tab: false,
             requested_new_tab_name: None,

@@ -16,7 +16,7 @@ use crate::remote_target::{
     RemoteWorkspaceResolveError, TargetRoute,
 };
 
-fn remote_workspace_resolve_error_body(
+pub(super) fn remote_workspace_resolve_error_body(
     err: RemoteWorkspaceResolveError,
 ) -> crate::api::schema::ErrorBody {
     let code = match &err {
@@ -112,7 +112,7 @@ impl App {
         )
     }
 
-    fn plan_workspace_target_remote_route(
+    pub(super) fn plan_workspace_target_remote_route(
         &self,
         workspace_id: &str,
     ) -> Result<
