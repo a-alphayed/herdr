@@ -1885,6 +1885,84 @@ mod tests {
         }
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct DetectorVisiblePaneInput {
+        pane_id: u32,
+        terminal_id: String,
+        screen: String,
+        osc_title: String,
+        osc_progress: String,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct DetectionBoundarySnapshot {
+        pane_ids: Vec<u32>,
+        terminal_ids: Vec<String>,
+        runtime_count: usize,
+        runtime_terminal_ids: Vec<String>,
+        detector_visible_panes: Vec<DetectorVisiblePaneInput>,
+        local_agents: Vec<crate::api::schema::AgentInfo>,
+    }
+
+    fn detection_boundary_snapshot(app: &crate::app::App) -> DetectionBoundarySnapshot {
+        let mut pane_ids = Vec::new();
+        let mut detector_visible_panes = Vec::new();
+        for (ws_idx, workspace) in app.state.workspaces.iter().enumerate() {
+            for tab in &workspace.tabs {
+                for pane_id in tab.layout.pane_ids() {
+                    pane_ids.push(pane_id.raw());
+                    let terminal_id = workspace
+                        .terminal_id(pane_id)
+                        .expect("layout pane should own a terminal");
+                    if let Some(runtime) = app.state.runtime_for_pane_in_workspace(
+                        &app.terminal_runtimes,
+                        ws_idx,
+                        pane_id,
+                    ) {
+                        detector_visible_panes.push(DetectorVisiblePaneInput {
+                            pane_id: pane_id.raw(),
+                            terminal_id: terminal_id.to_string(),
+                            screen: runtime.detection_text(),
+                            osc_title: runtime.agent_osc_title(),
+                            osc_progress: runtime.agent_osc_progress(),
+                        });
+                    }
+                }
+            }
+        }
+        pane_ids.sort_unstable();
+        detector_visible_panes.sort_by(|left, right| {
+            (left.pane_id, &left.terminal_id).cmp(&(right.pane_id, &right.terminal_id))
+        });
+
+        let mut terminal_ids = app
+            .state
+            .terminals
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        terminal_ids.sort();
+        let mut runtime_terminal_ids = app
+            .state
+            .terminals
+            .keys()
+            .filter(|terminal_id| app.terminal_runtimes.get(terminal_id).is_some())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        runtime_terminal_ids.sort();
+        let mut local_agents = app.collect_local_agent_infos();
+        local_agents.sort_by(|left, right| left.terminal_id.cmp(&right.terminal_id));
+
+        DetectionBoundarySnapshot {
+            pane_ids,
+            terminal_ids,
+            runtime_count: app.terminal_runtimes.len(),
+            runtime_terminal_ids,
+            detector_visible_panes,
+            local_agents,
+        }
+    }
+
     #[test]
     fn full_app_terminal_ansi_handshake_uses_exact_content_geometry() {
         assert_eq!(
@@ -1900,6 +1978,103 @@ mod tests {
                 launch_mode: ClientLaunchMode::App,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn active_glass_is_structurally_excluded_from_detection_and_agent_enumeration() {
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        let mut workspace = crate::workspace::Workspace::test_new("local");
+        let agent_pane = workspace.tabs[0].root_pane;
+        let shell_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let agent_terminal_id = workspace
+            .terminal_id(agent_pane)
+            .cloned()
+            .expect("agent pane terminal");
+        let shell_terminal_id = workspace
+            .terminal_id(shell_pane)
+            .cloned()
+            .expect("shell pane terminal");
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state
+            .terminals
+            .get_mut(&agent_terminal_id)
+            .expect("agent terminal metadata")
+            .set_agent_name("local-codex".into());
+        app.terminal_runtimes.insert(
+            agent_terminal_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(
+                40,
+                8,
+                b"ordinary local agent output\r\n",
+            ),
+        );
+        app.terminal_runtimes.insert(
+            shell_terminal_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(
+                40,
+                8,
+                b"ordinary local shell output\r\n",
+            ),
+        );
+
+        let before = detection_boundary_snapshot(&app);
+        assert_eq!(before.pane_ids.len(), 2);
+        assert_eq!(before.terminal_ids.len(), 2);
+        assert_eq!(before.runtime_count, 2);
+        assert_eq!(before.runtime_terminal_ids.len(), 2);
+        assert_eq!(before.detector_visible_panes.len(), 2);
+        assert_eq!(before.local_agents.len(), 1);
+        assert!(matches!(
+            app.event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        let host = RemoteHostKey::new("remote-a", "default");
+        app.state.host_glass_enabled = true;
+        app.state.view.layout = crate::app::state::ViewLayout::Desktop;
+        app.state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+        let generation = app.state.begin_host_glass_generation(host.clone());
+        assert!(app
+            .state
+            .set_host_glass_status(&host, generation, GlassStatus::Live, None));
+        app.host_glass_surfaces.insert(
+            host.clone(),
+            GlassSurfaceCore::new(Rect::new(8, 0, 72, 12), generation)
+                .expect("PTY-free glass surface"),
+        );
+        assert!(app.host_glass_surfaces.apply_frame(
+            &host,
+            generation,
+            b"\x1b]2;Action Required\x07\x1b]9;4;1;50\x07\x1b[2J\x1b[H\
+              Press Enter to confirm or Esc to cancel\r\n\
+              Allow command? [y/n]\r\n"
+        ));
+        assert!(app.state.host_glass_surface_active());
+        let glass = app
+            .host_glass_surfaces
+            .get(&host)
+            .expect("active selected glass surface");
+        assert!(glass.visible_text().contains("Press Enter to confirm"));
+        assert!(glass.visible_text().contains("Allow command? [y/n]"));
+
+        tokio::task::yield_now().await;
+        let after = detection_boundary_snapshot(&app);
+        assert_eq!(after, before);
+        assert!(matches!(
+            app.event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]
