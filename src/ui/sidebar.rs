@@ -16,7 +16,8 @@ use crate::terminal::TerminalRuntimeRegistry;
 
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
-const HOST_RAIL_HEADER_ROWS: u16 = 1;
+const HOST_RAIL_HEADER_ROWS: u16 = 2;
+const HOST_ROW_LEADING_GUTTER: u16 = 1;
 /// Fixed width of the dedicated host-selection rail beside the Spaces/Agents
 /// panel, matching the established pre-existing rail pattern
 /// (`SOURCE_RAIL_WIDTH`). The rail is always full sidebar height on expanded
@@ -170,9 +171,9 @@ pub(crate) fn host_rail_content_rect(area: Rect) -> Rect {
     Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height)
 }
 
-/// Body rect below the ` hosts` header, narrowed by one column when a
-/// scrollbar is needed. The rail is full sidebar height, so the body always
-/// spans the remaining rows below the single header row.
+/// Body rect below the ` hosts` header and its breathing row, narrowed by one
+/// column when a scrollbar is needed. The rail is full sidebar height, so the
+/// body spans the remaining rows below the two-row section header area.
 pub(crate) fn host_list_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
     let content = host_rail_content_rect(area);
     if content.width == 0 || content.height <= HOST_RAIL_HEADER_ROWS {
@@ -1287,10 +1288,14 @@ fn render_host_row(
     let marker_rect = entry
         .status
         .and_then(|_| (rect.width > 1).then_some(Rect::new(rect.x + rect.width - 1, rect.y, 1, 1)));
-    let label_width = rect.width.saturating_sub(u16::from(marker_rect.is_some()));
+    let label_x = rect.x.saturating_add(HOST_ROW_LEADING_GUTTER);
+    let label_width = rect
+        .width
+        .saturating_sub(HOST_ROW_LEADING_GUTTER)
+        .saturating_sub(u16::from(marker_rect.is_some()));
     frame.render_widget(
         Paragraph::new(truncate_text(&entry.label, label_width as usize)).style(style),
-        Rect::new(rect.x, rect.y, label_width, 1),
+        Rect::new(label_x, rect.y, label_width, 1),
     );
     if let (Some(status), Some(marker_rect)) = (entry.status, marker_rect) {
         let (symbol, marker_style) = host_status_marker(status, p);
@@ -1987,7 +1992,8 @@ mod tests {
                 status,
             );
         }
-        // Header (row 0) + local (row 1) + four remote hosts (rows 2..6).
+        // Header (row 0) + breathing row (row 1) + local (row 2) + four remote
+        // hosts (rows 3..6).
         let width = 10u16;
         let area = Rect::new(0, 0, width, 8);
         app.view.host_rail_rect = area;
@@ -1995,23 +2001,23 @@ mod tests {
         let buffer = rendered_host_rail_buffer(&app, area);
         let marker_x = area.x + area.width - 2;
 
-        assert_eq!(buffer[(marker_x, 2)].symbol(), "●");
-        assert_eq!(buffer[(marker_x, 2)].style().fg, Some(app.palette.green));
-        assert_eq!(buffer[(marker_x, 3)].symbol(), "○");
-        assert_eq!(buffer[(marker_x, 3)].style().fg, Some(app.palette.overlay0));
-        assert!(buffer[(marker_x, 3)]
-            .style()
-            .add_modifier
-            .contains(Modifier::DIM));
-        assert_eq!(buffer[(marker_x, 4)].symbol(), "↑");
-        assert_eq!(buffer[(marker_x, 4)].style().fg, Some(app.palette.yellow));
+        assert_eq!(buffer[(marker_x, 3)].symbol(), "●");
+        assert_eq!(buffer[(marker_x, 3)].style().fg, Some(app.palette.green));
+        assert_eq!(buffer[(marker_x, 4)].symbol(), "○");
+        assert_eq!(buffer[(marker_x, 4)].style().fg, Some(app.palette.overlay0));
         assert!(buffer[(marker_x, 4)]
             .style()
             .add_modifier
-            .contains(Modifier::BOLD));
-        assert_eq!(buffer[(marker_x, 5)].symbol(), "×");
-        assert_eq!(buffer[(marker_x, 5)].style().fg, Some(app.palette.red));
+            .contains(Modifier::DIM));
+        assert_eq!(buffer[(marker_x, 5)].symbol(), "↑");
+        assert_eq!(buffer[(marker_x, 5)].style().fg, Some(app.palette.yellow));
         assert!(buffer[(marker_x, 5)]
+            .style()
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(buffer[(marker_x, 6)].symbol(), "×");
+        assert_eq!(buffer[(marker_x, 6)].style().fg, Some(app.palette.red));
+        assert!(buffer[(marker_x, 6)]
             .style()
             .add_modifier
             .contains(Modifier::BOLD));
@@ -2032,9 +2038,9 @@ mod tests {
 
         let buffer = rendered_host_rail_buffer(&app, area);
         let marker_x = area.x + area.width - 2;
-        let marker_style = buffer[(marker_x, 2)].style();
+        let marker_style = buffer[(marker_x, 3)].style();
 
-        assert_eq!(buffer[(marker_x, 2)].symbol(), "↑");
+        assert_eq!(buffer[(marker_x, 3)].symbol(), "↑");
         assert_eq!(marker_style.fg, Some(app.palette.yellow));
         assert_eq!(marker_style.bg, Some(app.palette.surface0));
         assert!(marker_style.add_modifier.contains(Modifier::BOLD));
@@ -2052,16 +2058,40 @@ mod tests {
         app.view.host_rail_rect = area;
 
         let buffer = rendered_host_rail_buffer(&app, area);
-        // Header occupies row 0 and local occupies row 1, so the remote host
-        // renders on row 2. The right-edge divider column (area.width - 1) is
+        // Header occupies row 0, row 1 is the section breathing row, and local
+        // occupies row 2, so the remote host renders on row 3. The right-edge
+        // divider column (area.width - 1) is
         // the rail's own internal divider (drawn by `render_host_rail`, not
         // the outer sidebar/main-area divider from `render_sidebar`), so read
         // only the content columns up to and including the status marker.
         let row = (0..(area.width - 1))
-            .map(|x| buffer[(x, 2)].symbol())
+            .map(|x| buffer[(x, 3)].symbol())
             .collect::<String>();
 
-        assert_eq!(row, "verylon…●");
+        assert_eq!(row, " verylo…●");
+    }
+
+    #[test]
+    fn host_rail_header_buffer_and_body_rows_follow_sidebar_spacing() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.remote_sources.mark_status(
+            &RemoteHostKey::new("verylongremotehost", crate::session::DEFAULT_SESSION_NAME),
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        let area = Rect::new(0, 0, 10, 4);
+        app.view.host_rail_rect = area;
+
+        let buffer = rendered_host_rail_buffer(&app, area);
+        let row = |y| {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        assert_eq!(row(0), " hosts   │");
+        assert_eq!(row(1), "         │");
+        assert_eq!(row(2), " local   │");
+        assert_eq!(row(3), " verylo…●│");
     }
 
     #[test]
@@ -2118,8 +2148,8 @@ mod tests {
                 crate::remote_source::RemoteConnectionStatus::Connected,
             );
         }
-        // Small host rail viewport: header + 3 body rows.
-        let area = Rect::new(0, 0, 26, 4);
+        // Small host rail viewport: header + breathing row + 3 body rows.
+        let area = Rect::new(0, 0, 26, 5);
         app.view.host_rail_rect = area;
 
         let metrics = host_list_scroll_metrics(&app, area);
@@ -2136,11 +2166,12 @@ mod tests {
         assert_eq!(app.host_list_scroll, 28);
 
         // Visible rows track the scroll offset: only the viewport-height rows
-        // starting just below the header are reachable hit targets.
+        // starting below the header and breathing row are reachable hit
+        // targets.
         app.host_list_scroll = 5;
         let rows = host_list_row_areas(&app);
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].rect.y, area.y + 1);
+        assert_eq!(rows[0].rect.y, area.y + 2);
     }
 
     #[test]
@@ -2156,7 +2187,8 @@ mod tests {
                 crate::remote_source::RemoteConnectionStatus::Connected,
             );
         }
-        // Header + 3 body rows -> viewport capacity 3; 31 entries overflow.
+        // Header + breathing row + 2 body rows -> viewport capacity 2; 31
+        // entries overflow.
         let area = Rect::new(0, 0, 26, 4);
         app.view.host_rail_rect = area;
         app.host_list_scroll = 5;
@@ -2164,7 +2196,7 @@ mod tests {
         assert!(overflow_metrics.max_offset_from_bottom > 0);
 
         // Shrink: only one host survives, so local + 1 = 2 entries fit the
-        // 3-row viewport.
+        // 2-row viewport.
         let keeper = RemoteHostKey::new("host00", crate::session::DEFAULT_SESSION_NAME);
         app.remote_sources = crate::remote_source::RemoteSourceCache::default();
         app.remote_sources.mark_status(

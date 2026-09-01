@@ -2541,7 +2541,8 @@ mod tests {
             .map(|entry| entry.label)
             .collect::<Vec<_>>();
         assert_eq!(labels, vec!["local", "jafar", "jafar/agents"]);
-        // Row 0 is the ` hosts` header, so the first host row is row 1.
+        // Row 0 is the ` hosts` header, row 1 is its breathing buffer, and the
+        // first host row is row 2.
         assert_eq!(
             host_target_at(&app, 0, 0),
             None,
@@ -2549,10 +2550,15 @@ mod tests {
         );
         assert_eq!(
             host_target_at(&app, 0, 1),
-            Some(crate::app::state::SidebarSource::Local)
+            None,
+            "breathing row is not a host target"
         );
         assert_eq!(
             host_target_at(&app, 0, 2),
+            Some(crate::app::state::SidebarSource::Local)
+        );
+        assert_eq!(
+            host_target_at(&app, 0, 3),
             Some(crate::app::state::SidebarSource::Remote(default_host))
         );
     }
@@ -2620,7 +2626,7 @@ mod tests {
             crate::app::state::SidebarSource::Local
         );
         assert_eq!(
-            host_target_at(&app, 0, 1),
+            host_target_at(&app, 0, 2),
             Some(crate::app::state::SidebarSource::Local)
         );
     }

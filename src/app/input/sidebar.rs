@@ -849,8 +849,23 @@ mod tests {
         // both hosts' cached status up front and reassert it is bit-for-bit
         // unchanged after every switch below.
         let remote_cache_before = format!("{:?}", app.state.remote_sources);
+        let host_rows = crate::ui::host_list_row_areas(&app.state);
+        let first_row = host_rows
+            .iter()
+            .find(|row| row.source == crate::app::state::SidebarSource::Remote(first.clone()))
+            .expect("first remote host row")
+            .rect;
+        let second_row = host_rows
+            .iter()
+            .find(|row| row.source == crate::app::state::SidebarSource::Remote(second.clone()))
+            .expect("second remote host row")
+            .rect;
 
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 2));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            first_row.x,
+            first_row.y,
+        ));
 
         assert_eq!(
             app.state.sidebar_source,
@@ -871,7 +886,11 @@ mod tests {
         app.state.selected_remote_space = Some(remote_space_key());
         app.state.workspace_scroll = 3;
         app.state.agent_panel_scroll = 2;
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 3));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            second_row.x,
+            second_row.y,
+        ));
 
         assert_eq!(
             app.state.sidebar_source,
@@ -2196,7 +2215,7 @@ mod tests {
         // Spaces.
         let section = app.state.view.host_rail_rect;
         let col = section.x;
-        let local_row = section.y + 1;
+        let local_row = section.y + 2;
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, col, local_row));
         assert_eq!(
             app.state.sidebar_source,
@@ -2228,7 +2247,7 @@ mod tests {
         let section = app.state.view.host_rail_rect;
         assert!(section.height > 0);
         let col = section.x;
-        let row = section.y + 1;
+        let row = section.y + 2;
 
         assert_eq!(app.state.host_list_scroll, 0);
         app.handle_mouse(mouse(MouseEventKind::ScrollDown, col, row));
@@ -2273,15 +2292,25 @@ mod tests {
             .into_iter()
             .all(|area| area.source != crate::app::state::SidebarSource::Remote(target.clone())));
 
-        // Scroll down so host34 becomes a visible row.
-        app.state.host_list_scroll = 5;
+        // Scroll down just far enough to place host34 at the bottom of the
+        // current body viewport. Derive this from the body geometry so header
+        // spacing changes cannot silently desynchronize the hit-area test.
+        let target_source = crate::app::state::SidebarSource::Remote(target.clone());
+        let target_index = crate::ui::host_list_entries(&app.state)
+            .iter()
+            .position(|entry| entry.source == target_source)
+            .expect("host34 is present in the host list");
+        let viewport_rows =
+            crate::ui::host_list_scroll_metrics(&app.state, app.state.view.host_rail_rect)
+                .viewport_rows;
+        app.state.host_list_scroll = target_index.saturating_sub(viewport_rows.saturating_sub(1));
         let row = crate::ui::host_list_row_areas(&app.state)
             .into_iter()
-            .find(|area| area.source == crate::app::state::SidebarSource::Remote(target.clone()))
+            .find(|area| area.source == target_source)
             .expect("host34 is visible after scrolling")
             .rect;
         let scroll_before = app.state.host_list_scroll;
-        assert_eq!(scroll_before, 5);
+        assert!(scroll_before > 0);
 
         app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), row.x, row.y));
 
