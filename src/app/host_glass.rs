@@ -46,14 +46,14 @@ pub(crate) struct HostGlassState {
 ///
 /// This type deliberately has no pane/terminal id and is never inserted into
 /// PaneRuntime or TerminalRuntimeRegistry, keeping it outside agent detection.
-#[allow(dead_code)] // S1 foundation; stream ownership and UI rendering arrive in later slices.
 pub(crate) struct GlassSurfaceCore {
     generation: u64,
     area: Rect,
     terminal: PtyFreeTerminalSurface,
+    has_frame: std::sync::atomic::AtomicBool,
 }
 
-#[allow(dead_code)] // S1 foundation; stream ownership and UI rendering arrive in later slices.
+#[allow(dead_code)] // Visible-grid/cursor inspection is exercised by PTY-free parser tests.
 impl GlassSurfaceCore {
     pub(crate) fn new(area: Rect, generation: u64) -> io::Result<Self> {
         let terminal = PtyFreeTerminalSurface::new(
@@ -65,6 +65,7 @@ impl GlassSurfaceCore {
             generation,
             area,
             terminal,
+            has_frame: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -82,6 +83,12 @@ impl GlassSurfaceCore {
 
     pub(crate) fn feed(&self, bytes: &[u8]) {
         self.terminal.feed(bytes);
+        self.has_frame
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn has_frame(&self) -> bool {
+        self.has_frame.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn resize(&mut self, area: Rect) -> io::Result<()> {
@@ -113,12 +120,11 @@ impl GlassSurfaceCore {
 /// App-owned VT registry. The pure existence/status mirror lives separately
 /// on AppState; this collection contains only local runtime surfaces.
 #[derive(Default)]
-#[allow(dead_code)] // S1 foundation; reconciliation starts in the stream slice.
 pub(crate) struct HostGlassSurfaceRegistry {
     surfaces: BTreeMap<RemoteHostKey, GlassSurfaceCore>,
 }
 
-#[allow(dead_code)] // S1 foundation; reconciliation starts in the stream slice.
+#[allow(dead_code)] // Explicit removal is reserved for later bounded lifecycle pruning.
 impl HostGlassSurfaceRegistry {
     pub(crate) fn insert(&mut self, host: RemoteHostKey, surface: GlassSurfaceCore) {
         self.surfaces.insert(host, surface);
@@ -158,7 +164,7 @@ pub(crate) struct GlassGeometry {
 
 impl GlassGeometry {
     #[cfg(any(unix, test))]
-    fn hello(self) -> crate::protocol::ClientMessage {
+    pub(crate) fn hello(self) -> crate::protocol::ClientMessage {
         crate::protocol::ClientMessage::Hello {
             version: crate::protocol::PROTOCOL_VERSION,
             cols: self.area.width.max(1),
@@ -337,10 +343,9 @@ impl GlassSignature {
 
 /// App-owned bridge/stream lifecycle for the one selected host glass.
 ///
-/// S2 supplies the worker and reconciliation seam. S3 connects this seam to
-/// host-rail selection and rendering; keeping it dormant until then preserves
-/// the flag-off projection path bit-for-bit in this slice.
-#[allow(dead_code)] // Wired to host-rail selection in S3.
+/// The runtime is reconciled only after current content geometry is available;
+/// semantic projection may retire its predecessor earlier, but only one bridge
+/// consumer is active for the selected source.
 #[cfg_attr(not(unix), derive(Default))]
 pub(crate) struct HostGlassRuntime {
     source: Option<RemoteHostKey>,
@@ -372,7 +377,6 @@ impl Default for HostGlassRuntime {
     }
 }
 
-#[allow(dead_code)] // Wired to host-rail selection in S3.
 impl HostGlassRuntime {
     pub(crate) fn reconcile(
         &mut self,
@@ -414,9 +418,20 @@ impl HostGlassRuntime {
             self.source = next_source.clone();
             self.signature = None;
             if let Some(host) = next_source {
+                let has_cached_frame = surfaces.get(&host).is_some_and(GlassSurfaceCore::has_frame);
                 self.generation = state.begin_host_glass_generation(host.clone());
                 if let Some(surface) = surfaces.get_mut(&host) {
                     surface.retag_generation(self.generation);
+                }
+                if has_cached_frame {
+                    let _ = state.set_host_glass_status(
+                        &host,
+                        self.generation,
+                        GlassStatus::Stale {
+                            since: Instant::now(),
+                        },
+                        Some("cached frame; reconnecting host glass stream".into()),
+                    );
                 }
             } else {
                 self.generation = 0;
@@ -430,7 +445,7 @@ impl HostGlassRuntime {
             return;
         }
 
-        let had_cached_surface = surfaces.get(&host).is_some();
+        let had_cached_frame = surfaces.get(&host).is_some_and(GlassSurfaceCore::has_frame);
         match surfaces.get_mut(&host) {
             Some(surface) => {
                 if surface.area() != geometry.area {
@@ -464,7 +479,7 @@ impl HostGlassRuntime {
         }
 
         let Some(prepared) = state.remote_sources.connected_bridge_state(&host) else {
-            let status = if had_cached_surface {
+            let status = if had_cached_frame {
                 GlassStatus::Stale {
                     since: Instant::now(),
                 }
@@ -615,6 +630,19 @@ impl HostGlassRuntime {
                     status,
                     message,
                 } => {
+                    // A retained frame remains truthfully stale until the
+                    // replacement generation produces a fresh frame. Do not
+                    // overwrite the visible cached-state cue with a transient
+                    // Connecting update from the new worker.
+                    if status == GlassStatus::Connecting
+                        && surfaces.get(&host).is_some_and(GlassSurfaceCore::has_frame)
+                        && state.host_glass_states.get(&host).is_some_and(|glass| {
+                            glass.generation == generation
+                                && matches!(glass.status, GlassStatus::Stale { .. })
+                        })
+                    {
+                        continue;
+                    }
                     let _ = state.set_host_glass_status(&host, generation, status, message);
                 }
             }
@@ -1638,5 +1666,151 @@ mod tests {
                 shape: 5,
             })
         );
+    }
+
+    #[test]
+    fn repeated_first_attach_without_a_frame_remains_connecting() {
+        let mut state = crate::app::state::AppState::test_new();
+        state.host_glass_enabled = true;
+        state.view.layout = crate::app::state::ViewLayout::Desktop;
+        state.view.host_rail_rect = Rect::new(0, 0, 10, 20);
+        let host = RemoteHostKey::new("remote-a", crate::session::DEFAULT_SESSION_NAME);
+        state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+
+        let mut surfaces = HostGlassSurfaceRegistry::default();
+        let hosts = crate::remote_target::RemoteHostRegistry::default();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
+        let mut bridges = crate::app::remote_projection::SelectedHostBridgeRuntime::default();
+        let mut runtime = HostGlassRuntime::default();
+        let geometry = GlassGeometry {
+            area: Rect::new(10, 1, 50, 19),
+            cell_width_px: 8,
+            cell_height_px: 16,
+        };
+
+        for _ in 0..2 {
+            runtime.reconcile(
+                &mut state,
+                &mut surfaces,
+                &hosts,
+                &event_tx,
+                &mut bridges,
+                geometry,
+            );
+            assert!(matches!(
+                state.host_glass_states.get(&host).map(|glass| glass.status),
+                Some(GlassStatus::Connecting)
+            ));
+            assert!(!surfaces
+                .get(&host)
+                .expect("first attach allocates its PTY-free surface")
+                .has_frame());
+        }
+    }
+
+    #[test]
+    fn host_switch_retains_cached_surface_stale_until_a_fresh_frame() {
+        let mut state = crate::app::state::AppState::test_new();
+        state.host_glass_enabled = true;
+        state.view.layout = crate::app::state::ViewLayout::Desktop;
+        state.view.host_rail_rect = Rect::new(0, 0, 10, 20);
+        let host = RemoteHostKey::new("remote-a", crate::session::DEFAULT_SESSION_NAME);
+        state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+
+        let mut surfaces = HostGlassSurfaceRegistry::default();
+        let hosts = crate::remote_target::RemoteHostRegistry::default();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
+        let mut bridges = crate::app::remote_projection::SelectedHostBridgeRuntime::default();
+        let mut runtime = HostGlassRuntime::default();
+        let geometry = GlassGeometry {
+            area: Rect::new(10, 1, 50, 19),
+            cell_width_px: 8,
+            cell_height_px: 16,
+        };
+
+        runtime.reconcile(
+            &mut state,
+            &mut surfaces,
+            &hosts,
+            &event_tx,
+            &mut bridges,
+            geometry,
+        );
+        assert!(matches!(
+            state.host_glass_states.get(&host).map(|glass| glass.status),
+            Some(GlassStatus::Connecting)
+        ));
+        surfaces
+            .get(&host)
+            .expect("first selection creates a surface")
+            .feed(b"\x1b[2J\x1b[HCACHED");
+
+        state.select_sidebar_source(crate::app::state::SidebarSource::Local);
+        runtime.reconcile(
+            &mut state,
+            &mut surfaces,
+            &hosts,
+            &event_tx,
+            &mut bridges,
+            geometry,
+        );
+        state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+        runtime.reconcile(
+            &mut state,
+            &mut surfaces,
+            &hosts,
+            &event_tx,
+            &mut bridges,
+            geometry,
+        );
+
+        let retained = surfaces.get(&host).expect("cached surface retained");
+        assert!(retained.visible_text().starts_with("CACHED"));
+        assert!(matches!(
+            state.host_glass_states.get(&host).map(|glass| glass.status),
+            Some(GlassStatus::Stale { .. })
+        ));
+
+        #[cfg(unix)]
+        {
+            let generation = state
+                .host_glass_states
+                .get(&host)
+                .expect("reselected generation")
+                .generation;
+            runtime
+                .worker_update_tx
+                .send(GlassWorkerUpdate::Status {
+                    host: host.clone(),
+                    generation,
+                    status: GlassStatus::Connecting,
+                    message: Some("replacement worker connecting".into()),
+                })
+                .expect("queue replacement connecting status");
+            runtime.drain_worker_updates(&mut state, &mut surfaces);
+            assert!(matches!(
+                state.host_glass_states.get(&host).map(|glass| glass.status),
+                Some(GlassStatus::Stale { .. })
+            ));
+
+            runtime
+                .worker_update_tx
+                .send(GlassWorkerUpdate::Frame {
+                    host: host.clone(),
+                    generation,
+                    bytes: b"\x1b[2J\x1b[HFRESH".to_vec(),
+                })
+                .expect("queue fresh replacement frame");
+            runtime.drain_worker_updates(&mut state, &mut surfaces);
+            assert!(matches!(
+                state.host_glass_states.get(&host).map(|glass| glass.status),
+                Some(GlassStatus::Live)
+            ));
+            assert!(surfaces
+                .get(&host)
+                .expect("surface remains present")
+                .visible_text()
+                .starts_with("FRESH"));
+        }
     }
 }

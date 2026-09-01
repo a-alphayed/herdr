@@ -340,9 +340,18 @@ fn compute_view_internal(
                 )
             })
             .unwrap_or_default();
-        let remote_projection_tab_hit_areas =
-            compute_remote_projection_tab_hit_areas(app, main_area);
-        let remote_projection_hit_areas = compute_remote_projection_hit_areas(app, main_area);
+        let (remote_projection_tab_hit_areas, remote_projection_hit_areas) =
+            if app.host_glass_surface_active() {
+                // Glass is a single full-App surface, not a locally
+                // reconstructed pane layout. The host rail remains clickable,
+                // while every local/projection content hit target is absent.
+                (Vec::new(), Vec::new())
+            } else {
+                (
+                    compute_remote_projection_tab_hit_areas(app, main_area),
+                    compute_remote_projection_hit_areas(app, main_area),
+                )
+            };
         app.view = crate::app::ViewState {
             layout: ViewLayout::Desktop,
             sidebar_rect: sidebar_area,
@@ -559,6 +568,15 @@ pub fn render_with_runtime_registry(
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
 ) {
+    render_with_runtime_registry_and_glass(app, terminal_runtimes, None, frame);
+}
+
+pub(crate) fn render_with_runtime_registry_and_glass(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    glass_surfaces: Option<&crate::app::host_glass::HostGlassSurfaceRegistry>,
+    frame: &mut Frame,
+) {
     let sidebar_area = app.view.sidebar_rect;
     let tab_bar_area = app.view.tab_bar_rect;
     let terminal_area = app.view.terminal_area;
@@ -576,7 +594,9 @@ pub fn render_with_runtime_registry(
     if app.view.layout != ViewLayout::Mobile && !remote_projection_active {
         render_tab_bar(app, frame, tab_bar_area);
     }
-    if remote_projection_active {
+    if app.host_glass_surface_active() {
+        render_host_glass(app, glass_surfaces, frame, terminal_area);
+    } else if remote_projection_active {
         render_remote_projection(app, frame, terminal_area);
     } else {
         render_panes(app, terminal_runtimes, frame, terminal_area);
@@ -622,6 +642,139 @@ pub fn render_with_runtime_registry(
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
         Mode::Terminal => {}
+    }
+}
+
+/// The first main-area row is local, persistent identity/status chrome; only
+/// the remaining body is advertised to and painted by the remote full-App
+/// stream.
+pub(crate) fn host_glass_body_area(area: Rect) -> Rect {
+    if area.width == 0 || area.height <= 1 {
+        return Rect::default();
+    }
+    Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    )
+}
+
+fn render_host_glass(
+    app: &AppState,
+    glass_surfaces: Option<&crate::app::host_glass::HostGlassSurfaceRegistry>,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    use ratatui::layout::Alignment;
+    use ratatui::text::Line;
+    use ratatui::widgets::{Clear, Paragraph};
+
+    let crate::app::state::SidebarSource::Remote(host) = app.effective_sidebar_source() else {
+        return;
+    };
+    if area == Rect::default() {
+        return;
+    }
+
+    let metadata = app
+        .selected_host_glass_mode()
+        .map(|(_selected, glass)| glass);
+    let status = metadata
+        .map(|glass| glass.status)
+        .unwrap_or(crate::app::host_glass::GlassStatus::Connecting);
+    let (status_label, status_color) = match status {
+        crate::app::host_glass::GlassStatus::Connecting => ("Connecting", app.palette.yellow),
+        crate::app::host_glass::GlassStatus::Live => ("Live", app.palette.green),
+        crate::app::host_glass::GlassStatus::Stale { .. } => ("Stale", app.palette.peach),
+    };
+    let host_label = if host.session == crate::session::DEFAULT_SESSION_NAME {
+        host.host.clone()
+    } else {
+        format!("{} / {}", host.host, host.session)
+    };
+    let indicator = Line::from(vec![
+        Span::styled(" glass  ", Style::default().fg(app.palette.accent)),
+        Span::styled(
+            host_label,
+            Style::default()
+                .fg(app.palette.text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            status_label,
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let indicator_area = Rect::new(area.x, area.y, area.width, 1);
+    frame.render_widget(
+        Paragraph::new(indicator)
+            .style(Style::default().bg(app.palette.panel_bg))
+            .alignment(Alignment::Left),
+        indicator_area,
+    );
+
+    let body = host_glass_body_area(area);
+    if body == Rect::default() {
+        return;
+    }
+    let surface = glass_surfaces.and_then(|surfaces| surfaces.get(&host));
+    let frame_is_renderable =
+        surface.is_some_and(|surface| surface.has_frame() && surface.area() == body);
+
+    if frame_is_renderable {
+        if let Some(surface) = surface {
+            surface.render(
+                frame,
+                matches!(status, crate::app::host_glass::GlassStatus::Live),
+            );
+        }
+    } else {
+        frame.render_widget(Clear, body);
+    }
+
+    match status {
+        crate::app::host_glass::GlassStatus::Live if frame_is_renderable => {}
+        crate::app::host_glass::GlassStatus::Stale { .. } if frame_is_renderable => {
+            dim_background(frame, body);
+            let banner_area = Rect::new(
+                body.x,
+                body.y.saturating_add(body.height / 2),
+                body.width,
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(" STALE · cached frame · reconnecting ")
+                    .style(
+                        Style::default()
+                            .fg(app.palette.text)
+                            .bg(app.palette.surface0)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .alignment(Alignment::Center),
+                banner_area,
+            );
+        }
+        _ => {
+            let message = metadata
+                .and_then(|glass| glass.message.as_deref())
+                .unwrap_or("opening host glass stream");
+            let placeholder_area = Rect::new(
+                body.x,
+                body.y.saturating_add(body.height / 2),
+                body.width,
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(format!("{status_label} · {message}"))
+                    .style(Style::default().fg(app.palette.overlay0))
+                    .alignment(Alignment::Center),
+                placeholder_area,
+            );
+        }
     }
 }
 
@@ -2759,6 +2912,380 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+
+    #[test]
+    fn host_glass_takes_over_content_and_renders_identity_live_and_cached_stale_states() {
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("local")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.host_glass_enabled = true;
+        let host =
+            crate::remote_source::RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+
+        compute_view_with_runtime_registry(
+            &mut app.state,
+            &app.terminal_runtimes,
+            Rect::new(0, 0, 100, 20),
+        );
+        assert!(app.state.host_glass_surface_active());
+        assert!(app.state.view.host_rail_rect.width > 0);
+        assert_eq!(app.state.view.tab_bar_rect, Rect::default());
+        assert!(app.state.view.tab_hit_areas.is_empty());
+        assert!(app.state.view.pane_infos.is_empty());
+        assert!(app.state.view.split_borders.is_empty());
+        assert!(app.state.view.remote_projection_tab_hit_areas.is_empty());
+        assert!(app.state.view.remote_projection_hit_areas.is_empty());
+
+        let generation = app.state.begin_host_glass_generation(host.clone());
+        let body = host_glass_body_area(app.state.view.terminal_area);
+        let surface = crate::app::host_glass::GlassSurfaceCore::new(body, generation)
+            .expect("PTY-free host glass surface");
+        surface.feed(b"\x1b[2J\x1b[HREMOTE-APP");
+        app.host_glass_surfaces.insert(host.clone(), surface);
+        assert!(app.state.set_host_glass_status(
+            &host,
+            generation,
+            crate::app::host_glass::GlassStatus::Live,
+            None,
+        ));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_with_runtime_registry_and_glass(
+                    &app.state,
+                    &app.terminal_runtimes,
+                    Some(&app.host_glass_surfaces),
+                    frame,
+                )
+            })
+            .expect("render live glass");
+        let buffer = terminal.backend().buffer();
+        let indicator = buffer_row_text(
+            buffer,
+            app.state.view.terminal_area,
+            app.state.view.terminal_area.y,
+        );
+        assert!(indicator.contains("glass"));
+        assert!(indicator.contains("jafar"));
+        assert!(indicator.contains("Live"));
+        assert!(buffer_row_text(buffer, body, body.y).starts_with("REMOTE-APP"));
+
+        assert!(app.state.set_host_glass_status(
+            &host,
+            generation,
+            crate::app::host_glass::GlassStatus::Stale {
+                since: std::time::Instant::now(),
+            },
+            Some("cached frame".into()),
+        ));
+        terminal
+            .draw(|frame| {
+                render_with_runtime_registry_and_glass(
+                    &app.state,
+                    &app.terminal_runtimes,
+                    Some(&app.host_glass_surfaces),
+                    frame,
+                )
+            })
+            .expect("render stale glass");
+        let buffer = terminal.backend().buffer();
+        let indicator = buffer_row_text(
+            buffer,
+            app.state.view.terminal_area,
+            app.state.view.terminal_area.y,
+        );
+        assert!(indicator.contains("Stale"));
+        let banner_row = body.y + body.height / 2;
+        assert!(buffer_row_text(buffer, body, banner_row).contains("STALE"));
+        assert!(buffer[(body.x, body.y)]
+            .style()
+            .add_modifier
+            .contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn interactive_cached_host_reselect_uses_current_view_and_cell_pixels_without_kitty() {
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("local")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.host_glass_enabled = true;
+        assert!(!app.state.kitty_graphics_enabled);
+
+        let host = crate::remote_source::RemoteHostKey::new(
+            "remote-a",
+            crate::session::DEFAULT_SESSION_NAME,
+        );
+        assert!(app
+            .state
+            .remote_sources
+            .connected_bridge_state(&host)
+            .is_none());
+        let area = Rect::new(0, 0, 100, 20);
+        let cell_size = crate::kitty_graphics::HostCellSize {
+            width_px: 9,
+            height_px: 18,
+        };
+
+        // Populate one real retained surface through the same post-compute
+        // reconciliation seam used by the interactive loop.
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+        compute_view_with_runtime_registry(&mut app.state, &app.terminal_runtimes, area);
+        let first_geometry = app.reconcile_remote_content_surfaces(cell_size);
+        app.host_glass_surfaces
+            .get(&host)
+            .expect("first attach creates a surface without a prepared bridge")
+            .feed(b"\x1b[2J\x1b[HCACHED-EXACT");
+
+        // The local view's terminal area excludes its tab row. Detaching must
+        // not resize the cached glass from that unrelated geometry.
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Local);
+        compute_view_with_runtime_registry(&mut app.state, &app.terminal_runtimes, area);
+        assert_ne!(
+            host_glass_body_area(app.state.view.terminal_area),
+            first_geometry.area
+        );
+        app.reconcile_remote_content_surfaces(cell_size);
+
+        // Match the production order: projection retires before compute, then
+        // glass reconciles from the newly computed remote takeover geometry
+        // before the frame is rendered.
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+        app.remote_projection_runtime.reconcile(
+            &mut app.state,
+            &app.remote_hosts,
+            &app.event_tx,
+            &mut app.selected_host_bridge_runtime,
+        );
+        compute_view_with_runtime_registry(&mut app.state, &app.terminal_runtimes, area);
+        let expected_body = host_glass_body_area(app.state.view.terminal_area);
+        let geometry = app.reconcile_remote_content_surfaces(cell_size);
+
+        assert_eq!(geometry.area, expected_body);
+        assert_eq!(
+            geometry.hello(),
+            crate::protocol::ClientMessage::Hello {
+                version: crate::protocol::PROTOCOL_VERSION,
+                cols: expected_body.width,
+                rows: expected_body.height,
+                cell_width_px: 9,
+                cell_height_px: 18,
+                requested_encoding: crate::protocol::RenderEncoding::TerminalAnsi,
+                keybindings: crate::protocol::ClientKeybindings::Server,
+                launch_mode: crate::protocol::ClientLaunchMode::App,
+            }
+        );
+        let retained = app
+            .host_glass_surfaces
+            .get(&host)
+            .expect("cached surface remains available on reselect");
+        assert_eq!(retained.area(), expected_body);
+        assert!(matches!(
+            app.state
+                .host_glass_states
+                .get(&host)
+                .map(|glass| glass.status),
+            Some(crate::app::host_glass::GlassStatus::Stale { .. })
+        ));
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height))
+            .expect("cached reselect terminal");
+        terminal
+            .draw(|frame| {
+                render_with_runtime_registry_and_glass(
+                    &app.state,
+                    &app.terminal_runtimes,
+                    Some(&app.host_glass_surfaces),
+                    frame,
+                )
+            })
+            .expect("render cached reselect in the same frame");
+        assert_eq!(
+            buffer_row_text(terminal.backend().buffer(), expected_body, expected_body.y),
+            "CACHED-EXACT"
+        );
+    }
+
+    #[test]
+    fn first_host_glass_attach_renders_connecting_without_a_surface() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("local")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.host_glass_enabled = true;
+        let host = crate::remote_source::RemoteHostKey::new(
+            "remote-a",
+            crate::session::DEFAULT_SESSION_NAME,
+        );
+        app.select_sidebar_source(crate::app::state::SidebarSource::Remote(host));
+        compute_view(&mut app, Rect::new(0, 0, 100, 20));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| render(&app, frame))
+            .expect("render connecting glass");
+        let buffer = terminal.backend().buffer();
+        let indicator = buffer_row_text(buffer, app.view.terminal_area, app.view.terminal_area.y);
+        assert!(indicator.contains("remote-a"));
+        assert!(indicator.contains("Connecting"));
+        let body = host_glass_body_area(app.view.terminal_area);
+        assert!(buffer_row_text(buffer, body, body.y + body.height / 2).contains("Connecting"));
+    }
+
+    #[test]
+    fn host_glass_flag_round_trip_restores_projection_view_hits_and_render_exactly() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("local")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+
+        let host = crate::remote_source::RemoteHostKey::new(
+            "remote-a",
+            crate::session::DEFAULT_SESSION_NAME,
+        );
+        app.remote_sources.replace_workspace_snapshot(
+            host.clone(),
+            vec![crate::api::schema::WorkspaceInfo {
+                workspace_id: "ws-a".into(),
+                number: 1,
+                label: "remote space".into(),
+                focused: true,
+                pane_count: 1,
+                tab_count: 1,
+                active_tab_id: "tab-a".into(),
+                agent_status: crate::api::schema::AgentStatus::Unknown,
+                worktree: None,
+            }],
+        );
+        app.remote_sources.replace_tab_snapshot(
+            &host,
+            "ws-a",
+            vec![crate::api::schema::TabInfo {
+                tab_id: "tab-a".into(),
+                workspace_id: "ws-a".into(),
+                number: 1,
+                label: "remote tab".into(),
+                focused: true,
+                pane_count: 1,
+                agent_status: crate::api::schema::AgentStatus::Unknown,
+            }],
+        );
+        app.remote_sources.set_capabilities(
+            &host,
+            crate::remote_source::RemoteSourceCapabilities {
+                layout_export: true,
+                tab_focus: true,
+                tab_close: true,
+                tab_create: true,
+                ..Default::default()
+            },
+        );
+        app.remote_sources.apply_projection_snapshot(
+            &host,
+            vec![crate::remote_source::RemoteProjectionSnapshot {
+                workspace_id: "ws-a".into(),
+                tab_id: Some("tab-a".into()),
+                tab_label: Some("remote tab".into()),
+                status: crate::remote_source::RemoteProjectionStatus::Available,
+                layout: Some(crate::api::schema::LayoutDescription {
+                    workspace_id: "ws-a".into(),
+                    tab_id: "tab-a".into(),
+                    zoomed: false,
+                    focused_pane_id: "pane-a".into(),
+                    root: crate::api::schema::LayoutNode::Pane {
+                        pane: crate::api::schema::LayoutPane {
+                            pane_id: Some("pane-a".into()),
+                            terminal_id: Some("term-a".into()),
+                            label: Some("remote shell".into()),
+                            ..Default::default()
+                        },
+                    },
+                }),
+            }],
+        );
+        app.select_sidebar_source(crate::app::state::SidebarSource::Remote(host));
+
+        let area = Rect::new(0, 0, 100, 20);
+        compute_view(&mut app, area);
+        assert!(!app.host_glass_surface_active());
+        assert!(!app.view.remote_projection_tab_hit_areas.is_empty());
+        assert!(!app.view.remote_projection_hit_areas.is_empty());
+
+        let baseline_layout = app.view.layout;
+        let baseline_sidebar_rect = app.view.sidebar_rect;
+        let baseline_host_rail_rect = app.view.host_rail_rect;
+        let baseline_sidebar_panel_rect = app.view.sidebar_panel_rect;
+        let baseline_terminal_area = app.view.terminal_area;
+        let baseline_tab_bar_rect = app.view.tab_bar_rect;
+        let baseline_tab_hit_areas = app.view.tab_hit_areas.clone();
+        let baseline_remote_tab_hits = app.view.remote_projection_tab_hit_areas.clone();
+        let baseline_remote_pane_hits = app.view.remote_projection_hit_areas.clone();
+        let mut baseline_terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("baseline terminal");
+        baseline_terminal
+            .draw(|frame| render(&app, frame))
+            .expect("render baseline projection");
+        let baseline_buffer = baseline_terminal.backend().buffer().clone();
+
+        app.host_glass_enabled = true;
+        compute_view(&mut app, area);
+        assert!(app.host_glass_surface_active());
+        assert!(app.view.remote_projection_tab_hit_areas.is_empty());
+        assert!(app.view.remote_projection_hit_areas.is_empty());
+        let mut glass_terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("glass terminal");
+        glass_terminal
+            .draw(|frame| render(&app, frame))
+            .expect("render glass takeover");
+        assert_ne!(glass_terminal.backend().buffer(), &baseline_buffer);
+
+        app.host_glass_enabled = false;
+        compute_view(&mut app, area);
+        assert_eq!(app.view.layout, baseline_layout);
+        assert_eq!(app.view.sidebar_rect, baseline_sidebar_rect);
+        assert_eq!(app.view.host_rail_rect, baseline_host_rail_rect);
+        assert_eq!(app.view.sidebar_panel_rect, baseline_sidebar_panel_rect);
+        assert_eq!(app.view.terminal_area, baseline_terminal_area);
+        assert_eq!(app.view.tab_bar_rect, baseline_tab_bar_rect);
+        assert_eq!(app.view.tab_hit_areas, baseline_tab_hit_areas);
+        assert_eq!(
+            app.view.remote_projection_tab_hit_areas,
+            baseline_remote_tab_hits
+        );
+        assert_eq!(
+            app.view.remote_projection_hit_areas,
+            baseline_remote_pane_hits
+        );
+
+        let mut restored_terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("restored terminal");
+        restored_terminal
+            .draw(|frame| render(&app, frame))
+            .expect("render restored projection");
+        assert_eq!(restored_terminal.backend().buffer(), &baseline_buffer);
     }
 
     fn temp_git_repo(branch: &str) -> std::path::PathBuf {

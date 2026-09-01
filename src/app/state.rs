@@ -1976,7 +1976,6 @@ impl AppState {
 
     /// Return selected-host glass metadata only when the experimental mode is
     /// enabled and the effective desktop host-rail source is remote.
-    #[allow(dead_code)] // S1 pure-state seam; UI takeover starts in S3.
     pub(crate) fn selected_host_glass_mode(
         &self,
     ) -> Option<(
@@ -1990,6 +1989,15 @@ impl AppState {
             return None;
         };
         self.host_glass_states.get_key_value(&host)
+    }
+
+    /// Whether the experimental full-App glass owns the desktop content area.
+    /// This is keyed directly from the effective host-rail source so the first
+    /// selection takes over immediately, before runtime reconciliation has
+    /// created its generation metadata or received a frame.
+    pub(crate) fn host_glass_surface_active(&self) -> bool {
+        self.host_glass_enabled
+            && matches!(self.effective_sidebar_source(), SidebarSource::Remote(_))
     }
 
     /// Resolve an OSC-8 hyperlink from the exact selected remote semantic

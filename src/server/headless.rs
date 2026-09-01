@@ -567,12 +567,7 @@ impl HeadlessServer {
                 crate::render_prof::event("full_render_cause.api_requests");
             }
 
-            self.app.remote_projection_runtime.reconcile(
-                &mut self.app.state,
-                &self.app.remote_hosts,
-                &self.app.event_tx,
-                &mut self.app.selected_host_bridge_runtime,
-            );
+            self.reconcile_remote_content_surfaces();
 
             self.app.sync_focus_events();
             self.app.sync_session_save_schedule();
@@ -632,12 +627,7 @@ impl HeadlessServer {
                 // Full render/compute_view just published exact projected pane
                 // geometry, allowing first-time stream admission without a
                 // guessed remote PTY size.
-                self.app.remote_projection_runtime.reconcile(
-                    &mut self.app.state,
-                    &self.app.remote_hosts,
-                    &self.app.event_tx,
-                    &mut self.app.selected_host_bridge_runtime,
-                );
+                self.reconcile_remote_content_surfaces();
                 self.app.last_render_at = Some(now);
                 needs_render = false;
                 needs_full_render = false;
@@ -872,6 +862,20 @@ impl HeadlessServer {
         let stamp = self.next_activity_stamp;
         self.next_activity_stamp = self.next_activity_stamp.saturating_add(1);
         stamp
+    }
+
+    fn foreground_app_cell_size(&self) -> crate::kitty_graphics::HostCellSize {
+        self.foreground_client_id
+            .and_then(|client_id| self.clients.get(&client_id))
+            .filter(|client| client.is_full_app_client())
+            .map(|client| client.cell_size)
+            .filter(|cell_size| cell_size.is_known())
+            .unwrap_or_default()
+    }
+
+    fn reconcile_remote_content_surfaces(&mut self) -> crate::app::host_glass::GlassGeometry {
+        let cell_size = self.foreground_app_cell_size();
+        self.app.reconcile_remote_content_surfaces(cell_size)
     }
 
     fn resize_shared_runtime_to_effective_size(&mut self) {
@@ -3527,9 +3531,10 @@ impl HeadlessServer {
             let area = Rect::new(0, 0, cols, rows);
             let resize_panes = self.app.state.view.pane_infos.is_empty();
             let render_started = crate::render_prof::timer();
-            let _ = crate::server::render_stream::render_virtual_with_runtime_registry(
+            let _ = crate::server::render_stream::render_virtual_with_runtime_registry_and_glass(
                 &mut self.app.state,
                 &self.app.terminal_runtimes,
+                Some(&self.app.host_glass_surfaces),
                 area,
                 resize_panes,
                 crate::kitty_graphics::HostCellSize::default(),
@@ -3552,24 +3557,27 @@ impl HeadlessServer {
             let mut frame = match mode {
                 ClientConnectionMode::App => {
                     let render_started = crate::render_prof::timer();
-                    let (buffer, cursor) =
-                        if self.app.state.kitty_graphics_enabled && cell_size.is_known() {
-                            crate::server::render_stream::render_virtual_with_runtime_registry(
-                                &mut self.app.state,
-                                &self.app.terminal_runtimes,
-                                area,
-                                is_foreground,
-                                cell_size,
-                            )
-                        } else {
-                            crate::server::render_stream::render_virtual_with_runtime_registry(
-                                &mut self.app.state,
-                                &self.app.terminal_runtimes,
-                                area,
-                                is_foreground,
-                                crate::kitty_graphics::HostCellSize::default(),
-                            )
-                        };
+                    let (buffer, cursor) = if self.app.state.kitty_graphics_enabled
+                        && cell_size.is_known()
+                    {
+                        crate::server::render_stream::render_virtual_with_runtime_registry_and_glass(
+                            &mut self.app.state,
+                            &self.app.terminal_runtimes,
+                            Some(&self.app.host_glass_surfaces),
+                            area,
+                            is_foreground,
+                            cell_size,
+                        )
+                    } else {
+                        crate::server::render_stream::render_virtual_with_runtime_registry_and_glass(
+                            &mut self.app.state,
+                            &self.app.terminal_runtimes,
+                            Some(&self.app.host_glass_surfaces),
+                            area,
+                            is_foreground,
+                            crate::kitty_graphics::HostCellSize::default(),
+                        )
+                    };
                     crate::render_prof::duration_since(
                         "full_render.render_virtual",
                         render_started,
@@ -4657,6 +4665,65 @@ mod tests {
             control_rx,
             render_rx,
         )
+    }
+
+    #[test]
+    fn headless_host_glass_reconcile_uses_foreground_app_cell_geometry() {
+        let mut server = test_headless_server();
+        let host = crate::remote_source::RemoteHostKey::new(
+            "remote-a",
+            crate::session::DEFAULT_SESSION_NAME,
+        );
+        server.app.state.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        server.app.state.host_glass_enabled = true;
+        server
+            .app
+            .state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(host));
+
+        let (client_tx, _control_rx, _render_rx) = test_client_writer();
+        server.clients.insert(
+            41,
+            ClientConnection::new(
+                (120, 40),
+                crate::kitty_graphics::HostCellSize {
+                    width_px: 11,
+                    height_px: 22,
+                },
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(client_tx),
+            ),
+        );
+        server.foreground_client_id = Some(41);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+
+        let expected_area = crate::ui::host_glass_body_area(server.app.state.view.terminal_area);
+        let geometry = server.reconcile_remote_content_surfaces();
+        assert_eq!(geometry.area, expected_area);
+        assert_eq!(geometry.cell_width_px, 11);
+        assert_eq!(geometry.cell_height_px, 22);
+        assert_eq!(
+            geometry.hello(),
+            crate::protocol::ClientMessage::Hello {
+                version: crate::protocol::PROTOCOL_VERSION,
+                cols: expected_area.width,
+                rows: expected_area.height,
+                cell_width_px: 11,
+                cell_height_px: 22,
+                requested_encoding: RenderEncoding::TerminalAnsi,
+                keybindings: crate::protocol::ClientKeybindings::Server,
+                launch_mode: crate::protocol::ClientLaunchMode::App,
+            }
+        );
+
+        shutdown_test_runtimes(&mut server);
     }
 
     fn retained_test_server(

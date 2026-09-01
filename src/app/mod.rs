@@ -1074,6 +1074,36 @@ impl App {
         self.sync_prefix_input_source(previous_mode);
     }
 
+    /// Reconcile the mutually-exclusive selected-host content runtimes from
+    /// the already-computed view. Both runtime paths are App-owned and only
+    /// dispatch local listener/worker work; render remains read-only.
+    pub(crate) fn reconcile_remote_content_surfaces(
+        &mut self,
+        cell_size: crate::kitty_graphics::HostCellSize,
+    ) -> host_glass::GlassGeometry {
+        self.remote_projection_runtime.reconcile(
+            &mut self.state,
+            &self.remote_hosts,
+            &self.event_tx,
+            &mut self.selected_host_bridge_runtime,
+        );
+        let body = crate::ui::host_glass_body_area(self.state.view.terminal_area);
+        let geometry = host_glass::GlassGeometry {
+            area: body,
+            cell_width_px: cell_size.width_px.max(1),
+            cell_height_px: cell_size.height_px.max(1),
+        };
+        self.host_glass_runtime.reconcile(
+            &mut self.state,
+            &mut self.host_glass_surfaces,
+            &self.remote_hosts,
+            &self.event_tx,
+            &mut self.selected_host_bridge_runtime,
+            geometry,
+        );
+        geometry
+    }
+
     #[cfg(test)]
     pub(crate) fn set_prefix_input_source(
         &mut self,
@@ -1105,9 +1135,12 @@ impl App {
                 needs_render = true;
             }
 
-            // Reconcile source/focus changes before doing any further work so
-            // projection generation advances before Detach/socket shutdown;
-            // late predecessor frames are rejected from this point onward.
+            // Reconcile projection source/focus changes before doing any
+            // further work so its generation advances before Detach/socket
+            // shutdown; late predecessor frames are rejected from this point
+            // onward. Host glass waits for the current compute_view geometry
+            // below so retained surfaces are never resized from the previous
+            // view's terminal area.
             self.remote_projection_runtime.reconcile(
                 &mut self.state,
                 &self.remote_hosts,
@@ -1234,16 +1267,23 @@ impl App {
                     terminal.clear()?;
                     self.full_redraw_pending = false;
                 }
-                let mut cell_size = crate::kitty_graphics::HostCellSize::default();
+                let cell_size =
+                    std::cell::Cell::new(crate::kitty_graphics::HostCellSize::default());
                 terminal.draw(|frame| {
                     let area = frame.area();
+                    // Full-App TerminalAnsi glass always advertises the host
+                    // terminal's cell pixels. Kitty graphics controls image
+                    // painting only; it must not erase otherwise available
+                    // terminal geometry from the glass Hello/Resize path.
+                    let resolved_cell_size =
+                        crate::kitty_graphics::HostCellSize::from_terminal(area);
+                    cell_size.set(resolved_cell_size);
                     if kitty_graphics_enabled {
-                        cell_size = crate::kitty_graphics::HostCellSize::from_terminal(area);
                         crate::ui::compute_view_with_cell_size(
                             &mut self.state,
                             &self.terminal_runtimes,
                             area,
-                            cell_size,
+                            resolved_cell_size,
                         );
                     } else {
                         crate::ui::compute_view_with_runtime_registry(
@@ -1252,22 +1292,19 @@ impl App {
                             area,
                         );
                     }
-                    crate::ui::render_with_runtime_registry(
+                    // Reconcile against the view computed immediately above,
+                    // before render reads the retained surface. This makes a
+                    // cached host reselect paint in this frame even when no
+                    // prepared bridge exists to provide a later wake event.
+                    self.reconcile_remote_content_surfaces(resolved_cell_size);
+                    crate::ui::render_with_runtime_registry_and_glass(
                         &self.state,
                         &self.terminal_runtimes,
+                        Some(&self.host_glass_surfaces),
                         frame,
                     );
                 })?;
-                // `compute_view` just published exact projected pane geometry;
-                // a first-time selection that was waiting for geometry can now
-                // admit its bounded one-stream-per-leaf generation without
-                // guessing a remote PTY size.
-                self.remote_projection_runtime.reconcile(
-                    &mut self.state,
-                    &self.remote_hosts,
-                    &self.event_tx,
-                    &mut self.selected_host_bridge_runtime,
-                );
+                let cell_size = cell_size.get();
                 if kitty_graphics_enabled {
                     crate::kitty_graphics::paint_local_pane_graphics(
                         &self.state,

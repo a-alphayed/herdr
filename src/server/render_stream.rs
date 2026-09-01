@@ -286,6 +286,24 @@ pub(crate) fn render_virtual_with_runtime_registry(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    render_virtual_with_runtime_registry_and_glass(
+        app_state,
+        terminal_runtimes,
+        None,
+        area,
+        resize_panes,
+        cell_size,
+    )
+}
+
+pub(crate) fn render_virtual_with_runtime_registry_and_glass(
+    app_state: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    glass_surfaces: Option<&crate::app::host_glass::HostGlassSurfaceRegistry>,
+    area: Rect,
+    resize_panes: bool,
+    cell_size: crate::kitty_graphics::HostCellSize,
+) -> (ratatui::buffer::Buffer, Option<CursorState>) {
     let pre_compute_suppresses_focused_terminal_cursor =
         focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
     if resize_panes {
@@ -306,12 +324,22 @@ pub(crate) fn render_virtual_with_runtime_registry(
     // borrow immediately so cursor/backend queries below still compile.
     let buffer = terminal
         .draw(|frame| {
-            crate::ui::render_with_runtime_registry(app_state, terminal_runtimes, frame);
+            crate::ui::render_with_runtime_registry_and_glass(
+                app_state,
+                terminal_runtimes,
+                glass_surfaces,
+                frame,
+            );
         })
         .expect("render to TestBackend should never fail")
         .buffer
         .clone();
-    let cursor = if suppress_focused_terminal_cursor {
+    let cursor = if app_state.host_glass_surface_active() {
+        // Glass owns the whole content body, so its PTY-free VT cursor is the
+        // only render cursor that can be authoritative. A retained local pane
+        // must not override or suppress it in headless App-client frames.
+        terminal.backend().rendered_cursor()
+    } else if suppress_focused_terminal_cursor {
         None
     } else {
         focused_terminal_cursor(app_state, terminal_runtimes).or_else(|| {

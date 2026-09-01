@@ -358,6 +358,13 @@ fn layout_leaves<'a>(
 /// so the controller never resizes an authoritative remote PTY from a guessed
 /// local size.
 fn plan_projection_admission(state: &AppState) -> ProjectionAdmission {
+    // Host glass and per-leaf semantic projection are mutually exclusive
+    // consumers of the selected remote source. The flag-off path below is
+    // deliberately unchanged; when enabled, glass owns the one full-App
+    // TerminalAnsi stream and projection releases its bridge lease.
+    if state.host_glass_surface_active() {
+        return ProjectionAdmission::Inactive;
+    }
     let Some(source) = state.selected_remote_space.clone() else {
         return ProjectionAdmission::Inactive;
     };
@@ -1531,6 +1538,46 @@ mod tests {
             plan_projection_admission(&state),
             ProjectionAdmission::Waiting {
                 status: RemoteProjectionStreamStatus::Unsupported,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn host_glass_flag_is_the_only_projection_admission_branch_change() {
+        let mut state = selected_state(crate::remote_source::RemoteSourceCapabilities {
+            layout_export: true,
+            terminal_session_stream: true,
+            ..Default::default()
+        });
+
+        // Flag off follows the existing projection planner and waits only for
+        // its exact computed pane geometry in this fixture.
+        assert!(matches!(
+            plan_projection_admission(&state),
+            ProjectionAdmission::Waiting {
+                status: RemoteProjectionStreamStatus::Connecting,
+                ..
+            }
+        ));
+
+        // Flag on is the explicit mutual-exclusion branch: no semantic
+        // projection stream remains admitted while glass owns the source.
+        state.view.layout = crate::app::state::ViewLayout::Desktop;
+        state.view.host_rail_rect = ratatui::layout::Rect::new(0, 0, 10, 20);
+        state.sidebar_source =
+            crate::app::state::SidebarSource::Remote(RemoteHostKey::new("remote-a", "default"));
+        state.host_glass_enabled = true;
+        assert!(matches!(
+            plan_projection_admission(&state),
+            ProjectionAdmission::Inactive
+        ));
+
+        state.host_glass_enabled = false;
+        assert!(matches!(
+            plan_projection_admission(&state),
+            ProjectionAdmission::Waiting {
+                status: RemoteProjectionStreamStatus::Connecting,
                 ..
             }
         ));
