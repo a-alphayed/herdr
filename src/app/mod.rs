@@ -11,6 +11,7 @@ mod api;
 mod api_helpers;
 mod config_io;
 mod creation;
+pub(crate) mod host_glass;
 mod ids;
 mod input;
 mod remote_attach;
@@ -154,6 +155,11 @@ pub struct App {
     pub(crate) routed_executor: std::sync::Arc<api::routed_exec::RoutedExecutorPool>,
     pub(crate) remote_source_supervisors:
         Vec<crate::remote_supervisor::RemoteSourceSupervisorHandle>,
+    /// App-owned PTY-free VT surfaces for host glass. Pure existence/status
+    /// metadata is mirrored separately on `AppState`; no glass object enters
+    /// PaneRuntime or TerminalRuntimeRegistry.
+    #[allow(dead_code)] // S1 foundation; stream reconciliation starts in S2.
+    pub(crate) host_glass_surfaces: host_glass::HostGlassSurfaceRegistry,
     /// App-owned sockets/threads/SSH bridge for the currently selected remote
     /// projection. Pure frame/status data alone enters `AppState`.
     pub(crate) remote_projection_runtime: remote_projection::RemoteProjectionRuntime,
@@ -675,6 +681,7 @@ impl App {
             selected_remote_space: None,
             remote_projection_generation: 0,
             remote_projection_frames: std::collections::BTreeMap::new(),
+            host_glass_states: std::collections::BTreeMap::new(),
             selected_remote_agent: None,
             selected,
             mode,
@@ -798,6 +805,7 @@ impl App {
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
             hide_tab_bar_when_single_tab: config.ui.hide_tab_bar_when_single_tab,
             pane_history_persistence: config.experimental.pane_history,
+            host_glass_enabled: config.experimental.host_glass,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
             cjk_ime_agents: parse_cjk_ime_agents(&config.experimental.cjk_ime_agents),
@@ -934,6 +942,7 @@ impl App {
             #[cfg(unix)]
             routed_executor,
             remote_source_supervisors,
+            host_glass_surfaces: host_glass::HostGlassSurfaceRegistry::default(),
             remote_projection_runtime: remote_projection::RemoteProjectionRuntime::default(),
             pending_remote_lifecycle: std::collections::HashMap::new(),
             lifecycle_supervisor_starter:
@@ -1627,6 +1636,7 @@ impl App {
         if !invalid_section("experimental") {
             let was_kitty_graphics_enabled = self.state.kitty_graphics_enabled;
             self.state.kitty_graphics_enabled = config.experimental.kitty_graphics;
+            self.state.host_glass_enabled = config.experimental.host_glass;
             crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
             if was_kitty_graphics_enabled && !config.experimental.kitty_graphics {
                 let _ = crate::kitty_graphics::clear_all_host_graphics();

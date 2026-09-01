@@ -24,6 +24,9 @@ pub(crate) use routed::*;
 /// generation: a known primary success is never converted to "cancelled", and
 /// an outcome that cannot be known is reported as indeterminate (never
 /// auto-retried).
+// Windows retains this payload taxonomy for the shared event/reducer shape;
+// only the Unix routed executor constructs its variants.
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RoutedTaxonomy {
     /// Authoritative primary result (success or remote error response) plus
@@ -64,6 +67,9 @@ pub(crate) struct RoutedRefreshData {
 }
 
 /// How the reducer applies a routed sequence's completion.
+// Windows retains this payload taxonomy for the shared event/reducer shape;
+// only the Unix routed executor constructs its variants.
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RoutedApply {
     /// Apply refresh data to the cached tabs/projection only.

@@ -290,9 +290,6 @@ impl App {
         }
 
         for event in events {
-            let AppEvent::RemoteWorkspaceCreateTimedOut { ref host, token } = event else {
-                continue;
-            };
             // UI token expiry clears the spinner AND cancels a STILL-QUEUED
             // descriptor (it will never execute late). An EXECUTING
             // descriptor cannot be retracted: it runs to completion (there is
@@ -301,7 +298,9 @@ impl App {
             // "outcome unknown, host reconnecting" path as any other routed
             // mutation.
             #[cfg(unix)]
-            let _ = self.routed_executor.cancel_queued_create(host, token);
+            if let AppEvent::RemoteWorkspaceCreateTimedOut { ref host, token } = event {
+                let _ = self.routed_executor.cancel_queued_create(host, token);
+            }
             self.state.handle_app_event(event);
         }
         true

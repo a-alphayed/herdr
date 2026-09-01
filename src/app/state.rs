@@ -1508,6 +1508,12 @@ pub struct AppState {
         crate::remote_source::RemoteProjectionTerminalKey,
         crate::remote_source::RemoteProjectionFrameEntry,
     >,
+    /// Pure per-host glass existence/status metadata. PTY-free VT surfaces,
+    /// streams, sockets, and workers remain App-owned runtime state.
+    pub(crate) host_glass_states: std::collections::BTreeMap<
+        crate::remote_source::RemoteHostKey,
+        crate::app::host_glass::HostGlassState,
+    >,
     pub(crate) selected_remote_agent: Option<crate::remote_source::RemoteAgentKey>,
     pub selected: usize,
     pub mode: Mode,
@@ -1548,6 +1554,9 @@ pub struct AppState {
     /// `apply_routed_completion` in `app::api::routed_exec`): the last
     /// generation of a routed-sequence completion event the reducer has
     /// applied per host.
+    // Windows retains the shared reducer state shape even though only the
+    // Unix routed executor can produce and reconcile routed completions.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) remote_routed_reconciled:
         std::collections::BTreeMap<crate::remote_source::RemoteHostKey, u64>,
     pub(crate) next_remote_workspace_create_token: u64,
@@ -1645,6 +1654,9 @@ pub struct AppState {
     pub show_agent_labels_on_pane_borders: bool,
     pub hide_tab_bar_when_single_tab: bool,
     pub pane_history_persistence: bool,
+    /// Enables selected-host glass mode. Default false; see
+    /// `[experimental] host_glass`.
+    pub(crate) host_glass_enabled: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
     pub reveal_hidden_cursor_for_cjk_ime: bool,
@@ -1915,6 +1927,68 @@ impl AppState {
             })
     }
 
+    /// Start a new generation for one host and publish its truthful initial
+    /// Connecting state before any runtime work begins.
+    #[allow(dead_code)] // S1 pure-state seam; runtime reconciliation starts in S2.
+    pub(crate) fn begin_host_glass_generation(
+        &mut self,
+        host: crate::remote_source::RemoteHostKey,
+    ) -> u64 {
+        let mut generation = self
+            .host_glass_states
+            .get(&host)
+            .map(|state| state.generation.wrapping_add(1))
+            .unwrap_or(1);
+        if generation == 0 {
+            generation = 1;
+        }
+        self.host_glass_states.insert(
+            host,
+            crate::app::host_glass::HostGlassState {
+                generation,
+                status: crate::app::host_glass::GlassStatus::Connecting,
+            },
+        );
+        generation
+    }
+
+    /// Apply a generation-tagged status update. Late predecessor updates are
+    /// rejected without disturbing the current surface.
+    #[allow(dead_code)] // S1 pure-state seam; stream events start in S2.
+    pub(crate) fn set_host_glass_status(
+        &mut self,
+        host: &crate::remote_source::RemoteHostKey,
+        generation: u64,
+        status: crate::app::host_glass::GlassStatus,
+    ) -> bool {
+        let Some(state) = self.host_glass_states.get_mut(host) else {
+            return false;
+        };
+        if state.generation != generation {
+            return false;
+        }
+        state.status = status;
+        true
+    }
+
+    /// Return selected-host glass metadata only when the experimental mode is
+    /// enabled and the effective desktop host-rail source is remote.
+    #[allow(dead_code)] // S1 pure-state seam; UI takeover starts in S3.
+    pub(crate) fn selected_host_glass_mode(
+        &self,
+    ) -> Option<(
+        &crate::remote_source::RemoteHostKey,
+        &crate::app::host_glass::HostGlassState,
+    )> {
+        if !self.host_glass_enabled {
+            return None;
+        }
+        let SidebarSource::Remote(host) = self.effective_sidebar_source() else {
+            return None;
+        };
+        self.host_glass_states.get_key_value(&host)
+    }
+
     /// Resolve an OSC-8 hyperlink from the exact selected remote semantic
     /// frame/hit area. Coordinates are translated into the bordered pane
     /// interior; stale frames remain copy/open-readable while terminal input
@@ -2163,6 +2237,7 @@ impl AppState {
             selected_remote_space: None,
             remote_projection_generation: 0,
             remote_projection_frames: std::collections::BTreeMap::new(),
+            host_glass_states: std::collections::BTreeMap::new(),
             selected_remote_agent: None,
             selected: 0,
             mode: Mode::Navigate,
@@ -2277,6 +2352,7 @@ impl AppState {
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
             pane_history_persistence: false,
+            host_glass_enabled: false,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,
             cjk_ime_agents: Vec::new(),
@@ -2907,6 +2983,62 @@ mod tests {
         assert!(state.selected_remote_space.is_none());
         assert_eq!(state.active, Some(0));
         assert_eq!(state.workspaces[0].focused_pane_id(), local_focus);
+    }
+
+    #[test]
+    fn host_glass_status_is_generation_gated_and_feature_gated() {
+        let mut state = AppState::test_new();
+        let host = crate::remote_source::RemoteHostKey::new("remote-a", "default");
+        state.view.host_rail_rect = Rect::new(0, 0, 3, 20);
+        state.select_sidebar_source(SidebarSource::Remote(host.clone()));
+
+        let generation = state.begin_host_glass_generation(host.clone());
+        assert_eq!(generation, 1);
+        assert_eq!(
+            state.host_glass_states.get(&host),
+            Some(&crate::app::host_glass::HostGlassState {
+                generation,
+                status: crate::app::host_glass::GlassStatus::Connecting,
+            })
+        );
+        assert!(state.selected_host_glass_mode().is_none());
+
+        state.host_glass_enabled = true;
+        assert_eq!(
+            state
+                .selected_host_glass_mode()
+                .map(|(_, glass)| glass.status),
+            Some(crate::app::host_glass::GlassStatus::Connecting)
+        );
+        assert!(state.set_host_glass_status(
+            &host,
+            generation,
+            crate::app::host_glass::GlassStatus::Live,
+        ));
+
+        let next_generation = state.begin_host_glass_generation(host.clone());
+        assert_eq!(next_generation, generation + 1);
+        assert!(
+            !state.set_host_glass_status(
+                &host,
+                generation,
+                crate::app::host_glass::GlassStatus::Live,
+            ),
+            "a predecessor generation must not overwrite the replacement"
+        );
+        let since = std::time::Instant::now();
+        assert!(state.set_host_glass_status(
+            &host,
+            next_generation,
+            crate::app::host_glass::GlassStatus::Stale { since },
+        ));
+        assert_eq!(
+            state.host_glass_states.get(&host).map(|glass| glass.status),
+            Some(crate::app::host_glass::GlassStatus::Stale { since })
+        );
+
+        state.select_sidebar_source(SidebarSource::Local);
+        assert!(state.selected_host_glass_mode().is_none());
     }
 
     fn projected_selection_for_authority_test(

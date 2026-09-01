@@ -399,6 +399,47 @@ impl GhosttyPaneTerminal {
         })
     }
 
+    /// Feed a PTY-free ANSI surface without invoking pane-, process-, or
+    /// detector-specific bookkeeping. Terminal query replies are deliberately
+    /// discarded: callers of this seam consume a one-way rendered byte stream.
+    pub(crate) fn feed_ansi_surface_bytes(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Ok(mut core) = self.core.lock() else {
+            error!("ghostty core lock poisoned in ANSI surface feed");
+            return;
+        };
+        core.decscusr_tracker.observe(bytes);
+        core.terminal.write(bytes);
+        if let Ok(mut key_encoder) = self.key_encoder.lock() {
+            key_encoder.set_from_terminal(&core.terminal);
+        }
+        drop(core);
+        let _ = self.drain_pending_pty_responses();
+    }
+
+    /// Resize a PTY-free ANSI surface directly. Pane scrollback recovery and
+    /// detection-oriented resize heuristics intentionally do not apply.
+    pub(crate) fn resize_ansi_surface(
+        &self,
+        rows: u16,
+        cols: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> std::io::Result<()> {
+        let mut core = self
+            .core
+            .lock()
+            .map_err(|_| std::io::Error::other("ghostty core lock poisoned during ANSI resize"))?;
+        core.terminal
+            .resize(cols, rows, cell_width_px, cell_height_px)
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+        drop(core);
+        let _ = self.drain_pending_pty_responses();
+        Ok(())
+    }
+
     pub(super) fn set_windows_powershell_prompt_cwd_reporting(&self, enabled: bool) {
         if let Ok(mut core) = self.core.lock() {
             core.windows_powershell_prompt_cwd_reporting = enabled;

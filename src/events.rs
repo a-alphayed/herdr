@@ -245,6 +245,9 @@ pub enum AppEvent {
     /// atomically in one step and records the reconciliation. The legacy
     /// create-success event (`RemoteWorkspaceCreateSucceeded`) keeps its
     /// UI-notify role and is untouched by this path.
+    // Windows keeps this event in the shared reducer taxonomy even though
+    // only the Unix routed executor can construct it.
+    #[cfg_attr(windows, allow(dead_code))]
     RemoteRoutedSequenceCompleted {
         host: RemoteHostKey,
         generation: u64,
@@ -261,6 +264,9 @@ pub enum AppEvent {
     /// force-reconnects and re-syncs full state. There is no timeout
     /// anywhere in this executor (v11); this event fires only on a genuine
     /// transport/protocol failure, never on an elapsed bound.
+    // Windows keeps this event in the shared reducer taxonomy even though
+    // only the Unix routed executor can construct it.
+    #[cfg_attr(windows, allow(dead_code))]
     RemoteRoutedRecoveryNeeded {
         host: RemoteHostKey,
         generation: u64,

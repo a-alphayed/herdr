@@ -46,6 +46,51 @@ pub use self::{
     terminal::{InputState, ScrollMetrics, TerminalCursorState},
 };
 
+/// Narrow PTY-free terminal surface used by non-pane runtime owners.
+/// Keeping the pane terminal implementation private prevents this seam from
+/// exposing pane ids, detector state, or PaneRuntime construction.
+pub(crate) struct PtyFreeTerminalSurface {
+    terminal: GhosttyPaneTerminal,
+}
+
+impl PtyFreeTerminalSurface {
+    pub(crate) fn new(cols: u16, rows: u16, scrollback_limit_bytes: usize) -> io::Result<Self> {
+        let terminal = crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes)
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let (response_tx, _response_rx) = mpsc::channel(1);
+        Ok(Self {
+            terminal: GhosttyPaneTerminal::new(terminal, response_tx)?,
+        })
+    }
+
+    pub(crate) fn feed(&self, bytes: &[u8]) {
+        self.terminal.feed_ansi_surface_bytes(bytes);
+    }
+
+    pub(crate) fn resize(
+        &self,
+        rows: u16,
+        cols: u16,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    ) -> io::Result<()> {
+        self.terminal
+            .resize_ansi_surface(rows, cols, cell_width_px, cell_height_px)
+    }
+
+    pub(crate) fn visible_text(&self) -> String {
+        self.terminal.visible_text()
+    }
+
+    pub(crate) fn cursor_state(&self) -> Option<TerminalCursorState> {
+        self.terminal.cursor_state()
+    }
+
+    pub(crate) fn render(&self, frame: &mut Frame<'_>, area: Rect, show_cursor: bool) {
+        self.terminal.render(frame, area, show_cursor);
+    }
+}
+
 const RELEASE_REACQUIRE_SUPPRESSION: std::time::Duration = std::time::Duration::from_secs(1);
 const PANE_TERM: &str = "xterm-256color";
 const PANE_COLORTERM: &str = "truecolor";
