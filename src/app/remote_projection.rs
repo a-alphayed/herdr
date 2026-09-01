@@ -1208,7 +1208,7 @@ fn run_projection_stream_once(
 ) -> Result<(), StreamEnd> {
     use crate::protocol::{
         ClientKeybindings, ClientLaunchMode, ClientMessage, RenderEncoding, ServerMessage,
-        MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+        ViewContext, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
     };
 
     let mut stream = std::os::unix::net::UnixStream::connect(socket)
@@ -1222,6 +1222,7 @@ fn run_projection_stream_once(
         requested_encoding: RenderEncoding::SemanticFrame,
         keybindings: ClientKeybindings::Server,
         launch_mode: ClientLaunchMode::TerminalAttach,
+        view_context: ViewContext::Standalone,
     };
     crate::protocol::write_message(&mut stream, &hello)
         .map_err(|err| StreamEnd::Closed(format!("projection handshake send failed: {err}")))?;
@@ -1909,7 +1910,13 @@ mod tests {
         let (mut server, _) = listener.accept().expect("accept projection stream");
         let hello = crate::protocol::read_message::<_, ClientMessage>(&mut server, MAX_FRAME_SIZE)
             .expect("read hello");
-        assert!(matches!(hello, ClientMessage::Hello { .. }));
+        assert!(matches!(
+            hello,
+            ClientMessage::Hello {
+                view_context: crate::protocol::ViewContext::Standalone,
+                ..
+            }
+        ));
         crate::protocol::write_message(
             &mut server,
             &ServerMessage::Welcome {

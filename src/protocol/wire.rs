@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Current protocol version. Bumped when wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Maximum allowed frame payload size (2 MB). Frames larger than this are
 /// rejected to prevent denial-of-service via oversized length prefixes.
@@ -59,6 +59,17 @@ pub enum ClientLaunchMode {
     App,
     /// Direct terminal attach client.
     TerminalAttach,
+}
+
+/// Where a client renders the server-provided view.
+///
+/// Variant order is wire-significant: append new variants rather than reordering these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ViewContext {
+    /// A normal top-level Herdr client.
+    Standalone,
+    /// A Herdr view embedded within another Herdr surface.
+    Embedded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -320,6 +331,8 @@ pub enum ClientMessage {
         keybindings: ClientKeybindings,
         /// Whether this connection will render the full app or attach directly to a pane terminal.
         launch_mode: ClientLaunchMode,
+        /// Whether the client renders as a top-level or embedded view.
+        view_context: ViewContext,
     },
 
     /// Raw input bytes read from the client's stdin.
@@ -898,21 +911,25 @@ pub enum VersionCheck {
 /// - A client with an older version than the server is rejected
 ///   (backward compatibility is not yet supported).
 pub fn check_client_version(client_version: u32) -> VersionCheck {
+    check_client_version_against(client_version, PROTOCOL_VERSION)
+}
+
+fn check_client_version_against(client_version: u32, server_version: u32) -> VersionCheck {
     if client_version == 0 {
         return VersionCheck::Incompatible(
             "pre-persistence client (version 0) is not supported".to_owned(),
         );
     }
 
-    if client_version == PROTOCOL_VERSION {
+    if client_version == server_version {
         VersionCheck::Compatible
-    } else if client_version < PROTOCOL_VERSION {
+    } else if client_version < server_version {
         VersionCheck::Incompatible(format!(
-            "client version {client_version} is older than server version {PROTOCOL_VERSION}; please upgrade your herdr client"
+            "client version {client_version} is older than server version {server_version}; please upgrade your herdr client"
         ))
     } else {
         VersionCheck::Incompatible(format!(
-            "client version {client_version} is newer than server version {PROTOCOL_VERSION}; please upgrade the herdr server"
+            "client version {client_version} is newer than server version {server_version}; please upgrade the herdr server"
         ))
     }
 }
@@ -939,6 +956,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            view_context: ViewContext::Standalone,
         };
         let encoded = bincode::serde::encode_to_vec(&msg, bincode::config::standard()).unwrap();
         let (decoded, _): (ClientMessage, _) =
@@ -958,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn client_message_wire_tags_preserve_protocol_15_order() {
+    fn client_message_wire_tags_preserve_protocol_16_order() {
         fn tag(msg: &ClientMessage) -> u8 {
             *bincode::serde::encode_to_vec(msg, bincode::config::standard())
                 .unwrap()
@@ -976,6 +994,7 @@ mod tests {
                 requested_encoding: RenderEncoding::SemanticFrame,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                view_context: ViewContext::Standalone,
             }),
             0
         );
@@ -1028,6 +1047,51 @@ mod tests {
                 takeover: false,
             }),
             9
+        );
+    }
+
+    #[test]
+    fn hello_field_order_and_view_context_discriminants_are_stable() {
+        let standalone = ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            requested_encoding: RenderEncoding::SemanticFrame,
+            keybindings: ClientKeybindings::Server,
+            launch_mode: ClientLaunchMode::App,
+            view_context: ViewContext::Standalone,
+        };
+        let embedded = ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 8,
+            cell_height_px: 16,
+            requested_encoding: RenderEncoding::SemanticFrame,
+            keybindings: ClientKeybindings::Server,
+            launch_mode: ClientLaunchMode::App,
+            view_context: ViewContext::Embedded,
+        };
+
+        assert_eq!(
+            bincode::serde::encode_to_vec(&standalone, bincode::config::standard()).unwrap(),
+            vec![0, 16, 80, 24, 8, 16, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            bincode::serde::encode_to_vec(&embedded, bincode::config::standard()).unwrap(),
+            vec![0, 16, 80, 24, 8, 16, 0, 0, 0, 1]
+        );
+        assert_eq!(
+            bincode::serde::encode_to_vec(ViewContext::Standalone, bincode::config::standard())
+                .unwrap(),
+            vec![0]
+        );
+        assert_eq!(
+            bincode::serde::encode_to_vec(ViewContext::Embedded, bincode::config::standard())
+                .unwrap(),
+            vec![1]
         );
     }
 
@@ -1411,6 +1475,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            view_context: ViewContext::Standalone,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1485,6 +1550,7 @@ mod tests {
                     requested_encoding: RenderEncoding::SemanticFrame,
                     keybindings: ClientKeybindings::Server,
                     launch_mode: ClientLaunchMode::App,
+                    view_context: ViewContext::Standalone,
                 },
                 1 => ClientMessage::Input {
                     data: vec![(i % 256) as u8; (i as usize % 50) + 1],
@@ -1622,6 +1688,28 @@ mod tests {
         if let VersionCheck::Incompatible(msg) = result {
             assert!(msg.contains("newer"), "error should mention newer version");
         }
+    }
+
+    #[test]
+    fn protocol_15_client_is_told_to_upgrade_for_protocol_16_server() {
+        assert_eq!(
+            check_client_version_against(15, 16),
+            VersionCheck::Incompatible(
+                "client version 15 is older than server version 16; please upgrade your herdr client"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn protocol_16_client_is_told_to_upgrade_protocol_15_server() {
+        assert_eq!(
+            check_client_version_against(16, 15),
+            VersionCheck::Incompatible(
+                "client version 16 is newer than server version 15; please upgrade the herdr server"
+                    .to_owned()
+            )
+        );
     }
 
     // ---- Pre-persistence client rejection ----
@@ -1921,6 +2009,7 @@ mod tests {
             requested_encoding: RenderEncoding::SemanticFrame,
             keybindings: ClientKeybindings::Server,
             launch_mode: ClientLaunchMode::App,
+            view_context: ViewContext::Standalone,
         };
         let mut buf = Vec::new();
         write_message(&mut buf, &msg).unwrap();
@@ -1957,6 +2046,7 @@ mod tests {
                 requested_encoding: RenderEncoding::SemanticFrame,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                view_context: ViewContext::Standalone,
             },
             ClientMessage::Input {
                 data: b"hello world".to_vec(),

@@ -3263,6 +3263,7 @@ mod tests {
                 requested_encoding: crate::protocol::RenderEncoding::TerminalAnsi,
                 keybindings: crate::protocol::ClientKeybindings::Server,
                 launch_mode: crate::protocol::ClientLaunchMode::App,
+                view_context: crate::protocol::ViewContext::Standalone,
             }
         );
         let retained = app

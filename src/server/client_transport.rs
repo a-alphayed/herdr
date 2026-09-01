@@ -19,8 +19,8 @@ use tracing::{debug, warn};
 use crate::ipc::LocalStream;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientInputEvent, ClientKeybindings,
-    ClientLaunchMode, ClientMessage, RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD,
-    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    ClientLaunchMode, ClientMessage, RenderEncoding, ServerMessage, ViewContext,
+    MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 
 /// Minimum accepted attached client size.
@@ -289,6 +289,7 @@ pub(crate) enum ServerEvent {
         cell_width_px: u32,
         cell_height_px: u32,
         render_encoding: RenderEncoding,
+        view_context: ViewContext,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
         direct_attach_requested: bool,
         writer: ClientWriter,
@@ -461,6 +462,7 @@ pub(crate) fn handle_client_handshake(
         cell_width_px,
         cell_height_px,
         render_encoding,
+        view_context,
         keybindings,
         direct_attach_requested,
     ) = match hello {
@@ -473,6 +475,7 @@ pub(crate) fn handle_client_handshake(
             requested_encoding,
             keybindings,
             launch_mode,
+            view_context,
         } => {
             // Version check.
             match protocol::check_client_version(version) {
@@ -510,6 +513,7 @@ pub(crate) fn handle_client_handshake(
                 cell_width_px,
                 cell_height_px,
                 requested_encoding,
+                view_context,
                 keybindings,
                 launch_mode == ClientLaunchMode::TerminalAttach,
             )
@@ -564,6 +568,7 @@ pub(crate) fn handle_client_handshake(
         cell_width_px,
         cell_height_px,
         render_encoding,
+        view_context,
         keybindings,
         direct_attach_requested,
         writer,
@@ -1057,6 +1062,7 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
+                view_context: ViewContext::Standalone,
             },
         )
         .expect("write hello");
@@ -1087,6 +1093,7 @@ new_tab = "ctrl+notakey"
                 cell_width_px,
                 cell_height_px,
                 render_encoding,
+                view_context,
                 keybindings,
                 direct_attach_requested,
                 writer,
@@ -1095,6 +1102,7 @@ new_tab = "ctrl+notakey"
                 assert_eq!((cols, rows), (100, 30));
                 assert_eq!((cell_width_px, cell_height_px), (8, 16));
                 assert_eq!(render_encoding, RenderEncoding::TerminalAnsi);
+                assert_eq!(view_context, ViewContext::Standalone);
                 assert!(keybindings.is_none());
                 assert!(!direct_attach_requested);
                 drop(writer);
@@ -1132,6 +1140,7 @@ new_tab = "ctrl+notakey"
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::TerminalAttach,
+                view_context: ViewContext::Standalone,
             },
         )
         .expect("write hello");

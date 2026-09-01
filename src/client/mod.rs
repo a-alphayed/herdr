@@ -41,7 +41,7 @@ use crate::protocol::render_ansi;
 use crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD;
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, ClientKeybindings, ClientLaunchMode,
-    ClientMessage, NotifyKind, RenderEncoding, ServerMessage, MAX_FRAME_SIZE,
+    ClientMessage, NotifyKind, RenderEncoding, ServerMessage, ViewContext, MAX_FRAME_SIZE,
     MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 use crate::server::socket_paths::client_socket_path;
@@ -733,6 +733,7 @@ fn do_handshake(
         } else {
             ClientLaunchMode::App
         },
+        view_context: ViewContext::Standalone,
     };
     protocol::write_message(stream, &hello)
         .map_err(|e| ClientError::ConnectionFailed(io::Error::other(e.to_string())))?;
