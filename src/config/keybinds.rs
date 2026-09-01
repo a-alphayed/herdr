@@ -8,6 +8,7 @@ use super::Config;
 use crate::input::TerminalKey;
 
 pub type KeyCombo = (KeyCode, KeyModifiers);
+pub(crate) const HOST_GLASS_EXIT_DEFAULT: &str = "ctrl+shift+f12";
 
 #[derive(Debug, Clone)]
 pub struct LiveKeybindConfig {
@@ -301,6 +302,7 @@ pub struct Keybinds {
     pub workspace_picker: ActionKeybinds,
     pub goto: ActionKeybinds,
     pub detach: ActionKeybinds,
+    pub host_glass_exit: ActionKeybinds,
     pub reload_config: ActionKeybinds,
     pub open_notification_target: ActionKeybinds,
     pub previous_workspace: ActionKeybinds,
@@ -436,6 +438,17 @@ impl Config {
         let mut navigate_registry = BindingRegistry::new(prefix, prefix_source);
         navigate_registry.reserve_direct(prefix, "keys.prefix", prefix_source);
         reserve_navigate_runtime_keys(&mut navigate_registry);
+        let host_glass_exit = resolve_host_glass_exit_binding(
+            &self.keys.host_glass_exit,
+            &mut registry,
+            &mut diagnostics,
+            if self.keys.key_field_is_user_configured("host_glass_exit") {
+                BindingSource::User
+            } else {
+                BindingSource::Default
+            },
+            self.experimental.host_glass,
+        );
 
         macro_rules! empty_action {
             () => {
@@ -463,6 +476,7 @@ impl Config {
             workspace_picker: empty_action!(),
             goto: empty_action!(),
             detach: empty_action!(),
+            host_glass_exit,
             reload_config: empty_action!(),
             open_notification_target: empty_action!(),
             previous_workspace: empty_action!(),
@@ -787,6 +801,65 @@ fn parse_action_bindings(
         }
     }
     ActionKeybinds { bindings }
+}
+
+fn resolve_host_glass_exit_binding(
+    raw: &str,
+    registry: &mut BindingRegistry,
+    diagnostics: &mut Vec<String>,
+    source: BindingSource,
+    reserve: bool,
+) -> ActionKeybinds {
+    const FIELD: &str = "keys.host_glass_exit";
+    let raw = raw.trim();
+    let parsed = match parse_binding_string(raw) {
+        Some(ParsedBinding::Single(binding)) if binding.trigger.is_direct() => Some(binding),
+        _ => None,
+    };
+    let binding = parsed.filter(|binding| {
+        !is_unmodified_printable(binding.trigger.combo()) && registry.conflict(binding).is_none()
+    });
+    let binding = binding.unwrap_or_else(|| {
+        let reason = match parse_binding_string(raw) {
+            _ if raw.is_empty() => "empty",
+            Some(ParsedBinding::Single(binding)) if !binding.trigger.is_direct() => "prefix",
+            Some(ParsedBinding::Range(_)) => "range",
+            Some(ParsedBinding::Single(binding))
+                if is_unmodified_printable(binding.trigger.combo()) =>
+            {
+                "unsafe"
+            }
+            Some(ParsedBinding::Single(_)) => "colliding",
+            None => "invalid",
+        };
+        let diag = format!(
+            "{reason} host glass exit keybinding: {FIELD} = {raw:?}; using safe default {HOST_GLASS_EXIT_DEFAULT:?}"
+        );
+        warn!(message = %diag, "config diagnostic");
+        diagnostics.push(diag);
+        ResolvedBinding {
+            trigger: BindingTrigger::Direct((
+                KeyCode::F(12),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            label: HOST_GLASS_EXIT_DEFAULT.into(),
+        }
+    });
+
+    if reserve {
+        if let Some(conflict) = registry.conflict(&binding) {
+            let diag = format!(
+                "reserved host glass exit keybinding {} takes priority over {} while glass is selected",
+                binding.label, conflict.field
+            );
+            warn!(message = %diag, "config diagnostic");
+            diagnostics.push(diag);
+        }
+        registry.register(&binding, FIELD, source);
+    }
+    ActionKeybinds {
+        bindings: vec![binding],
+    }
 }
 
 fn parse_navigate_bindings(
@@ -2183,5 +2256,113 @@ description = "say hello"
             keybinds.custom_commands[0].description,
             Some("say hello".to_string())
         );
+    }
+
+    #[test]
+    fn host_glass_exit_has_exactly_one_direct_noncolliding_default() {
+        let config = Config::default();
+        let bindings = &config.keybinds().host_glass_exit.bindings;
+
+        assert_eq!(config.keys.host_glass_exit, "ctrl+shift+f12");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].label, "ctrl+shift+f12");
+        assert!(matches!(
+            bindings[0].trigger,
+            BindingTrigger::Direct((
+                KeyCode::F(12),
+                modifiers
+            )) if modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        ));
+    }
+
+    #[test]
+    fn host_glass_exit_accepts_one_custom_direct_chord() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+host_glass_exit = "ctrl+alt+f11"
+"#,
+        )
+        .expect("custom glass escape chord parses");
+
+        assert_eq!(
+            binding_triggers(&config.keybinds().host_glass_exit),
+            vec![BindingTrigger::Direct((
+                KeyCode::F(11),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ))]
+        );
+    }
+
+    #[test]
+    fn host_glass_exit_falls_back_to_one_safe_direct_chord_for_invalid_config() {
+        for value in [
+            "",
+            "prefix+q",
+            "ctrl+1..9",
+            "x",
+            "ctrl+definitely-not-a-key",
+        ] {
+            let config: Config = toml::from_str(&format!("[keys]\nhost_glass_exit = {value:?}\n"))
+                .expect("glass escape config parses");
+            let bindings = config.keybinds().host_glass_exit.bindings;
+            assert_eq!(bindings.len(), 1, "{value}");
+            assert_eq!(bindings[0].label, HOST_GLASS_EXIT_DEFAULT, "{value}");
+            assert!(bindings[0].trigger.is_direct(), "{value}");
+            let diagnostics = config.collect_diagnostics();
+            assert!(
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic.contains("host glass exit keybinding")
+                        && diagnostic.contains("using safe default")
+                }),
+                "{value}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_glass_exit_reservation_wins_default_chord_collision() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+new_workspace = "ctrl+shift+f12"
+
+[experimental]
+host_glass = true
+"#,
+        )
+        .expect("colliding config parses");
+        let keybinds = config.keybinds();
+
+        assert_eq!(keybinds.host_glass_exit.bindings.len(), 1);
+        assert_eq!(
+            keybinds.host_glass_exit.bindings[0].label,
+            HOST_GLASS_EXIT_DEFAULT
+        );
+        assert!(keybinds.new_workspace.bindings.is_empty());
+        assert!(config.collect_diagnostics().iter().any(|diagnostic| {
+            diagnostic.contains("kept keys.host_glass_exit")
+                && diagnostic.contains("disabled keys.new_workspace")
+        }));
+    }
+
+    #[test]
+    fn host_glass_flag_off_does_not_reserve_its_hidden_exit_chord() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+new_workspace = "ctrl+shift+f12"
+"#,
+        )
+        .expect("flag-off collision config parses");
+        let keybinds = config.keybinds();
+
+        assert!(!config.experimental.host_glass);
+        assert_eq!(keybinds.host_glass_exit.bindings.len(), 1);
+        assert_eq!(keybinds.new_workspace.bindings.len(), 1);
+        assert!(config
+            .collect_diagnostics()
+            .iter()
+            .all(|diagnostic| !diagnostic.contains("keys.host_glass_exit")));
     }
 }

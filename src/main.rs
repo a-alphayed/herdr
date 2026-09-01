@@ -171,6 +171,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # help = "prefix+?"
 # settings = "prefix+s"
 # detach = "prefix+q"
+# host_glass_exit = "ctrl+shift+f12" # one local-only escape hatch while glass is selected
 # reload_config = "prefix+shift+r"
 # open_notification_target = "prefix+o"
 # workspace_picker = "prefix+w"

@@ -59,6 +59,27 @@ fn translate_remote_projection_mouse(
     })
 }
 
+fn translate_host_glass_mouse(
+    body: ratatui::layout::Rect,
+    mouse: MouseEvent,
+) -> Option<crate::protocol::ClientInputEvent> {
+    if body.width == 0
+        || body.height == 0
+        || mouse.column < body.x
+        || mouse.row < body.y
+        || mouse.column >= body.x.saturating_add(body.width)
+        || mouse.row >= body.y.saturating_add(body.height)
+    {
+        return None;
+    }
+    Some(crate::protocol::ClientInputEvent::Mouse {
+        kind: crate::protocol::ClientMouseKind::from_crossterm(mouse.kind)?,
+        column: mouse.column - body.x,
+        row: mouse.row - body.y,
+        modifiers: mouse.modifiers.bits(),
+    })
+}
+
 /// Translate screen coordinates into the exact visible copy grid of one
 /// projected hit area — the `min(pane interior, frame)` rectangle the render
 /// loop actually draws. Returns None when the point is on the pane
@@ -185,8 +206,13 @@ impl App {
         }
 
         // A selected remote source routes paste only through the in-place
-        // controller stream. Unsupported/stale/owned states consume
-        // fail-closed and never paste into a local terminal runtime.
+        // authority stream. Glass uses the full-App structured input path;
+        // projection uses its focused controller. Unsupported/stale states
+        // consume fail-closed and never paste into a local terminal runtime.
+        if self.state.host_glass_surface_active() {
+            let _ = self.route_host_glass_input(crate::protocol::ClientInputEvent::Paste { text });
+            return;
+        }
         if self.state.remote_projection_surface_active() {
             let _ = self.remote_projection_runtime.send_input(
                 &self.state,
@@ -419,6 +445,56 @@ impl App {
         true
     }
 
+    /// Forward mouse input over the selected full-App glass using the exact
+    /// PTY-free body geometry advertised in Hello/Resize. The persistent
+    /// local indicator and host rail are never forwarded; the rail therefore
+    /// remains the unconditional mouse escape hatch.
+    fn handle_host_glass_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.state.mode != Mode::Terminal || !self.state.host_glass_surface_active() {
+            return false;
+        }
+
+        let rail = self.state.view.host_rail_rect;
+        if mouse.column >= rail.x
+            && mouse.column < rail.x.saturating_add(rail.width)
+            && mouse.row >= rail.y
+            && mouse.row < rail.y.saturating_add(rail.height)
+        {
+            return false;
+        }
+
+        // Preserve the existing clickable local notification above glass.
+        let toast = self.state.view.toast_hit_area;
+        if self
+            .state
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.target.is_some())
+            && mouse.column >= toast.x
+            && mouse.column < toast.x.saturating_add(toast.width)
+            && mouse.row >= toast.y
+            && mouse.row < toast.y.saturating_add(toast.height)
+        {
+            return false;
+        }
+
+        let area = self.state.view.terminal_area;
+        if mouse.column < area.x
+            || mouse.column >= area.x.saturating_add(area.width)
+            || mouse.row < area.y
+            || mouse.row >= area.y.saturating_add(area.height)
+        {
+            return false;
+        }
+        let body = crate::ui::host_glass_body_area(area);
+        let Some(event) = translate_host_glass_mouse(body, mouse) else {
+            // The one-row glass identity/status indicator is local chrome.
+            return true;
+        };
+        let _ = self.route_host_glass_input(event);
+        true
+    }
+
     /// Start a local projected-frame selection for an exact terminal hit.
     /// Returns true when the gesture was claimed for local selection; false
     /// preserves the existing structured remote forwarding / fail-closed
@@ -598,6 +674,10 @@ impl App {
         }
 
         if self.handle_overlay_mouse(mouse) {
+            return;
+        }
+
+        if self.handle_host_glass_mouse(mouse) {
             return;
         }
 
@@ -1138,6 +1218,434 @@ mod tests {
             },
         )
         .is_none());
+    }
+
+    #[test]
+    fn host_glass_mouse_translation_is_body_local_for_buttons_and_scroll() {
+        let body = ratatui::layout::Rect::new(26, 3, 80, 17);
+        let down = translate_host_glass_mouse(
+            body,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 31,
+                row: 7,
+                modifiers: KeyModifiers::ALT,
+            },
+        )
+        .expect("glass body button");
+        assert_eq!(
+            down,
+            crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Left,
+                ),
+                column: 5,
+                row: 4,
+                modifiers: KeyModifiers::ALT.bits(),
+            }
+        );
+        assert_eq!(
+            translate_host_glass_mouse(
+                body,
+                MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: 26,
+                    row: 3,
+                    modifiers: KeyModifiers::empty(),
+                },
+            ),
+            Some(crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: 0,
+            })
+        );
+        assert!(translate_host_glass_mouse(
+            body,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 25,
+                row: 3,
+                modifiers: KeyModifiers::empty(),
+            },
+        )
+        .is_none());
+    }
+
+    #[cfg(unix)]
+    fn glass_input_test_app(
+        status: crate::app::host_glass::GlassStatus,
+    ) -> (
+        App,
+        std::sync::mpsc::Receiver<crate::protocol::ClientMessage>,
+        crate::remote_source::RemoteHostKey,
+    ) {
+        let mut app = test_app();
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("local")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.host_glass_enabled = true;
+        let host = crate::remote_source::RemoteHostKey::new(
+            "remote-a",
+            crate::session::DEFAULT_SESSION_NAME,
+        );
+        app.state.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+        crate::ui::compute_view_with_runtime_registry(
+            &mut app.state,
+            &app.terminal_runtimes,
+            ratatui::layout::Rect::new(0, 0, 106, 20),
+        );
+        let generation = app.state.begin_host_glass_generation(host.clone());
+        assert!(app
+            .state
+            .set_host_glass_status(&host, generation, status, None));
+        let receiver = app.host_glass_runtime.test_install_connected_stream(
+            host.clone(),
+            generation,
+            Some(true),
+        );
+        (app, receiver, host)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_glass_routes_body_mouse_but_keeps_host_rail_local() {
+        let (mut app, receiver, _host) =
+            glass_input_test_app(crate::app::host_glass::GlassStatus::Live);
+        let body = crate::ui::host_glass_body_area(app.state.view.terminal_area);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x + 4,
+            body.y + 2,
+        ));
+        assert_eq!(
+            receiver.try_recv().expect("glass body mouse forwarded"),
+            crate::protocol::ClientMessage::InputEvents {
+                events: vec![crate::protocol::ClientInputEvent::Mouse {
+                    kind: crate::protocol::ClientMouseKind::Down(
+                        crate::protocol::ClientMouseButton::Left,
+                    ),
+                    column: 4,
+                    row: 2,
+                    modifiers: 0,
+                }]
+            }
+        );
+
+        let local = crate::ui::host_list_row_areas(&app.state)
+            .into_iter()
+            .find(|row| row.source == crate::app::state::SidebarSource::Local)
+            .expect("local host-rail row")
+            .rect;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            local.x,
+            local.y,
+        ));
+
+        assert_eq!(
+            app.state.effective_sidebar_source(),
+            crate::app::state::SidebarSource::Local
+        );
+        assert!(receiver.try_recv().is_err(), "rail click never goes remote");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn host_glass_status_row_is_consumed_locally_and_never_forwarded() {
+        let (mut app, receiver, _host) =
+            glass_input_test_app(crate::app::host_glass::GlassStatus::Live);
+        let status_row = app.state.view.terminal_area;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            status_row.x + 3,
+            status_row.y,
+        ));
+
+        assert!(app.state.host_glass_surface_active());
+        assert!(
+            receiver.try_recv().is_err(),
+            "local status row never goes remote"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn glass_escape_is_the_only_local_key_and_deselects_without_forwarding() {
+        let (mut app, receiver, _host) =
+            glass_input_test_app(crate::app::host_glass::GlassStatus::Live);
+        let config: crate::config::Config = toml::from_str(
+            r#"
+[keys]
+new_workspace = "ctrl+shift+f12"
+
+[experimental]
+host_glass = true
+"#,
+        )
+        .expect("colliding glass escape config parses");
+        app.state.keybinds = config.keybinds();
+        assert_eq!(app.state.keybinds.host_glass_exit.bindings.len(), 1);
+        assert!(app.state.keybinds.new_workspace.bindings.is_empty());
+
+        app.handle_terminal_key_headless(crate::input::TerminalKey::new(
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        ));
+        assert_eq!(
+            receiver.try_recv().expect("ordinary key passes through"),
+            crate::protocol::ClientMessage::InputEvents {
+                events: vec![crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('x'),
+                    modifiers: 0,
+                    kind: crate::protocol::ClientKeyKind::Press,
+                }]
+            }
+        );
+
+        app.handle_terminal_key_headless(crate::input::TerminalKey::new(
+            KeyCode::F(12),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+
+        assert_eq!(
+            app.state.effective_sidebar_source(),
+            crate::app::state::SidebarSource::Local
+        );
+        assert!(receiver.try_recv().is_err(), "escape chord stays local");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn stale_glass_drops_key_paste_and_mouse_without_queue_and_sets_brief_cue() {
+        let (mut app, receiver, host) =
+            glass_input_test_app(crate::app::host_glass::GlassStatus::Stale {
+                since: std::time::Instant::now(),
+            });
+        let body = crate::ui::host_glass_body_area(app.state.view.terminal_area);
+
+        app.handle_terminal_key_headless(crate::input::TerminalKey::new(
+            KeyCode::Char('k'),
+            KeyModifiers::empty(),
+        ));
+        app.handle_paste("never queued".into()).await;
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, body.x + 2, body.y + 1));
+
+        assert!(receiver.try_recv().is_err());
+        assert!(app.state.host_glass_states.get(&host).is_some_and(|glass| {
+            glass.input_drop_cue == Some(crate::app::host_glass::GlassInputDropReason::Stale)
+        }));
+        let deadline = app
+            .host_glass_input_drop_cue_deadline
+            .expect("stale drop cue has a bounded deadline");
+        assert!(app.handle_scheduled_tasks(deadline, false));
+        assert!(app.host_glass_input_drop_cue_deadline.is_none());
+        assert!(!app
+            .state
+            .host_glass_states
+            .get(&host)
+            .is_some_and(|glass| glass.input_drop_cue.is_some()));
+        assert!(
+            receiver.try_recv().is_err(),
+            "expiration cannot replay input"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn first_attach_drops_key_paste_and_mouse_with_rendered_not_queued_cue() {
+        let mut app = test_app();
+        let workspace = crate::workspace::Workspace::test_new("local");
+        let pane_id = workspace.focused_pane_id().expect("focused local pane");
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.mouse_capture = false;
+        app.state.host_glass_enabled = true;
+        let host = crate::remote_source::RemoteHostKey::new(
+            "remote-a",
+            crate::session::DEFAULT_SESSION_NAME,
+        );
+        app.state.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        let area = ratatui::layout::Rect::new(0, 0, 106, 20);
+        crate::ui::compute_view_with_runtime_registry(&mut app.state, &app.terminal_runtimes, area);
+        let local_info = app
+            .state
+            .pane_info_by_id(pane_id)
+            .expect("local pane geometry before source switch")
+            .clone();
+        let (runtime, mut local_input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                local_info.inner_rect.width,
+                local_info.inner_rect.height,
+                0,
+                b"\x1b[?1002hlocal input target",
+                8,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+
+        // Match the real first-attach window: selection is authoritative now,
+        // but compute/reconciliation has not created HostGlassState yet.
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+        assert!(!app.state.host_glass_states.contains_key(&host));
+
+        app.handle_terminal_key_headless(crate::input::TerminalKey::new(
+            KeyCode::Char('k'),
+            KeyModifiers::empty(),
+        ));
+        app.handle_paste("never queued".into()).await;
+        let body = crate::ui::host_glass_body_area(app.state.view.terminal_area);
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x,
+            body.y,
+        ));
+
+        assert!(
+            local_input_rx.try_recv().is_err(),
+            "first-attach input must never reach the stale local terminal runtime"
+        );
+        let glass = app
+            .state
+            .host_glass_states
+            .get(&host)
+            .expect("first-attach drop creates cue metadata");
+        assert_eq!(glass.generation, 0);
+        assert_eq!(
+            glass.status,
+            crate::app::host_glass::GlassStatus::Connecting
+        );
+        assert_eq!(
+            glass.input_drop_cue,
+            Some(crate::app::host_glass::GlassInputDropReason::Connecting)
+        );
+        assert!(app.host_glass_input_drop_cue_deadline.is_some());
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                .expect("first-attach cue terminal");
+        terminal
+            .draw(|frame| crate::ui::render(&app.state, frame))
+            .expect("render first-attach cue");
+        let cue_row = body.y + body.height / 2;
+        let cue = (body.x..body.x + body.width)
+            .map(|x| terminal.backend().buffer()[(x, cue_row)].symbol())
+            .collect::<String>();
+        assert!(cue.contains("INPUT DROPPED"));
+        assert!(cue.contains("glass is connecting"));
+        assert!(cue.contains("not queued"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn glass_queue_full_and_closed_are_consumed_with_truthful_drop_cues() {
+        let (mut app, receiver, host) =
+            glass_input_test_app(crate::app::host_glass::GlassStatus::Live);
+        let key = crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty());
+
+        for _ in 0..crate::app::host_glass::GLASS_OUTBOUND_CAPACITY {
+            app.handle_terminal_key_headless(key);
+        }
+        app.handle_terminal_key_headless(key);
+        assert_eq!(
+            app.state
+                .host_glass_states
+                .get(&host)
+                .and_then(|glass| glass.input_drop_cue),
+            Some(crate::app::host_glass::GlassInputDropReason::QueueFull)
+        );
+        assert!(app.host_glass_input_drop_cue_deadline.is_some());
+
+        drop(receiver);
+        app.handle_terminal_key_headless(key);
+        assert_eq!(
+            app.state
+                .host_glass_states
+                .get(&host)
+                .and_then(|glass| glass.input_drop_cue),
+            Some(crate::app::host_glass::GlassInputDropReason::QueueClosed)
+        );
+        app.handle_terminal_key_headless(key);
+        assert_eq!(
+            app.state
+                .host_glass_states
+                .get(&host)
+                .and_then(|glass| glass.input_drop_cue),
+            Some(crate::app::host_glass::GlassInputDropReason::Disconnected)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn glass_missing_connecting_and_changed_streams_drop_locally_with_cues() {
+        let (mut app, receiver, host) =
+            glass_input_test_app(crate::app::host_glass::GlassStatus::Live);
+        let key = crate::input::TerminalKey::new(KeyCode::Char('x'), KeyModifiers::empty());
+        drop(receiver);
+        app.host_glass_runtime = crate::app::host_glass::HostGlassRuntime::default();
+
+        app.handle_terminal_key_headless(key);
+        assert_eq!(
+            app.state
+                .host_glass_states
+                .get(&host)
+                .and_then(|glass| glass.input_drop_cue),
+            Some(crate::app::host_glass::GlassInputDropReason::MissingStream)
+        );
+
+        let generation = app
+            .state
+            .host_glass_states
+            .get(&host)
+            .expect("glass metadata")
+            .generation;
+        assert!(app.state.set_host_glass_status(
+            &host,
+            generation,
+            crate::app::host_glass::GlassStatus::Connecting,
+            None,
+        ));
+        app.handle_terminal_key_headless(key);
+        assert_eq!(
+            app.state
+                .host_glass_states
+                .get(&host)
+                .and_then(|glass| glass.input_drop_cue),
+            Some(crate::app::host_glass::GlassInputDropReason::Connecting)
+        );
+
+        let mut runtime = crate::app::host_glass::HostGlassRuntime::default();
+        let _receiver =
+            runtime.test_install_connected_stream(host.clone(), generation, Some(false));
+        app.host_glass_runtime = runtime;
+        let next_generation = app.state.begin_host_glass_generation(host.clone());
+        assert!(app.state.set_host_glass_status(
+            &host,
+            next_generation,
+            crate::app::host_glass::GlassStatus::Live,
+            None,
+        ));
+        app.handle_terminal_key_headless(key);
+        assert_eq!(
+            app.state
+                .host_glass_states
+                .get(&host)
+                .and_then(|glass| glass.input_drop_cue),
+            Some(crate::app::host_glass::GlassInputDropReason::GenerationChanged)
+        );
     }
 
     #[tokio::test]

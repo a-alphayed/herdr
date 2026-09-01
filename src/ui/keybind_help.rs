@@ -63,23 +63,27 @@ pub(super) fn keybind_help_groups(app: &AppState) -> Vec<HelpGroup> {
     let kb = &app.keybinds;
     let mut groups = Vec::new();
 
-    groups.push((
-        "global",
-        vec![
-            help_entry(
-                crate::config::format_key_combo((app.prefix_code, app.prefix_mods)),
-                "prefix mode",
-            ),
-            help_entry(keybind_label(&kb.help), "keybinds"),
-            help_entry(keybind_label(&kb.settings), "settings"),
-            help_entry(keybind_label(&kb.detach), "detach"),
-            help_entry(keybind_label(&kb.reload_config), "reload config"),
-            help_entry(
-                keybind_label(&kb.open_notification_target),
-                "open notification target",
-            ),
-        ],
-    ));
+    let mut global = vec![
+        help_entry(
+            crate::config::format_key_combo((app.prefix_code, app.prefix_mods)),
+            "prefix mode",
+        ),
+        help_entry(keybind_label(&kb.help), "keybinds"),
+        help_entry(keybind_label(&kb.settings), "settings"),
+        help_entry(keybind_label(&kb.detach), "detach"),
+        help_entry(keybind_label(&kb.reload_config), "reload config"),
+        help_entry(
+            keybind_label(&kb.open_notification_target),
+            "open notification target",
+        ),
+    ];
+    if app.host_glass_enabled {
+        global.insert(
+            4,
+            help_entry(keybind_label(&kb.host_glass_exit), "exit host glass"),
+        );
+    }
+    groups.push(("global", global));
 
     groups.push((
         "navigation",

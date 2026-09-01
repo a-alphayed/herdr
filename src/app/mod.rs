@@ -50,6 +50,7 @@ const SIDEBAR_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 const PANE_COPY_HIGHLIGHT_DURATION: Duration = Duration::from_millis(500);
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_secs(2);
+const HOST_GLASS_INPUT_DROP_CUE_DURATION: Duration = Duration::from_secs(2);
 
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -113,6 +114,7 @@ pub struct App {
     pub(crate) config_diagnostic_deadline: Option<Instant>,
     pub(crate) toast_deadline: Option<Instant>,
     pub(crate) copy_feedback_deadline: Option<Instant>,
+    pub(crate) host_glass_input_drop_cue_deadline: Option<Instant>,
     pub(crate) last_api_notification_at: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) git_refresh_in_flight: bool,
@@ -478,6 +480,15 @@ impl App {
     }
 
     pub(crate) fn should_route_mouse_pane_only(&self, mouse: crossterm::event::MouseEvent) -> bool {
+        // Source selection changes authority immediately, before the next
+        // compute_view() replaces local pane geometry. Never let stale
+        // pane_infos route a later event from the same drained batch into a
+        // local PTY once an enabled glass host is selected.
+        if self.state.host_glass_enabled
+            && matches!(self.state.sidebar_source, state::SidebarSource::Remote(_))
+        {
+            return false;
+        }
         if self.state.mouse_capture || self.state.mode != Mode::Terminal {
             return false;
         }
@@ -903,6 +914,7 @@ impl App {
             config_diagnostic_deadline: None,
             toast_deadline: None,
             copy_feedback_deadline: None,
+            host_glass_input_drop_cue_deadline: None,
             last_api_notification_at: None,
             state,
             terminal_runtimes: restored_terminal_runtimes,
@@ -1387,6 +1399,10 @@ impl App {
     pub(crate) fn desired_host_mouse_capture(&self) -> bool {
         self.state
             .should_capture_host_mouse_from(&self.terminal_runtimes)
+            || self
+                .host_glass_runtime
+                .selected_mouse_capture(&self.state)
+                .unwrap_or(false)
             || self
                 .remote_projection_runtime
                 .focused_projected_control_mouse_capture(&self.state)
@@ -1932,6 +1948,11 @@ impl App {
                 crate::raw_input::RawInputEvent::Paste(text) => {
                     if self.state.mode != Mode::Terminal {
                         self.paste_into_active_text_input(&text);
+                    } else if self.state.host_glass_surface_active() {
+                        let _ =
+                            self.route_host_glass_input(crate::protocol::ClientInputEvent::Paste {
+                                text,
+                            });
                     } else if self.state.remote_projection_surface_active() {
                         // Structured paste is encoded by the authoritative
                         // remote TerminalRuntime (including bracketed-paste
@@ -2207,6 +2228,43 @@ mod tests {
         assert!(app.desired_host_mouse_capture());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn desired_host_mouse_capture_honors_selected_live_glass_report_only() {
+        let mut app = test_app();
+        app.state.mouse_capture = false;
+        app.state.host_glass_enabled = true;
+        app.state.view.layout = state::ViewLayout::Desktop;
+        app.state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
+        let host = crate::remote_source::RemoteHostKey::new("remote-a", "default");
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+        let generation = app.state.begin_host_glass_generation(host.clone());
+        assert!(app.state.set_host_glass_status(
+            &host,
+            generation,
+            crate::app::host_glass::GlassStatus::Live,
+            None,
+        ));
+        let _receiver = app.host_glass_runtime.test_install_connected_stream(
+            host.clone(),
+            generation,
+            Some(true),
+        );
+
+        assert!(app.desired_host_mouse_capture());
+
+        assert!(app.state.set_host_glass_status(
+            &host,
+            generation,
+            crate::app::host_glass::GlassStatus::Stale {
+                since: Instant::now(),
+            },
+            None,
+        ));
+        assert!(!app.desired_host_mouse_capture());
+    }
+
     /// Register an inert stub supervisor handle (no worker thread) for `host`
     /// at `generation` so the App's generation-filtered remote-source event
     /// admission accepts its events. Tests that feed supervisor events
@@ -2377,6 +2435,63 @@ mod tests {
             focused_col,
             focused_row,
         )));
+    }
+
+    #[tokio::test]
+    async fn headless_client_batch_glass_selection_blocks_stale_local_pane_mouse_routing() {
+        let mut fixture = app_with_focused_mouse_reporting_split(false);
+        fixture.app.state.host_glass_enabled = true;
+        let host = crate::remote_source::RemoteHostKey::new(
+            "remote-a",
+            crate::session::DEFAULT_SESSION_NAME,
+        );
+        fixture.app.state.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        let remote_row = crate::ui::host_list_row_areas(&fixture.app.state)
+            .into_iter()
+            .find(|row| row.source == state::SidebarSource::Remote(host.clone()))
+            .expect("remote host is visible in the current rail")
+            .rect;
+        let body_col = fixture.focused_info.inner_rect.x;
+        let body_row = fixture.focused_info.inner_rect.y;
+        assert!(fixture.app.should_route_mouse_pane_only(test_mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            body_col,
+            body_row,
+        )));
+
+        fixture.app.route_client_events(
+            vec![
+                raw_mouse_event(
+                    MouseEventKind::Down(MouseButton::Left),
+                    remote_row.x,
+                    remote_row.y,
+                ),
+                raw_mouse_event(MouseEventKind::Down(MouseButton::Left), body_col, body_row),
+            ],
+            false,
+        );
+
+        assert_eq!(
+            fixture.app.state.sidebar_source,
+            state::SidebarSource::Remote(host.clone())
+        );
+        assert!(
+            fixture.focused_rx.try_recv().is_err(),
+            "headless routing must not send the second same-batch event to the local PTY"
+        );
+        assert!(fixture.local_rx.try_recv().is_err());
+        assert_eq!(
+            fixture
+                .app
+                .state
+                .host_glass_states
+                .get(&host)
+                .and_then(|glass| glass.input_drop_cue),
+            Some(crate::app::host_glass::GlassInputDropReason::Connecting)
+        );
     }
 
     #[tokio::test]

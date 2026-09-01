@@ -34,6 +34,28 @@ impl App {
 
         let key_event = key.as_key_event();
 
+        // Glass reserves exactly one local direct escape chord. Every other
+        // supported key is structured input for the authoritative remote App,
+        // which applies its own keybindings and focused VT modes. Repeats of
+        // the escape press remain suppressed after the local deselection.
+        if self.state.host_glass_surface_active() {
+            if self.state.keybinds.host_glass_exit.matches_direct_key(key) {
+                self.suppressed_repeat_keys
+                    .insert(super::super::repeat_key_identity(&key));
+                self.state
+                    .select_sidebar_source(crate::app::state::SidebarSource::Local);
+                return None;
+            }
+            if let Some(code) = crate::protocol::ClientKeyCode::from_crossterm(key_event.code) {
+                let _ = self.route_host_glass_input(crate::protocol::ClientInputEvent::Key {
+                    code,
+                    modifiers: key_event.modifiers.bits(),
+                    kind: crate::protocol::ClientKeyKind::from_crossterm(key_event.kind),
+                });
+            }
+            return None;
+        }
+
         // A projected remote space is an authority-routing boundary. Terminal
         // keys go only to the current live controller stream as STRUCTURED
         // input; the authoritative remote TerminalRuntime encodes its keyboard

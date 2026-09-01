@@ -1934,6 +1934,10 @@ impl AppState {
         &mut self,
         host: crate::remote_source::RemoteHostKey,
     ) -> u64 {
+        let input_drop_cue = self
+            .host_glass_states
+            .get(&host)
+            .and_then(|state| state.input_drop_cue);
         let mut generation = self
             .host_glass_states
             .get(&host)
@@ -1948,6 +1952,9 @@ impl AppState {
                 generation,
                 status: crate::app::host_glass::GlassStatus::Connecting,
                 message: Some("opening host glass stream".into()),
+                // A generation-0 first-attach cue must remain visible when
+                // reconciliation starts generation 1 in the same loop turn.
+                input_drop_cue,
             },
         );
         generation
@@ -1972,6 +1979,42 @@ impl AppState {
         state.status = status;
         state.message = message;
         true
+    }
+
+    /// Mark the selected glass with local-only input-drop feedback.
+    /// The App runtime owns the bounded cue deadline.
+    pub(crate) fn note_selected_host_glass_input_dropped(
+        &mut self,
+        reason: crate::app::host_glass::GlassInputDropReason,
+    ) -> bool {
+        if !self.host_glass_enabled {
+            return false;
+        }
+        let SidebarSource::Remote(host) = self.effective_sidebar_source() else {
+            return false;
+        };
+        // Runtime reconciliation may not have started the first real
+        // generation yet. Generation 0 is local-only cue metadata: it never
+        // claims a live stream, and begin_host_glass_generation() advances it
+        // to generation 1 while preserving the bounded cue.
+        let glass = self.host_glass_states.entry(host).or_insert_with(|| {
+            crate::app::host_glass::HostGlassState {
+                generation: 0,
+                status: crate::app::host_glass::GlassStatus::Connecting,
+                message: Some("opening host glass stream".into()),
+                input_drop_cue: None,
+            }
+        });
+        glass.input_drop_cue = Some(reason);
+        true
+    }
+
+    pub(crate) fn clear_host_glass_input_drop_cues(&mut self) -> bool {
+        let mut changed = false;
+        for glass in self.host_glass_states.values_mut() {
+            changed |= glass.input_drop_cue.take().is_some();
+        }
+        changed
     }
 
     /// Return selected-host glass metadata only when the experimental mode is
@@ -3011,6 +3054,7 @@ mod tests {
                 generation,
                 status: crate::app::host_glass::GlassStatus::Connecting,
                 message: Some("opening host glass stream".into()),
+                input_drop_cue: None,
             })
         );
         assert!(state.selected_host_glass_mode().is_none());
@@ -3054,6 +3098,51 @@ mod tests {
 
         state.select_sidebar_source(SidebarSource::Local);
         assert!(state.selected_host_glass_mode().is_none());
+    }
+
+    #[test]
+    fn first_attach_input_drop_metadata_is_connecting_and_survives_generation_start() {
+        let mut state = AppState::test_new();
+        state.host_glass_enabled = true;
+        state.view.layout = ViewLayout::Desktop;
+        state.view.host_rail_rect = Rect::new(0, 0, 8, 20);
+        let host = crate::remote_source::RemoteHostKey::new("remote-a", "default");
+        state.select_sidebar_source(SidebarSource::Remote(host.clone()));
+
+        assert!(!state.host_glass_states.contains_key(&host));
+        assert!(state.note_selected_host_glass_input_dropped(
+            crate::app::host_glass::GlassInputDropReason::Connecting,
+        ));
+        let pre_generation = state
+            .host_glass_states
+            .get(&host)
+            .expect("first-attach cue creates local metadata");
+        assert_eq!(pre_generation.generation, 0);
+        assert_eq!(
+            pre_generation.status,
+            crate::app::host_glass::GlassStatus::Connecting
+        );
+        assert_eq!(
+            pre_generation.input_drop_cue,
+            Some(crate::app::host_glass::GlassInputDropReason::Connecting)
+        );
+
+        let generation = state.begin_host_glass_generation(host.clone());
+        assert_eq!(generation, 1);
+        let started = state
+            .host_glass_states
+            .get(&host)
+            .expect("generation metadata replaces the local placeholder");
+        assert_eq!(started.generation, generation);
+        assert_eq!(
+            started.status,
+            crate::app::host_glass::GlassStatus::Connecting
+        );
+        assert_eq!(
+            started.input_drop_cue,
+            Some(crate::app::host_glass::GlassInputDropReason::Connecting),
+            "same-turn reconciliation must not erase the visible drop cue"
+        );
     }
 
     fn projected_selection_for_authority_test(

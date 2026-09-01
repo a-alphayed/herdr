@@ -737,7 +737,30 @@ fn render_host_glass(
     }
 
     match status {
-        crate::app::host_glass::GlassStatus::Live if frame_is_renderable => {}
+        crate::app::host_glass::GlassStatus::Live if frame_is_renderable => {
+            if let Some(reason) = metadata.and_then(|glass| glass.input_drop_cue) {
+                let banner_area = Rect::new(
+                    body.x,
+                    body.y.saturating_add(body.height / 2),
+                    body.width,
+                    1,
+                );
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        " INPUT DROPPED · {} · not queued ",
+                        reason.cue_text()
+                    ))
+                    .style(
+                        Style::default()
+                            .fg(app.palette.text)
+                            .bg(app.palette.surface0)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .alignment(Alignment::Center),
+                    banner_area,
+                );
+            }
+        }
         crate::app::host_glass::GlassStatus::Stale { .. } if frame_is_renderable => {
             dim_background(frame, body);
             let banner_area = Rect::new(
@@ -746,8 +769,12 @@ fn render_host_glass(
                 body.width,
                 1,
             );
+            let banner = metadata
+                .and_then(|glass| glass.input_drop_cue)
+                .map(|reason| format!(" INPUT DROPPED · {} · not queued ", reason.cue_text()))
+                .unwrap_or_else(|| " STALE · cached frame · reconnecting ".into());
             frame.render_widget(
-                Paragraph::new(" STALE · cached frame · reconnecting ")
+                Paragraph::new(banner)
                     .style(
                         Style::default()
                             .fg(app.palette.text)
@@ -759,9 +786,14 @@ fn render_host_glass(
             );
         }
         _ => {
-            let message = metadata
-                .and_then(|glass| glass.message.as_deref())
-                .unwrap_or("opening host glass stream");
+            let message = if let Some(reason) = metadata.and_then(|glass| glass.input_drop_cue) {
+                format!("INPUT DROPPED · {} · not queued", reason.cue_text())
+            } else {
+                metadata
+                    .and_then(|glass| glass.message.as_deref())
+                    .unwrap_or("opening host glass stream")
+                    .to_string()
+            };
             let placeholder_area = Rect::new(
                 body.x,
                 body.y.saturating_add(body.height / 2),
@@ -2982,6 +3014,32 @@ mod tests {
         assert!(indicator.contains("Live"));
         assert!(buffer_row_text(buffer, body, body.y).starts_with("REMOTE-APP"));
 
+        app.state
+            .host_glass_states
+            .get_mut(&host)
+            .expect("selected glass metadata")
+            .input_drop_cue = Some(crate::app::host_glass::GlassInputDropReason::QueueFull);
+        terminal
+            .draw(|frame| {
+                render_with_runtime_registry_and_glass(
+                    &app.state,
+                    &app.terminal_runtimes,
+                    Some(&app.host_glass_surfaces),
+                    frame,
+                )
+            })
+            .expect("render live queue-full cue");
+        let live_cue_row = body.y + body.height / 2;
+        let live_cue = buffer_row_text(terminal.backend().buffer(), body, live_cue_row);
+        assert!(live_cue.contains("INPUT DROPPED"));
+        assert!(live_cue.contains("input queue full"));
+        assert!(live_cue.contains("not queued"));
+        app.state
+            .host_glass_states
+            .get_mut(&host)
+            .expect("selected glass metadata")
+            .input_drop_cue = None;
+
         assert!(app.state.set_host_glass_status(
             &host,
             generation,
@@ -3013,6 +3071,29 @@ mod tests {
             .style()
             .add_modifier
             .contains(Modifier::DIM));
+
+        app.state
+            .host_glass_states
+            .get_mut(&host)
+            .expect("selected glass metadata")
+            .input_drop_cue = Some(crate::app::host_glass::GlassInputDropReason::Stale);
+        terminal
+            .draw(|frame| {
+                render_with_runtime_registry_and_glass(
+                    &app.state,
+                    &app.terminal_runtimes,
+                    Some(&app.host_glass_surfaces),
+                    frame,
+                )
+            })
+            .expect("render stale input-drop cue");
+        assert!(
+            buffer_row_text(terminal.backend().buffer(), body, banner_row)
+                .contains("INPUT DROPPED")
+        );
+        assert!(
+            buffer_row_text(terminal.backend().buffer(), body, banner_row).contains("not queued")
+        );
     }
 
     #[test]
@@ -3152,6 +3233,30 @@ mod tests {
         assert!(indicator.contains("Connecting"));
         let body = host_glass_body_area(app.view.terminal_area);
         assert!(buffer_row_text(buffer, body, body.y + body.height / 2).contains("Connecting"));
+
+        let host = match app.effective_sidebar_source() {
+            crate::app::state::SidebarSource::Remote(host) => host,
+            crate::app::state::SidebarSource::Local => panic!("remote glass remains selected"),
+        };
+        let generation = app.begin_host_glass_generation(host.clone());
+        assert!(app.set_host_glass_status(
+            &host,
+            generation,
+            crate::app::host_glass::GlassStatus::Stale {
+                since: std::time::Instant::now(),
+            },
+            Some("link down".into()),
+        ));
+        assert!(app.note_selected_host_glass_input_dropped(
+            crate::app::host_glass::GlassInputDropReason::Stale,
+        ));
+        terminal
+            .draw(|frame| render(&app, frame))
+            .expect("render stale no-frame input cue");
+        assert!(
+            buffer_row_text(terminal.backend().buffer(), body, body.y + body.height / 2)
+                .contains("INPUT DROPPED")
+        );
     }
 
     #[test]
@@ -3233,6 +3338,10 @@ mod tests {
         assert!(!app.host_glass_surface_active());
         assert!(!app.view.remote_projection_tab_hit_areas.is_empty());
         assert!(!app.view.remote_projection_hit_areas.is_empty());
+        let baseline_help = keybind_help_groups(&app);
+        assert!(baseline_help.iter().all(|(_, entries)| entries
+            .iter()
+            .all(|(_, label)| label.as_ref() != "exit host glass")));
 
         let baseline_layout = app.view.layout;
         let baseline_sidebar_rect = app.view.sidebar_rect;
@@ -3255,6 +3364,9 @@ mod tests {
         assert!(app.host_glass_surface_active());
         assert!(app.view.remote_projection_tab_hit_areas.is_empty());
         assert!(app.view.remote_projection_hit_areas.is_empty());
+        assert!(keybind_help_groups(&app).iter().any(|(_, entries)| entries
+            .iter()
+            .any(|(_, label)| label.as_ref() == "exit host glass")));
         let mut glass_terminal =
             Terminal::new(TestBackend::new(area.width, area.height)).expect("glass terminal");
         glass_terminal
@@ -3279,6 +3391,7 @@ mod tests {
             app.view.remote_projection_hit_areas,
             baseline_remote_pane_hits
         );
+        assert_eq!(keybind_help_groups(&app), baseline_help);
 
         let mut restored_terminal =
             Terminal::new(TestBackend::new(area.width, area.height)).expect("restored terminal");

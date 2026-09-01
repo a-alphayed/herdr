@@ -357,6 +357,8 @@ pub struct KeysConfig {
     pub navigate_pane_right: BindingConfig,
     /// Detach from server/client mode, or exit --no-session mode. Default: "prefix+q".
     pub detach: BindingConfig,
+    /// Exit the selected host glass locally. Exactly one direct chord. Default: "ctrl+shift+f12".
+    pub host_glass_exit: String,
     /// Reload config.toml in the running app/server. Default: "prefix+shift+r".
     pub reload_config: BindingConfig,
     /// Focus the currently visible notification target. Default: "prefix+o".
@@ -477,6 +479,8 @@ pub(crate) struct KeysConfigOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     detach: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    host_glass_exit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     reload_config: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     open_notification_target: Option<BindingConfig>,
@@ -587,6 +591,7 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(navigate_pane_up);
         apply_field!(navigate_pane_right);
         apply_field!(detach);
+        apply_field!(host_glass_exit);
         apply_field!(reload_config);
         apply_field!(open_notification_target);
         apply_field!(previous_workspace);
@@ -685,6 +690,7 @@ impl KeysConfig {
         copy_effective_action_field!(navigate_pane_up, keybinds.navigate.pane_up);
         copy_effective_action_field!(navigate_pane_right, keybinds.navigate.pane_right);
         copy_effective_action_field!(detach, keybinds.detach);
+        copy_user_field!(host_glass_exit);
         copy_effective_action_field!(reload_config, keybinds.reload_config);
         copy_effective_action_field!(open_notification_target, keybinds.open_notification_target);
         copy_effective_action_field!(previous_workspace, keybinds.previous_workspace);
@@ -927,6 +933,7 @@ impl Default for KeysConfig {
             navigate_pane_up: BindingConfig::one("k"),
             navigate_pane_right: BindingConfig::one("l"),
             detach: BindingConfig::one("prefix+q"),
+            host_glass_exit: super::keybinds::HOST_GLASS_EXIT_DEFAULT.into(),
             reload_config: BindingConfig::one("prefix+shift+r"),
             open_notification_target: BindingConfig::one("prefix+o"),
             previous_workspace: BindingConfig::empty(),

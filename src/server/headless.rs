@@ -3871,6 +3871,15 @@ impl HeadlessServer {
 
         if self
             .app
+            .host_glass_input_drop_cue_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.app.host_glass_input_drop_cue_deadline = None;
+            changed |= self.app.state.clear_host_glass_input_drop_cues();
+        }
+
+        if self
+            .app
             .next_animation_tick
             .is_some_and(|deadline| now >= deadline)
         {
@@ -7126,6 +7135,95 @@ next_tab = ""
             server.app.state.settings.section,
             crate::app::state::SettingsSection::Integrations
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_ansi_full_app_structured_input_uses_authoritative_vt_modes() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("glass-target");
+        let pane_id = workspace.focused_pane_id().expect("focused pane");
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80,
+                24,
+                0,
+                b"\x1b[?1h\x1b[?2004h\x1b[?1002h\x1b[?1006h",
+                8,
+            );
+        workspace.insert_test_runtime(pane_id, runtime);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (100, 30),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                Some(true),
+                1,
+                RenderEncoding::TerminalAnsi,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+        let pane = server
+            .app
+            .state
+            .pane_info_by_id(pane_id)
+            .expect("rendered pane geometry")
+            .clone();
+        let column = pane.inner_rect.x + 2;
+        let row = pane.inner_rect.y + 3;
+
+        assert!(server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 1,
+            events: vec![
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Up,
+                    modifiers: 0,
+                    kind: crate::protocol::ClientKeyKind::Press,
+                },
+                crate::protocol::ClientInputEvent::Paste {
+                    text: "glass paste".into(),
+                },
+                crate::protocol::ClientInputEvent::Mouse {
+                    kind: crate::protocol::ClientMouseKind::Down(
+                        crate::protocol::ClientMouseButton::Left,
+                    ),
+                    column,
+                    row,
+                    modifiers: 0,
+                },
+                crate::protocol::ClientInputEvent::Mouse {
+                    kind: crate::protocol::ClientMouseKind::ScrollDown,
+                    column,
+                    row,
+                    modifiers: 0,
+                },
+            ],
+        }));
+
+        assert_eq!(
+            input_rx.try_recv().expect("application-cursor key"),
+            Bytes::from_static(b"\x1bOA")
+        );
+        assert_eq!(
+            input_rx.try_recv().expect("authoritative bracketed paste"),
+            Bytes::from_static(b"\x1b[200~glass paste\x1b[201~")
+        );
+        assert_eq!(
+            input_rx.try_recv().expect("authoritative SGR mouse press"),
+            Bytes::from_static(b"\x1b[<0;3;4M")
+        );
+        assert_eq!(
+            input_rx.try_recv().expect("authoritative SGR wheel"),
+            Bytes::from_static(b"\x1b[<65;3;4M")
+        );
+        assert!(input_rx.try_recv().is_err());
     }
 
     #[test]

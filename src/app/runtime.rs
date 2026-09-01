@@ -314,6 +314,14 @@ impl App {
         }
 
         if self
+            .host_glass_input_drop_cue_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.host_glass_input_drop_cue_deadline = None;
+            changed |= self.state.clear_host_glass_input_drop_cues();
+        }
+
+        if self
             .next_animation_tick
             .is_some_and(|deadline| now >= deadline)
         {
@@ -627,6 +635,7 @@ impl App {
             self.toast_deadline,
             self.state.next_pending_agent_notification_deadline(),
             self.copy_feedback_deadline,
+            self.host_glass_input_drop_cue_deadline,
             self.next_animation_tick,
             include_git_refresh
                 .then(|| self.git_refresh_deadline())
@@ -1097,6 +1106,99 @@ mod tests {
             .expect("test terminal should still exist")
             .pending_agent_resume_plan
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn raw_input_batch_glass_selection_blocks_stale_local_pane_mouse_routing() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut app, pane_id) = test_app_with_pane();
+        app.state.mode = Mode::Terminal;
+        app.state.mouse_capture = false;
+        app.state.host_glass_enabled = true;
+        app.state.view.layout = state::ViewLayout::Desktop;
+        app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 26, 20);
+        app.state.view.host_rail_rect = ratatui::layout::Rect::new(0, 0, 8, 20);
+        app.state.view.sidebar_panel_rect = ratatui::layout::Rect::new(8, 0, 18, 20);
+        app.state.view.terminal_area = ratatui::layout::Rect::new(26, 0, 80, 20);
+        let body = crate::ui::host_glass_body_area(app.state.view.terminal_area);
+        app.state.view.pane_infos[0].rect = body;
+        app.state.view.pane_infos[0].inner_rect = body;
+
+        let host = crate::remote_source::RemoteHostKey::new(
+            "remote-a",
+            crate::session::DEFAULT_SESSION_NAME,
+        );
+        app.state.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        let remote_row = crate::ui::host_list_row_areas(&app.state)
+            .into_iter()
+            .find(|row| row.source == state::SidebarSource::Remote(host.clone()))
+            .expect("remote host is visible in the current rail")
+            .rect;
+
+        let (runtime, mut local_input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                body.width,
+                body.height,
+                0,
+                b"\x1b[?1002hlocal mouse target",
+                8,
+            );
+        app.state.insert_test_runtime(pane_id, runtime);
+        assert!(app.should_route_mouse_pane_only(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: body.x,
+            row: body.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        }));
+
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel(2);
+        app.input_rx = Some(input_rx);
+        input_tx
+            .try_send(crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: body.x,
+                row: body.y,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            }))
+            .expect("queue the second same-batch body event");
+
+        assert!(
+            app.handle_raw_input_batch(crate::raw_input::RawInputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: remote_row.x,
+                row: remote_row.y,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            }))
+            .await
+        );
+
+        assert_eq!(
+            app.state.sidebar_source,
+            state::SidebarSource::Remote(host.clone())
+        );
+        assert!(
+            local_input_rx.try_recv().is_err(),
+            "stale pane geometry must not send the second batch event to the local PTY"
+        );
+        let glass = app
+            .state
+            .host_glass_states
+            .get(&host)
+            .expect("the glass path consumes and records the pre-attach drop");
+        assert_eq!(glass.generation, 0);
+        assert_eq!(
+            glass.status,
+            crate::app::host_glass::GlassStatus::Connecting
+        );
+        assert_eq!(
+            glass.input_drop_cue,
+            Some(crate::app::host_glass::GlassInputDropReason::Connecting)
+        );
+        assert!(app.host_glass_input_drop_cue_deadline.is_some());
     }
 
     #[tokio::test]

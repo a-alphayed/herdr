@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, SyncSender, TrySendError},
-    Arc, Mutex,
+    Arc, Mutex, TryLockError,
 };
 #[cfg(unix)]
 use std::thread::JoinHandle;
@@ -40,6 +40,8 @@ pub(crate) struct HostGlassState {
     pub(crate) generation: u64,
     pub(crate) status: GlassStatus,
     pub(crate) message: Option<String>,
+    /// Brief local-only feedback after glass-directed input is discarded.
+    pub(crate) input_drop_cue: Option<GlassInputDropReason>,
 }
 
 /// A local, PTY-free VT surface fed only by TerminalAnsi bytes.
@@ -193,7 +195,7 @@ impl GlassGeometry {
 }
 
 #[cfg(unix)]
-const GLASS_OUTBOUND_CAPACITY: usize = 16;
+pub(super) const GLASS_OUTBOUND_CAPACITY: usize = 16;
 #[cfg(unix)]
 const GLASS_RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 #[cfg(unix)]
@@ -202,6 +204,112 @@ const GLASS_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(2);
 const GLASS_BACKOFF_POLL: Duration = Duration::from_millis(25);
 #[cfg(unix)]
 const GLASS_TEARDOWN_BUDGET: Duration = Duration::from_millis(500);
+
+#[cfg(unix)]
+const GLASS_MOUSE_CAPTURE_UNKNOWN: u8 = 0;
+#[cfg(unix)]
+const GLASS_MOUSE_CAPTURE_DISABLED: u8 = 1;
+#[cfg(unix)]
+const GLASS_MOUSE_CAPTURE_ENABLED: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GlassInputOutcome {
+    NotActive,
+    #[cfg(unix)]
+    Queued,
+    Dropped(GlassInputDropReason),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GlassInputDropReason {
+    Stale,
+    Connecting,
+    MissingStream,
+    #[cfg(unix)]
+    GenerationChanged,
+    #[cfg(unix)]
+    Disconnected,
+    #[cfg(unix)]
+    AdmissionBusy,
+    #[cfg(unix)]
+    QueueFull,
+    #[cfg(unix)]
+    QueueClosed,
+}
+
+impl GlassInputDropReason {
+    pub(crate) fn cue_text(self) -> &'static str {
+        match self {
+            Self::Stale => "glass is stale",
+            Self::Connecting => "glass is connecting",
+            Self::MissingStream => "stream unavailable",
+            #[cfg(unix)]
+            Self::GenerationChanged => "stream changed",
+            #[cfg(unix)]
+            Self::Disconnected => "stream disconnected",
+            #[cfg(unix)]
+            Self::AdmissionBusy => "stream reconnecting",
+            #[cfg(unix)]
+            Self::QueueFull => "input queue full",
+            #[cfg(unix)]
+            Self::QueueClosed => "stream closed",
+        }
+    }
+}
+
+#[cfg(unix)]
+struct GlassOutboundAdmission {
+    connection: u64,
+    sender: SyncSender<crate::protocol::ClientMessage>,
+}
+
+#[cfg(unix)]
+type GlassOutboundGate = Arc<Mutex<Option<GlassOutboundAdmission>>>;
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GlassAdmissionOutcome {
+    Queued,
+    Disconnected,
+    Busy,
+    Full,
+    Closed,
+}
+
+#[cfg(unix)]
+fn try_admit_glass_message(
+    gate: &GlassOutboundGate,
+    message: crate::protocol::ClientMessage,
+) -> GlassAdmissionOutcome {
+    let mut admission = match gate.try_lock() {
+        Ok(admission) => admission,
+        Err(TryLockError::WouldBlock) => return GlassAdmissionOutcome::Busy,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+    };
+    let Some(active) = admission.as_ref() else {
+        return GlassAdmissionOutcome::Disconnected;
+    };
+    match active.sender.try_send(message) {
+        Ok(()) => GlassAdmissionOutcome::Queued,
+        Err(TrySendError::Full(_)) => GlassAdmissionOutcome::Full,
+        Err(TrySendError::Disconnected(_)) => {
+            *admission = None;
+            GlassAdmissionOutcome::Closed
+        }
+    }
+}
+
+#[cfg(unix)]
+fn close_glass_admission(gate: &GlassOutboundGate, connection: Option<u64>) {
+    let mut admission = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if connection.is_none_or(|connection| {
+        admission
+            .as_ref()
+            .is_some_and(|active| active.connection == connection)
+    }) {
+        admission.take();
+    }
+}
 
 #[cfg(unix)]
 #[derive(Debug)]
@@ -228,9 +336,10 @@ impl Drop for GlassShutdownRegistration<'_> {
 
 #[cfg(unix)]
 struct GlassStreamHandle {
-    outbound: SyncSender<crate::protocol::ClientMessage>,
+    outbound_gate: GlassOutboundGate,
     geometry: Arc<Mutex<GlassGeometry>>,
     connected: Arc<AtomicBool>,
+    mouse_capture: Arc<std::sync::atomic::AtomicU8>,
     shutdown_stream: Arc<Mutex<Option<std::os::unix::net::UnixStream>>>,
     stop: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
@@ -247,21 +356,24 @@ impl GlassStreamHandle {
             .geometry
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = geometry;
-        if !self.connected.load(Ordering::Acquire) {
-            return false;
-        }
-        match self.outbound.try_send(geometry.resize()) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
-        }
+        matches!(
+            try_admit_glass_message(&self.outbound_gate, geometry.resize()),
+            GlassAdmissionOutcome::Queued
+        )
     }
 
     fn stop_and_join(&mut self) {
         self.stop.store(true, Ordering::Release);
         self.connected.store(false, Ordering::Release);
-        let _ = self
-            .outbound
-            .try_send(crate::protocol::ClientMessage::Detach);
+        let detach_sender = self
+            .outbound_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .map(|active| active.sender);
+        if let Some(sender) = detach_sender {
+            let _ = sender.try_send(crate::protocol::ClientMessage::Detach);
+        }
         if let Some(stream) = self
             .shutdown_stream
             .lock()
@@ -378,6 +490,113 @@ impl Default for HostGlassRuntime {
 }
 
 impl HostGlassRuntime {
+    /// Queue one structured input event without socket IO on the App/event
+    /// loop. Stale/connecting input is never queued, and any bounded-channel
+    /// failure is a drop rather than a reconnect replay.
+    pub(crate) fn send_input(
+        &self,
+        state: &crate::app::state::AppState,
+        event: crate::protocol::ClientInputEvent,
+    ) -> GlassInputOutcome {
+        if !state.host_glass_surface_active() {
+            return GlassInputOutcome::NotActive;
+        }
+        let Some((host, glass)) = state.selected_host_glass_mode() else {
+            // Selection owns the content area immediately, while runtime
+            // reconciliation creates generation metadata later. Input in
+            // that first-attach window is consumed and truthfully reported,
+            // never allowed to fall through or queue for a future stream.
+            return GlassInputOutcome::Dropped(GlassInputDropReason::Connecting);
+        };
+        if matches!(glass.status, GlassStatus::Stale { .. }) {
+            return GlassInputOutcome::Dropped(GlassInputDropReason::Stale);
+        }
+        if glass.status != GlassStatus::Live {
+            return GlassInputOutcome::Dropped(GlassInputDropReason::Connecting);
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = host;
+            let _ = event;
+            GlassInputOutcome::Dropped(GlassInputDropReason::MissingStream)
+        }
+
+        #[cfg(unix)]
+        {
+            let Some(stream) = self
+                .source
+                .as_ref()
+                .filter(|source| *source == host)
+                .and(self.stream.as_ref())
+            else {
+                return GlassInputOutcome::Dropped(GlassInputDropReason::MissingStream);
+            };
+            if glass.generation != self.generation {
+                return GlassInputOutcome::Dropped(GlassInputDropReason::GenerationChanged);
+            }
+            match try_admit_glass_message(
+                &stream.outbound_gate,
+                crate::protocol::ClientMessage::InputEvents {
+                    events: vec![event],
+                },
+            ) {
+                GlassAdmissionOutcome::Queued => GlassInputOutcome::Queued,
+                GlassAdmissionOutcome::Disconnected => {
+                    GlassInputOutcome::Dropped(GlassInputDropReason::Disconnected)
+                }
+                GlassAdmissionOutcome::Busy => {
+                    GlassInputOutcome::Dropped(GlassInputDropReason::AdmissionBusy)
+                }
+                GlassAdmissionOutcome::Full => {
+                    GlassInputOutcome::Dropped(GlassInputDropReason::QueueFull)
+                }
+                GlassAdmissionOutcome::Closed => {
+                    GlassInputOutcome::Dropped(GlassInputDropReason::QueueClosed)
+                }
+            }
+        }
+    }
+
+    /// Latest full-App capture mode reported by the selected remote Herdr.
+    /// The server derives this from its authoritative App/VT state. A stale,
+    /// disconnected, or predecessor stream can never force local capture.
+    pub(crate) fn selected_mouse_capture(
+        &self,
+        state: &crate::app::state::AppState,
+    ) -> Option<bool> {
+        let (host, glass) = state.selected_host_glass_mode()?;
+        if glass.status != GlassStatus::Live {
+            return None;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = host;
+            None
+        }
+
+        #[cfg(unix)]
+        {
+            if glass.generation != self.generation {
+                return None;
+            }
+            let stream = self
+                .source
+                .as_ref()
+                .filter(|source| *source == host)
+                .and(self.stream.as_ref())?;
+            if !stream.connected.load(Ordering::Acquire) {
+                return None;
+            }
+            match stream.mouse_capture.load(Ordering::Acquire) {
+                GLASS_MOUSE_CAPTURE_DISABLED => Some(false),
+                GLASS_MOUSE_CAPTURE_ENABLED => Some(true),
+                _ => None,
+            }
+        }
+    }
+
     pub(crate) fn reconcile(
         &mut self,
         state: &mut crate::app::state::AppState,
@@ -669,11 +888,78 @@ impl HostGlassRuntime {
             }
         }
     }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn test_install_connected_stream(
+        &mut self,
+        host: RemoteHostKey,
+        generation: u64,
+        mouse_capture: Option<bool>,
+    ) -> Receiver<crate::protocol::ClientMessage> {
+        let (outbound, receiver) = mpsc::sync_channel(GLASS_OUTBOUND_CAPACITY);
+        let outbound_gate = Arc::new(Mutex::new(Some(GlassOutboundAdmission {
+            connection: 1,
+            sender: outbound,
+        })));
+        self.source = Some(host.clone());
+        self.generation = generation;
+        self.stream = Some(GlassStreamHandle {
+            outbound_gate,
+            geometry: Arc::new(Mutex::new(GlassGeometry {
+                area: Rect::new(0, 0, 80, 24),
+                cell_width_px: 1,
+                cell_height_px: 1,
+            })),
+            connected: Arc::new(AtomicBool::new(true)),
+            mouse_capture: Arc::new(std::sync::atomic::AtomicU8::new(match mouse_capture {
+                None => GLASS_MOUSE_CAPTURE_UNKNOWN,
+                Some(false) => GLASS_MOUSE_CAPTURE_DISABLED,
+                Some(true) => GLASS_MOUSE_CAPTURE_ENABLED,
+            })),
+            shutdown_stream: Arc::new(Mutex::new(None)),
+            stop: Arc::new(AtomicBool::new(false)),
+            done: Arc::new(AtomicBool::new(true)),
+            join: None,
+        });
+        self.signature = Some(GlassSignature {
+            host,
+            prepared_shell_path: "test".into(),
+            geometry: GlassGeometry {
+                area: Rect::new(0, 0, 80, 24),
+                cell_width_px: 1,
+                cell_height_px: 1,
+            },
+        });
+        receiver
+    }
 }
 
 impl Drop for HostGlassRuntime {
     fn drop(&mut self) {
         self.retire_stream();
+    }
+}
+
+impl crate::app::App {
+    /// Route one glass-directed structured input event. Returning true means
+    /// the glass authority boundary consumed it even when delivery was
+    /// intentionally dropped. Every drop raises the bounded local cue.
+    pub(crate) fn route_host_glass_input(
+        &mut self,
+        event: crate::protocol::ClientInputEvent,
+    ) -> bool {
+        match self.host_glass_runtime.send_input(&self.state, event) {
+            GlassInputOutcome::NotActive => false,
+            GlassInputOutcome::Dropped(reason) => {
+                if self.state.note_selected_host_glass_input_dropped(reason) {
+                    self.host_glass_input_drop_cue_deadline =
+                        Some(Instant::now() + super::HOST_GLASS_INPUT_DROP_CUE_DURATION);
+                }
+                true
+            }
+            #[cfg(unix)]
+            GlassInputOutcome::Queued => true,
+        }
     }
 }
 
@@ -725,15 +1011,19 @@ fn spawn_glass_stream(
     event_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
     worker_update_tx: mpsc::Sender<GlassWorkerUpdate>,
 ) -> GlassStreamHandle {
-    let (outbound, receiver) = mpsc::sync_channel(GLASS_OUTBOUND_CAPACITY);
-    let receiver = Arc::new(Mutex::new(receiver));
+    let outbound_gate = Arc::new(Mutex::new(None));
     let shared_geometry = Arc::new(Mutex::new(geometry));
     let connected = Arc::new(AtomicBool::new(false));
+    let mouse_capture = Arc::new(std::sync::atomic::AtomicU8::new(
+        GLASS_MOUSE_CAPTURE_UNKNOWN,
+    ));
     let shutdown_stream = Arc::new(Mutex::new(None));
     let stop = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
     let worker_geometry = Arc::clone(&shared_geometry);
+    let worker_outbound_gate = Arc::clone(&outbound_gate);
     let worker_connected = Arc::clone(&connected);
+    let worker_mouse_capture = Arc::clone(&mouse_capture);
     let worker_shutdown_stream = Arc::clone(&shutdown_stream);
     let worker_stop = Arc::clone(&stop);
     let worker_done = Arc::clone(&done);
@@ -741,6 +1031,7 @@ fn spawn_glass_stream(
     let join = std::thread::spawn(move || {
         let mut backoff = GLASS_RECONNECT_INITIAL_BACKOFF;
         let mut first_attempt = true;
+        let mut connection = 0_u64;
         while !worker_stop.load(Ordering::Acquire) {
             if first_attempt {
                 emit_glass_status(
@@ -774,20 +1065,22 @@ fn spawn_glass_stream(
                     continue;
                 }
             };
+            connection = connection.wrapping_add(1).max(1);
             let result = run_glass_stream_once_and_publish_lifecycle(
                 stream,
                 &host,
                 generation,
+                connection,
                 &event_tx,
-                &receiver,
+                &worker_outbound_gate,
                 &worker_geometry,
                 &worker_connected,
+                &worker_mouse_capture,
                 &worker_shutdown_stream,
                 &worker_stop,
                 &worker_update_tx,
             );
             worker_connected.store(false, Ordering::Release);
-            drain_outbound(&receiver);
             match result {
                 GlassStreamEnd::Stopped => break,
                 GlassStreamEnd::Fatal(_) => break,
@@ -804,9 +1097,10 @@ fn spawn_glass_stream(
     });
 
     GlassStreamHandle {
-        outbound,
+        outbound_gate,
         geometry: shared_geometry,
         connected,
+        mouse_capture,
         shutdown_stream,
         stop,
         done,
@@ -820,10 +1114,12 @@ fn run_glass_stream_once_and_publish_lifecycle(
     stream: std::os::unix::net::UnixStream,
     host: &RemoteHostKey,
     generation: u64,
+    connection: u64,
     event_tx: &tokio::sync::mpsc::Sender<crate::events::AppEvent>,
-    outbound: &Arc<Mutex<Receiver<crate::protocol::ClientMessage>>>,
+    outbound_gate: &GlassOutboundGate,
     geometry: &Arc<Mutex<GlassGeometry>>,
     connected: &Arc<AtomicBool>,
+    mouse_capture: &Arc<std::sync::atomic::AtomicU8>,
     shutdown_stream: &Arc<Mutex<Option<std::os::unix::net::UnixStream>>>,
     stop: &Arc<AtomicBool>,
     worker_update_tx: &mpsc::Sender<GlassWorkerUpdate>,
@@ -832,11 +1128,13 @@ fn run_glass_stream_once_and_publish_lifecycle(
         stream,
         host,
         generation,
+        connection,
         event_tx,
         worker_update_tx,
-        outbound,
+        outbound_gate,
         geometry,
         connected,
+        mouse_capture,
         shutdown_stream,
         stop,
     );
@@ -873,23 +1171,18 @@ fn wait_for_retry(stop: &AtomicBool, duration: Duration) -> bool {
 }
 
 #[cfg(unix)]
-fn drain_outbound(receiver: &Arc<Mutex<Receiver<crate::protocol::ClientMessage>>>) {
-    let receiver = receiver
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    while receiver.try_recv().is_ok() {}
-}
-
-#[cfg(unix)]
+#[allow(clippy::too_many_arguments)] // Keeps the worker's connection-scoped IO resources explicit.
 fn run_glass_stream_once(
     mut stream: std::os::unix::net::UnixStream,
     host: &RemoteHostKey,
     generation: u64,
+    connection: u64,
     event_tx: &tokio::sync::mpsc::Sender<crate::events::AppEvent>,
     worker_update_tx: &mpsc::Sender<GlassWorkerUpdate>,
-    outbound: &Arc<Mutex<Receiver<crate::protocol::ClientMessage>>>,
+    outbound_gate: &GlassOutboundGate,
     geometry: &Arc<Mutex<GlassGeometry>>,
     connected: &Arc<AtomicBool>,
+    mouse_capture: &Arc<std::sync::atomic::AtomicU8>,
     shutdown_stream: &Arc<Mutex<Option<std::os::unix::net::UnixStream>>>,
     stop: &Arc<AtomicBool>,
 ) -> GlassStreamEnd {
@@ -952,25 +1245,21 @@ fn run_glass_stream_once(
         Err(err) => return GlassStreamEnd::Fatal(format!("glass handshake invalid: {err}")),
     }
 
-    connected.store(true, Ordering::Release);
+    mouse_capture.store(GLASS_MOUSE_CAPTURE_UNKNOWN, Ordering::Release);
     let mut write_stream = match stream.try_clone() {
         Ok(stream) => stream,
         Err(err) => {
-            connected.store(false, Ordering::Release);
             return GlassStreamEnd::Retryable(format!("glass stream clone failed: {err}"));
         }
     };
+    let (outbound_sender, outbound_receiver) = mpsc::sync_channel(GLASS_OUTBOUND_CAPACITY);
     let writer_stop = Arc::new(AtomicBool::new(false));
     let writer_done = Arc::clone(&writer_stop);
-    let writer_outbound = Arc::clone(outbound);
     let writer_geometry = Arc::clone(geometry);
     let worker_stop = Arc::clone(stop);
     let writer = std::thread::spawn(move || {
         while !worker_stop.load(Ordering::Acquire) && !writer_done.load(Ordering::Acquire) {
-            let message = writer_outbound
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .recv_timeout(Duration::from_millis(50));
+            let message = outbound_receiver.recv_timeout(Duration::from_millis(50));
             match message {
                 Ok(mut message) => {
                     if matches!(message, crate::protocol::ClientMessage::Resize { .. }) {
@@ -992,6 +1281,16 @@ fn run_glass_stream_once(
             }
         }
     });
+    {
+        let mut admission = outbound_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *admission = Some(GlassOutboundAdmission {
+            connection,
+            sender: outbound_sender,
+        });
+        connected.store(true, Ordering::Release);
+    }
 
     let result = loop {
         if stop.load(Ordering::Acquire) {
@@ -1023,6 +1322,16 @@ fn run_glass_stream_once(
                 // MVP intentionally drops Kitty graphics. TerminalAnsi text
                 // remains authoritative and continues streaming.
             }
+            Ok(ServerMessage::MouseCapture { enabled }) => {
+                mouse_capture.store(
+                    if enabled {
+                        GLASS_MOUSE_CAPTURE_ENABLED
+                    } else {
+                        GLASS_MOUSE_CAPTURE_DISABLED
+                    },
+                    Ordering::Release,
+                );
+            }
             Ok(ServerMessage::ServerShutdown { reason }) => {
                 break GlassStreamEnd::Retryable(
                     reason.unwrap_or_else(|| "remote Herdr app stream closed".into()),
@@ -1046,6 +1355,11 @@ fn run_glass_stream_once(
             }
         }
     };
+    // Close admission before stopping or draining the per-connection writer.
+    // The event loop's try-lock admission cannot enqueue after this point,
+    // and the receiver is dropped with this connection, so no accepted input
+    // can survive into a replacement connection.
+    close_glass_admission(outbound_gate, Some(connection));
     connected.store(false, Ordering::Release);
     writer_stop.store(true, Ordering::Release);
     let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -1100,6 +1414,295 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn live_input_is_structured_fire_and_forget_and_stale_input_never_replays() {
+        let host = RemoteHostKey::new("remote-a", "default");
+        let mut state = crate::app::state::AppState::test_new();
+        state.host_glass_enabled = true;
+        state.view.layout = crate::app::state::ViewLayout::Desktop;
+        state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
+        state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+        let generation = state.begin_host_glass_generation(host.clone());
+        assert!(state.set_host_glass_status(&host, generation, GlassStatus::Live, None));
+
+        let mut runtime = HostGlassRuntime::default();
+        let receiver = runtime.test_install_connected_stream(host.clone(), generation, Some(true));
+        let events = [
+            crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('x'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+            },
+            crate::protocol::ClientInputEvent::Paste {
+                text: "bracket me".into(),
+            },
+            crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::ScrollDown,
+                column: 7,
+                row: 4,
+                modifiers: 0,
+            },
+        ];
+        for event in &events {
+            assert_eq!(
+                runtime.send_input(&state, event.clone()),
+                GlassInputOutcome::Queued
+            );
+            assert_eq!(
+                receiver.try_recv().expect("one queued structured event"),
+                ClientMessage::InputEvents {
+                    events: vec![event.clone()]
+                }
+            );
+        }
+
+        assert!(state.set_host_glass_status(
+            &host,
+            generation,
+            GlassStatus::Stale {
+                since: Instant::now(),
+            },
+            Some("link down".into()),
+        ));
+        assert_eq!(
+            runtime.send_input(
+                &state,
+                crate::protocol::ClientInputEvent::Paste {
+                    text: "must-not-replay".into(),
+                },
+            ),
+            GlassInputOutcome::Dropped(GlassInputDropReason::Stale)
+        );
+        assert!(receiver.try_recv().is_err(), "stale input must not queue");
+
+        assert!(state.set_host_glass_status(&host, generation, GlassStatus::Live, None));
+        let fresh = crate::protocol::ClientInputEvent::Key {
+            code: crate::protocol::ClientKeyCode::Enter,
+            modifiers: 0,
+            kind: crate::protocol::ClientKeyKind::Press,
+        };
+        assert_eq!(
+            runtime.send_input(&state, fresh.clone()),
+            GlassInputOutcome::Queued
+        );
+        assert_eq!(
+            receiver.try_recv().expect("fresh post-reconnect input"),
+            ClientMessage::InputEvents {
+                events: vec![fresh]
+            }
+        );
+        assert!(receiver.try_recv().is_err(), "no stale replay may follow");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn disconnect_drain_reconnect_admission_interleaving_cannot_replay_input() {
+        let host = RemoteHostKey::new("remote-a", "default");
+        let mut state = crate::app::state::AppState::test_new();
+        state.host_glass_enabled = true;
+        state.view.layout = crate::app::state::ViewLayout::Desktop;
+        state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
+        state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+        let generation = state.begin_host_glass_generation(host.clone());
+        assert!(state.set_host_glass_status(&host, generation, GlassStatus::Live, None));
+
+        let mut runtime = HostGlassRuntime::default();
+        let old_receiver =
+            runtime.test_install_connected_stream(host.clone(), generation, Some(true));
+        let old = crate::protocol::ClientInputEvent::Paste {
+            text: "old-connection".into(),
+        };
+        assert_eq!(
+            runtime.send_input(&state, old.clone()),
+            GlassInputOutcome::Queued
+        );
+        assert_eq!(
+            old_receiver
+                .try_recv()
+                .expect("worker drains old connection queue"),
+            ClientMessage::InputEvents { events: vec![old] }
+        );
+        assert!(old_receiver.try_recv().is_err());
+
+        let stream = runtime.stream.as_ref().expect("test stream installed");
+        let mut admission = stream
+            .outbound_gate
+            .lock()
+            .expect("test outbound gate remains healthy");
+        let old_admission = admission.take().expect("old connection admitted");
+
+        // This is the exact former race window: the public connected flag and
+        // App metadata still say Live, while the worker has closed admission
+        // and is about to drain/drop the old receiver. The event loop never
+        // waits for that critical section and cannot enqueue behind the drain.
+        assert!(stream.connected.load(Ordering::Acquire));
+        assert_eq!(
+            runtime.send_input(
+                &state,
+                crate::protocol::ClientInputEvent::Paste {
+                    text: "raced-after-drain".into(),
+                },
+            ),
+            GlassInputOutcome::Dropped(GlassInputDropReason::AdmissionBusy)
+        );
+
+        let (new_sender, new_receiver) = mpsc::sync_channel(GLASS_OUTBOUND_CAPACITY);
+        *admission = Some(GlassOutboundAdmission {
+            connection: 2,
+            sender: new_sender,
+        });
+        drop(old_admission);
+        drop(admission);
+
+        assert!(
+            old_receiver.try_recv().is_err(),
+            "raced input cannot appear behind the old drain"
+        );
+        assert!(
+            new_receiver.try_recv().is_err(),
+            "new connection starts empty"
+        );
+
+        let fresh = crate::protocol::ClientInputEvent::Key {
+            code: crate::protocol::ClientKeyCode::Enter,
+            modifiers: 0,
+            kind: crate::protocol::ClientKeyKind::Press,
+        };
+        assert_eq!(
+            runtime.send_input(&state, fresh.clone()),
+            GlassInputOutcome::Queued
+        );
+        assert_eq!(
+            new_receiver.try_recv().expect("fresh input uses new queue"),
+            ClientMessage::InputEvents {
+                events: vec![fresh]
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_input_admission_reports_full_and_closed_without_queueing() {
+        let host = RemoteHostKey::new("remote-a", "default");
+        let mut state = crate::app::state::AppState::test_new();
+        state.host_glass_enabled = true;
+        state.view.layout = crate::app::state::ViewLayout::Desktop;
+        state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
+        state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+        let generation = state.begin_host_glass_generation(host.clone());
+        assert!(state.set_host_glass_status(&host, generation, GlassStatus::Live, None));
+
+        let mut runtime = HostGlassRuntime::default();
+        let receiver = runtime.test_install_connected_stream(host, generation, Some(false));
+        let event = crate::protocol::ClientInputEvent::Key {
+            code: crate::protocol::ClientKeyCode::Char('x'),
+            modifiers: 0,
+            kind: crate::protocol::ClientKeyKind::Press,
+        };
+        for _ in 0..GLASS_OUTBOUND_CAPACITY {
+            assert_eq!(
+                runtime.send_input(&state, event.clone()),
+                GlassInputOutcome::Queued
+            );
+        }
+        assert_eq!(
+            runtime.send_input(&state, event.clone()),
+            GlassInputOutcome::Dropped(GlassInputDropReason::QueueFull)
+        );
+
+        drop(receiver);
+        assert_eq!(
+            runtime.send_input(&state, event.clone()),
+            GlassInputOutcome::Dropped(GlassInputDropReason::QueueClosed)
+        );
+        assert_eq!(
+            runtime.send_input(&state, event),
+            GlassInputOutcome::Dropped(GlassInputDropReason::Disconnected)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn selected_live_stream_exposes_only_its_vt_reported_mouse_capture_mode() {
+        let host = RemoteHostKey::new("remote-a", "default");
+        let mut state = crate::app::state::AppState::test_new();
+        state.host_glass_enabled = true;
+        state.view.layout = crate::app::state::ViewLayout::Desktop;
+        state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
+        state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+        let generation = state.begin_host_glass_generation(host.clone());
+        assert!(state.set_host_glass_status(&host, generation, GlassStatus::Live, None));
+
+        let mut runtime = HostGlassRuntime::default();
+        let _receiver = runtime.test_install_connected_stream(host.clone(), generation, Some(true));
+        assert_eq!(runtime.selected_mouse_capture(&state), Some(true));
+
+        assert!(state.set_host_glass_status(
+            &host,
+            generation,
+            GlassStatus::Stale {
+                since: Instant::now(),
+            },
+            None,
+        ));
+        assert_eq!(runtime.selected_mouse_capture(&state), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stream_consumes_server_mouse_capture_reports_without_wire_changes() {
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().expect("stream pair");
+        let server = std::thread::spawn(move || {
+            accept_test_hello(&mut server);
+            crate::protocol::write_message(
+                &mut server,
+                &crate::protocol::ServerMessage::MouseCapture { enabled: true },
+            )
+            .expect("write mouse-capture report");
+            crate::protocol::write_message(
+                &mut server,
+                &crate::protocol::ServerMessage::ServerShutdown {
+                    reason: Some("capture observed".into()),
+                },
+            )
+            .expect("close fake stream");
+        });
+        let host = RemoteHostKey::new("remote-a", "default");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let (worker_update_tx, _worker_update_rx) = mpsc::channel();
+        let outbound_gate = Arc::new(Mutex::new(None));
+        let shared_geometry = Arc::new(Mutex::new(geometry(12, 4)));
+        let connected = Arc::new(AtomicBool::new(false));
+        let mouse_capture = Arc::new(std::sync::atomic::AtomicU8::new(
+            GLASS_MOUSE_CAPTURE_UNKNOWN,
+        ));
+        let shutdown_stream = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let result = run_glass_stream_once(
+            client,
+            &host,
+            9,
+            1,
+            &event_tx,
+            &worker_update_tx,
+            &outbound_gate,
+            &shared_geometry,
+            &connected,
+            &mouse_capture,
+            &shutdown_stream,
+            &stop,
+        );
+        server.join().expect("fake server should finish");
+
+        assert!(matches!(result, GlassStreamEnd::Retryable(_)));
+        assert_eq!(
+            mouse_capture.load(Ordering::Acquire),
+            GLASS_MOUSE_CAPTURE_ENABLED
+        );
+    }
+
     #[cfg(unix)]
     fn run_fake_glass_stream(
         server: std::os::unix::net::UnixStream,
@@ -1110,20 +1713,24 @@ mod tests {
     ) -> GlassStreamEnd {
         let server = std::thread::spawn(move || server_body(server));
         let host = RemoteHostKey::new("remote-a", "default");
-        let (_outbound_tx, outbound_rx) = mpsc::sync_channel(4);
-        let outbound = Arc::new(Mutex::new(outbound_rx));
+        let outbound_gate = Arc::new(Mutex::new(None));
         let shared_geometry = Arc::new(Mutex::new(geometry(12, 4)));
         let connected = Arc::new(AtomicBool::new(false));
+        let mouse_capture = Arc::new(std::sync::atomic::AtomicU8::new(
+            GLASS_MOUSE_CAPTURE_UNKNOWN,
+        ));
         let shutdown_stream = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
         let result = run_glass_stream_once_and_publish_lifecycle(
             client,
             &host,
             7,
+            1,
             &event_tx,
-            &outbound,
+            &outbound_gate,
             &shared_geometry,
             &connected,
+            &mouse_capture,
             &shutdown_stream,
             &stop,
             &worker_update_tx,
@@ -1143,6 +1750,7 @@ mod tests {
                 generation,
                 status: GlassStatus::Connecting,
                 message: Some("test connection".into()),
+                input_drop_cue: None,
             },
         );
         state
@@ -1194,6 +1802,7 @@ mod tests {
                 generation,
                 status: GlassStatus::Connecting,
                 message: Some("test connection".into()),
+                input_drop_cue: None,
             },
         );
         app.host_glass_surfaces.insert(
@@ -1438,7 +2047,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn retiring_stream_never_waits_for_worker_join_on_caller() {
-        let (outbound, _outbound_rx) = mpsc::sync_channel(1);
+        let outbound_gate = Arc::new(Mutex::new(None));
         let geometry = Arc::new(Mutex::new(geometry(12, 4)));
         let connected = Arc::new(AtomicBool::new(false));
         let shutdown_stream = Arc::new(Mutex::new(None));
@@ -1451,9 +2060,12 @@ mod tests {
             worker_done.store(true, Ordering::Release);
         });
         let handle = GlassStreamHandle {
-            outbound,
+            outbound_gate,
             geometry,
             connected,
+            mouse_capture: Arc::new(std::sync::atomic::AtomicU8::new(
+                GLASS_MOUSE_CAPTURE_UNKNOWN,
+            )),
             shutdown_stream,
             stop,
             done: Arc::clone(&done),
@@ -1506,15 +2118,18 @@ mod tests {
         let host = RemoteHostKey::new("remote-a", "default");
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
         let (worker_update_tx, _worker_update_rx) = mpsc::channel();
-        let (outbound_tx, outbound_rx) = mpsc::sync_channel(4);
-        let outbound = Arc::new(Mutex::new(outbound_rx));
+        let outbound_gate = Arc::new(Mutex::new(None));
         let shared_geometry = Arc::new(Mutex::new(geometry(12, 4)));
         let connected = Arc::new(AtomicBool::new(false));
+        let mouse_capture = Arc::new(std::sync::atomic::AtomicU8::new(
+            GLASS_MOUSE_CAPTURE_UNKNOWN,
+        ));
         let shutdown_stream = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
-        let worker_outbound = Arc::clone(&outbound);
+        let worker_outbound_gate = Arc::clone(&outbound_gate);
         let worker_geometry = Arc::clone(&shared_geometry);
         let worker_connected = Arc::clone(&connected);
+        let worker_mouse_capture = Arc::clone(&mouse_capture);
         let worker_shutdown = Arc::clone(&shutdown_stream);
         let worker_stop = Arc::clone(&stop);
         let worker = std::thread::spawn(move || {
@@ -1522,11 +2137,13 @@ mod tests {
                 client,
                 &host,
                 9,
+                1,
                 &event_tx,
                 &worker_update_tx,
-                &worker_outbound,
+                &worker_outbound_gate,
                 &worker_geometry,
                 &worker_connected,
+                &worker_mouse_capture,
                 &worker_shutdown,
                 &worker_stop,
             )
@@ -1539,9 +2156,10 @@ mod tests {
         *shared_geometry
             .lock()
             .expect("test geometry lock should remain healthy") = geometry(100, 31);
-        outbound_tx
-            .try_send(geometry(100, 31).resize())
-            .expect("queue resize without network IO on test loop");
+        assert_eq!(
+            try_admit_glass_message(&outbound_gate, geometry(100, 31).resize()),
+            GlassAdmissionOutcome::Queued
+        );
 
         assert_eq!(
             server.join().expect("fake server should finish"),
