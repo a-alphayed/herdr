@@ -758,6 +758,7 @@ impl App {
                 layout: state::ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
                 host_rail_rect: Rect::default(),
+                host_rail_visually_suppressed: false,
                 sidebar_panel_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),

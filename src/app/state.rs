@@ -736,6 +736,11 @@ pub struct ViewState {
     /// desktop sidebar panel. `Rect::default()` for collapsed sidebar or
     /// mobile layout.
     pub host_rail_rect: Rect,
+    /// True only when a client-specific embedded render deliberately omits
+    /// the rail while preserving the selected remote source's authority.
+    /// This is distinct from collapsed/mobile/tiny layouts, where an absent
+    /// rail continues to make the effective source local.
+    pub host_rail_visually_suppressed: bool,
     /// Sidebar content panel rect (Spaces/Agents). This is the area used by
     /// workspace and agent panel render/input helpers.
     pub sidebar_panel_rect: Rect,
@@ -2050,7 +2055,8 @@ impl AppState {
     pub(crate) fn effective_sidebar_source(&self) -> SidebarSource {
         if self.view.layout != ViewLayout::Desktop
             || self.sidebar_collapsed
-            || self.view.host_rail_rect == Rect::default()
+            || (self.view.host_rail_rect == Rect::default()
+                && !self.view.host_rail_visually_suppressed)
         {
             return SidebarSource::Local;
         }
@@ -2315,6 +2321,7 @@ impl AppState {
                 layout: ViewLayout::Desktop,
                 sidebar_rect: Rect::default(),
                 host_rail_rect: Rect::default(),
+                host_rail_visually_suppressed: false,
                 sidebar_panel_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),

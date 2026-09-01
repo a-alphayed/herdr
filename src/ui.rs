@@ -105,6 +105,7 @@ pub(crate) use self::{
 };
 use crate::app::state::ViewLayout;
 use crate::app::{AppState, Mode};
+use crate::protocol::ViewContext;
 use crate::terminal::TerminalRuntimeRegistry;
 
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
@@ -131,12 +132,13 @@ pub fn compute_view_with_runtime_registry(
     terminal_runtimes: &TerminalRuntimeRegistry,
     area: Rect,
 ) {
-    compute_view_internal(
+    compute_view_with_context(
         app,
         terminal_runtimes,
         area,
         true,
         crate::kitty_graphics::HostCellSize::default(),
+        ViewContext::Standalone,
     );
 }
 
@@ -146,7 +148,14 @@ pub fn compute_view_with_cell_size(
     area: Rect,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) {
-    compute_view_internal(app, terminal_runtimes, area, true, cell_size);
+    compute_view_with_context(
+        app,
+        terminal_runtimes,
+        area,
+        true,
+        cell_size,
+        ViewContext::Standalone,
+    );
 }
 
 /// Compute view geometry for a client-sized render without resizing pane runtimes.
@@ -159,12 +168,36 @@ pub(crate) fn compute_view_without_resizing_panes(
     terminal_runtimes: &TerminalRuntimeRegistry,
     area: Rect,
 ) {
-    compute_view_internal(
+    compute_view_with_context(
         app,
         terminal_runtimes,
         area,
         false,
         crate::kitty_graphics::HostCellSize::default(),
+        ViewContext::Standalone,
+    );
+}
+
+pub(crate) fn compute_view_with_context(
+    app: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    area: Rect,
+    resize_panes: bool,
+    cell_size: crate::kitty_graphics::HostCellSize,
+    view_context: ViewContext,
+) {
+    let cell_size = if resize_panes {
+        cell_size
+    } else {
+        crate::kitty_graphics::HostCellSize::default()
+    };
+    compute_view_internal(
+        app,
+        terminal_runtimes,
+        area,
+        resize_panes,
+        cell_size,
+        view_context,
     );
 }
 
@@ -222,6 +255,7 @@ fn compute_view_internal(
     area: Rect,
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
+    view_context: ViewContext,
 ) {
     if is_mobile_width(area, app.mobile_width_threshold) {
         compute_mobile_view(app, terminal_runtimes, area, resize_panes, cell_size);
@@ -239,7 +273,9 @@ fn compute_view_internal(
     // by width: it is always present on expanded desktop (only collapsed
     // sidebar and mobile layout drop it), so ordinary narrow expanded-desktop
     // widths and local-only setups both keep it visible.
-    let rail_w = if app.sidebar_collapsed {
+    let host_rail_visually_suppressed =
+        !app.sidebar_collapsed && view_context == ViewContext::Embedded;
+    let rail_w = if app.sidebar_collapsed || host_rail_visually_suppressed {
         0
     } else {
         host_rail_width()
@@ -286,6 +322,7 @@ fn compute_view_internal(
     app.view.layout = ViewLayout::Desktop;
     app.view.sidebar_rect = sidebar_area;
     app.view.host_rail_rect = host_rail_rect;
+    app.view.host_rail_visually_suppressed = host_rail_visually_suppressed;
     app.view.sidebar_panel_rect = sidebar_panel_rect;
 
     let (tab_bar_rect, terminal_area) = app
@@ -297,8 +334,10 @@ fn compute_view_internal(
     if !app.sidebar_collapsed {
         app.workspace_scroll =
             normalized_workspace_scroll(app, sidebar_panel_rect, app.workspace_scroll);
-        app.host_list_scroll =
-            crate::ui::sidebar::normalized_host_list_scroll(app, app.host_list_scroll);
+        if !host_rail_visually_suppressed {
+            app.host_list_scroll =
+                crate::ui::sidebar::normalized_host_list_scroll(app, app.host_list_scroll);
+        }
         let (_, detail_area) =
             expanded_sidebar_sections(sidebar_panel_rect, app.sidebar_section_split);
         let max_agent_scroll = agent_panel_scroll_metrics(app, detail_area).max_offset_from_bottom;
@@ -351,6 +390,7 @@ fn compute_view_internal(
             layout: ViewLayout::Desktop,
             sidebar_rect: sidebar_area,
             host_rail_rect,
+            host_rail_visually_suppressed,
             sidebar_panel_rect,
             workspace_card_areas,
             tab_bar_rect: Rect::default(),
@@ -425,6 +465,7 @@ fn compute_view_internal(
         layout: ViewLayout::Desktop,
         sidebar_rect: sidebar_area,
         host_rail_rect,
+        host_rail_visually_suppressed,
         sidebar_panel_rect,
         workspace_card_areas,
         tab_bar_rect,
@@ -480,6 +521,7 @@ fn compute_mobile_view(
             layout: ViewLayout::Mobile,
             sidebar_rect: Rect::default(),
             host_rail_rect: Rect::default(),
+            host_rail_visually_suppressed: false,
             sidebar_panel_rect: Rect::default(),
             workspace_card_areas: Vec::new(),
             tab_bar_rect: Rect::default(),
@@ -533,6 +575,7 @@ fn compute_mobile_view(
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
         host_rail_rect: Rect::default(),
+        host_rail_visually_suppressed: false,
         sidebar_panel_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
         tab_bar_rect: Rect::default(),
@@ -2564,6 +2607,97 @@ mod tests {
     }
 
     #[test]
+    fn embedded_view_omits_host_rail_and_reflows_without_losing_remote_authority() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.host_glass_enabled = true;
+        let host = crate::remote_source::RemoteHostKey::new(
+            "remote-a",
+            crate::session::DEFAULT_SESSION_NAME,
+        );
+        app.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        app.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+
+        let area = Rect::new(0, 0, 100, 20);
+        compute_view(&mut app, area);
+        let standalone_sidebar = app.view.sidebar_rect;
+        let standalone_panel = app.view.sidebar_panel_rect;
+        let standalone_main = app.view.terminal_area;
+        let standalone_rail = app.view.host_rail_rect;
+        let mut standalone_terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("standalone terminal");
+        standalone_terminal
+            .draw(|frame| render(&app, frame))
+            .expect("render standalone host rail");
+        let standalone_buffer = standalone_terminal.backend().buffer().clone();
+
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        compute_view_with_context(
+            &mut app,
+            &terminal_runtimes,
+            area,
+            true,
+            crate::kitty_graphics::HostCellSize::default(),
+            ViewContext::Embedded,
+        );
+
+        assert_eq!(app.view.layout, ViewLayout::Desktop);
+        assert_eq!(app.view.host_rail_rect, Rect::default());
+        assert!(app.view.host_rail_visually_suppressed);
+        assert_eq!(app.view.sidebar_panel_rect.x, standalone_sidebar.x);
+        assert_eq!(app.view.sidebar_panel_rect.width, standalone_panel.width);
+        assert_eq!(
+            app.view.sidebar_rect.width + host_rail_width(),
+            standalone_sidebar.width
+        );
+        assert_eq!(
+            app.view.terminal_area.x + host_rail_width(),
+            standalone_main.x
+        );
+        assert_eq!(
+            app.view.terminal_area.width,
+            standalone_main.width + host_rail_width()
+        );
+        assert_eq!(app.host_list_scroll, 0);
+        assert_eq!(host_target_at(&app, standalone_rail.x, 2), None);
+        assert_eq!(
+            app.effective_sidebar_source(),
+            crate::app::state::SidebarSource::Remote(host)
+        );
+        assert!(app.host_glass_surface_active());
+
+        let mut embedded_terminal =
+            Terminal::new(TestBackend::new(area.width, area.height)).expect("embedded terminal");
+        embedded_terminal
+            .draw(|frame| render(&app, frame))
+            .expect("render embedded sidebar");
+        let embedded_buffer = embedded_terminal.backend().buffer();
+        let standalone_divider_x = standalone_rail.x + standalone_rail.width - 1;
+        let embedded_outer_divider_x =
+            app.view.sidebar_rect.x + app.view.sidebar_rect.width.saturating_sub(1);
+        assert!(
+            (0..area.height).all(|y| standalone_buffer[(standalone_divider_x, y)].symbol() == "│")
+        );
+        assert!(
+            (0..area.height).any(|y| embedded_buffer[(standalone_divider_x, y)].symbol() != "│")
+        );
+        assert!((0..area.height)
+            .all(|y| embedded_buffer[(embedded_outer_divider_x, y)].symbol() == "│"));
+        assert!(buffer_row_text(
+            embedded_buffer,
+            app.view.sidebar_panel_rect,
+            app.view.sidebar_panel_rect.y
+        )
+        .starts_with(" spaces"));
+    }
+
+    #[test]
     fn compute_view_keeps_host_rail_on_narrow_expanded_desktop() {
         // Ahmed's 2026-07-20 correction: an ordinary narrow EXPANDED-DESKTOP
         // width (just above the mobile threshold) must still show the fixed
@@ -3263,7 +3397,7 @@ mod tests {
                 requested_encoding: crate::protocol::RenderEncoding::TerminalAnsi,
                 keybindings: crate::protocol::ClientKeybindings::Server,
                 launch_mode: crate::protocol::ClientLaunchMode::App,
-                view_context: crate::protocol::ViewContext::Standalone,
+                view_context: crate::protocol::ViewContext::Embedded,
             }
         );
         let retained = app

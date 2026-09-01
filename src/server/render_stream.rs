@@ -6,7 +6,9 @@ use ratatui::layout::{Position, Rect, Size};
 use crate::app::state::AppState;
 use crate::app::Mode;
 use crate::protocol::render_ansi::{BlitEncoder, EncodedBlit};
-use crate::protocol::{CursorState, FrameData, RenderEncoding, ServerMessage, TerminalFrame};
+use crate::protocol::{
+    CursorState, FrameData, RenderEncoding, ServerMessage, TerminalFrame, ViewContext,
+};
 use crate::terminal::TerminalRuntimeRegistry;
 
 /// Per-client render baseline for the negotiated render encoding.
@@ -304,12 +306,43 @@ pub(crate) fn render_virtual_with_runtime_registry_and_glass(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    render_virtual_with_runtime_registry_and_glass_in_context(
+        app_state,
+        terminal_runtimes,
+        glass_surfaces,
+        area,
+        resize_panes,
+        cell_size,
+        ViewContext::Standalone,
+    )
+}
+
+pub(crate) fn render_virtual_with_runtime_registry_and_glass_in_context(
+    app_state: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    glass_surfaces: Option<&crate::app::host_glass::HostGlassSurfaceRegistry>,
+    area: Rect,
+    resize_panes: bool,
+    cell_size: crate::kitty_graphics::HostCellSize,
+    view_context: ViewContext,
+) -> (ratatui::buffer::Buffer, Option<CursorState>) {
     let pre_compute_suppresses_focused_terminal_cursor =
         focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
-    if resize_panes {
-        crate::ui::compute_view_with_cell_size(app_state, terminal_runtimes, area, cell_size);
+    if view_context == ViewContext::Standalone {
+        if resize_panes {
+            crate::ui::compute_view_with_cell_size(app_state, terminal_runtimes, area, cell_size);
+        } else {
+            crate::ui::compute_view_without_resizing_panes(app_state, terminal_runtimes, area);
+        }
     } else {
-        crate::ui::compute_view_without_resizing_panes(app_state, terminal_runtimes, area);
+        crate::ui::compute_view_with_context(
+            app_state,
+            terminal_runtimes,
+            area,
+            resize_panes,
+            cell_size,
+            view_context,
+        );
     }
     let suppress_focused_terminal_cursor = pre_compute_suppresses_focused_terminal_cursor
         || focused_terminal_suppresses_host_cursor(app_state, terminal_runtimes);
@@ -547,6 +580,52 @@ fn focused_terminal_suppresses_host_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_render_matches_pre_embedded_context_baseline() {
+        use sha2::{Digest, Sha256};
+
+        let mut app = crate::app::state::AppState::test_new();
+        let mut workspace = crate::workspace::Workspace::test_new("one");
+        workspace.cached_git_branch = Some("baseline".to_owned());
+        app.workspaces = vec![workspace];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = crate::app::Mode::Terminal;
+
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        let (buffer, cursor) = render_virtual_with_runtime_registry_and_glass_in_context(
+            &mut app,
+            &terminal_runtimes,
+            None,
+            Rect::new(0, 0, 80, 20),
+            true,
+            crate::kitty_graphics::HostCellSize::default(),
+            ViewContext::Standalone,
+        );
+        assert_eq!(cursor, None);
+        let frame = FrameData::from_ratatui_buffer(&buffer, cursor);
+        let frame_bytes = bincode::serde::encode_to_vec(&frame, bincode::config::standard())
+            .expect("serialize standalone frame baseline");
+        let mut render_state = ClientRenderState::new(RenderEncoding::TerminalAnsi);
+        let prepared = render_state
+            .prepare_frame(frame)
+            .expect("initial standalone frame is emitted");
+        let terminal_message_bytes =
+            bincode::serde::encode_to_vec(prepared.message(), bincode::config::standard())
+                .expect("serialize standalone TerminalAnsi baseline");
+
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&frame_bytes)),
+            "76cc900be42161e95f349c298f4749307b745a54defe1fdf25018d415be7a66b",
+            "complete FrameData bytes changed from the pre-S4 Standalone capture"
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&terminal_message_bytes)),
+            "ba6d70e30bb9107d21bdff6f1673d0842586784b8d5fa4a4db8a551c21646a5f",
+            "serialized TerminalAnsi message changed from the pre-S4 Standalone capture"
+        );
+    }
 
     /// The semantic buffer returned by the virtual render seam must be the
     /// completed pre-diff frame: wide-glyph continuation (`skip`) topology

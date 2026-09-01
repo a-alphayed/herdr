@@ -901,20 +901,19 @@ impl HeadlessServer {
         };
         let (cols, rows) = self.effective_size;
         let area = Rect::new(0, 0, cols, rows);
-        if self.app.state.kitty_graphics_enabled && client.cell_size.is_known() {
-            crate::ui::compute_view_with_cell_size(
-                &mut self.app.state,
-                &self.app.terminal_runtimes,
-                area,
-                client.cell_size,
-            );
+        let cell_size = if self.app.state.kitty_graphics_enabled && client.cell_size.is_known() {
+            client.cell_size
         } else {
-            crate::ui::compute_view_with_runtime_registry(
-                &mut self.app.state,
-                &self.app.terminal_runtimes,
-                area,
-            );
-        }
+            crate::kitty_graphics::HostCellSize::default()
+        };
+        crate::ui::compute_view_with_context(
+            &mut self.app.state,
+            &self.app.terminal_runtimes,
+            area,
+            true,
+            cell_size,
+            client.view_context(),
+        );
 
         // Shared runtime size changes affect pane wrapping and foreground-driven
         // rendering semantics. Force one fresh frame to every remaining client
@@ -2629,6 +2628,7 @@ impl HeadlessServer {
                     client_id,
                     ClientConnection::new_with_mode(
                         ClientConnectionMode::App,
+                        view_context,
                         keybindings,
                         (cols, rows),
                         crate::kitty_graphics::HostCellSize {
@@ -3361,7 +3361,7 @@ impl HeadlessServer {
         }
 
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
-        let [(client_id, (cols, rows), cell_size, _is_foreground, mode)] =
+        let [(client_id, (cols, rows), cell_size, _is_foreground, _view_context, mode)] =
             render_targets.as_slice()
         else {
             retained_fallback!("multiple_or_no_target");
@@ -3576,7 +3576,9 @@ impl HeadlessServer {
 
         let mut broken_clients: Vec<u64> = Vec::new();
         let mut deferred_frame = false;
-        for (client_id, (cols, rows), cell_size, is_foreground, mode) in render_targets {
+        for (client_id, (cols, rows), cell_size, is_foreground, view_context, mode) in
+            render_targets
+        {
             let area = Rect::new(0, 0, cols, rows);
             let is_app_client = matches!(mode, ClientConnectionMode::App);
             let mut frame = match mode {
@@ -3585,22 +3587,24 @@ impl HeadlessServer {
                     let (buffer, cursor) = if self.app.state.kitty_graphics_enabled
                         && cell_size.is_known()
                     {
-                        crate::server::render_stream::render_virtual_with_runtime_registry_and_glass(
+                        crate::server::render_stream::render_virtual_with_runtime_registry_and_glass_in_context(
                             &mut self.app.state,
                             &self.app.terminal_runtimes,
                             Some(&self.app.host_glass_surfaces),
                             area,
                             is_foreground,
                             cell_size,
+                            view_context,
                         )
                     } else {
-                        crate::server::render_stream::render_virtual_with_runtime_registry_and_glass(
+                        crate::server::render_stream::render_virtual_with_runtime_registry_and_glass_in_context(
                             &mut self.app.state,
                             &self.app.terminal_runtimes,
                             Some(&self.app.host_glass_surfaces),
                             area,
                             is_foreground,
                             crate::kitty_graphics::HostCellSize::default(),
+                            view_context,
                         )
                     };
                     crate::render_prof::duration_since(
@@ -4759,7 +4763,7 @@ mod tests {
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: crate::protocol::ClientKeybindings::Server,
                 launch_mode: crate::protocol::ClientLaunchMode::App,
-                view_context: crate::protocol::ViewContext::Standalone,
+                view_context: crate::protocol::ViewContext::Embedded,
             }
         );
 
@@ -4768,6 +4772,17 @@ mod tests {
 
     fn retained_test_server(
         initial_screen: &[u8],
+    ) -> (
+        HeadlessServer,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        crate::layout::PaneId,
+    ) {
+        retained_test_server_with_context(initial_screen, crate::protocol::ViewContext::Standalone)
+    }
+
+    fn retained_test_server_with_context(
+        initial_screen: &[u8],
+        view_context: crate::protocol::ViewContext,
     ) -> (
         HeadlessServer,
         std::sync::mpsc::Receiver<Vec<u8>>,
@@ -4788,13 +4803,14 @@ mod tests {
         let (client_tx, _client_control_rx, client_rx) = test_client_writer();
         server.clients.insert(
             1,
-            ClientConnection::new(
+            ClientConnection::new_with_view_context(
                 (80, 24),
                 crate::kitty_graphics::HostCellSize::default(),
                 crate::terminal_theme::TerminalTheme::default(),
                 None,
                 1,
                 RenderEncoding::SemanticFrame,
+                view_context,
                 Some(client_tx),
             ),
         );
@@ -4829,6 +4845,36 @@ mod tests {
                 idx / usize::from(actual.width),
             );
         }
+    }
+
+    #[test]
+    fn client_connection_retains_handshake_view_context() {
+        let mut server = test_headless_server();
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 1,
+            cols: 80,
+            rows: 24,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::SemanticFrame,
+            view_context: crate::protocol::ViewContext::Embedded,
+            keybindings: None,
+            direct_attach_requested: false,
+            writer,
+        }));
+
+        assert_eq!(
+            server.clients[&1].view_context(),
+            crate::protocol::ViewContext::Embedded
+        );
+        assert_eq!(
+            render_targets(&server.clients, server.foreground_client_id)[0].4,
+            crate::protocol::ViewContext::Embedded
+        );
+        assert_eq!(server.app.state.view.host_rail_rect, Rect::default());
+        assert!(server.app.state.view.host_rail_visually_suppressed);
     }
 
     #[test]
@@ -7443,6 +7489,113 @@ next_tab = ""
         assert_eq!((phone_frame.width, phone_frame.height), (80, 24));
     }
 
+    #[test]
+    fn render_and_stream_keeps_standalone_and_embedded_layouts_and_baselines_independent() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("test")];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let (standalone_tx, _standalone_control_rx, standalone_rx) = test_client_writer();
+        let (embedded_tx, _embedded_control_rx, embedded_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new_with_view_context(
+                (100, 20),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                crate::protocol::ViewContext::Standalone,
+                Some(standalone_tx),
+            ),
+        );
+        server.clients.insert(
+            2,
+            ClientConnection::new_with_view_context(
+                (100, 20),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                crate::protocol::ViewContext::Embedded,
+                Some(embedded_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+
+        server.render_and_stream();
+
+        let standalone_frame = read_server_frame(
+            standalone_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("standalone frame"),
+        );
+        let embedded_frame = read_server_frame(
+            embedded_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("embedded frame"),
+        );
+        assert!(frame_text(&standalone_frame).contains(" hosts"));
+        assert!(!frame_text(&embedded_frame).contains(" hosts"));
+        assert!(frame_text(&embedded_frame).starts_with(" spaces"));
+        assert_ne!(standalone_frame, embedded_frame);
+        assert_eq!(
+            server.clients[&1].view_context(),
+            crate::protocol::ViewContext::Standalone
+        );
+        assert_eq!(
+            server.clients[&2].view_context(),
+            crate::protocol::ViewContext::Embedded
+        );
+        assert_frame_data_eq(
+            server.clients[&1]
+                .render_state
+                .last_frame()
+                .expect("standalone retained baseline"),
+            &standalone_frame,
+        );
+        assert_frame_data_eq(
+            server.clients[&2]
+                .render_state
+                .last_frame()
+                .expect("embedded retained baseline"),
+            &embedded_frame,
+        );
+
+        server.render_and_stream();
+        assert!(standalone_rx
+            .recv_timeout(Duration::from_millis(50))
+            .is_err());
+        assert!(embedded_rx.recv_timeout(Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
+    fn render_and_stream_without_clients_uses_standalone_view_context() {
+        let mut server = test_headless_server();
+        server.app.state.workspaces = vec![crate::workspace::Workspace::test_new("test")];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        server.render_and_stream();
+
+        assert_eq!(
+            server.app.state.view.host_rail_rect.width,
+            crate::ui::host_rail_width()
+        );
+        assert!(!server.app.state.view.host_rail_visually_suppressed);
+        assert_eq!(
+            server.app.state.view.sidebar_panel_rect.x,
+            server.app.state.view.sidebar_rect.x + crate::ui::host_rail_width()
+        );
+    }
+
     #[tokio::test]
     async fn resize_shared_runtime_resizes_background_tabs() {
         let mut server = test_headless_server();
@@ -8032,6 +8185,46 @@ next_tab = ""
         );
         assert!(patched.cells.iter().any(|cell| cell.symbol == "Z"));
         assert_eq!((patched.width, patched.height), (80, 24));
+    }
+
+    #[tokio::test]
+    async fn retained_pty_update_preserves_embedded_layout_baseline() {
+        let (mut server, client_rx, pane_id) =
+            retained_test_server_with_context(b"aaaa", crate::protocol::ViewContext::Embedded);
+        server.render_and_stream();
+        let initial = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("initial embedded frame"),
+        );
+        assert!(!frame_text(&initial).contains(" hosts"));
+        assert!(frame_text(&initial).starts_with(" spaces"));
+        assert_eq!(server.app.state.view.host_rail_rect, Rect::default());
+        assert!(server.app.state.view.host_rail_visually_suppressed);
+
+        server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime")
+            .test_process_pty_bytes(b"\rZ");
+
+        assert!(server.render_retained_pty_update_and_stream());
+        let retained = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("retained embedded frame"),
+        );
+        assert!(retained.cells.iter().any(|cell| cell.symbol == "Z"));
+        assert!(!frame_text(&retained).contains(" hosts"));
+        assert!(frame_text(&retained).starts_with(" spaces"));
+        assert_frame_data_eq(
+            server.clients[&1]
+                .render_state
+                .last_frame()
+                .expect("embedded retained baseline"),
+            &retained,
+        );
     }
 
     #[tokio::test]

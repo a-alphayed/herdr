@@ -189,7 +189,7 @@ impl GlassGeometry {
             requested_encoding: crate::protocol::RenderEncoding::TerminalAnsi,
             keybindings: crate::protocol::ClientKeybindings::Server,
             launch_mode: crate::protocol::ClientLaunchMode::App,
-            view_context: crate::protocol::ViewContext::Standalone,
+            view_context: crate::protocol::ViewContext::Embedded,
         }
     }
 
@@ -1977,7 +1977,7 @@ mod tests {
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 keybindings: ClientKeybindings::Server,
                 launch_mode: ClientLaunchMode::App,
-                view_context: crate::protocol::ViewContext::Standalone,
+                view_context: crate::protocol::ViewContext::Embedded,
             }
         );
     }
@@ -2732,7 +2732,7 @@ mod tests {
                 version: crate::protocol::PROTOCOL_VERSION,
                 requested_encoding: RenderEncoding::TerminalAnsi,
                 launch_mode: ClientLaunchMode::App,
-                view_context: crate::protocol::ViewContext::Standalone,
+                view_context: crate::protocol::ViewContext::Embedded,
                 ..
             }
         ));

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::protocol::RenderEncoding;
+use crate::protocol::{RenderEncoding, ViewContext};
 use crate::server::client_transport::ClientWriter;
 use crate::server::render_stream::ClientRenderState;
 
@@ -17,6 +17,7 @@ pub(crate) type RenderTarget = (
     (u16, u16),
     crate::kitty_graphics::HostCellSize,
     bool,
+    ViewContext,
     ClientConnectionMode,
 );
 
@@ -24,6 +25,9 @@ pub(crate) type RenderTarget = (
 pub(crate) struct ClientConnection {
     /// Whether this connection is the full app client or a direct terminal attach.
     pub(crate) mode: ClientConnectionMode,
+    /// Per-client App layout context declared during the handshake. Kept
+    /// immutable so a retained render baseline cannot outlive its layout.
+    view_context: ViewContext,
     /// True after the handshake for clients that will switch into direct terminal attach mode.
     pub(crate) pending_terminal_attach: bool,
     /// Client-local app keybindings. None means use the server's keybindings.
@@ -77,8 +81,32 @@ impl ClientConnection {
         render_encoding: RenderEncoding,
         writer: Option<ClientWriter>,
     ) -> Self {
+        Self::new_with_view_context(
+            terminal_size,
+            cell_size,
+            host_terminal_theme,
+            outer_terminal_focus,
+            last_activity,
+            render_encoding,
+            ViewContext::Standalone,
+            writer,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_view_context(
+        terminal_size: (u16, u16),
+        cell_size: crate::kitty_graphics::HostCellSize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        outer_terminal_focus: Option<bool>,
+        last_activity: u64,
+        render_encoding: RenderEncoding,
+        view_context: ViewContext,
+        writer: Option<ClientWriter>,
+    ) -> Self {
         Self::new_with_mode(
             ClientConnectionMode::App,
+            view_context,
             None,
             terminal_size,
             cell_size,
@@ -93,6 +121,7 @@ impl ClientConnection {
 
     pub(crate) fn new_with_mode(
         mode: ClientConnectionMode,
+        view_context: ViewContext,
         keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
         terminal_size: (u16, u16),
         cell_size: crate::kitty_graphics::HostCellSize,
@@ -105,6 +134,7 @@ impl ClientConnection {
     ) -> Self {
         Self {
             mode,
+            view_context,
             pending_terminal_attach,
             keybindings,
             terminal_size,
@@ -148,6 +178,10 @@ impl ClientConnection {
 
     pub(crate) fn is_full_app_client(&self) -> bool {
         matches!(self.mode, ClientConnectionMode::App) && !self.pending_terminal_attach
+    }
+
+    pub(crate) fn view_context(&self) -> ViewContext {
+        self.view_context
     }
 
     pub(crate) fn request_semantic_redraw_after_input(&mut self) {
@@ -280,11 +314,12 @@ pub(crate) fn render_targets(
                 client.terminal_size,
                 client.cell_size,
                 foreground_client_id == Some(client_id),
+                client.view_context,
                 client.mode.clone(),
             )
         })
         .collect();
 
-    targets.sort_by_key(|(client_id, _, _, is_foreground, _)| (*is_foreground, *client_id));
+    targets.sort_by_key(|(client_id, _, _, is_foreground, _, _)| (*is_foreground, *client_id));
     targets
 }
