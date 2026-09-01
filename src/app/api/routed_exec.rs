@@ -66,7 +66,7 @@ use crate::remote::{
     completion_from_parts, one_shot_full_request, one_shot_prepared_request,
     production_transport_starter, release_persistent_bridge_active, remote_agent_bridge_pool,
     return_persistent_bridge, routed_sequence_worker, synthetic_indeterminate_final,
-    OneShotFullLeg, OneShotPreparedLeg, PrimaryResult, RefreshLegOutcome, RemoteAgentBridgePool,
+    OneShotFullLeg, OneShotPreparedLeg, RefreshLegOutcome, RemoteAgentBridgePool,
     RemoteApiBridgeState, RoutedCompletion, RoutedRefreshSpec, RoutedSequenceSpec, SequenceFinal,
     WorkerFinished, WorkerTransport,
 };
@@ -100,17 +100,11 @@ const ROUTED_PERMIT_WAIT_MAX: Duration = Duration::from_secs(30);
 // Completion sink
 // ---------------------------------------------------------------------------
 
-/// Exactly-once completion sink for one routed sequence. `ApiResponder`
-/// resolves an API client's response channel; `UiCreate` resolves the remote
-/// workspace-create UI flow through its tokenized `AppEvent`s (the same events
-/// the inline worker emits today). Both variants are dropped-receiver safe.
+/// Exactly-once completion sink for one routed sequence.
 pub(crate) enum CompletionSink {
     ApiResponder {
         respond_to: mpsc::Sender<String>,
         request_id: String,
-    },
-    UiCreate {
-        token: u64,
     },
 }
 
@@ -132,10 +126,6 @@ impl CompletionSink {
                     });
                 let _ = respond_to.send(value);
             }
-            Self::UiCreate { .. } => {
-                // Create sinks resolve through events (see resolve_create);
-                // success application is the event handler's job.
-            }
         }
     }
 
@@ -147,7 +137,6 @@ impl CompletionSink {
             } => {
                 let _ = respond_to.send(encode_error(request_id, code, message));
             }
-            Self::UiCreate { .. } => {}
         }
     }
 }
@@ -162,9 +151,8 @@ pub(crate) struct RoutedSequenceDescriptor {
     pub(crate) source_generation: Option<u64>,
     pub(crate) bridge_state: Option<RemoteApiBridgeState>,
     pub(crate) spec: RoutedSequenceSpec,
-    /// Set by the dispatch site: the API seam fills the responder, internal
-    /// TUI dispatches use a dropped-receiver channel (fire-and-forget), and
-    /// the create flow uses the UI-event sink. `None` resolves nothing.
+    /// Set by the dispatch site: the API seam fills the responder and internal
+    /// TUI dispatches may use `None` for fire-and-forget work.
     pub(crate) sink: Option<CompletionSink>,
 }
 
@@ -286,27 +274,6 @@ impl RoutedExecutorPool {
         Ok(())
     }
 
-    /// Cancel a STILL-QUEUED create descriptor (UI token expiry cancel hook).
-    /// Returns the removed descriptor so the caller resolves it
-    /// cancelled-before-write (it never executes late); an EXECUTING
-    /// descriptor cannot be retracted and runs to completion (there is no
-    /// deadline to bound it — see the module contract).
-    pub(crate) fn cancel_queued_create(
-        &self,
-        host: &RemoteHostKey,
-        token: u64,
-    ) -> Option<RoutedSequenceDescriptor> {
-        let mut inner = self.lock();
-        let host_queue = inner.hosts.get_mut(host)?;
-        let position = host_queue.queue.iter().position(|descriptor| {
-            matches!(
-                &descriptor.sink,
-                Some(CompletionSink::UiCreate { token: pending }) if *pending == token
-            )
-        })?;
-        host_queue.queue.remove(position)
-    }
-
     /// H6 (plan v6/v8: a generation bump cancels ALL queued descriptors as
     /// cancelled-before-write): drain every STILL-QUEUED descriptor for
     /// `host` — pane/tab/workspace mutations and any queued create alike.
@@ -382,15 +349,6 @@ impl RoutedExecutorPool {
         };
         for descriptor in cancelled {
             match descriptor.sink {
-                Some(CompletionSink::UiCreate { token }) => {
-                    resolve_create_failure(
-                        &self.env,
-                        host.clone(),
-                        token,
-                        "remote host generation changed before this request executed; safe to retry"
-                            .to_string(),
-                    );
-                }
                 Some(CompletionSink::ApiResponder {
                     respond_to,
                     request_id,
@@ -638,19 +596,13 @@ enum TerminalOutcome {
     PermitWaitExpired,
 }
 
-/// H5: `CompletionSink::resolve_success`/`resolve_error` are deliberate
-/// no-ops for `UiCreate` (a create resolves through its own tokenized
-/// `AppEvent`s, never through the generic sink). Every terminal path below
-/// must therefore pair a `UiCreate` sink with the RIGHT create event itself —
-/// a bare `sink.resolve_error(...)`/`resolve_success(...)` call alone
-/// silently strands the pending create spinner forever for that branch.
 fn resolve_sink_terminal(
-    env: &RoutedEnv,
+    _env: &RoutedEnv,
     descriptor: RoutedSequenceDescriptor,
     outcome: TerminalOutcome,
 ) {
     let RoutedSequenceDescriptor {
-        host_key,
+        host_key: _,
         source_generation: _,
         sink,
         ..
@@ -659,49 +611,23 @@ fn resolve_sink_terminal(
         return;
     };
     match outcome {
-        TerminalOutcome::PreWriteFailure(message) => match sink {
-            CompletionSink::ApiResponder { .. } => {
-                sink.resolve_error("remote_request_failed", message);
-            }
-            CompletionSink::UiCreate { token } => {
-                resolve_create_failure(env, host_key, token, message);
-            }
-        },
+        TerminalOutcome::PreWriteFailure(message) => {
+            sink.resolve_error("remote_request_failed", message);
+        }
         TerminalOutcome::PermitWaitExpired => {
             // FIX-1: the SAME busy signal the FIFO-overflow path already
             // uses (`RoutedEnqueueError::Busy`) — no permit was ever held,
             // no transport was ever opened, nothing to retry-unsafely repeat.
             let message =
                 "remote host mutation queue is saturated (permit wait exceeded); retry shortly";
-            match sink {
-                CompletionSink::ApiResponder { .. } => {
-                    sink.resolve_error("remote_bridge_busy", message);
-                }
-                CompletionSink::UiCreate { token } => {
-                    resolve_create_failure(env, host_key, token, message.to_string());
-                }
-            }
+            sink.resolve_error("remote_bridge_busy", message);
         }
     }
 }
 
-/// Emit the terminal create event for a definitive failure (pre-write
-/// failure or an indeterminate outcome): never a silent no-op that strands
-/// the pending create spinner (H5).
-fn resolve_create_failure(env: &RoutedEnv, host_key: RemoteHostKey, token: u64, message: String) {
-    let _ = env
-        .event_tx
-        .blocking_send(AppEvent::RemoteWorkspaceCreateFailed {
-            host: host_key,
-            token,
-            message,
-        });
-}
-
 /// Normal completion: resolve the sink from the worker's final outcome and
 /// emit the generation-stamped completion event (state application through
-/// the reducer only). A create (`UiCreate`) sink resolves through the create
-/// events instead.
+/// the reducer only).
 impl RoutedExecutorPool {
     /// REQ-4/REQ-5: a post-write transport/protocol error (EOF, broken pipe,
     /// or any other primary-leg failure at or after the first write attempt
@@ -724,13 +650,7 @@ impl RoutedExecutorPool {
             .as_ref()
             .map(|refresh| refresh.workspace_id.clone());
         let apply = descriptor.spec.apply.clone();
-        let completion_event = if matches!(descriptor.sink, Some(CompletionSink::UiCreate { .. })) {
-            // Create sinks resolve through the create events (which apply the
-            // workspace cache), not the generic completion event.
-            None
-        } else {
-            completion_from_parts(final_, stale_workspace_id, apply)
-        };
+        let completion_event = completion_from_parts(final_, stale_workspace_id, apply);
 
         let RoutedSequenceDescriptor {
             host_key: descriptor_host_key,
@@ -759,57 +679,23 @@ impl RoutedExecutorPool {
             return;
         };
         match taxonomy {
-            TaxonomyChoice::PreWriteFailure => match sink {
-                CompletionSink::ApiResponder { .. } => {
-                    sink.resolve_error("remote_request_failed", final_.primary_error_message());
+            TaxonomyChoice::PreWriteFailure => {
+                sink.resolve_error("remote_request_failed", final_.primary_error_message());
+            }
+            TaxonomyChoice::Completed | TaxonomyChoice::PrimaryPreserved => {
+                if let Ok(primary) = final_.primary.as_ref() {
+                    sink.resolve_success(primary);
                 }
-                CompletionSink::UiCreate { token } => {
-                    // H5: never a silent no-op — the create definitely never
-                    // reached the remote (pre-write), resolve it as a plain
-                    // failure so the spinner clears and a retry can proceed.
-                    resolve_create_failure(
-                        env,
-                        descriptor_host_key.clone(),
-                        token,
-                        final_.primary_error_message(),
-                    );
-                }
-            },
-            TaxonomyChoice::Completed | TaxonomyChoice::PrimaryPreserved => match sink {
-                CompletionSink::ApiResponder { .. } => {
-                    if let Ok(primary) = final_.primary.as_ref() {
-                        sink.resolve_success(primary);
-                    }
-                }
-                CompletionSink::UiCreate { token } => {
-                    resolve_create_events(env, &descriptor_host_key, token, &final_.primary);
-                }
-            },
-            TaxonomyChoice::Indeterminate => match sink {
-                CompletionSink::ApiResponder { .. } => {
-                    sink.resolve_error(
-                        "remote_request_indeterminate",
-                        format!(
-                            "outcome unknown — refresh before retrying: {}",
-                            final_.primary_error_message()
-                        ),
-                    );
-                }
-                CompletionSink::UiCreate { token } => {
-                    // No claim/uncertain-retry tracking: an indeterminate
-                    // create resolves as a plain failure so the spinner
-                    // clears and a retry can proceed.
-                    resolve_create_failure(
-                        env,
-                        descriptor_host_key.clone(),
-                        token,
-                        format!(
-                            "outcome unknown — refresh before retrying: {}",
-                            final_.primary_error_message()
-                        ),
-                    );
-                }
-            },
+            }
+            TaxonomyChoice::Indeterminate => {
+                sink.resolve_error(
+                    "remote_request_indeterminate",
+                    format!(
+                        "outcome unknown — refresh before retrying: {}",
+                        final_.primary_error_message()
+                    ),
+                );
+            }
         }
 
         // Generation-stamped completion event for state application (refresh
@@ -824,39 +710,6 @@ impl RoutedExecutorPool {
                 });
         }
     }
-}
-
-/// Resolve a `UiCreate` sink from any available primary result (authoritative
-/// success/error, or a definitive transport error) by parsing it exactly like
-/// a normal completion would.
-fn resolve_create_events(
-    env: &RoutedEnv,
-    host_key: &RemoteHostKey,
-    token: u64,
-    primary: &PrimaryResult,
-) {
-    let event = match primary.as_ref() {
-        Ok(response) => {
-            match crate::app::remote_workspace::parse_remote_workspace_create_response(response) {
-                Ok(workspace) => AppEvent::RemoteWorkspaceCreateSucceeded {
-                    host: host_key.clone(),
-                    token,
-                    workspace,
-                },
-                Err(err) => AppEvent::RemoteWorkspaceCreateFailed {
-                    host: host_key.clone(),
-                    token,
-                    message: err.to_string(),
-                },
-            }
-        }
-        Err(err) => AppEvent::RemoteWorkspaceCreateFailed {
-            host: host_key.clone(),
-            token,
-            message: err.to_io().to_string(),
-        },
-    };
-    let _ = env.event_tx.blocking_send(event);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -900,7 +753,7 @@ fn taxonomy_choice(final_: &SequenceFinal) -> TaxonomyChoice {
 impl SequenceFinal {
     fn primary_error_message(&self) -> String {
         match self.primary.as_ref() {
-            Err(err) => err.message.clone(),
+            Err(err) => err.to_io().to_string(),
             Ok(primary) if !crate::remote::primary_response_parses(primary) => {
                 "primary response did not parse as a valid remote API response".to_string()
             }
@@ -1704,7 +1557,7 @@ mod tests {
     use super::*;
     use crate::api::schema::{Method, WorkspaceRenameParams};
     use crate::app::state::AppState;
-    use crate::remote::{RoutedApply, RoutedIoError, RoutedTaxonomy};
+    use crate::remote::{RoutedApply, RoutedTaxonomy};
     use crate::remote_source::{RemoteConnectionStatus, RemoteSourceCapabilities};
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -2859,11 +2712,8 @@ mod tests {
     /// `start_remote_lifecycle_reconnect`, reached here exactly as
     /// production reaches it, via the internal `RemoteRoutedRecoveryNeeded`
     /// escalation the executor emits on an at-or-after-write failure —
-    /// cancels every STILL-QUEUED descriptor for the host: resolving a
-    /// queued `ApiResponder` with a retryable cancellation, and resolving a
-    /// queued create's `UiCreate` sink with a terminal
-    /// `RemoteWorkspaceCreateFailed` event (never a silent drop, which would
-    /// strand the pending spinner forever). The already-EXECUTING descriptor
+    /// cancels every STILL-QUEUED descriptor for the host by resolving its
+    /// `ApiResponder` with a retryable cancellation. The already-EXECUTING descriptor
     /// is untouched. Round 3 specifically faulted the prior version of this
     /// test for exercising `RemoteSourceDisconnected` directly instead of the
     /// real transition; this drives the actual transition.
@@ -2908,44 +2758,11 @@ mod tests {
             .enqueue(mutation_descriptor(&host, respond2))
             .expect("enqueue #2");
 
-        // #3: a queued CREATE.
-        let create_token = 55u64;
-        let create_descriptor = RoutedSequenceDescriptor {
-            host_key: host_key.clone(),
-            host: host.clone(),
-            source_generation: None,
-            bridge_state: None,
-            spec: RoutedSequenceSpec {
-                primary: Request {
-                    id: "create-55".to_string(),
-                    method: Method::WorkspaceCreate(crate::api::schema::WorkspaceCreateParams {
-                        cwd: None,
-                        focus: true,
-                        label: None,
-                        env: Default::default(),
-                    }),
-                },
-                refresh: None,
-                tab_list_capable: false,
-                layout_export_capable: false,
-                apply: RoutedApply::WorkspaceCreate {
-                    token: create_token,
-                },
-            },
-            sink: Some(CompletionSink::UiCreate {
-                token: create_token,
-            }),
-        };
-        harness
-            .executor
-            .enqueue(create_descriptor)
-            .expect("enqueue #3 (create)");
-
         // Drive the ACTUAL recovery transition (REQ-2): the internal event
         // the executor emits on an at-or-after-write failure, which routes
         // through `App::start_remote_routed_recovery` ->
         // `start_remote_lifecycle_reconnect` — never `RemoteSourceDisconnected`
-        // directly. Drains #2 and #3 (still queued); #1 (executing, blocked
+        // directly. Drains #2 (still queued); #1 (executing, blocked
         // on its real child) is untouched.
         app.handle_internal_event(AppEvent::RemoteRoutedRecoveryNeeded {
             host: host_key.clone(),
@@ -2957,25 +2774,6 @@ mod tests {
             response2.contains("remote_request_cancelled"),
             "response: {response2}"
         );
-        // The queued create's `UiCreate` sink resolves through a terminal
-        // failure event, never silently — the pending spinner would
-        // otherwise hang forever.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut resolved = false;
-        while Instant::now() < deadline {
-            while let Ok(event) = app.event_rx.try_recv() {
-                if let AppEvent::RemoteWorkspaceCreateFailed { token, .. } = event {
-                    assert_eq!(token, create_token);
-                    resolved = true;
-                }
-            }
-            if resolved {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(resolved, "queued create must resolve as a terminal failure");
-
         // The recovery transition itself actually ran: the generation-41
         // supervisor was retired and a fresh one started.
         assert!(
@@ -3641,229 +3439,6 @@ mod tests {
                 .any(|handle| handle.host_key == host_key),
             "a fresh supervisor must be started after admitted recovery"
         );
-    }
-
-    // --- UI (create) sink ----------------------------------------------------
-
-    #[test]
-    fn ui_create_sink_resolves_exactly_once_on_success() {
-        let mut harness = harness();
-        let host = test_host(&unique_host("create"));
-        let leg = register_fake_leg(&host.name);
-        let workspace = workspace_info("ws-new");
-        leg.push_response(Ok(serde_json::to_string(&SuccessResponse {
-            id: "remote-workspace.create.1".to_string(),
-            result: ResponseResult::WorkspaceCreated {
-                workspace: workspace.clone(),
-                tab: crate::api::schema::TabInfo {
-                    tab_id: "tab-1".to_string(),
-                    workspace_id: "ws-new".to_string(),
-                    number: 1,
-                    label: "1".to_string(),
-                    focused: true,
-                    pane_count: 1,
-                    agent_status: crate::api::schema::AgentStatus::Unknown,
-                },
-                root_pane: crate::api::schema::PaneInfo {
-                    pane_id: "pane-1".to_string(),
-                    terminal_id: "term-1".to_string(),
-                    workspace_id: "ws-new".to_string(),
-                    tab_id: "tab-1".to_string(),
-                    cwd: None,
-                    foreground_cwd: None,
-                    label: None,
-                    focused: true,
-                    agent: None,
-                    agent_status: crate::api::schema::AgentStatus::Unknown,
-                    title: None,
-                    display_agent: None,
-                    custom_status: None,
-                    state_labels: std::collections::HashMap::new(),
-                    agent_session: None,
-                    revision: 1,
-                },
-            },
-        })
-        .unwrap()));
-
-        let descriptor = RoutedSequenceDescriptor {
-            host_key: RemoteHostKey::new(&host.name, &host.session),
-            host,
-            source_generation: None,
-            bridge_state: None,
-            spec: RoutedSequenceSpec {
-                primary: Request {
-                    id: "remote-workspace.create.1".to_string(),
-                    method: Method::WorkspaceCreate(crate::api::schema::WorkspaceCreateParams {
-                        cwd: None,
-                        focus: true,
-                        label: None,
-                        env: Default::default(),
-                    }),
-                },
-                refresh: None,
-                tab_list_capable: false,
-                layout_export_capable: false,
-                apply: RoutedApply::WorkspaceCreate { token: 1 },
-            },
-            sink: Some(CompletionSink::UiCreate { token: 1 }),
-        };
-        harness.executor.enqueue(descriptor).expect("enqueue");
-
-        // Exactly ONE create event resolves the UI sink.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut successes = 0;
-        while Instant::now() < deadline {
-            while let Ok(event) = harness.event_rx.try_recv() {
-                match event {
-                    AppEvent::RemoteWorkspaceCreateSucceeded { token, .. } => {
-                        assert_eq!(token, 1);
-                        successes += 1;
-                    }
-                    AppEvent::RemoteWorkspaceCreateFailed { .. } => {
-                        panic!("unexpected create failure event")
-                    }
-                    _ => {}
-                }
-            }
-            if successes == 1 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(successes, 1, "exactly one create-success event");
-        std::thread::sleep(Duration::from_millis(100));
-        while let Ok(event) = harness.event_rx.try_recv() {
-            assert!(
-                !matches!(
-                    event,
-                    AppEvent::RemoteWorkspaceCreateSucceeded { .. }
-                        | AppEvent::RemoteWorkspaceCreateFailed { .. }
-                ),
-                "no second terminal create event"
-            );
-        }
-    }
-
-    /// H5 regression: every terminal path that resolves a `UiCreate` sink
-    /// must emit a matching create `AppEvent` — `resolve_success`/
-    /// `resolve_error` are deliberate no-ops for `UiCreate`, so a branch that
-    /// only calls those (without ALSO emitting the event) silently strands
-    /// the pending spinner forever. Exercises `resolve_sink_terminal`'s
-    /// `PreWriteFailure` (v11 removed the deadline/kill/classification
-    /// machinery, so `resolve_normal` resolves every worker-completion
-    /// outcome directly from the worker's own result; `PermitWaitExpired`,
-    /// FIX-1's other `TerminalOutcome` variant, is covered separately by
-    /// `saturated_permit_wait_expires_with_busy_error_not_a_reconnect`), plus
-    /// `resolve_normal`'s `PreWriteFailure` and `Indeterminate` (no claim/
-    /// uncertain-retry tracking anymore — an indeterminate outcome resolves
-    /// as a plain failure).
-    #[test]
-    fn ui_create_sink_resolves_on_every_terminal_path() {
-        fn descriptor_for(token: u64) -> RoutedSequenceDescriptor {
-            RoutedSequenceDescriptor {
-                host_key: RemoteHostKey::new("h5host", crate::session::DEFAULT_SESSION_NAME),
-                host: test_host("h5host"),
-                source_generation: None,
-                bridge_state: None,
-                spec: RoutedSequenceSpec {
-                    primary: Request {
-                        id: format!("create-{token}"),
-                        method: Method::WorkspaceCreate(
-                            crate::api::schema::WorkspaceCreateParams {
-                                cwd: None,
-                                focus: true,
-                                label: None,
-                                env: Default::default(),
-                            },
-                        ),
-                    },
-                    refresh: None,
-                    tab_list_capable: false,
-                    layout_export_capable: false,
-                    apply: RoutedApply::WorkspaceCreate { token },
-                },
-                sink: Some(CompletionSink::UiCreate { token }),
-            }
-        }
-
-        fn drain_next(event_rx: &mut tokio_mpsc::Receiver<AppEvent>) -> AppEvent {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                if let Ok(event) = event_rx.try_recv() {
-                    if matches!(
-                        event,
-                        AppEvent::RemoteWorkspaceCreateSucceeded { .. }
-                            | AppEvent::RemoteWorkspaceCreateFailed { .. }
-                    ) {
-                        return event;
-                    }
-                }
-                assert!(Instant::now() < deadline, "no terminal create event");
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-
-        // 1. resolve_sink_terminal / TerminalOutcome::PreWriteFailure.
-        {
-            let mut harness = harness();
-            resolve_sink_terminal(
-                &harness.executor.env,
-                descriptor_for(101),
-                TerminalOutcome::PreWriteFailure("connect refused".to_string()),
-            );
-            match drain_next(&mut harness.event_rx) {
-                AppEvent::RemoteWorkspaceCreateFailed { token, .. } => assert_eq!(token, 101),
-                other => panic!("expected create-failed, got {other:?}"),
-            }
-        }
-
-        // 2. resolve_normal / TaxonomyChoice::Indeterminate: no claim/
-        //    uncertain-retry tracking — the create resolves as a plain
-        //    failure so the spinner clears and a retry can proceed.
-        {
-            let mut harness = harness();
-            let host_key = RemoteHostKey::new("h5host", crate::session::DEFAULT_SESSION_NAME);
-            let final_ = SequenceFinal {
-                primary: Err(RoutedIoError {
-                    kind: io::ErrorKind::UnexpectedEof,
-                    message: "eof".to_string(),
-                }),
-                refresh: RefreshLegOutcome::None,
-                wrote: true,
-                route: "pooled",
-            };
-            harness
-                .executor
-                .resolve_normal(&host_key, descriptor_for(102), &final_);
-            match drain_next(&mut harness.event_rx) {
-                AppEvent::RemoteWorkspaceCreateFailed { token, .. } => assert_eq!(token, 102),
-                other => panic!("expected create-failed, got {other:?}"),
-            }
-        }
-
-        // 3. resolve_normal / TaxonomyChoice::PreWriteFailure: the worker
-        //    completed normally but never attempted a write.
-        {
-            let mut harness = harness();
-            let host_key = RemoteHostKey::new("h5host", crate::session::DEFAULT_SESSION_NAME);
-            let final_ = SequenceFinal {
-                primary: Err(RoutedIoError {
-                    kind: io::ErrorKind::ConnectionRefused,
-                    message: "spawn failed".to_string(),
-                }),
-                refresh: RefreshLegOutcome::None,
-                wrote: false,
-                route: "one_shot_full",
-            };
-            harness
-                .executor
-                .resolve_normal(&host_key, descriptor_for(103), &final_);
-            match drain_next(&mut harness.event_rx) {
-                AppEvent::RemoteWorkspaceCreateFailed { token, .. } => assert_eq!(token, 103),
-                other => panic!("expected create-failed, got {other:?}"),
-            }
-        }
     }
 
     // --- refresh application through the reducer ----------------------------

@@ -60,8 +60,7 @@ impl App {
         // keys go only to the current live controller stream as STRUCTURED
         // input; the authoritative remote TerminalRuntime encodes its keyboard
         // protocol/modes. Unsupported/stale/owned states consume fail-closed and
-        // never fall through to a local pane. The old plain-Enter
-        // `request_remote_attach_in_new_split` path is deliberately removed.
+        // never fall through to a local pane.
         if self.state.remote_projection_surface_active() {
             if let Some(code) = crate::protocol::ClientKeyCode::from_crossterm(key_event.code) {
                 let _ = self.remote_projection_runtime.send_input(
@@ -1272,14 +1271,10 @@ mod tests {
             prepared.is_none(),
             "terminal key must not forward while a remote space is projected"
         );
-        // Projection selection must remain: the key was dropped, not an attach.
+        // Projection selection must remain: the key was dropped.
         assert!(
             app.state.selected_remote_space.is_some(),
             "projection selection must remain after projected input"
-        );
-        assert!(
-            app.state.request_remote_attach_in_new_split.is_none(),
-            "no attach must be scheduled for a non-Enter key while projected"
         );
     }
 
@@ -1319,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn plain_enter_on_live_focused_projection_pane_never_schedules_new_split() {
+    fn plain_enter_on_live_focused_projection_pane_stays_projected() {
         let mut app = app_projected_with_live_pane(true, true, true);
 
         let result = app
@@ -1333,22 +1328,14 @@ mod tests {
             app.state.selected_remote_space.is_some(),
             "in-place projection remains selected"
         );
-        assert!(
-            app.state.request_remote_attach_in_new_split.is_none(),
-            "projected Enter must never create a local split/PTY"
-        );
     }
 
     #[test]
-    fn plain_enter_on_projection_without_terminal_id_does_not_schedule_attach() {
+    fn plain_enter_on_projection_without_terminal_id_stays_projected() {
         let mut app = app_projected_with_live_pane(true, true, false);
 
         app.prepare_terminal_key_forward(TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()));
 
-        assert!(
-            app.state.request_remote_attach_in_new_split.is_none(),
-            "no attach when focused pane has no terminal_id"
-        );
         assert!(
             app.state.selected_remote_space.is_some(),
             "projection stays selected when no terminal_id"
@@ -1356,39 +1343,29 @@ mod tests {
     }
 
     #[test]
-    fn plain_enter_on_stale_projection_pane_does_not_schedule_attach() {
+    fn plain_enter_on_stale_projection_pane_is_consumed() {
         let mut app = app_projected_with_live_pane(false, true, true);
 
         app.prepare_terminal_key_forward(TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()));
 
-        assert!(
-            app.state.request_remote_attach_in_new_split.is_none(),
-            "no attach for stale/unavailable projection pane"
-        );
+        assert!(app.state.selected_remote_space.is_some());
     }
 
     #[test]
-    fn plain_enter_on_non_focused_live_pane_does_not_schedule_attach() {
+    fn plain_enter_on_non_focused_live_pane_is_consumed() {
         let mut app = app_projected_with_live_pane(true, false, true);
 
         app.prepare_terminal_key_forward(TerminalKey::new(KeyCode::Enter, KeyModifiers::empty()));
 
-        assert!(
-            app.state.request_remote_attach_in_new_split.is_none(),
-            "no attach when the pane is not focused"
-        );
+        assert!(app.state.selected_remote_space.is_some());
     }
 
     #[test]
-    fn modified_enter_while_projected_does_not_schedule_attach() {
+    fn modified_enter_while_projected_stays_projected() {
         let mut app = app_projected_with_live_pane(true, true, true);
 
         app.prepare_terminal_key_forward(TerminalKey::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
-        assert!(
-            app.state.request_remote_attach_in_new_split.is_none(),
-            "modified Enter must not schedule attach"
-        );
         assert!(
             app.state.selected_remote_space.is_some(),
             "projection stays selected for modified Enter"

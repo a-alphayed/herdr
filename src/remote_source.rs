@@ -64,12 +64,6 @@ impl RemoteAttachTarget {
             terminal_id: self.terminal_id.clone(),
         }
     }
-
-    pub(crate) fn same_remote_terminal(&self, other: &Self) -> bool {
-        self.host == other.host
-            && self.session == other.session
-            && self.terminal_id == other.terminal_id
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -683,10 +677,6 @@ impl RemoteSourceCache {
         self.hosts.get(host).map(|host_cache| host_cache.status)
     }
 
-    pub(crate) fn host_supports_workspace_create(&self, host: &RemoteHostKey) -> bool {
-        self.host_capabilities(host).workspace_create
-    }
-
     pub(crate) fn upsert_workspace(&mut self, host: RemoteHostKey, workspace: WorkspaceInfo) {
         let host_cache = self.hosts.entry(host).or_default();
         let workspaces = host_cache.workspaces.get_or_insert_with(BTreeMap::new);
@@ -1073,7 +1063,6 @@ mod tests {
     fn remote_source_capabilities_are_host_scoped() {
         let mut cache = RemoteSourceCache::default();
         let capable = RemoteHostKey::new("jafar", "default");
-        let other = RemoteHostKey::new("work", "default");
 
         assert_eq!(
             cache.host_capabilities(&capable),
@@ -1093,7 +1082,6 @@ mod tests {
             },
         );
 
-        assert!(cache.host_supports_workspace_create(&capable));
         assert_eq!(
             cache.host_capabilities(&capable),
             RemoteSourceCapabilities {
@@ -1107,7 +1095,6 @@ mod tests {
                 ..Default::default()
             }
         );
-        assert!(!cache.host_supports_workspace_create(&other));
     }
 
     #[test]

@@ -16,7 +16,6 @@ mod ids;
 mod input;
 mod remote_attach;
 mod remote_projection;
-mod remote_workspace;
 mod runtime;
 mod runtime_mutations;
 mod session;
@@ -702,7 +701,6 @@ impl App {
             remote_projection_generation: 0,
             remote_projection_frames: std::collections::BTreeMap::new(),
             host_glass_states: std::collections::BTreeMap::new(),
-            selected_remote_agent: None,
             selected,
             mode,
             should_quit: false,
@@ -720,17 +718,11 @@ impl App {
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
-            request_remote_attach: None,
-            request_remote_attach_in_new_split: None,
             request_remote_detach_view: None,
-            request_remote_workspace_create: None,
-            pending_remote_attach: None,
             pending_remote_projected_pane_close: None,
             pending_remote_projected_tab_close: None,
             rename_remote_pane_target: None,
-            pending_remote_workspace_creates: std::collections::BTreeMap::new(),
             remote_routed_reconciled: std::collections::BTreeMap::new(),
-            next_remote_workspace_create_token: 1,
             creating_new_tab: false,
             requested_new_tab_name: None,
             rename_pane_target: None,
@@ -2068,9 +2060,6 @@ impl App {
             Mode::ConfirmClose => {
                 self.handle_confirm_close_key_via_api(key_event);
             }
-            Mode::ConfirmRemoteAttach => {
-                self.handle_confirm_remote_attach_key(key_event);
-            }
             Mode::ConfirmRemoteProjectedPaneClose => {
                 self.handle_confirm_remote_projected_pane_close_key(key_event);
             }
@@ -2105,8 +2094,6 @@ impl App {
                 // Should not be called in terminal mode.
             }
         }
-        self.drain_remote_attach_request();
-        self.drain_remote_attach_in_new_split_request();
         self.drain_remote_detach_view_request();
     }
 

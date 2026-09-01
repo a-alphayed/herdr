@@ -22,8 +22,7 @@ mod text;
 mod widgets;
 
 use self::dialogs::{
-    render_confirm_close_overlay, render_confirm_remote_attach_overlay,
-    render_confirm_remote_projected_pane_close_overlay,
+    render_confirm_close_overlay, render_confirm_remote_projected_pane_close_overlay,
     render_confirm_remote_projected_tab_close_overlay, render_new_linked_worktree_overlay,
     render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
 };
@@ -57,10 +56,7 @@ use self::settings::render_settings_overlay;
 /// re-exported for non-test cross-module use.
 pub(crate) use self::sidebar::host_list_entries;
 #[cfg(test)]
-pub(crate) use self::sidebar::{
-    all_source_agent_panel_entries, compute_workspace_list_areas, host_list_row_areas,
-    WorkspaceListRemoteRowArea,
-};
+pub(crate) use self::sidebar::host_list_row_areas;
 use self::sidebar::{render_sidebar, render_sidebar_collapsed};
 use self::status::{
     copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_toast_notification,
@@ -69,8 +65,8 @@ use self::status::{
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
     dialogs::{
-        confirm_close_button_rects, confirm_close_popup_rect, confirm_remote_attach_button_rects,
-        confirm_remote_attach_inner_rect, confirm_remote_projected_pane_close_button_rects,
+        confirm_close_button_rects, confirm_close_popup_rect,
+        confirm_remote_projected_pane_close_button_rects,
         confirm_remote_projected_pane_close_inner_rect,
         confirm_remote_projected_tab_close_button_rects,
         confirm_remote_projected_tab_close_inner_rect, new_linked_worktree_button_rects,
@@ -93,9 +89,8 @@ pub(crate) use self::{
         workspace_drop_indicator_row, workspace_list_entries, workspace_list_entries_expanded,
         workspace_list_footer_rect, workspace_list_local_actions_rect,
         workspace_list_menu_button_rect, workspace_list_new_button_rect, workspace_list_rect,
-        workspace_list_remote_target_at, workspace_list_scroll_metrics,
-        workspace_list_scrollbar_rect, workspace_parent_group_state, AgentPanelEntry,
-        WorkspaceListEntry, WorkspaceListRemoteTarget,
+        workspace_list_scroll_metrics, workspace_list_scrollbar_rect, workspace_parent_group_state,
+        AgentPanelEntry, WorkspaceListEntry,
     },
 };
 pub(crate) use self::{
@@ -617,9 +612,6 @@ pub(crate) fn render_with_runtime_registry_and_glass(
         Mode::Copy => render_copy_mode_overlay(app, frame, terminal_area),
         Mode::Resize => render_resize_overlay(app, frame, terminal_area),
         Mode::ConfirmClose => render_confirm_close_overlay(app, frame, terminal_area),
-        Mode::ConfirmRemoteAttach => {
-            render_confirm_remote_attach_overlay(app, frame, terminal_area)
-        }
         Mode::ConfirmRemoteProjectedPaneClose => {
             render_confirm_remote_projected_pane_close_overlay(app, frame, terminal_area)
         }

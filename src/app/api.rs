@@ -1036,17 +1036,6 @@ impl App {
     ) {
         for descriptor in self.routed_executor.cancel_all_queued(host) {
             match descriptor.sink {
-                Some(crate::app::api::routed_exec::CompletionSink::UiCreate { token }) => {
-                    let _ = self
-                        .event_tx
-                        .blocking_send(AppEvent::RemoteWorkspaceCreateFailed {
-                            host: host.clone(),
-                            token,
-                            message:
-                                "remote host generation changed before this request executed; safe to retry"
-                                    .to_string(),
-                        });
-                }
                 Some(crate::app::api::routed_exec::CompletionSink::ApiResponder {
                     respond_to,
                     request_id,

@@ -41,11 +41,6 @@ pub(super) enum MouseAction {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     },
-    FocusRemoteAttachPane {
-        ws_idx: usize,
-        pane_id: crate::layout::PaneId,
-        selected_remote_agent: crate::remote_source::RemoteAgentKey,
-    },
     RemoteProjectedTabCreate {
         target: RemoteProjectedWorkspaceTarget,
     },
@@ -584,12 +579,7 @@ impl AppState {
                         && mouse.row < new_button.y + new_button.height
                         && mouse.column >= new_button.x
                         && mouse.column < new_button.x + new_button.width;
-                    if on_new_button
-                        && matches!(
-                            self.effective_sidebar_source(),
-                            crate::app::state::SidebarSource::Local
-                        )
-                    {
+                    if on_new_button {
                         self.request_new_workspace = true;
                         return None;
                     }
@@ -605,23 +595,6 @@ impl AppState {
                             }
                             ScrollbarClickTarget::Track { offset_from_bottom } => {
                                 self.set_workspace_list_offset_from_bottom(offset_from_bottom);
-                            }
-                        }
-                        return None;
-                    }
-
-                    if let Some(target) =
-                        self.workspace_list_remote_target_at(mouse.column, mouse.row)
-                    {
-                        match target {
-                            crate::ui::WorkspaceListRemoteTarget::Space { key } => {
-                                self.selected_remote_space = Some(key);
-                                self.selected_remote_agent = None;
-                            }
-                            crate::ui::WorkspaceListRemoteTarget::New { host } => {
-                                self.selected_remote_space = None;
-                                self.selected_remote_agent = None;
-                                self.request_remote_workspace_create = Some(host);
                             }
                         }
                         return None;
@@ -688,26 +661,8 @@ impl AppState {
                     if let Some(entry) = self.agent_detail_entry_at(mouse.row) {
                         if let Some((ws_idx, _tab_idx, pane_id)) = entry.local_target() {
                             self.selected_remote_space = None;
-                            self.selected_remote_agent = None;
                             self.mode = Mode::Terminal;
                             return Some(MouseAction::FocusPane { ws_idx, pane_id });
-                        } else if let Some(target) = entry.remote_attach_target() {
-                            let selected_key = target.key();
-                            self.selected_remote_space = None;
-                            self.selected_remote_agent = Some(selected_key.clone());
-                            if let Some((ws_idx, pane_id)) = self.find_remote_attach_pane(&target) {
-                                self.selected_remote_space = None;
-                                self.selected_remote_agent = Some(selected_key.clone());
-                                self.mode = Mode::Terminal;
-                                return Some(MouseAction::FocusRemoteAttachPane {
-                                    ws_idx,
-                                    pane_id,
-                                    selected_remote_agent: selected_key,
-                                });
-                            }
-                        } else {
-                            self.selected_remote_space = None;
-                            self.selected_remote_agent = None;
                         }
                         return None;
                     }
@@ -1252,52 +1207,13 @@ impl AppState {
                 {
                     return None;
                 }
-                if let Some(target) = self.workspace_list_remote_target_at(mouse.column, mouse.row)
-                {
-                    match target {
-                        crate::ui::WorkspaceListRemoteTarget::Space { key } => {
-                            self.selected_remote_space = Some(key.clone());
-                            self.selected_remote_agent = None;
-                            self.context_menu = Some(ContextMenuState {
-                                kind: ContextMenuKind::RemoteSpace { key },
-                                x: mouse.column,
-                                y: mouse.row,
-                                list: MenuListState::new(0),
-                            });
-                            self.mode = Mode::ContextMenu;
-                        }
-                        crate::ui::WorkspaceListRemoteTarget::New { .. } => {
-                            self.selected_remote_space = None;
-                            self.selected_remote_agent = None;
-                        }
-                    }
-                    return None;
-                }
                 if let Some(entry) = self.agent_detail_entry_at(mouse.row) {
-                    if let Some(target) = entry.remote_attach_target() {
-                        let attached_pane = self.remote_attach_pane_target_for(&target);
-                        self.selected_remote_space = None;
-                        self.selected_remote_agent = Some(target.key());
-                        self.context_menu = Some(ContextMenuState {
-                            kind: ContextMenuKind::RemoteAgent {
-                                target,
-                                focused_pane: self.current_remote_attach_pane_target(),
-                                attached_pane,
-                            },
-                            x: mouse.column,
-                            y: mouse.row,
-                            list: MenuListState::new(0),
-                        });
-                        self.mode = Mode::ContextMenu;
-                    } else {
-                        self.selected_remote_space = None;
-                        self.selected_remote_agent = None;
-                    }
+                    let _ = entry;
+                    self.selected_remote_space = None;
                     return None;
                 }
                 if let Some(idx) = self.workspace_at_row(mouse.row) {
                     self.selected_remote_space = None;
-                    self.selected_remote_agent = None;
                     self.selected = idx;
                     let kind = self
                         .workspaces
@@ -4519,10 +4435,6 @@ mod tests {
         assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
         assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
         assert_eq!(app.state.mode, Mode::Terminal);
-        assert!(
-            app.state.request_remote_attach_in_new_split.is_none(),
-            "left-click should not trigger attach"
-        );
         match action {
             Some(MouseAction::RemoteProjectedPaneFocus { target }) => {
                 assert_eq!(target.host, "jafar");
@@ -4577,6 +4489,5 @@ mod tests {
             !matches!(action, Some(MouseAction::RemoteProjectedPaneFocus { .. })),
             "stale projected pane should not return focus action"
         );
-        assert!(app.state.request_remote_attach_in_new_split.is_none());
     }
 }

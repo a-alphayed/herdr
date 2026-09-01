@@ -173,7 +173,6 @@ impl App {
                 Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
                 Mode::Resize => self.handle_resize_key_via_api(key),
                 Mode::ConfirmClose => self.handle_confirm_close_key_via_api(key_event),
-                Mode::ConfirmRemoteAttach => self.handle_confirm_remote_attach_key(key_event),
                 Mode::ConfirmRemoteProjectedPaneClose => {
                     self.handle_confirm_remote_projected_pane_close_key(key_event)
                 }
@@ -192,10 +191,7 @@ impl App {
                 Mode::Terminal => unreachable!(),
             },
         }
-        self.drain_remote_attach_request();
-        self.drain_remote_attach_in_new_split_request();
         self.drain_remote_detach_view_request();
-        self.drain_remote_workspace_create_request();
         self.sync_toast_deadline(previous_toast);
     }
 
@@ -669,10 +665,6 @@ impl App {
     }
 
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if self.handle_confirm_remote_attach_mouse(mouse) {
-            return;
-        }
-
         if self.handle_overlay_mouse(mouse) {
             return;
         }
@@ -765,15 +757,6 @@ impl App {
                     MouseAction::FocusPane { ws_idx, pane_id } => {
                         self.focus_pane_internal_via_api(ws_idx, pane_id)
                     }
-                    MouseAction::FocusRemoteAttachPane {
-                        ws_idx,
-                        pane_id,
-                        selected_remote_agent,
-                    } => {
-                        self.focus_pane_internal_via_api(ws_idx, pane_id);
-                        self.state.selected_remote_space = None;
-                        self.state.selected_remote_agent = Some(selected_remote_agent);
-                    }
                     MouseAction::RemoteProjectedTabCreate { target } => {
                         self.create_remote_projected_tab_via_api(target);
                     }
@@ -806,10 +789,7 @@ impl App {
                 }
             }
         }
-        self.drain_remote_attach_request();
-        self.drain_remote_attach_in_new_split_request();
         self.drain_remote_detach_view_request();
-        self.drain_remote_workspace_create_request();
         self.sync_toast_deadline(previous_toast);
         if previous_settings_section != crate::app::state::SettingsSection::Integrations
             && self.state.settings.section == crate::app::state::SettingsSection::Integrations

@@ -19,10 +19,6 @@ impl TerminalRuntime {
         self.0.runtime_token()
     }
 
-    pub(crate) fn foreground_is_pane_shell(&self) -> Option<bool> {
-        self.0.foreground_is_pane_shell()
-    }
-
     pub fn shutdown(self) {
         self.0.shutdown();
     }

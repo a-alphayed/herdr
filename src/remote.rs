@@ -83,11 +83,10 @@ pub(crate) enum RoutedApply {
     /// The primary response is a `workspace.rename` result: upsert the cached
     /// workspace from it.
     WorkspaceUpsert,
-    /// The primary response is a remote workspace-create result for the given
-    /// UI token: identifies the sequence for `CompletionSink::UiCreate`
-    /// routing. No extra reducer-side cache application beyond the generic
-    /// reconciliation stamp — the create's own terminal events
-    /// (`RemoteWorkspaceCreateSucceeded`/`Failed`) apply the workspace.
+    /// The primary response is a remote workspace-create result. Preserve the
+    /// request token in the taxonomy for callers that need to correlate the
+    /// generic routed sequence; cache reconciliation remains generic.
+    #[allow(dead_code)] // Retained for generic routed workspace-create API taxonomy.
     WorkspaceCreate { token: u64 },
 }
 

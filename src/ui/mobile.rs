@@ -117,13 +117,12 @@ fn rendered_mobile_workspace_entries(entries: &[WorkspaceListEntry]) -> Vec<Mobi
     entries
         .iter()
         .enumerate()
-        .filter_map(|(source_idx, entry)| match entry {
-            WorkspaceListEntry::Workspace { ws_idx, indented } => Some(MobileWorkspaceEntry {
+        .map(|(source_idx, entry)| match entry {
+            WorkspaceListEntry::Workspace { ws_idx, indented } => MobileWorkspaceEntry {
                 source_idx,
                 ws_idx: *ws_idx,
                 indented: *indented,
-            }),
-            WorkspaceListEntry::RemoteSpace { .. } => None,
+            },
         })
         .collect()
 }

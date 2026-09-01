@@ -227,20 +227,6 @@ pub enum AppEvent {
     /// drains their single ordered, lossless mailbox before handling any event.
     #[cfg_attr(windows, allow(dead_code))]
     HostGlassWake,
-    /// A remote workspace create request succeeded on the authoritative host.
-    RemoteWorkspaceCreateSucceeded {
-        host: RemoteHostKey,
-        token: u64,
-        workspace: WorkspaceInfo,
-    },
-    /// A remote workspace create request failed before a definitive local result.
-    RemoteWorkspaceCreateFailed {
-        host: RemoteHostKey,
-        token: u64,
-        message: String,
-    },
-    /// A remote workspace create request exceeded the local pending deadline.
-    RemoteWorkspaceCreateTimedOut { host: RemoteHostKey, token: u64 },
     /// A routed remote request sequence (primary + refresh legs) completed on
     /// its IO worker — there is no deadline anywhere in this executor (v11;
     /// see `app::api::routed_exec`'s module contract), so "completed" here
@@ -248,8 +234,6 @@ pub enum AppEvent {
     /// a bound expired. Generation-stamped with the descriptor's source
     /// generation; the reducer applies refresh data / stale marking
     /// atomically in one step and records the reconciliation. The legacy
-    /// create-success event (`RemoteWorkspaceCreateSucceeded`) keeps its
-    /// UI-notify role and is untouched by this path.
     // Windows keeps this event in the shared reducer taxonomy even though
     // only the Unix routed executor can construct it.
     #[cfg_attr(windows, allow(dead_code))]

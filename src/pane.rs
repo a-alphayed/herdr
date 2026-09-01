@@ -1003,11 +1003,6 @@ impl PaneRuntimeIo {
         }
     }
 
-    #[cfg(not(unix))]
-    fn foreground_process_group_id(&self) -> Option<u32> {
-        None
-    }
-
     #[cfg(unix)]
     fn begin_handoff(&self, timeout: std::time::Duration) -> std::io::Result<()> {
         match self {
@@ -1416,25 +1411,6 @@ impl PaneRuntime {
 
     pub(crate) fn runtime_token(&self) -> u64 {
         self.runtime_token
-    }
-
-    pub(crate) fn foreground_is_pane_shell(&self) -> Option<bool> {
-        let pid = self.child_pid.load(Ordering::Acquire);
-        if pid == 0 {
-            return None;
-        }
-        let foreground_pgid = self
-            .io
-            .foreground_process_group_id()
-            .or_else(|| crate::platform::foreground_process_group_id(pid));
-        let probe = probe_foreground_process(pid, foreground_pgid);
-        if foreground_pgid.is_none()
-            && probe.process_group_id.is_none()
-            && !probe.foreground_is_pane_shell
-        {
-            return None;
-        }
-        Some(probe.foreground_is_pane_shell)
     }
 
     pub fn shutdown(mut self) {

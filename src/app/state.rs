@@ -843,7 +843,6 @@ pub enum Mode {
     ConfirmRemoveWorktree,
     Resize,
     ConfirmClose,
-    ConfirmRemoteAttach,
     ConfirmRemoteProjectedPaneClose,
     ConfirmRemoteProjectedTabClose,
     ContextMenu,
@@ -1183,23 +1182,12 @@ pub enum ContextMenuKind {
     RemoteProjectedPane {
         target: RemoteProjectedPaneTarget,
     },
-    RemoteAgent {
-        target: crate::remote_source::RemoteAttachTarget,
-        focused_pane: Option<RemoteAttachPaneTarget>,
-        attached_pane: Option<RemoteAttachPaneTarget>,
-    },
     /// A projected remote source (source-rail row) context menu. Carries the
     /// configured-host alias so copy actions can resolve the host config. It is
     /// copy-only and never runs remote commands; right-clicking a rail row must
     /// not switch the active projected source.
     RemoteSource {
         host: crate::remote_source::RemoteHostKey,
-    },
-    /// A projected remote space (workspace list row) context menu. Same copy-only
-    /// semantics as [`ContextMenuKind::RemoteSource`]; the space key carries the
-    /// host alias and projected session.
-    RemoteSpace {
-        key: crate::remote_source::RemoteSpaceKey,
     },
 }
 
@@ -1363,15 +1351,7 @@ impl ContextMenuState {
                 "Split down",
                 "Close pane",
             ],
-            ContextMenuKind::RemoteAgent {
-                attached_pane: Some(_),
-                ..
-            } => &["Focus attached pane", "Detach view"],
-            ContextMenuKind::RemoteAgent {
-                attached_pane: None,
-                ..
-            } => &["Attach to focused pane", "Attach in new split"],
-            ContextMenuKind::RemoteSource { .. } | ContextMenuKind::RemoteSpace { .. } => &[
+            ContextMenuKind::RemoteSource { .. } => &[
                 "Copy remote diagnostics command",
                 "Copy full remote command",
             ],
@@ -1469,18 +1449,6 @@ pub(crate) struct RemoteAttachPaneTarget {
     pub terminal_id: crate::terminal::TerminalId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PendingRemoteAttach {
-    pub target: crate::remote_source::RemoteAttachTarget,
-    pub pane: RemoteAttachPaneTarget,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PendingRemoteWorkspaceCreate {
-    pub(crate) token: u64,
-    pub(crate) deadline: std::time::Instant,
-}
-
 /// All application state — pure data, no channels or async runtime.
 /// Testable without PTYs or a tokio runtime.
 pub struct AppState {
@@ -1521,7 +1489,6 @@ pub struct AppState {
         crate::remote_source::RemoteHostKey,
         crate::app::host_glass::HostGlassState,
     >,
-    pub(crate) selected_remote_agent: Option<crate::remote_source::RemoteAgentKey>,
     pub selected: usize,
     pub mode: Mode,
     pub should_quit: bool,
@@ -1546,17 +1513,9 @@ pub struct AppState {
     /// Set when UI interaction requested a clipboard write that must be
     /// handled by the outer App/event loop instead of directly from AppState.
     pub request_clipboard_write: Option<Vec<u8>>,
-    pub(crate) request_remote_attach: Option<PendingRemoteAttach>,
-    pub(crate) request_remote_attach_in_new_split: Option<crate::remote_source::RemoteAttachTarget>,
     pub(crate) request_remote_detach_view: Option<RemoteAttachPaneTarget>,
-    pub(crate) request_remote_workspace_create: Option<crate::remote_source::RemoteHostKey>,
-    pub(crate) pending_remote_attach: Option<PendingRemoteAttach>,
     pub(crate) pending_remote_projected_pane_close: Option<RemoteProjectedPaneTarget>,
     pub(crate) pending_remote_projected_tab_close: Option<RemoteProjectedTabTarget>,
-    pub(crate) pending_remote_workspace_creates: std::collections::BTreeMap<
-        crate::remote_source::RemoteHostKey,
-        PendingRemoteWorkspaceCreate,
-    >,
     /// Reducer-side reconciliation record (test-observability only — see
     /// `apply_routed_completion` in `app::api::routed_exec`): the last
     /// generation of a routed-sequence completion event the reducer has
@@ -1566,7 +1525,6 @@ pub struct AppState {
     #[cfg_attr(windows, allow(dead_code))]
     pub(crate) remote_routed_reconciled:
         std::collections::BTreeMap<crate::remote_source::RemoteHostKey, u64>,
-    pub(crate) next_remote_workspace_create_token: u64,
     pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
     pub rename_pane_target: Option<PaneId>,
@@ -1753,7 +1711,6 @@ impl AppState {
         };
         self.sidebar_source = source;
         self.selected_remote_space = selected_remote_space;
-        self.selected_remote_agent = None;
         // Source selection is an authority boundary: a projected selection
         // keyed to the old source must not survive it.
         self.projected_selection = None;
@@ -2310,7 +2267,6 @@ impl AppState {
             remote_projection_generation: 0,
             remote_projection_frames: std::collections::BTreeMap::new(),
             host_glass_states: std::collections::BTreeMap::new(),
-            selected_remote_agent: None,
             selected: 0,
             mode: Mode::Navigate,
             should_quit: false,
@@ -2328,16 +2284,10 @@ impl AppState {
             request_reload_config: false,
             request_client_config_reload: false,
             request_clipboard_write: None,
-            request_remote_attach: None,
-            request_remote_attach_in_new_split: None,
             request_remote_detach_view: None,
-            request_remote_workspace_create: None,
-            pending_remote_attach: None,
             pending_remote_projected_pane_close: None,
             pending_remote_projected_tab_close: None,
-            pending_remote_workspace_creates: std::collections::BTreeMap::new(),
             remote_routed_reconciled: std::collections::BTreeMap::new(),
-            next_remote_workspace_create_token: 1,
             creating_new_tab: false,
             requested_new_tab_name: None,
             rename_pane_target: None,
@@ -2804,20 +2754,8 @@ impl AppState {
                         assert_live_pane(source_pane_id, "context menu source pane");
                     }
                 }
-                ContextMenuKind::RemoteProjectedPane { .. } => {}
-                ContextMenuKind::RemoteSource { .. } | ContextMenuKind::RemoteSpace { .. } => {}
-                ContextMenuKind::RemoteAgent {
-                    ref focused_pane,
-                    ref attached_pane,
-                    ..
-                } => {
-                    if let Some(pane) = focused_pane {
-                        assert_live_pane(pane.pane_id, "remote agent focused pane");
-                    }
-                    if let Some(pane) = attached_pane {
-                        assert_live_pane(pane.pane_id, "remote agent attached pane");
-                    }
-                }
+                ContextMenuKind::RemoteProjectedPane { .. }
+                | ContextMenuKind::RemoteSource { .. } => {}
             }
         }
     }
