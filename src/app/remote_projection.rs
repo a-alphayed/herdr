@@ -11,11 +11,10 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 #[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::{
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
     Arc, Mutex,
 };
 #[cfg(unix)]
@@ -41,6 +40,271 @@ struct ProjectionSignature {
     source: RemoteSpaceKey,
     prepared_shell_path: String,
     streams: Vec<DesiredStream>,
+}
+
+#[cfg(unix)]
+const SELECTED_HOST_BRIDGE_MAX_STREAMS: usize = crate::app::api::MAX_LAYOUT_PANES + 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectedHostBridgeConsumer {
+    Projection,
+    HostGlass,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SelectedHostBridgeSignature {
+    host: RemoteHostKey,
+    prepared_shell_path: String,
+}
+
+#[cfg(unix)]
+struct RetiredSelectedHostBridge {
+    bridge: crate::remote::SshStdioBridge,
+    local_socket: PathBuf,
+}
+
+#[cfg(unix)]
+struct SelectedHostBridgeReaper {
+    tx: std::sync::mpsc::Sender<RetiredSelectedHostBridge>,
+}
+
+#[cfg(unix)]
+type SelectedHostBridgeStarter = Arc<
+    dyn Fn(
+            &crate::remote_target::RemoteHostConfig,
+            &crate::remote::RemoteApiBridgeState,
+            PathBuf,
+            usize,
+        ) -> std::io::Result<crate::remote::SshStdioBridge>
+        + Send
+        + Sync,
+>;
+
+#[cfg(unix)]
+impl Default for SelectedHostBridgeReaper {
+    fn default() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<RetiredSelectedHostBridge>();
+        std::thread::spawn(move || {
+            while let Ok(retired) = rx.recv() {
+                // SshStdioBridge owns its bounded shutdown budget. Keeping the
+                // drop on this dedicated worker makes selected-host switches
+                // independent of that budget on the App/event loop.
+                drop(retired.bridge);
+                let _ = std::fs::remove_file(retired.local_socket);
+            }
+        });
+        Self { tx }
+    }
+}
+
+/// Single bridge owner for every stream opened against the selected host.
+/// Projection leases up to the authoritative layout cap; host glass leases the
+/// one additional full-App stream. Both receive the same active connector
+/// generation; a retired bridge may coexist only while its off-loop reaper
+/// drains predecessor workers.
+#[cfg_attr(not(unix), derive(Default))]
+pub(crate) struct SelectedHostBridgeRuntime {
+    #[cfg(unix)]
+    signature: Option<SelectedHostBridgeSignature>,
+    #[cfg(unix)]
+    bridge: Option<crate::remote::SshStdioBridge>,
+    #[cfg(unix)]
+    local_socket: Option<PathBuf>,
+    #[cfg(unix)]
+    projection_lease: bool,
+    #[cfg(unix)]
+    glass_lease: bool,
+    #[cfg(unix)]
+    reaper: SelectedHostBridgeReaper,
+    #[cfg(unix)]
+    starter: SelectedHostBridgeStarter,
+}
+
+#[cfg(unix)]
+impl Default for SelectedHostBridgeRuntime {
+    fn default() -> Self {
+        Self {
+            #[cfg(unix)]
+            signature: None,
+            #[cfg(unix)]
+            bridge: None,
+            #[cfg(unix)]
+            local_socket: None,
+            #[cfg(unix)]
+            projection_lease: false,
+            #[cfg(unix)]
+            glass_lease: false,
+            #[cfg(unix)]
+            reaper: SelectedHostBridgeReaper::default(),
+            #[cfg(unix)]
+            starter: Arc::new(crate::remote::start_projection_bridge),
+        }
+    }
+}
+
+impl SelectedHostBridgeRuntime {
+    #[cfg(unix)]
+    pub(crate) fn is_acquired_by(
+        &self,
+        consumer: SelectedHostBridgeConsumer,
+        host: &RemoteHostKey,
+        prepared: &crate::remote::RemoteApiBridgeState,
+    ) -> bool {
+        self.signature.as_ref()
+            == Some(&SelectedHostBridgeSignature {
+                host: host.clone(),
+                prepared_shell_path: prepared.shell_path.clone(),
+            })
+            && self.bridge.is_some()
+            && match consumer {
+                SelectedHostBridgeConsumer::Projection => self.projection_lease,
+                SelectedHostBridgeConsumer::HostGlass => self.glass_lease,
+            }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn acquire(
+        &mut self,
+        consumer: SelectedHostBridgeConsumer,
+        host: &RemoteHostKey,
+        host_config: &crate::remote_target::RemoteHostConfig,
+        prepared: &crate::remote::RemoteApiBridgeState,
+    ) -> std::io::Result<PathBuf> {
+        let signature = SelectedHostBridgeSignature {
+            host: host.clone(),
+            prepared_shell_path: prepared.shell_path.clone(),
+        };
+        if self.signature.as_ref() != Some(&signature) {
+            self.retire();
+            self.projection_lease = false;
+            self.glass_lease = false;
+            let socket = selected_host_bridge_socket_path();
+            let bridge = (self.starter)(
+                host_config,
+                prepared,
+                socket.clone(),
+                SELECTED_HOST_BRIDGE_MAX_STREAMS,
+            )?;
+            self.signature = Some(signature);
+            self.local_socket = Some(socket);
+            self.bridge = Some(bridge);
+        }
+        match consumer {
+            SelectedHostBridgeConsumer::Projection => self.projection_lease = true,
+            SelectedHostBridgeConsumer::HostGlass => self.glass_lease = true,
+        }
+        self.local_socket
+            .clone()
+            .ok_or_else(|| std::io::Error::other("selected-host bridge socket unavailable"))
+    }
+
+    /// Replace the projection connector with a new listener before retiring
+    /// the old one. This gives a full 24-leaf replacement a fresh 25-slot
+    /// admission domain even while old bridge workers are still reaping.
+    #[cfg(unix)]
+    fn rotate_projection(
+        &mut self,
+        host: &RemoteHostKey,
+        host_config: &crate::remote_target::RemoteHostConfig,
+        prepared: &crate::remote::RemoteApiBridgeState,
+    ) -> std::io::Result<PathBuf> {
+        let signature = SelectedHostBridgeSignature {
+            host: host.clone(),
+            prepared_shell_path: prepared.shell_path.clone(),
+        };
+        let socket = selected_host_bridge_socket_path();
+        // Construct/bind first. A failed replacement leaves the prior bridge
+        // wholly intact, so rotation is atomic from consumers' perspective.
+        let bridge = (self.starter)(
+            host_config,
+            prepared,
+            socket.clone(),
+            SELECTED_HOST_BRIDGE_MAX_STREAMS,
+        )?;
+
+        let retired_bridge = self.bridge.replace(bridge);
+        let retired_socket = self.local_socket.replace(socket.clone());
+        self.signature = Some(signature);
+        self.projection_lease = true;
+        // A glass worker connected to the retired socket must reacquire and
+        // restart on this connector generation before it can be considered
+        // current again.
+        self.glass_lease = false;
+        self.reap_retired(retired_bridge, retired_socket);
+        Ok(socket)
+    }
+
+    pub(crate) fn release(&mut self, consumer: SelectedHostBridgeConsumer) {
+        #[cfg(unix)]
+        {
+            match consumer {
+                SelectedHostBridgeConsumer::Projection => self.projection_lease = false,
+                SelectedHostBridgeConsumer::HostGlass => self.glass_lease = false,
+            }
+            if !self.projection_lease && !self.glass_lease {
+                self.retire();
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = consumer;
+    }
+
+    #[cfg(unix)]
+    fn retire(&mut self) {
+        self.signature = None;
+        let retired_bridge = self.bridge.take();
+        let retired_socket = self.local_socket.take();
+        self.reap_retired(retired_bridge, retired_socket);
+    }
+
+    #[cfg(unix)]
+    fn reap_retired(
+        &self,
+        retired_bridge: Option<crate::remote::SshStdioBridge>,
+        retired_socket: Option<PathBuf>,
+    ) {
+        let Some(bridge) = retired_bridge else {
+            return;
+        };
+        let Some(local_socket) = retired_socket else {
+            // This state cannot be constructed through `acquire`; if it is
+            // ever reached, leak rather than synchronously run bridge Drop on
+            // the App loop.
+            std::mem::forget(bridge);
+            return;
+        };
+        if let Err(err) = self.reaper.tx.send(RetiredSelectedHostBridge {
+            bridge,
+            local_socket,
+        }) {
+            // The reaper is process-lifetime infrastructure. If it died, keep
+            // the event loop nonblocking even under this impossible invariant
+            // violation; the process teardown will reclaim the leaked bridge.
+            std::mem::forget(err.0);
+            tracing::error!("selected-host bridge reaper stopped unexpectedly");
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_starter(starter: SelectedHostBridgeStarter) -> Self {
+        Self {
+            signature: None,
+            bridge: None,
+            local_socket: None,
+            projection_lease: false,
+            glass_lease: false,
+            reaper: SelectedHostBridgeReaper::default(),
+            starter,
+        }
+    }
+}
+
+impl Drop for SelectedHostBridgeRuntime {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        self.retire();
+    }
 }
 
 impl ProjectionSignature {
@@ -282,8 +546,6 @@ pub(crate) struct RemoteProjectionRuntime {
     source: Option<RemoteSpaceKey>,
     signature: Option<ProjectionSignature>,
     generation: u64,
-    bridge: Option<crate::remote::SshStdioBridge>,
-    local_socket: Option<PathBuf>,
     #[cfg(unix)]
     streams: BTreeMap<String, ProjectionStreamHandle>,
 }
@@ -308,6 +570,7 @@ impl RemoteProjectionRuntime {
             )
         )]
         event_tx: &tokio::sync::mpsc::Sender<AppEvent>,
+        bridge_owner: &mut SelectedHostBridgeRuntime,
     ) {
         let admission = plan_projection_admission(state);
         let next_source = match &admission {
@@ -317,9 +580,11 @@ impl RemoteProjectionRuntime {
         };
 
         if self.source != next_source {
-            // Generation FIRST, before Detach/socket shutdown/bridge join.
+            // Generation FIRST, before stream Detach/socket shutdown. The
+            // shared bridge owner reaps any final bridge release off-loop.
             self.generation = state.begin_remote_projection_generation(next_source.as_ref(), false);
             self.teardown();
+            bridge_owner.release(SelectedHostBridgeConsumer::Projection);
             self.source = next_source.clone();
             self.signature = None;
         } else if self.generation == 0 && next_source.is_some() {
@@ -335,10 +600,11 @@ impl RemoteProjectionRuntime {
                 message,
                 preserve_last_known,
             } => {
-                if self.bridge.is_some() || self.signature.is_some() {
+                if self.signature.is_some() {
                     self.generation = state
                         .begin_remote_projection_generation(Some(&source), preserve_last_known);
                     self.teardown();
+                    bridge_owner.release(SelectedHostBridgeConsumer::Projection);
                     self.signature = None;
                 }
                 state.seed_remote_projection_streams(
@@ -358,7 +624,18 @@ impl RemoteProjectionRuntime {
                     prepared_shell_path: prepared.shell_path.clone(),
                     streams: streams.clone(),
                 };
-                if self.signature.as_ref() == Some(&signature) {
+                #[cfg(unix)]
+                let connector_unchanged = {
+                    let bridge_host = RemoteHostKey::new(&source.host, &source.session);
+                    bridge_owner.is_acquired_by(
+                        SelectedHostBridgeConsumer::Projection,
+                        &bridge_host,
+                        &prepared,
+                    )
+                };
+                #[cfg(not(unix))]
+                let connector_unchanged = true;
+                if self.signature.as_ref() == Some(&signature) && connector_unchanged {
                     self.prune_finished_streams();
                     return;
                 }
@@ -366,6 +643,7 @@ impl RemoteProjectionRuntime {
                     .signature
                     .as_ref()
                     .is_some_and(|existing| existing.same_stream_identity(&signature))
+                    && connector_unchanged
                 {
                     // Geometry-only change: keep ownership/streams and send the
                     // existing structured Resize substrate. Observers update
@@ -376,9 +654,10 @@ impl RemoteProjectionRuntime {
                     return;
                 }
 
-                // Focus/layout/prepared-state change: generation first,
-                // then graceful Detach, local socket shutdown, bounded bridge
-                // teardown, then admit the new generation.
+                // Focus/layout/prepared-state change: generation first, then
+                // graceful stream Detach. Replacement streams use a fresh
+                // 25-slot connector before the old bridge retires off-loop, so
+                // predecessor workers cannot consume replacement admission.
                 self.generation = state.begin_remote_projection_generation(Some(&source), true);
                 self.teardown();
                 state.seed_remote_projection_streams(
@@ -418,6 +697,7 @@ impl RemoteProjectionRuntime {
                         .get(&source.host)
                         .filter(|host| host.session == source.session)
                     else {
+                        bridge_owner.release(SelectedHostBridgeConsumer::Projection);
                         state.seed_remote_projection_streams(
                             self.generation,
                             streams.into_iter().map(|stream| {
@@ -434,18 +714,16 @@ impl RemoteProjectionRuntime {
                         );
                         return;
                     };
-                    let socket = projection_socket_path(self.generation);
-                    match crate::remote::start_projection_bridge(
+                    let bridge_host = RemoteHostKey::new(&source.host, &source.session);
+                    let socket = match bridge_owner.rotate_projection(
+                        &bridge_host,
                         host_config,
                         &prepared,
-                        socket.clone(),
-                        crate::app::api::MAX_LAYOUT_PANES,
                     ) {
-                        Ok(bridge) => {
-                            self.local_socket = Some(socket.clone());
-                            self.bridge = Some(bridge);
-                        }
+                        Ok(socket) => socket,
                         Err(err) => {
+                            self.signature = None;
+                            bridge_owner.release(SelectedHostBridgeConsumer::Projection);
                             state.seed_remote_projection_streams(
                                 self.generation,
                                 streams.into_iter().map(|stream| {
@@ -459,7 +737,7 @@ impl RemoteProjectionRuntime {
                             );
                             return;
                         }
-                    }
+                    };
 
                     for desired in streams {
                         let handle = spawn_projection_stream(
@@ -735,9 +1013,8 @@ impl RemoteProjectionRuntime {
     fn teardown(&mut self) {
         #[cfg(unix)]
         {
-            // Detach/release first, then local socket shutdown. Bridge Drop is
-            // intentionally LAST and supplies the bounded deadline/kill
-            // fallback before joining its accepted 1:1 workers.
+            // Detach/release each client stream. Shared bridge ownership and
+            // its off-loop bounded retirement live in SelectedHostBridgeRuntime.
             for handle in self.streams.values_mut() {
                 let mut writer = handle
                     .writer
@@ -753,7 +1030,6 @@ impl RemoteProjectionRuntime {
                 writer.take();
                 handle.writable.store(false, Ordering::Release);
             }
-            drop(self.bridge.take());
             for (_, mut handle) in std::mem::take(&mut self.streams) {
                 if handle.done.load(Ordering::Acquire) {
                     if let Some(join) = handle.join.take() {
@@ -765,14 +1041,6 @@ impl RemoteProjectionRuntime {
                     drop(handle.join.take());
                 }
             }
-            if let Some(path) = self.local_socket.take() {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            self.bridge = None;
-            self.local_socket = None;
         }
     }
 }
@@ -784,8 +1052,10 @@ impl Drop for RemoteProjectionRuntime {
 }
 
 #[cfg(unix)]
-fn projection_socket_path(generation: u64) -> PathBuf {
-    let name = format!("herdr-projection-{}-{generation}.sock", std::process::id());
+fn selected_host_bridge_socket_path() -> PathBuf {
+    static NEXT_SOCKET: AtomicU64 = AtomicU64::new(1);
+    let serial = NEXT_SOCKET.fetch_add(1, Ordering::Relaxed);
+    let name = format!("herdr-selected-host-{}-{serial}.sock", std::process::id());
     let in_tmp = std::env::temp_dir().join(&name);
     use std::os::unix::ffi::OsStrExt;
     if in_tmp.as_os_str().as_bytes().len() <= 103 {
@@ -1146,6 +1416,106 @@ mod tests {
             crate::remote::BRIDGE_MAX_CONCURRENT_STREAMS,
             crate::app::api::MAX_LAYOUT_PANES
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn selected_host_bridge_reserves_exactly_one_stream_for_glass() {
+        assert_eq!(
+            SELECTED_HOST_BRIDGE_MAX_STREAMS,
+            crate::app::api::MAX_LAYOUT_PANES + 1
+        );
+        assert_eq!(
+            crate::remote::BRIDGE_MAX_CONCURRENT_STREAMS,
+            crate::app::api::MAX_LAYOUT_PANES,
+            "the projection/layout admission cap itself remains unchanged"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn full_projection_turnover_admits_twenty_four_replacements_plus_glass() {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let program = selected_host_bridge_socket_path().with_extension("sh");
+        std::fs::write(&program, "#!/bin/sh\nexec cat\n").expect("write fake ssh program");
+        let mut permissions = std::fs::metadata(&program)
+            .expect("fake ssh metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&program, permissions).expect("make fake ssh executable");
+
+        let starter_program = program.clone();
+        let starter: SelectedHostBridgeStarter = Arc::new(move |_, _, socket, max| {
+            crate::remote::start_test_projection_bridge(socket, max, starter_program.clone())
+        });
+        let mut owner = SelectedHostBridgeRuntime::with_starter(starter);
+        let host_key = RemoteHostKey::new("remote-a", "default");
+        let host = crate::remote_target::RemoteHostConfig::new(
+            "remote-a",
+            "ignored-target",
+            "default",
+            true,
+        );
+        let prepared = crate::remote::RemoteApiBridgeState {
+            shell_path: "/ignored/herdr".into(),
+            capabilities: crate::api::schema::FederationCapabilities::current(),
+        };
+
+        fn admit_echo(path: &Path, value: u8) -> std::os::unix::net::UnixStream {
+            let mut stream = std::os::unix::net::UnixStream::connect(path)
+                .expect("replacement bridge connection should be admitted");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .expect("set bridge read timeout");
+            stream.write_all(&[value]).expect("write bridge probe");
+            let mut echoed = [0_u8; 1];
+            stream
+                .read_exact(&mut echoed)
+                .expect("admitted bridge worker should echo");
+            assert_eq!(echoed[0], value);
+            stream
+        }
+
+        let old_socket = owner
+            .rotate_projection(&host_key, &host, &prepared)
+            .expect("start predecessor connector");
+        let old_streams: Vec<_> = (0..crate::app::api::MAX_LAYOUT_PANES)
+            .map(|index| admit_echo(&old_socket, index as u8))
+            .collect();
+        assert_eq!(old_streams.len(), 24);
+
+        let replacement_socket = owner
+            .rotate_projection(&host_key, &host, &prepared)
+            .expect("rotate to fresh connector");
+        assert_ne!(replacement_socket, old_socket);
+        assert!(!owner.is_acquired_by(SelectedHostBridgeConsumer::HostGlass, &host_key, &prepared,));
+        let glass_socket = owner
+            .acquire(
+                SelectedHostBridgeConsumer::HostGlass,
+                &host_key,
+                &host,
+                &prepared,
+            )
+            .expect("glass must reacquire the replacement connector generation");
+        assert_eq!(glass_socket, replacement_socket);
+        assert!(owner.is_acquired_by(SelectedHostBridgeConsumer::HostGlass, &host_key, &prepared,));
+
+        let mut replacements: Vec<_> = (0..crate::app::api::MAX_LAYOUT_PANES)
+            .map(|index| admit_echo(&replacement_socket, (index + 32) as u8))
+            .collect();
+        replacements.push(admit_echo(&glass_socket, 0xff));
+        assert_eq!(
+            replacements.len(),
+            crate::app::api::MAX_LAYOUT_PANES + 1,
+            "fresh connector must admit all 24 replacement leaves and glass"
+        );
+
+        drop(old_streams);
+        drop(replacements);
+        drop(owner);
+        let _ = std::fs::remove_file(program);
     }
 
     #[test]

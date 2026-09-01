@@ -571,6 +571,7 @@ impl HeadlessServer {
                 &mut self.app.state,
                 &self.app.remote_hosts,
                 &self.app.event_tx,
+                &mut self.app.selected_host_bridge_runtime,
             );
 
             self.app.sync_focus_events();
@@ -635,6 +636,7 @@ impl HeadlessServer {
                     &mut self.app.state,
                     &self.app.remote_hosts,
                     &self.app.event_tx,
+                    &mut self.app.selected_host_bridge_runtime,
                 );
                 self.app.last_render_at = Some(now);
                 needs_render = false;

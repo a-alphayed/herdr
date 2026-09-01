@@ -66,6 +66,12 @@ impl App {
     }
 
     pub(crate) fn handle_internal_event(&mut self, ev: AppEvent) {
+        // The bounded Tokio event is only a wake mechanism. Drain the single
+        // authoritative worker mailbox before every event so a dropped/full
+        // wake hint cannot strand an ordered Frame -> lifecycle transition.
+        self.host_glass_runtime
+            .drain_worker_updates(&mut self.state, &mut self.host_glass_surfaces);
+
         let ev = match ev {
             AppEvent::PaneRuntimeDied {
                 pane_id,
@@ -85,6 +91,10 @@ impl App {
         };
 
         if self.remote_source_event_is_from_unconfigured_host(&ev) {
+            return;
+        }
+
+        if matches!(ev, AppEvent::HostGlassWake) {
             return;
         }
 

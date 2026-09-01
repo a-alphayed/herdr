@@ -222,6 +222,11 @@ pub enum AppEvent {
         frame: Option<crate::protocol::FrameData>,
         message: Option<String>,
     },
+    /// Wake hint for the App-owned host-glass worker mailbox. Frame bytes and
+    /// lifecycle truth never travel through this bounded event queue; the App
+    /// drains their single ordered, lossless mailbox before handling any event.
+    #[cfg_attr(windows, allow(dead_code))]
+    HostGlassWake,
     /// A remote workspace create request succeeded on the authoritative host.
     RemoteWorkspaceCreateSucceeded {
         host: RemoteHostKey,

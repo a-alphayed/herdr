@@ -590,6 +590,27 @@ pub(crate) fn start_projection_bridge(
     )
 }
 
+/// Test-only real listener/worker seam for projection connector turnover.
+/// The supplied executable stands in for `ssh` while the production bridge
+/// accept/capacity/worker machinery remains unmocked.
+#[cfg(test)]
+pub(crate) fn start_test_projection_bridge(
+    local_socket: PathBuf,
+    max_concurrent: usize,
+    ssh_program: PathBuf,
+) -> io::Result<SshStdioBridge> {
+    SshStdioBridge::start_with_bridge_command(
+        "ignored-target".into(),
+        "ignored-command".into(),
+        local_socket,
+        None,
+        None,
+        max_concurrent,
+        None,
+        ssh_program,
+    )
+}
+
 pub(crate) fn prepare_remote_binary_to_host_noninteractive(
     host: &crate::remote_target::RemoteHostConfig,
 ) -> io::Result<RemoteHerdr> {

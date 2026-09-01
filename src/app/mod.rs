@@ -160,6 +160,14 @@ pub struct App {
     /// PaneRuntime or TerminalRuntimeRegistry.
     #[allow(dead_code)] // S1 foundation; stream reconciliation starts in S2.
     pub(crate) host_glass_surfaces: host_glass::HostGlassSurfaceRegistry,
+    /// One selected-host bridge and full-App TerminalAnsi worker. S3 wires
+    /// selection/reconciliation; all socket IO remains on its worker threads.
+    #[allow(dead_code)] // S2 worker seam; host-rail activation starts in S3.
+    pub(crate) host_glass_runtime: host_glass::HostGlassRuntime,
+    /// The sole no-start client bridge for the currently selected remote host.
+    /// Projection leaves and host glass open independent streams through this
+    /// one owner; bridge retirement is reaped off the App loop.
+    pub(crate) selected_host_bridge_runtime: remote_projection::SelectedHostBridgeRuntime,
     /// App-owned sockets/threads/SSH bridge for the currently selected remote
     /// projection. Pure frame/status data alone enters `AppState`.
     pub(crate) remote_projection_runtime: remote_projection::RemoteProjectionRuntime,
@@ -943,6 +951,8 @@ impl App {
             routed_executor,
             remote_source_supervisors,
             host_glass_surfaces: host_glass::HostGlassSurfaceRegistry::default(),
+            host_glass_runtime: host_glass::HostGlassRuntime::default(),
+            selected_host_bridge_runtime: remote_projection::SelectedHostBridgeRuntime::default(),
             remote_projection_runtime: remote_projection::RemoteProjectionRuntime::default(),
             pending_remote_lifecycle: std::collections::HashMap::new(),
             lifecycle_supervisor_starter:
@@ -1102,6 +1112,7 @@ impl App {
                 &mut self.state,
                 &self.remote_hosts,
                 &self.event_tx,
+                &mut self.selected_host_bridge_runtime,
             );
 
             self.sync_focus_events();
@@ -1255,6 +1266,7 @@ impl App {
                     &mut self.state,
                     &self.remote_hosts,
                     &self.event_tx,
+                    &mut self.selected_host_bridge_runtime,
                 );
                 if kitty_graphics_enabled {
                     crate::kitty_graphics::paint_local_pane_graphics(

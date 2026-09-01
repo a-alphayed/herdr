@@ -1947,6 +1947,7 @@ impl AppState {
             crate::app::host_glass::HostGlassState {
                 generation,
                 status: crate::app::host_glass::GlassStatus::Connecting,
+                message: Some("opening host glass stream".into()),
             },
         );
         generation
@@ -1960,6 +1961,7 @@ impl AppState {
         host: &crate::remote_source::RemoteHostKey,
         generation: u64,
         status: crate::app::host_glass::GlassStatus,
+        message: Option<String>,
     ) -> bool {
         let Some(state) = self.host_glass_states.get_mut(host) else {
             return false;
@@ -1968,6 +1970,7 @@ impl AppState {
             return false;
         }
         state.status = status;
+        state.message = message;
         true
     }
 
@@ -2999,6 +3002,7 @@ mod tests {
             Some(&crate::app::host_glass::HostGlassState {
                 generation,
                 status: crate::app::host_glass::GlassStatus::Connecting,
+                message: Some("opening host glass stream".into()),
             })
         );
         assert!(state.selected_host_glass_mode().is_none());
@@ -3014,6 +3018,7 @@ mod tests {
             &host,
             generation,
             crate::app::host_glass::GlassStatus::Live,
+            None,
         ));
 
         let next_generation = state.begin_host_glass_generation(host.clone());
@@ -3023,6 +3028,7 @@ mod tests {
                 &host,
                 generation,
                 crate::app::host_glass::GlassStatus::Live,
+                None,
             ),
             "a predecessor generation must not overwrite the replacement"
         );
@@ -3031,6 +3037,7 @@ mod tests {
             &host,
             next_generation,
             crate::app::host_glass::GlassStatus::Stale { since },
+            Some("disconnected".into()),
         ));
         assert_eq!(
             state.host_glass_states.get(&host).map(|glass| glass.status),

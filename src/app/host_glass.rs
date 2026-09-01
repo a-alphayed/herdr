@@ -1,5 +1,17 @@
 use std::collections::BTreeMap;
 use std::io;
+#[cfg(unix)]
+use std::path::Path;
+#[cfg(unix)]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, SyncSender, TrySendError},
+    Arc, Mutex,
+};
+#[cfg(unix)]
+use std::thread::JoinHandle;
+#[cfg(unix)]
+use std::time::Duration;
 use std::time::Instant;
 
 use ratatui::layout::Rect;
@@ -23,10 +35,11 @@ pub(crate) enum GlassStatus {
 
 /// Pure AppState metadata for one host glass generation. Presence in the
 /// AppState map is the existence marker; runtime objects stay on `App`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HostGlassState {
     pub(crate) generation: u64,
     pub(crate) status: GlassStatus,
+    pub(crate) message: Option<String>,
 }
 
 /// A local, PTY-free VT surface fed only by TerminalAnsi bytes.
@@ -57,6 +70,10 @@ impl GlassSurfaceCore {
 
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub(crate) fn retag_generation(&mut self, generation: u64) {
+        self.generation = generation;
     }
 
     pub(crate) fn area(&self) -> Rect {
@@ -118,12 +135,903 @@ impl HostGlassSurfaceRegistry {
     pub(crate) fn remove(&mut self, host: &RemoteHostKey) -> Option<GlassSurfaceCore> {
         self.surfaces.remove(host)
     }
+
+    pub(crate) fn apply_frame(&self, host: &RemoteHostKey, generation: u64, bytes: &[u8]) -> bool {
+        let Some(surface) = self.surfaces.get(host) else {
+            return false;
+        };
+        if surface.generation() != generation {
+            return false;
+        }
+        surface.feed(bytes);
+        true
+    }
+}
+
+/// Exact geometry advertised by one full-App TerminalAnsi client stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GlassGeometry {
+    pub(crate) area: Rect,
+    pub(crate) cell_width_px: u32,
+    pub(crate) cell_height_px: u32,
+}
+
+impl GlassGeometry {
+    #[cfg(any(unix, test))]
+    fn hello(self) -> crate::protocol::ClientMessage {
+        crate::protocol::ClientMessage::Hello {
+            version: crate::protocol::PROTOCOL_VERSION,
+            cols: self.area.width.max(1),
+            rows: self.area.height.max(1),
+            cell_width_px: self.cell_width_px,
+            cell_height_px: self.cell_height_px,
+            requested_encoding: crate::protocol::RenderEncoding::TerminalAnsi,
+            keybindings: crate::protocol::ClientKeybindings::Server,
+            launch_mode: crate::protocol::ClientLaunchMode::App,
+        }
+    }
+
+    #[cfg(any(unix, test))]
+    fn resize(self) -> crate::protocol::ClientMessage {
+        crate::protocol::ClientMessage::Resize {
+            cols: self.area.width.max(1),
+            rows: self.area.height.max(1),
+            cell_width_px: self.cell_width_px,
+            cell_height_px: self.cell_height_px,
+        }
+    }
+
+    fn usable(self) -> bool {
+        self.area != Rect::default() && self.area.width > 0 && self.area.height > 0
+    }
+}
+
+#[cfg(unix)]
+const GLASS_OUTBOUND_CAPACITY: usize = 16;
+#[cfg(unix)]
+const GLASS_RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+#[cfg(unix)]
+const GLASS_RECONNECT_MAX_BACKOFF: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const GLASS_BACKOFF_POLL: Duration = Duration::from_millis(25);
+#[cfg(unix)]
+const GLASS_TEARDOWN_BUDGET: Duration = Duration::from_millis(500);
+
+#[cfg(unix)]
+#[derive(Debug)]
+enum GlassStreamEnd {
+    Retryable(String),
+    Fatal(String),
+    Stopped,
+}
+
+#[cfg(unix)]
+struct GlassShutdownRegistration<'a> {
+    slot: &'a Arc<Mutex<Option<std::os::unix::net::UnixStream>>>,
+}
+
+#[cfg(unix)]
+impl Drop for GlassShutdownRegistration<'_> {
+    fn drop(&mut self) {
+        *self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[cfg(unix)]
+struct GlassStreamHandle {
+    outbound: SyncSender<crate::protocol::ClientMessage>,
+    geometry: Arc<Mutex<GlassGeometry>>,
+    connected: Arc<AtomicBool>,
+    shutdown_stream: Arc<Mutex<Option<std::os::unix::net::UnixStream>>>,
+    stop: Arc<AtomicBool>,
+    done: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl GlassStreamHandle {
+    /// Queue one resize without ever writing a socket from the App/event loop.
+    /// A disconnected stream drops the command; the next Hello reads the
+    /// latest shared geometry instead of replaying stale queued commands.
+    fn resize(&self, geometry: GlassGeometry) -> bool {
+        *self
+            .geometry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = geometry;
+        if !self.connected.load(Ordering::Acquire) {
+            return false;
+        }
+        match self.outbound.try_send(geometry.resize()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.connected.store(false, Ordering::Release);
+        let _ = self
+            .outbound
+            .try_send(crate::protocol::ClientMessage::Detach);
+        if let Some(stream) = self
+            .shutdown_stream
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        let deadline = Instant::now() + GLASS_TEARDOWN_BUDGET;
+        while !self.done.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if let Some(join) = self.join.take() {
+            if self.done.load(Ordering::Acquire) {
+                let _ = join.join();
+            } else {
+                // The socket has already been shut down and the worker owns no
+                // App state. Detach rather than make process/app teardown
+                // unbounded on an unexpected worker stall.
+                drop(join);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GlassStreamHandle {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+enum GlassWorkerUpdate {
+    Frame {
+        host: RemoteHostKey,
+        generation: u64,
+        bytes: Vec<u8>,
+    },
+    Status {
+        host: RemoteHostKey,
+        generation: u64,
+        status: GlassStatus,
+        message: Option<String>,
+    },
+}
+
+#[cfg(unix)]
+struct GlassStreamReaper {
+    tx: mpsc::Sender<GlassStreamHandle>,
+}
+
+#[cfg(unix)]
+impl Default for GlassStreamReaper {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::channel::<GlassStreamHandle>();
+        std::thread::spawn(move || {
+            while let Ok(stream) = rx.recv() {
+                drop(stream);
+            }
+        });
+        Self { tx }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GlassSignature {
+    host: RemoteHostKey,
+    prepared_shell_path: String,
+    geometry: GlassGeometry,
+}
+
+impl GlassSignature {
+    fn same_stream_identity(&self, other: &Self) -> bool {
+        self.host == other.host && self.prepared_shell_path == other.prepared_shell_path
+    }
+}
+
+/// App-owned bridge/stream lifecycle for the one selected host glass.
+///
+/// S2 supplies the worker and reconciliation seam. S3 connects this seam to
+/// host-rail selection and rendering; keeping it dormant until then preserves
+/// the flag-off projection path bit-for-bit in this slice.
+#[allow(dead_code)] // Wired to host-rail selection in S3.
+#[cfg_attr(not(unix), derive(Default))]
+pub(crate) struct HostGlassRuntime {
+    source: Option<RemoteHostKey>,
+    generation: u64,
+    signature: Option<GlassSignature>,
+    #[cfg(unix)]
+    stream: Option<GlassStreamHandle>,
+    #[cfg(unix)]
+    worker_update_tx: mpsc::Sender<GlassWorkerUpdate>,
+    #[cfg(unix)]
+    worker_update_rx: Receiver<GlassWorkerUpdate>,
+    #[cfg(unix)]
+    reaper: GlassStreamReaper,
+}
+
+#[cfg(unix)]
+impl Default for HostGlassRuntime {
+    fn default() -> Self {
+        let (worker_update_tx, worker_update_rx) = mpsc::channel();
+        Self {
+            source: None,
+            generation: 0,
+            signature: None,
+            stream: None,
+            worker_update_tx,
+            worker_update_rx,
+            reaper: GlassStreamReaper::default(),
+        }
+    }
+}
+
+#[allow(dead_code)] // Wired to host-rail selection in S3.
+impl HostGlassRuntime {
+    pub(crate) fn reconcile(
+        &mut self,
+        state: &mut crate::app::state::AppState,
+        surfaces: &mut HostGlassSurfaceRegistry,
+        hosts: &crate::remote_target::RemoteHostRegistry,
+        event_tx: &tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+        bridge_owner: &mut crate::app::remote_projection::SelectedHostBridgeRuntime,
+        geometry: GlassGeometry,
+    ) {
+        self.drain_worker_updates(state, surfaces);
+        let next_source = if state.host_glass_enabled {
+            match state.effective_sidebar_source() {
+                crate::app::state::SidebarSource::Remote(host) => Some(host),
+                crate::app::state::SidebarSource::Local => None,
+            }
+        } else {
+            None
+        };
+
+        if self.source != next_source {
+            if let Some(previous) = self.source.clone() {
+                let retired = state.begin_host_glass_generation(previous.clone());
+                let _ = state.set_host_glass_status(
+                    &previous,
+                    retired,
+                    GlassStatus::Stale {
+                        since: Instant::now(),
+                    },
+                    Some("glass detached; showing cached frame".into()),
+                );
+                if let Some(surface) = surfaces.get_mut(&previous) {
+                    surface.retag_generation(retired);
+                }
+            }
+            self.retire_stream();
+            bridge_owner
+                .release(crate::app::remote_projection::SelectedHostBridgeConsumer::HostGlass);
+            self.source = next_source.clone();
+            self.signature = None;
+            if let Some(host) = next_source {
+                self.generation = state.begin_host_glass_generation(host.clone());
+                if let Some(surface) = surfaces.get_mut(&host) {
+                    surface.retag_generation(self.generation);
+                }
+            } else {
+                self.generation = 0;
+            }
+        }
+
+        let Some(host) = self.source.clone() else {
+            return;
+        };
+        if !geometry.usable() {
+            return;
+        }
+
+        let had_cached_surface = surfaces.get(&host).is_some();
+        match surfaces.get_mut(&host) {
+            Some(surface) => {
+                if surface.area() != geometry.area {
+                    if let Err(err) = surface.resize(geometry.area) {
+                        let _ = state.set_host_glass_status(
+                            &host,
+                            self.generation,
+                            GlassStatus::Stale {
+                                since: Instant::now(),
+                            },
+                            Some(format!("glass surface resize failed: {err}")),
+                        );
+                        return;
+                    }
+                }
+            }
+            None => match GlassSurfaceCore::new(geometry.area, self.generation) {
+                Ok(surface) => surfaces.insert(host.clone(), surface),
+                Err(err) => {
+                    let _ = state.set_host_glass_status(
+                        &host,
+                        self.generation,
+                        GlassStatus::Stale {
+                            since: Instant::now(),
+                        },
+                        Some(format!("glass surface initialization failed: {err}")),
+                    );
+                    return;
+                }
+            },
+        }
+
+        let Some(prepared) = state.remote_sources.connected_bridge_state(&host) else {
+            let status = if had_cached_surface {
+                GlassStatus::Stale {
+                    since: Instant::now(),
+                }
+            } else {
+                GlassStatus::Connecting
+            };
+            let _ = state.set_host_glass_status(
+                &host,
+                self.generation,
+                status,
+                Some("waiting for supervisor-prepared no-start bridge state".into()),
+            );
+            self.retire_stream();
+            bridge_owner
+                .release(crate::app::remote_projection::SelectedHostBridgeConsumer::HostGlass);
+            self.signature = None;
+            return;
+        };
+
+        let signature = GlassSignature {
+            host: host.clone(),
+            prepared_shell_path: prepared.shell_path.clone(),
+            geometry,
+        };
+        #[cfg(unix)]
+        let connector_unchanged = bridge_owner.is_acquired_by(
+            crate::app::remote_projection::SelectedHostBridgeConsumer::HostGlass,
+            &host,
+            &prepared,
+        ) && self.stream.is_some();
+        #[cfg(not(unix))]
+        let connector_unchanged = true;
+        if self.signature.as_ref() == Some(&signature) && connector_unchanged {
+            return;
+        }
+        if self
+            .signature
+            .as_ref()
+            .is_some_and(|existing| existing.same_stream_identity(&signature))
+            && connector_unchanged
+        {
+            #[cfg(unix)]
+            if let Some(stream) = self.stream.as_ref() {
+                let _ = stream.resize(geometry);
+            }
+            self.signature = Some(signature);
+            return;
+        }
+
+        if self.signature.is_some() {
+            self.generation = state.begin_host_glass_generation(host.clone());
+            if let Some(surface) = surfaces.get_mut(&host) {
+                surface.retag_generation(self.generation);
+            }
+            self.retire_stream();
+        }
+        self.signature = Some(signature);
+
+        #[cfg(not(unix))]
+        {
+            let _ = hosts;
+            let _ = event_tx;
+            let _ = state.set_host_glass_status(
+                &host,
+                self.generation,
+                GlassStatus::Stale {
+                    since: Instant::now(),
+                },
+                Some("host glass streaming is unsupported on Windows".into()),
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            let Some(host_config) = hosts
+                .get(&host.host)
+                .filter(|candidate| candidate.session == host.session)
+            else {
+                bridge_owner
+                    .release(crate::app::remote_projection::SelectedHostBridgeConsumer::HostGlass);
+                let _ = state.set_host_glass_status(
+                    &host,
+                    self.generation,
+                    GlassStatus::Stale {
+                        since: Instant::now(),
+                    },
+                    Some("selected remote host/session is no longer configured".into()),
+                );
+                return;
+            };
+            match bridge_owner.acquire(
+                crate::app::remote_projection::SelectedHostBridgeConsumer::HostGlass,
+                &host,
+                host_config,
+                &prepared,
+            ) {
+                Ok(socket) => {
+                    self.stream = Some(spawn_glass_stream(
+                        &socket,
+                        host,
+                        self.generation,
+                        geometry,
+                        event_tx.clone(),
+                        self.worker_update_tx.clone(),
+                    ));
+                }
+                Err(err) => {
+                    let _ = state.set_host_glass_status(
+                        &host,
+                        self.generation,
+                        GlassStatus::Stale {
+                            since: Instant::now(),
+                        },
+                        Some(format!("glass bridge failed closed: {err}")),
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn drain_worker_updates(
+        &mut self,
+        state: &mut crate::app::state::AppState,
+        surfaces: &mut HostGlassSurfaceRegistry,
+    ) {
+        while let Ok(update) = self.worker_update_rx.try_recv() {
+            match update {
+                GlassWorkerUpdate::Frame {
+                    host,
+                    generation,
+                    bytes,
+                } => {
+                    let current_generation = state
+                        .host_glass_states
+                        .get(&host)
+                        .map(|glass| glass.generation);
+                    if current_generation == Some(generation)
+                        && surfaces.apply_frame(&host, generation, &bytes)
+                    {
+                        let _ =
+                            state.set_host_glass_status(&host, generation, GlassStatus::Live, None);
+                    }
+                }
+                GlassWorkerUpdate::Status {
+                    host,
+                    generation,
+                    status,
+                    message,
+                } => {
+                    let _ = state.set_host_glass_status(&host, generation, status, message);
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn drain_worker_updates(
+        &mut self,
+        _state: &mut crate::app::state::AppState,
+        _surfaces: &mut HostGlassSurfaceRegistry,
+    ) {
+    }
+
+    fn retire_stream(&mut self) {
+        #[cfg(unix)]
+        if let Some(stream) = self.stream.take() {
+            if let Err(err) = self.reaper.tx.send(stream) {
+                // A dead process-lifetime reaper is an invariant violation.
+                // Preserve event-loop responsiveness rather than running the
+                // handle's bounded-but-nonzero teardown inline.
+                std::mem::forget(err.0);
+                tracing::error!("host glass stream reaper stopped unexpectedly");
+            }
+        }
+    }
+}
+
+impl Drop for HostGlassRuntime {
+    fn drop(&mut self) {
+        self.retire_stream();
+    }
+}
+
+#[cfg(unix)]
+fn emit_glass_update(
+    worker_update_tx: &mpsc::Sender<GlassWorkerUpdate>,
+    event_tx: &tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    update: GlassWorkerUpdate,
+) -> bool {
+    // This unbounded std channel is the one authoritative App-owned ordering
+    // path for both bytes and lifecycle. Sending does not wait for the App
+    // loop. The bounded Tokio event carries no state; it only wakes that loop.
+    if worker_update_tx.send(update).is_err() {
+        tracing::debug!("retired host glass worker-update receiver is closed");
+        return false;
+    }
+    if let Err(err) = event_tx.try_send(crate::events::AppEvent::HostGlassWake) {
+        tracing::debug!(%err, "host glass event queue unavailable");
+        false
+    } else {
+        true
+    }
+}
+
+#[cfg(unix)]
+fn emit_glass_status(
+    worker_update_tx: &mpsc::Sender<GlassWorkerUpdate>,
+    event_tx: &tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    host: &RemoteHostKey,
+    generation: u64,
+    status: GlassStatus,
+    message: Option<String>,
+) {
+    let update = GlassWorkerUpdate::Status {
+        host: host.clone(),
+        generation,
+        status,
+        message,
+    };
+    let _ = emit_glass_update(worker_update_tx, event_tx, update);
+}
+
+#[cfg(unix)]
+fn spawn_glass_stream(
+    socket: &Path,
+    host: RemoteHostKey,
+    generation: u64,
+    geometry: GlassGeometry,
+    event_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    worker_update_tx: mpsc::Sender<GlassWorkerUpdate>,
+) -> GlassStreamHandle {
+    let (outbound, receiver) = mpsc::sync_channel(GLASS_OUTBOUND_CAPACITY);
+    let receiver = Arc::new(Mutex::new(receiver));
+    let shared_geometry = Arc::new(Mutex::new(geometry));
+    let connected = Arc::new(AtomicBool::new(false));
+    let shutdown_stream = Arc::new(Mutex::new(None));
+    let stop = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let worker_geometry = Arc::clone(&shared_geometry);
+    let worker_connected = Arc::clone(&connected);
+    let worker_shutdown_stream = Arc::clone(&shutdown_stream);
+    let worker_stop = Arc::clone(&stop);
+    let worker_done = Arc::clone(&done);
+    let worker_socket = socket.to_owned();
+    let join = std::thread::spawn(move || {
+        let mut backoff = GLASS_RECONNECT_INITIAL_BACKOFF;
+        let mut first_attempt = true;
+        while !worker_stop.load(Ordering::Acquire) {
+            if first_attempt {
+                emit_glass_status(
+                    &worker_update_tx,
+                    &event_tx,
+                    &host,
+                    generation,
+                    GlassStatus::Connecting,
+                    Some("opening no-start full-app TerminalAnsi stream".into()),
+                );
+                first_attempt = false;
+            }
+            let stream = match std::os::unix::net::UnixStream::connect(&worker_socket) {
+                Ok(stream) => stream,
+                Err(err) => {
+                    let message = format!("glass stream connect failed: {err}");
+                    emit_glass_status(
+                        &worker_update_tx,
+                        &event_tx,
+                        &host,
+                        generation,
+                        GlassStatus::Stale {
+                            since: Instant::now(),
+                        },
+                        Some(message),
+                    );
+                    if !wait_for_retry(&worker_stop, backoff) {
+                        break;
+                    }
+                    backoff = (backoff * 2).min(GLASS_RECONNECT_MAX_BACKOFF);
+                    continue;
+                }
+            };
+            let result = run_glass_stream_once_and_publish_lifecycle(
+                stream,
+                &host,
+                generation,
+                &event_tx,
+                &receiver,
+                &worker_geometry,
+                &worker_connected,
+                &worker_shutdown_stream,
+                &worker_stop,
+                &worker_update_tx,
+            );
+            worker_connected.store(false, Ordering::Release);
+            drain_outbound(&receiver);
+            match result {
+                GlassStreamEnd::Stopped => break,
+                GlassStreamEnd::Fatal(_) => break,
+                GlassStreamEnd::Retryable(_) => {
+                    if !wait_for_retry(&worker_stop, backoff) {
+                        break;
+                    }
+                    backoff = (backoff * 2).min(GLASS_RECONNECT_MAX_BACKOFF);
+                }
+            }
+        }
+        worker_connected.store(false, Ordering::Release);
+        worker_done.store(true, Ordering::Release);
+    });
+
+    GlassStreamHandle {
+        outbound,
+        geometry: shared_geometry,
+        connected,
+        shutdown_stream,
+        stop,
+        done,
+        join: Some(join),
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)] // Keeps the worker seam's shared generation resources explicit.
+fn run_glass_stream_once_and_publish_lifecycle(
+    stream: std::os::unix::net::UnixStream,
+    host: &RemoteHostKey,
+    generation: u64,
+    event_tx: &tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    outbound: &Arc<Mutex<Receiver<crate::protocol::ClientMessage>>>,
+    geometry: &Arc<Mutex<GlassGeometry>>,
+    connected: &Arc<AtomicBool>,
+    shutdown_stream: &Arc<Mutex<Option<std::os::unix::net::UnixStream>>>,
+    stop: &Arc<AtomicBool>,
+    worker_update_tx: &mpsc::Sender<GlassWorkerUpdate>,
+) -> GlassStreamEnd {
+    let result = run_glass_stream_once(
+        stream,
+        host,
+        generation,
+        event_tx,
+        worker_update_tx,
+        outbound,
+        geometry,
+        connected,
+        shutdown_stream,
+        stop,
+    );
+    match &result {
+        GlassStreamEnd::Retryable(message) | GlassStreamEnd::Fatal(message) => {
+            emit_glass_status(
+                worker_update_tx,
+                event_tx,
+                host,
+                generation,
+                GlassStatus::Stale {
+                    since: Instant::now(),
+                },
+                Some(message.clone()),
+            );
+        }
+        GlassStreamEnd::Stopped => {}
+    }
+    result
+}
+
+#[cfg(unix)]
+fn wait_for_retry(stop: &AtomicBool, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        std::thread::sleep(
+            GLASS_BACKOFF_POLL.min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+    !stop.load(Ordering::Acquire)
+}
+
+#[cfg(unix)]
+fn drain_outbound(receiver: &Arc<Mutex<Receiver<crate::protocol::ClientMessage>>>) {
+    let receiver = receiver
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while receiver.try_recv().is_ok() {}
+}
+
+#[cfg(unix)]
+fn run_glass_stream_once(
+    mut stream: std::os::unix::net::UnixStream,
+    host: &RemoteHostKey,
+    generation: u64,
+    event_tx: &tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    worker_update_tx: &mpsc::Sender<GlassWorkerUpdate>,
+    outbound: &Arc<Mutex<Receiver<crate::protocol::ClientMessage>>>,
+    geometry: &Arc<Mutex<GlassGeometry>>,
+    connected: &Arc<AtomicBool>,
+    shutdown_stream: &Arc<Mutex<Option<std::os::unix::net::UnixStream>>>,
+    stop: &Arc<AtomicBool>,
+) -> GlassStreamEnd {
+    use crate::protocol::{
+        RenderEncoding, ServerMessage, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    };
+
+    match stream.try_clone() {
+        Ok(clone) => {
+            *shutdown_stream
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(clone);
+        }
+        Err(err) => {
+            return GlassStreamEnd::Retryable(format!("glass stream clone failed: {err}"));
+        }
+    }
+    let _shutdown_registration = GlassShutdownRegistration {
+        slot: shutdown_stream,
+    };
+    let hello = geometry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .hello();
+    if let Err(err) = crate::protocol::write_message(&mut stream, &hello) {
+        return GlassStreamEnd::Retryable(format!("glass handshake send failed: {err}"));
+    }
+    match crate::protocol::read_message::<_, ServerMessage>(
+        &mut stream,
+        crate::protocol::MAX_FRAME_SIZE,
+    ) {
+        Ok(ServerMessage::Welcome {
+            version,
+            encoding: RenderEncoding::TerminalAnsi,
+            error: None,
+        }) if version == PROTOCOL_VERSION => {}
+        Ok(ServerMessage::Welcome {
+            version,
+            error: Some(error),
+            ..
+        }) => {
+            return GlassStreamEnd::Fatal(format!(
+                "glass handshake rejected (version {version}): {error}"
+            ));
+        }
+        Ok(ServerMessage::Welcome {
+            version, encoding, ..
+        }) => {
+            return GlassStreamEnd::Fatal(format!(
+                "glass handshake mismatch: server version {version}, encoding {encoding:?}; expected version {PROTOCOL_VERSION}, TerminalAnsi"
+            ));
+        }
+        Ok(_) => return GlassStreamEnd::Fatal("glass handshake expected Welcome".into()),
+        Err(crate::protocol::FramingError::UnexpectedEof) => {
+            return GlassStreamEnd::Retryable("glass handshake stream disconnected".into());
+        }
+        Err(crate::protocol::FramingError::Io(err)) => {
+            return GlassStreamEnd::Retryable(format!("glass handshake read failed: {err}"));
+        }
+        Err(err) => return GlassStreamEnd::Fatal(format!("glass handshake invalid: {err}")),
+    }
+
+    connected.store(true, Ordering::Release);
+    let mut write_stream = match stream.try_clone() {
+        Ok(stream) => stream,
+        Err(err) => {
+            connected.store(false, Ordering::Release);
+            return GlassStreamEnd::Retryable(format!("glass stream clone failed: {err}"));
+        }
+    };
+    let writer_stop = Arc::new(AtomicBool::new(false));
+    let writer_done = Arc::clone(&writer_stop);
+    let writer_outbound = Arc::clone(outbound);
+    let writer_geometry = Arc::clone(geometry);
+    let worker_stop = Arc::clone(stop);
+    let writer = std::thread::spawn(move || {
+        while !worker_stop.load(Ordering::Acquire) && !writer_done.load(Ordering::Acquire) {
+            let message = writer_outbound
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv_timeout(Duration::from_millis(50));
+            match message {
+                Ok(mut message) => {
+                    if matches!(message, crate::protocol::ClientMessage::Resize { .. }) {
+                        message = writer_geometry
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .resize();
+                    }
+                    if crate::protocol::write_message(&mut write_stream, &message).is_err() {
+                        let _ = write_stream.shutdown(std::net::Shutdown::Both);
+                        break;
+                    }
+                    if matches!(message, crate::protocol::ClientMessage::Detach) {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+
+    let result = loop {
+        if stop.load(Ordering::Acquire) {
+            break GlassStreamEnd::Stopped;
+        }
+        match crate::protocol::read_message::<_, ServerMessage>(
+            &mut stream,
+            MAX_GRAPHICS_FRAME_SIZE,
+        ) {
+            Ok(ServerMessage::Terminal(frame)) => {
+                if !emit_glass_update(
+                    worker_update_tx,
+                    event_tx,
+                    GlassWorkerUpdate::Frame {
+                        host: host.clone(),
+                        generation,
+                        bytes: frame.bytes,
+                    },
+                ) {
+                    // Dropping one incremental TerminalAnsi frame would make
+                    // every later delta ambiguous. Reconnect instead so the
+                    // next stream starts from a fresh full-frame baseline.
+                    break GlassStreamEnd::Retryable(
+                        "host glass event queue saturated; restarting stream".into(),
+                    );
+                }
+            }
+            Ok(ServerMessage::Graphics { .. }) => {
+                // MVP intentionally drops Kitty graphics. TerminalAnsi text
+                // remains authoritative and continues streaming.
+            }
+            Ok(ServerMessage::ServerShutdown { reason }) => {
+                break GlassStreamEnd::Retryable(
+                    reason.unwrap_or_else(|| "remote Herdr app stream closed".into()),
+                );
+            }
+            Ok(ServerMessage::Welcome { .. }) | Ok(ServerMessage::Frame(_)) => {
+                break GlassStreamEnd::Fatal(
+                    "glass stream received a message incompatible with negotiated TerminalAnsi"
+                        .into(),
+                );
+            }
+            Ok(_) => {}
+            Err(crate::protocol::FramingError::UnexpectedEof) => {
+                break GlassStreamEnd::Retryable("remote glass stream disconnected".into());
+            }
+            Err(crate::protocol::FramingError::Io(err)) => {
+                break GlassStreamEnd::Retryable(format!("remote glass stream failed: {err}"));
+            }
+            Err(err) => {
+                break GlassStreamEnd::Fatal(format!("remote glass protocol failed: {err}"));
+            }
+        }
+    };
+    connected.store(false, Ordering::Release);
+    writer_stop.store(true, Ordering::Release);
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    let _ = writer.join();
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{CellData, CursorState, FrameData};
+    use crate::protocol::{
+        CellData, ClientKeybindings, ClientLaunchMode, ClientMessage, CursorState, FrameData,
+        RenderEncoding,
+    };
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
     use ratatui::Terminal;
@@ -137,6 +1045,489 @@ mod tests {
             skip: false,
             hyperlink: None,
         }
+    }
+
+    fn geometry(cols: u16, rows: u16) -> GlassGeometry {
+        GlassGeometry {
+            area: Rect::new(3, 2, cols, rows),
+            cell_width_px: 9,
+            cell_height_px: 18,
+        }
+    }
+
+    #[test]
+    fn full_app_terminal_ansi_handshake_uses_exact_content_geometry() {
+        assert_eq!(
+            geometry(91, 27).hello(),
+            ClientMessage::Hello {
+                version: crate::protocol::PROTOCOL_VERSION,
+                cols: 91,
+                rows: 27,
+                cell_width_px: 9,
+                cell_height_px: 18,
+                requested_encoding: RenderEncoding::TerminalAnsi,
+                keybindings: ClientKeybindings::Server,
+                launch_mode: ClientLaunchMode::App,
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    fn run_fake_glass_stream(
+        server: std::os::unix::net::UnixStream,
+        client: std::os::unix::net::UnixStream,
+        event_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+        worker_update_tx: mpsc::Sender<GlassWorkerUpdate>,
+        server_body: impl FnOnce(std::os::unix::net::UnixStream) + Send + 'static,
+    ) -> GlassStreamEnd {
+        let server = std::thread::spawn(move || server_body(server));
+        let host = RemoteHostKey::new("remote-a", "default");
+        let (_outbound_tx, outbound_rx) = mpsc::sync_channel(4);
+        let outbound = Arc::new(Mutex::new(outbound_rx));
+        let shared_geometry = Arc::new(Mutex::new(geometry(12, 4)));
+        let connected = Arc::new(AtomicBool::new(false));
+        let shutdown_stream = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let result = run_glass_stream_once_and_publish_lifecycle(
+            client,
+            &host,
+            7,
+            &event_tx,
+            &outbound,
+            &shared_geometry,
+            &connected,
+            &shutdown_stream,
+            &stop,
+            &worker_update_tx,
+        );
+        server.join().expect("fake glass server should finish");
+        result
+    }
+
+    fn state_with_glass_generation(
+        host: &RemoteHostKey,
+        generation: u64,
+    ) -> crate::app::state::AppState {
+        let mut state = crate::app::state::AppState::test_new();
+        state.host_glass_states.insert(
+            host.clone(),
+            HostGlassState {
+                generation,
+                status: GlassStatus::Connecting,
+                message: Some("test connection".into()),
+            },
+        );
+        state
+    }
+
+    #[cfg(unix)]
+    fn accept_test_hello(stream: &mut std::os::unix::net::UnixStream) {
+        assert!(matches!(
+            crate::protocol::read_message::<_, ClientMessage>(
+                stream,
+                crate::protocol::MAX_FRAME_SIZE
+            )
+            .expect("read glass hello"),
+            ClientMessage::Hello {
+                version: crate::protocol::PROTOCOL_VERSION,
+                requested_encoding: RenderEncoding::TerminalAnsi,
+                launch_mode: ClientLaunchMode::App,
+                ..
+            }
+        ));
+        crate::protocol::write_message(
+            stream,
+            &crate::protocol::ServerMessage::Welcome {
+                version: crate::protocol::PROTOCOL_VERSION,
+                encoding: RenderEncoding::TerminalAnsi,
+                error: None,
+            },
+        )
+        .expect("write glass welcome");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn worker_frame_then_stale_drains_in_order_through_app_runtime() {
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("stream pair");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let host = RemoteHostKey::new("remote-a", "default");
+        let generation = 7;
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        app.state.host_glass_states.insert(
+            host.clone(),
+            HostGlassState {
+                generation,
+                status: GlassStatus::Connecting,
+                message: Some("test connection".into()),
+            },
+        );
+        app.host_glass_surfaces.insert(
+            host.clone(),
+            GlassSurfaceCore::new(Rect::new(0, 0, 12, 4), generation).expect("test surface"),
+        );
+        let result = run_fake_glass_stream(
+            server,
+            client,
+            event_tx,
+            app.host_glass_runtime.worker_update_tx.clone(),
+            |mut server| {
+                accept_test_hello(&mut server);
+                crate::protocol::write_message(
+                    &mut server,
+                    &crate::protocol::ServerMessage::Terminal(crate::protocol::TerminalFrame {
+                        seq: 1,
+                        width: 12,
+                        height: 4,
+                        full: true,
+                        bytes: b"\x1b[2J\x1b[Hframe-from-remote".to_vec(),
+                    }),
+                )
+                .expect("write terminal frame");
+                crate::protocol::write_message(
+                    &mut server,
+                    &crate::protocol::ServerMessage::ServerShutdown {
+                        reason: Some("test complete".into()),
+                    },
+                )
+                .expect("close fake stream");
+            },
+        );
+        assert!(matches!(result, GlassStreamEnd::Retryable(_)));
+
+        let event = event_rx.blocking_recv().expect("worker wake hint");
+        app.handle_internal_event(event);
+        assert!(app
+            .host_glass_surfaces
+            .get(&host)
+            .expect("surface retained")
+            .visible_text()
+            .starts_with("frame-from-r"));
+        assert!(matches!(
+            app.state
+                .host_glass_states
+                .get(&host)
+                .map(|glass| glass.status),
+            Some(GlassStatus::Stale { .. })
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn worker_connecting_then_frame_drains_to_live_through_app_runtime() {
+        let host = RemoteHostKey::new("remote-a", "default");
+        let generation = 7;
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        app.state = state_with_glass_generation(&host, generation);
+        app.host_glass_surfaces.insert(
+            host.clone(),
+            GlassSurfaceCore::new(Rect::new(0, 0, 12, 4), generation).expect("test surface"),
+        );
+        app.host_glass_runtime
+            .worker_update_tx
+            .send(GlassWorkerUpdate::Status {
+                host: host.clone(),
+                generation,
+                status: GlassStatus::Connecting,
+                message: Some("opening".into()),
+            })
+            .expect("queue connecting");
+        app.host_glass_runtime
+            .worker_update_tx
+            .send(GlassWorkerUpdate::Frame {
+                host: host.clone(),
+                generation,
+                bytes: b"first-live-frame".to_vec(),
+            })
+            .expect("queue frame");
+
+        app.handle_internal_event(crate::events::AppEvent::HostGlassWake);
+
+        assert_eq!(
+            app.state
+                .host_glass_states
+                .get(&host)
+                .map(|glass| glass.status),
+            Some(GlassStatus::Live)
+        );
+        assert!(app
+            .host_glass_surfaces
+            .get(&host)
+            .expect("surface retained")
+            .visible_text()
+            .starts_with("first-live-f"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn handshake_refusal_is_fatal_instead_of_silent_retry() {
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("stream pair");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let mut runtime = HostGlassRuntime::default();
+        let result = run_fake_glass_stream(
+            server,
+            client,
+            event_tx,
+            runtime.worker_update_tx.clone(),
+            |mut server| {
+                let _hello = crate::protocol::read_message::<_, ClientMessage>(
+                    &mut server,
+                    crate::protocol::MAX_FRAME_SIZE,
+                )
+                .expect("read glass hello");
+                crate::protocol::write_message(
+                    &mut server,
+                    &crate::protocol::ServerMessage::Welcome {
+                        version: crate::protocol::PROTOCOL_VERSION,
+                        encoding: RenderEncoding::TerminalAnsi,
+                        error: Some("version refused".into()),
+                    },
+                )
+                .expect("write refusal");
+            },
+        );
+        assert!(matches!(
+            result,
+            GlassStreamEnd::Fatal(message) if message.contains("version refused")
+        ));
+        let host = RemoteHostKey::new("remote-a", "default");
+        let mut state = state_with_glass_generation(&host, 7);
+        runtime.drain_worker_updates(&mut state, &mut HostGlassSurfaceRegistry::default());
+        let glass = state.host_glass_states.get(&host).expect("glass state");
+        assert!(matches!(glass.status, GlassStatus::Stale { .. }));
+        assert!(glass
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("version refused")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn closed_runtime_stream_transitions_current_generation_to_stale() {
+        let host = RemoteHostKey::new("remote-a", "default");
+        let generation = 7;
+        let mut state = state_with_glass_generation(&host, generation);
+        let mut runtime = HostGlassRuntime::default();
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("stream pair");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let result = run_fake_glass_stream(
+            server,
+            client,
+            event_tx,
+            runtime.worker_update_tx.clone(),
+            |mut server| {
+                accept_test_hello(&mut server);
+                drop(server);
+            },
+        );
+        assert!(matches!(result, GlassStreamEnd::Retryable(_)));
+        runtime.drain_worker_updates(&mut state, &mut HostGlassSurfaceRegistry::default());
+        let glass = state.host_glass_states.get(&host).expect("glass state");
+        assert!(matches!(glass.status, GlassStatus::Stale { .. }));
+        assert!(glass
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("disconnected")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn saturated_app_queue_still_delivers_stale_truth_through_runtime_mailbox() {
+        let host = RemoteHostKey::new("remote-a", "default");
+        let generation = 7;
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            tokio::sync::mpsc::unbounded_channel().1,
+            crate::api::EventHub::default(),
+        );
+        app.state = state_with_glass_generation(&host, generation);
+        app.host_glass_surfaces.insert(
+            host.clone(),
+            GlassSurfaceCore::new(Rect::new(0, 0, 12, 4), generation).expect("test surface"),
+        );
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        event_tx
+            .try_send(crate::events::AppEvent::HostGlassWake)
+            .expect("fill bounded App queue");
+
+        let (client, server) = std::os::unix::net::UnixStream::pair().expect("stream pair");
+        let result = run_fake_glass_stream(
+            server,
+            client,
+            event_tx,
+            app.host_glass_runtime.worker_update_tx.clone(),
+            |mut server| {
+                accept_test_hello(&mut server);
+                crate::protocol::write_message(
+                    &mut server,
+                    &crate::protocol::ServerMessage::Terminal(crate::protocol::TerminalFrame {
+                        seq: 1,
+                        width: 12,
+                        height: 4,
+                        full: true,
+                        bytes: b"frame-that-cannot-be-queued".to_vec(),
+                    }),
+                )
+                .expect("write terminal frame");
+            },
+        );
+        assert!(matches!(
+            result,
+            GlassStreamEnd::Retryable(ref message) if message.contains("queue saturated")
+        ));
+
+        // The full Tokio queue carries only a wake. Handling that queued hint
+        // drains the authoritative same-generation Frame -> Stale sequence.
+        app.handle_internal_event(event_rx.blocking_recv().expect("queued wake"));
+        assert!(app
+            .host_glass_surfaces
+            .get(&host)
+            .expect("surface retained")
+            .visible_text()
+            .starts_with("frame-that-c"));
+        let glass = app.state.host_glass_states.get(&host).expect("glass state");
+        assert!(matches!(glass.status, GlassStatus::Stale { .. }));
+        assert!(glass
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("queue saturated")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn retiring_stream_never_waits_for_worker_join_on_caller() {
+        let (outbound, _outbound_rx) = mpsc::sync_channel(1);
+        let geometry = Arc::new(Mutex::new(geometry(12, 4)));
+        let connected = Arc::new(AtomicBool::new(false));
+        let shutdown_stream = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_done = Arc::clone(&done);
+        let (release_tx, release_rx) = mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+            worker_done.store(true, Ordering::Release);
+        });
+        let handle = GlassStreamHandle {
+            outbound,
+            geometry,
+            connected,
+            shutdown_stream,
+            stop,
+            done: Arc::clone(&done),
+            join: Some(join),
+        };
+        let mut runtime = HostGlassRuntime::default();
+        runtime.stream = Some(handle);
+
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let retire = std::thread::spawn(move || {
+            runtime.retire_stream();
+            let _ = returned_tx.send(());
+            runtime
+        });
+        let returned = returned_rx.recv_timeout(Duration::from_millis(100));
+        // Let the reaper's intentionally blocked test worker finish even when
+        // the assertion below fails, keeping this test failure bounded.
+        let _ = release_tx.send(());
+        let runtime = retire.join().expect("retirement caller should finish");
+        assert!(returned.is_ok(), "retirement waited for the worker join");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !done.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(done.load(Ordering::Acquire));
+        drop(runtime);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resize_is_forwarded_by_worker_writer_as_structured_message() {
+        let (client, mut server) = std::os::unix::net::UnixStream::pair().expect("stream pair");
+        let server = std::thread::spawn(move || {
+            accept_test_hello(&mut server);
+            let resize = crate::protocol::read_message::<_, ClientMessage>(
+                &mut server,
+                crate::protocol::MAX_FRAME_SIZE,
+            )
+            .expect("read forwarded resize");
+            crate::protocol::write_message(
+                &mut server,
+                &crate::protocol::ServerMessage::ServerShutdown {
+                    reason: Some("resize observed".into()),
+                },
+            )
+            .expect("close fake stream");
+            resize
+        });
+
+        let host = RemoteHostKey::new("remote-a", "default");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let (worker_update_tx, _worker_update_rx) = mpsc::channel();
+        let (outbound_tx, outbound_rx) = mpsc::sync_channel(4);
+        let outbound = Arc::new(Mutex::new(outbound_rx));
+        let shared_geometry = Arc::new(Mutex::new(geometry(12, 4)));
+        let connected = Arc::new(AtomicBool::new(false));
+        let shutdown_stream = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_outbound = Arc::clone(&outbound);
+        let worker_geometry = Arc::clone(&shared_geometry);
+        let worker_connected = Arc::clone(&connected);
+        let worker_shutdown = Arc::clone(&shutdown_stream);
+        let worker_stop = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            run_glass_stream_once(
+                client,
+                &host,
+                9,
+                &event_tx,
+                &worker_update_tx,
+                &worker_outbound,
+                &worker_geometry,
+                &worker_connected,
+                &worker_shutdown,
+                &worker_stop,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !connected.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(connected.load(Ordering::Acquire));
+        *shared_geometry
+            .lock()
+            .expect("test geometry lock should remain healthy") = geometry(100, 31);
+        outbound_tx
+            .try_send(geometry(100, 31).resize())
+            .expect("queue resize without network IO on test loop");
+
+        assert_eq!(
+            server.join().expect("fake server should finish"),
+            ClientMessage::Resize {
+                cols: 100,
+                rows: 31,
+                cell_width_px: 9,
+                cell_height_px: 18,
+            }
+        );
+        assert!(matches!(
+            worker.join().expect("glass worker should finish"),
+            GlassStreamEnd::Retryable(_)
+        ));
     }
 
     #[test]

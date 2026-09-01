@@ -2691,6 +2691,9 @@ impl AppState {
                 );
                 Vec::new()
             }
+            // Host-glass worker updates belong to the App-owned runtime and
+            // are drained before the pure reducer sees this wake hint.
+            AppEvent::HostGlassWake => Vec::new(),
             AppEvent::RemoteSourceRemoved { host } => {
                 if self.sidebar_source == crate::app::state::SidebarSource::Remote(host.clone()) {
                     self.select_sidebar_source(crate::app::state::SidebarSource::Local);
