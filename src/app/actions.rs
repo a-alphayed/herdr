@@ -2909,7 +2909,9 @@ impl AppState {
             }
             // Intercepted in App::handle_internal_event before reaching this
             // dispatch; never touches AppState.
-            AppEvent::ClipboardWrite { .. } => Vec::new(),
+            AppEvent::ClipboardWrite { .. } | AppEvent::HostGlassClipboardWrite { .. } => {
+                Vec::new()
+            }
             AppEvent::TerminalCwdReported { pane_id, cwd } => {
                 if !cwd.is_absolute() || !cwd.is_dir() {
                     return Vec::new();

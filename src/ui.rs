@@ -696,7 +696,7 @@ fn render_host_glass(
     let indicator = Line::from(vec![
         Span::styled(" glass  ", Style::default().fg(app.palette.accent)),
         Span::styled(
-            host_label,
+            host_label.clone(),
             Style::default()
                 .fg(app.palette.text)
                 .add_modifier(Modifier::BOLD),
@@ -763,26 +763,23 @@ fn render_host_glass(
         }
         crate::app::host_glass::GlassStatus::Stale { .. } if frame_is_renderable => {
             dim_background(frame, body);
-            let banner_area = Rect::new(
-                body.x,
-                body.y.saturating_add(body.height / 2),
-                body.width,
-                1,
+            render_host_glass_stale_banner(
+                app,
+                frame,
+                body,
+                &host_label,
+                metadata.and_then(|glass| glass.last_live_frame_age_secs),
+                metadata.and_then(|glass| glass.input_drop_cue),
             );
-            let banner = metadata
-                .and_then(|glass| glass.input_drop_cue)
-                .map(|reason| format!(" INPUT DROPPED · {} · not queued ", reason.cue_text()))
-                .unwrap_or_else(|| " STALE · cached frame · reconnecting ".into());
-            frame.render_widget(
-                Paragraph::new(banner)
-                    .style(
-                        Style::default()
-                            .fg(app.palette.text)
-                            .bg(app.palette.surface0)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                    .alignment(Alignment::Center),
-                banner_area,
+        }
+        crate::app::host_glass::GlassStatus::Stale { .. } => {
+            render_host_glass_stale_banner(
+                app,
+                frame,
+                body,
+                &host_label,
+                metadata.and_then(|glass| glass.last_live_frame_age_secs),
+                metadata.and_then(|glass| glass.input_drop_cue),
             );
         }
         _ => {
@@ -808,6 +805,55 @@ fn render_host_glass(
             );
         }
     }
+}
+
+fn render_host_glass_stale_banner(
+    app: &AppState,
+    frame: &mut Frame<'_>,
+    body: Rect,
+    host_label: &str,
+    last_live_frame_age_secs: Option<u64>,
+    input_drop: Option<crate::app::host_glass::GlassInputDropReason>,
+) {
+    use ratatui::layout::Alignment;
+    use ratatui::text::Line;
+    use ratatui::widgets::Paragraph;
+
+    let lines = host_glass_stale_banner_lines(host_label, last_live_frame_age_secs, input_drop);
+    let height = lines.len() as u16;
+    let center_row = body.y.saturating_add(body.height / 2);
+    let banner_area = Rect::new(
+        body.x,
+        center_row.saturating_sub(height.saturating_sub(1)),
+        body.width,
+        height,
+    );
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+            .style(
+                Style::default()
+                    .fg(app.palette.text)
+                    .bg(app.palette.surface0)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .alignment(Alignment::Center),
+        banner_area,
+    );
+}
+
+fn host_glass_stale_banner_lines(
+    host_label: &str,
+    last_live_frame_age_secs: Option<u64>,
+    input_drop: Option<crate::app::host_glass::GlassInputDropReason>,
+) -> [String; 2] {
+    let frame_age = last_live_frame_age_secs.map_or_else(
+        || "no live frame received".to_string(),
+        |age_secs| format!("last live frame {age_secs}s ago"),
+    );
+    let detail = input_drop.map_or(frame_age.clone(), |_| {
+        format!("{frame_age} · INPUT DROPPED · not queued")
+    });
+    [format!(" STALE · {host_label} "), format!(" {detail} ")]
 }
 
 // ---------------------------------------------------------------------------
@@ -3040,14 +3086,26 @@ mod tests {
             .expect("selected glass metadata")
             .input_drop_cue = None;
 
+        let stale_now = std::time::Instant::now();
+        app.state
+            .host_glass_states
+            .get_mut(&host)
+            .expect("selected glass metadata")
+            .last_frame_at = Some(stale_now - std::time::Duration::from_secs(42));
         assert!(app.state.set_host_glass_status(
             &host,
             generation,
-            crate::app::host_glass::GlassStatus::Stale {
-                since: std::time::Instant::now(),
-            },
+            crate::app::host_glass::GlassStatus::Stale { since: stale_now },
             Some("cached frame".into()),
         ));
+        assert!(app.tick_host_glass_status(stale_now));
+        assert_eq!(
+            app.state
+                .host_glass_states
+                .get(&host)
+                .and_then(|glass| glass.last_live_frame_age_secs),
+            Some(42)
+        );
         terminal
             .draw(|frame| {
                 render_with_runtime_registry_and_glass(
@@ -3065,8 +3123,16 @@ mod tests {
             app.state.view.terminal_area.y,
         );
         assert!(indicator.contains("Stale"));
-        let banner_row = body.y + body.height / 2;
-        assert!(buffer_row_text(buffer, body, banner_row).contains("STALE"));
+        let detail_row = body.y + body.height / 2;
+        let identity_row = detail_row - 1;
+        assert_eq!(
+            buffer_row_text(buffer, body, identity_row).trim(),
+            "STALE · jafar"
+        );
+        assert_eq!(
+            buffer_row_text(buffer, body, detail_row).trim(),
+            "last live frame 42s ago"
+        );
         assert!(buffer[(body.x, body.y)]
             .style()
             .add_modifier
@@ -3087,12 +3153,35 @@ mod tests {
                 )
             })
             .expect("render stale input-drop cue");
-        assert!(
-            buffer_row_text(terminal.backend().buffer(), body, banner_row)
-                .contains("INPUT DROPPED")
+        assert_eq!(
+            buffer_row_text(terminal.backend().buffer(), body, identity_row).trim(),
+            "STALE · jafar"
         );
-        assert!(
-            buffer_row_text(terminal.backend().buffer(), body, banner_row).contains("not queued")
+        assert_eq!(
+            buffer_row_text(terminal.backend().buffer(), body, detail_row).trim(),
+            "last live frame 42s ago · INPUT DROPPED · not queued"
+        );
+    }
+
+    #[test]
+    fn host_glass_stale_banner_names_host_and_reports_exact_last_frame_age() {
+        let banner = host_glass_stale_banner_lines("jafar", Some(42), None);
+        assert_eq!(banner, [" STALE · jafar ", " last live frame 42s ago "]);
+
+        let dropped = host_glass_stale_banner_lines(
+            "jafar / work",
+            Some(42),
+            Some(crate::app::host_glass::GlassInputDropReason::Stale),
+        );
+        assert_eq!(dropped[0], " STALE · jafar / work ");
+        assert_eq!(
+            dropped[1],
+            " last live frame 42s ago · INPUT DROPPED · not queued "
+        );
+
+        assert_eq!(
+            host_glass_stale_banner_lines("jafar", None, None),
+            [" STALE · jafar ", " no live frame received "]
         );
     }
 
@@ -3253,9 +3342,14 @@ mod tests {
         terminal
             .draw(|frame| render(&app, frame))
             .expect("render stale no-frame input cue");
-        assert!(
-            buffer_row_text(terminal.backend().buffer(), body, body.y + body.height / 2)
-                .contains("INPUT DROPPED")
+        let detail_row = body.y + body.height / 2;
+        assert_eq!(
+            buffer_row_text(terminal.backend().buffer(), body, detail_row - 1).trim(),
+            "STALE · remote-a"
+        );
+        assert_eq!(
+            buffer_row_text(terminal.backend().buffer(), body, detail_row).trim(),
+            "no live frame received · INPUT DROPPED · not queued"
         );
     }
 

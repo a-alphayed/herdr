@@ -1934,10 +1934,17 @@ impl AppState {
         &mut self,
         host: crate::remote_source::RemoteHostKey,
     ) -> u64 {
-        let input_drop_cue = self
+        let (input_drop_cue, last_frame_at, last_live_frame_age_secs) = self
             .host_glass_states
             .get(&host)
-            .and_then(|state| state.input_drop_cue);
+            .map(|state| {
+                (
+                    state.input_drop_cue,
+                    state.last_frame_at,
+                    state.last_live_frame_age_secs,
+                )
+            })
+            .unwrap_or((None, None, None));
         let mut generation = self
             .host_glass_states
             .get(&host)
@@ -1952,6 +1959,8 @@ impl AppState {
                 generation,
                 status: crate::app::host_glass::GlassStatus::Connecting,
                 message: Some("opening host glass stream".into()),
+                last_frame_at,
+                last_live_frame_age_secs,
                 // A generation-0 first-attach cue must remain visible when
                 // reconciliation starts generation 1 in the same loop turn.
                 input_drop_cue,
@@ -2002,6 +2011,8 @@ impl AppState {
                 generation: 0,
                 status: crate::app::host_glass::GlassStatus::Connecting,
                 message: Some("opening host glass stream".into()),
+                last_frame_at: None,
+                last_live_frame_age_secs: None,
                 input_drop_cue: None,
             }
         });
@@ -3054,6 +3065,8 @@ mod tests {
                 generation,
                 status: crate::app::host_glass::GlassStatus::Connecting,
                 message: Some("opening host glass stream".into()),
+                last_frame_at: None,
+                last_live_frame_age_secs: None,
                 input_drop_cue: None,
             })
         );

@@ -69,8 +69,11 @@ impl App {
         // The bounded Tokio event is only a wake mechanism. Drain the single
         // authoritative worker mailbox before every event so a dropped/full
         // wake hint cannot strand an ordered Frame -> lifecycle transition.
-        self.host_glass_runtime
-            .drain_worker_updates(&mut self.state, &mut self.host_glass_surfaces);
+        self.host_glass_runtime.drain_worker_updates(
+            &mut self.state,
+            &mut self.host_glass_surfaces,
+            &self.event_tx,
+        );
 
         let ev = match ev {
             AppEvent::PaneRuntimeDied {
@@ -94,11 +97,61 @@ impl App {
             return;
         }
 
+        match &ev {
+            AppEvent::RemoteSourceBridgeState { host, .. } => {
+                let _ =
+                    self.host_glass_runtime
+                        .note_bridge_health(&self.state, host, Instant::now());
+            }
+            AppEvent::RemoteSourceDisconnected { host, status, .. } => {
+                let _ = self.host_glass_runtime.note_bridge_disconnected(
+                    &mut self.state,
+                    host,
+                    *status,
+                    Instant::now(),
+                );
+            }
+            _ => {}
+        }
+
         if matches!(ev, AppEvent::HostGlassWake) {
             return;
         }
 
         if let AppEvent::ClipboardWrite { content } = ev {
+            #[cfg(not(test))]
+            crate::selection::write_osc52_bytes(&content);
+            #[cfg(test)]
+            let _ = content;
+            self.show_clipboard_feedback();
+            return;
+        }
+
+        if let AppEvent::HostGlassClipboardWrite {
+            host,
+            generation,
+            connection,
+            content,
+        } = ev
+        {
+            // This is the final authority gate immediately before the local
+            // clipboard side effect. A queued predecessor event cannot write
+            // after disable, deselection, retirement, or reconnect.
+            if !self.host_glass_runtime.clipboard_provenance_is_current(
+                &self.state,
+                &host,
+                generation,
+                connection,
+            ) {
+                tracing::debug!(
+                    host = %host.host,
+                    session = %host.session,
+                    generation,
+                    connection,
+                    "discarding revoked host glass clipboard write"
+                );
+                return;
+            }
             #[cfg(not(test))]
             crate::selection::write_osc52_bytes(&content);
             #[cfg(test)]

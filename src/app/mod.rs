@@ -115,6 +115,7 @@ pub struct App {
     pub(crate) toast_deadline: Option<Instant>,
     pub(crate) copy_feedback_deadline: Option<Instant>,
     pub(crate) host_glass_input_drop_cue_deadline: Option<Instant>,
+    pub(crate) host_glass_status_refresh_deadline: Option<Instant>,
     pub(crate) last_api_notification_at: Option<Instant>,
     pub(crate) last_git_remote_status_refresh: Instant,
     pub(crate) git_refresh_in_flight: bool,
@@ -915,6 +916,7 @@ impl App {
             toast_deadline: None,
             copy_feedback_deadline: None,
             host_glass_input_drop_cue_deadline: None,
+            host_glass_status_refresh_deadline: None,
             last_api_notification_at: None,
             state,
             terminal_runtimes: restored_terminal_runtimes,
@@ -1382,6 +1384,11 @@ impl App {
             }
         }
 
+        // Retire glass admission/worker ownership before persistence and
+        // terminal teardown. The actual bounded join/drop stays on its reaper.
+        self.host_glass_runtime
+            .shutdown(&mut self.selected_host_bridge_runtime);
+
         // Save session on exit (skip in --no-session mode)
         if !self.no_session {
             self.save_session_now();
@@ -1700,8 +1707,19 @@ impl App {
 
         if !invalid_section("experimental") {
             let was_kitty_graphics_enabled = self.state.kitty_graphics_enabled;
+            let was_host_glass_enabled = self.state.host_glass_enabled;
             self.state.kitty_graphics_enabled = config.experimental.kitty_graphics;
             self.state.host_glass_enabled = config.experimental.host_glass;
+            if was_host_glass_enabled && !self.state.host_glass_enabled {
+                self.host_glass_runtime.deactivate(
+                    &mut self.state,
+                    &mut self.host_glass_surfaces,
+                    &mut self.selected_host_bridge_runtime,
+                );
+                self.host_glass_status_refresh_deadline = None;
+                self.host_glass_input_drop_cue_deadline = None;
+                let _ = self.state.clear_host_glass_input_drop_cues();
+            }
             crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
             if was_kitty_graphics_enabled && !config.experimental.kitty_graphics {
                 let _ = crate::kitty_graphics::clear_all_host_graphics();
@@ -2263,6 +2281,56 @@ mod tests {
             None,
         ));
         assert!(!app.desired_host_mouse_capture());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_config_disable_immediately_retires_host_glass_stream_and_queue() {
+        let mut app = test_app();
+        app.state.host_glass_enabled = true;
+        app.state.view.layout = state::ViewLayout::Desktop;
+        app.state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
+        let host = crate::remote_source::RemoteHostKey::new("remote-a", "default");
+        app.state
+            .select_sidebar_source(state::SidebarSource::Remote(host.clone()));
+        let generation = app.state.begin_host_glass_generation(host.clone());
+        assert!(app.state.set_host_glass_status(
+            &host,
+            generation,
+            crate::app::host_glass::GlassStatus::Live,
+            None,
+        ));
+        let receiver = app.host_glass_runtime.test_install_connected_stream(
+            host.clone(),
+            generation,
+            Some(false),
+        );
+
+        let config = crate::config::Config::default();
+        assert!(!config.experimental.host_glass);
+        let report = app.apply_live_config(&config, &[], &[], false);
+
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert!(!app.state.host_glass_enabled);
+        assert!(!app.state.host_glass_surface_active());
+        assert!(app.host_glass_runtime.test_is_idle());
+        assert!(app.state.host_glass_states.get(&host).is_some_and(|glass| {
+            glass.generation == generation + 1
+                && matches!(
+                    glass.status,
+                    crate::app::host_glass::GlassStatus::Stale { .. }
+                )
+        }));
+        assert!(app.host_glass_status_refresh_deadline.is_none());
+        assert!(app.host_glass_input_drop_cue_deadline.is_none());
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            Ok(crate::protocol::ClientMessage::Detach)
+        );
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
     }
 
     /// Register an inert stub supervisor handle (no worker thread) for `host`
@@ -3148,6 +3216,91 @@ mod tests {
         let feedback = app.state.copy_feedback.as_ref().expect("copy feedback");
         assert_eq!(feedback.message, "copied to clipboard");
         assert!(app.copy_feedback_deadline.is_some());
+    }
+
+    #[cfg(unix)]
+    fn install_current_host_glass_clipboard_event(
+        app: &mut App,
+    ) -> (
+        AppEvent,
+        std::sync::mpsc::Receiver<crate::protocol::ClientMessage>,
+    ) {
+        let host = crate::remote_source::RemoteHostKey::new("remote-a", "default");
+        app.state.host_glass_enabled = true;
+        app.state.view.layout = state::ViewLayout::Desktop;
+        app.state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
+        app.state
+            .select_sidebar_source(state::SidebarSource::Remote(host.clone()));
+        let generation = app.state.begin_host_glass_generation(host.clone());
+        let receiver = app.host_glass_runtime.test_install_connected_stream(
+            host.clone(),
+            generation,
+            Some(false),
+        );
+        assert!(app
+            .host_glass_runtime
+            .clipboard_provenance_is_current(&app.state, &host, generation, 1,));
+        (
+            AppEvent::HostGlassClipboardWrite {
+                host,
+                generation,
+                connection: 1,
+                content: b"remote".to_vec(),
+            },
+            receiver,
+        )
+    }
+
+    #[cfg(unix)]
+    fn assert_host_glass_clipboard_final_gate_rejects(revoke: impl FnOnce(&mut App)) {
+        let mut app = test_app();
+        let (event, _receiver) = install_current_host_glass_clipboard_event(&mut app);
+        revoke(&mut app);
+
+        app.handle_internal_event(event);
+
+        assert!(app.state.copy_feedback.is_none());
+        assert!(app.copy_feedback_deadline.is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn host_glass_clipboard_final_gate_accepts_unchanged_provenance() {
+        let mut app = test_app();
+        let (event, _receiver) = install_current_host_glass_clipboard_event(&mut app);
+
+        app.handle_internal_event(event);
+
+        assert_eq!(
+            app.state
+                .copy_feedback
+                .as_ref()
+                .map(|feedback| feedback.message.as_str()),
+            Some("copied to clipboard")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn host_glass_clipboard_final_gate_rejects_deselect_disable_retire_and_replace() {
+        assert_host_glass_clipboard_final_gate_rejects(|app| {
+            app.state.select_sidebar_source(state::SidebarSource::Local);
+        });
+        assert_host_glass_clipboard_final_gate_rejects(|app| {
+            app.state.host_glass_enabled = false;
+        });
+        assert_host_glass_clipboard_final_gate_rejects(|app| {
+            app.host_glass_runtime.test_retire_connection();
+        });
+        assert_host_glass_clipboard_final_gate_rejects(|app| {
+            let state::SidebarSource::Remote(host) = app.state.effective_sidebar_source() else {
+                panic!("test host glass should be selected");
+            };
+            let _ = app.state.begin_host_glass_generation(host);
+        });
+        assert_host_glass_clipboard_final_gate_rejects(|app| {
+            app.host_glass_runtime.test_replace_connection(2);
+        });
     }
 
     #[test]

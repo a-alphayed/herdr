@@ -267,6 +267,7 @@ impl App {
         let mut resized = false;
 
         self.sync_animation_timer(now);
+        changed |= self.tick_host_glass_status(now);
 
         if now >= self.next_resize_poll {
             resized = self.handle_resize_poll();
@@ -636,6 +637,8 @@ impl App {
             self.state.next_pending_agent_notification_deadline(),
             self.copy_feedback_deadline,
             self.host_glass_input_drop_cue_deadline,
+            self.host_glass_runtime.stale_deadline(&self.state),
+            self.host_glass_status_refresh_deadline,
             self.next_animation_tick,
             include_git_refresh
                 .then(|| self.git_refresh_deadline())

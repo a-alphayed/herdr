@@ -1950,6 +1950,29 @@ impl HeadlessServer {
                 }
                 true
             }
+            AppEvent::HostGlassClipboardWrite {
+                host,
+                generation,
+                connection,
+                content,
+            } => {
+                // Preserve the nested glass connection's authority tags until
+                // immediately before the headless server forwards the local
+                // clipboard side effect to its foreground client.
+                if !self.app.host_glass_runtime.clipboard_provenance_is_current(
+                    &self.app.state,
+                    host,
+                    *generation,
+                    *connection,
+                ) {
+                    return false;
+                }
+                let data = base64::engine::general_purpose::STANDARD.encode(content.as_slice());
+                if self.send_to_foreground_client(ServerMessage::Clipboard { data }) {
+                    self.app.show_clipboard_feedback();
+                }
+                true
+            }
             AppEvent::StateChanged { pane_id, agent, .. } => {
                 // Capture toast before handling.
                 let toast_before = self.app.state.toast.clone();
@@ -3816,6 +3839,7 @@ impl HeadlessServer {
         let mut changed = false;
 
         self.app.sync_headless_animation_timer(now);
+        changed |= self.app.tick_host_glass_status(now);
 
         // No resize polling needed — server has no terminal.
         // Client resize messages drive size changes instead.
@@ -3987,6 +4011,10 @@ impl HeadlessServer {
     /// close client connections, remove socket files, and clean up.
     fn complete_shutdown(&mut self) -> io::Result<()> {
         info!("completing server shutdown");
+
+        self.app
+            .host_glass_runtime
+            .shutdown(&mut self.app.selected_host_bridge_runtime);
 
         // Send ServerShutdown to all remaining clients.
         if !self.clients.is_empty() {
@@ -8410,6 +8438,69 @@ next_tab = ""
                 .recv_timeout(Duration::from_millis(50))
                 .is_err(),
             "background client should not receive clipboard writes"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn host_glass_clipboard_forwarding_revalidates_before_foreground_side_effect() {
+        let mut server = test_headless_server();
+        let (foreground_tx, foreground_control_rx, _foreground_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                Some(foreground_tx),
+            ),
+        );
+        server.foreground_client_id = Some(1);
+
+        let host = crate::remote_source::RemoteHostKey::new("remote-a", "default");
+        server.app.state.host_glass_enabled = true;
+        server.app.state.view.layout = crate::app::state::ViewLayout::Desktop;
+        server.app.state.view.host_rail_rect = ratatui::layout::Rect::new(0, 0, 8, 24);
+        server
+            .app
+            .state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+        let generation = server.app.state.begin_host_glass_generation(host.clone());
+        let _glass_receiver = server.app.host_glass_runtime.test_install_connected_stream(
+            host.clone(),
+            generation,
+            Some(false),
+        );
+
+        let current_event = || AppEvent::HostGlassClipboardWrite {
+            host: host.clone(),
+            generation,
+            connection: 1,
+            content: b"remote".to_vec(),
+        };
+        assert!(server.handle_internal_event_with_forwarding(current_event()));
+        match read_server_message(
+            foreground_control_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("current host glass clipboard message"),
+        ) {
+            ServerMessage::Clipboard { data } => assert_eq!(data, "cmVtb3Rl"),
+            other => panic!("expected clipboard message, got {other:?}"),
+        }
+
+        server
+            .app
+            .state
+            .select_sidebar_source(crate::app::state::SidebarSource::Local);
+        assert!(!server.handle_internal_event_with_forwarding(current_event()));
+        assert!(
+            foreground_control_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "revoked host glass clipboard must not reach the foreground client"
         );
     }
 

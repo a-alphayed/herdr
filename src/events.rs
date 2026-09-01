@@ -284,6 +284,18 @@ pub enum AppEvent {
     /// A pane child emitted a valid OSC 52 clipboard write. The main loop
     /// re-emits it through herdr's own clipboard writer.
     ClipboardWrite { content: Vec<u8> },
+    /// The current host-glass connection emitted a valid OSC 52 clipboard
+    /// write. Keep its non-secret authority tags until the main-loop side
+    /// effect so selection, generation, or connection retirement can revoke
+    /// an already-queued write.
+    #[cfg_attr(windows, allow(dead_code))]
+    // Windows keeps the shared event taxonomy, but host-glass streams are Unix-only.
+    HostGlassClipboardWrite {
+        host: RemoteHostKey,
+        generation: u64,
+        connection: u64,
+        content: Vec<u8>,
+    },
     /// A pane child reported its shell current directory through terminal
     /// metadata such as OSC 7.
     TerminalCwdReported {

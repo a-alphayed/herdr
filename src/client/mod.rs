@@ -1766,7 +1766,7 @@ fn should_bridge_clipboard_image_paste(
 // ---------------------------------------------------------------------------
 
 /// Decode a clipboard payload forwarded by the server.
-fn decode_clipboard_payload(data: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_clipboard_payload(data: &str) -> Option<Vec<u8>> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(data).ok()
 }
