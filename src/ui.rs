@@ -385,12 +385,11 @@ fn compute_view_internal(
         compute_workspace_card_areas(app, sidebar_panel_rect)
     };
 
-    // A selected remote source reserves the main area as an authority-routing
-    // boundary, even while its first authoritative workspace snapshot is still
-    // pending. Local tab/pane geometry, hit targets, split borders, and
-    // background pane resizing are all suppressed so no local terminal runtime
-    // can be touched through mouse/keyboard while the remote surface is active.
-    if app.remote_projection_surface_active() {
+    // Full-App glass owns the main area. Local tab/pane geometry, hit targets,
+    // split borders, and background pane resizing are suppressed so no local
+    // terminal runtime can be touched through mouse/keyboard while glass is
+    // active.
+    if app.host_glass_surface_active() {
         let toast_hit_area = app
             .toast
             .as_ref()
@@ -403,18 +402,6 @@ fn compute_view_internal(
                 )
             })
             .unwrap_or_default();
-        let (remote_projection_tab_hit_areas, remote_projection_hit_areas) =
-            if app.host_glass_surface_active() {
-                // Glass is a single full-App surface, not a locally
-                // reconstructed pane layout. The host rail remains clickable,
-                // while every local/projection content hit target is absent.
-                (Vec::new(), Vec::new())
-            } else {
-                (
-                    compute_remote_projection_tab_hit_areas(app, main_area),
-                    compute_remote_projection_hit_areas(app, main_area),
-                )
-            };
         app.view = crate::app::ViewState {
             layout: ViewLayout::Desktop,
             sidebar_rect: sidebar_area,
@@ -434,8 +421,8 @@ fn compute_view_internal(
             toast_hit_area,
             pane_infos: Vec::new(),
             split_borders: Vec::new(),
-            remote_projection_tab_hit_areas,
-            remote_projection_hit_areas,
+            remote_projection_tab_hit_areas: Vec::new(),
+            remote_projection_hit_areas: Vec::new(),
         };
         return;
     }
@@ -490,6 +477,15 @@ fn compute_view_internal(
             )
         })
         .unwrap_or_default();
+    let (remote_projection_tab_hit_areas, remote_projection_hit_areas) =
+        if app.selected_remote_space.is_some() {
+            (
+                compute_remote_projection_tab_hit_areas(app, main_area),
+                compute_remote_projection_hit_areas(app, main_area),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
@@ -510,8 +506,8 @@ fn compute_view_internal(
         toast_hit_area,
         pane_infos,
         split_borders,
-        remote_projection_tab_hit_areas: Vec::new(),
-        remote_projection_hit_areas: Vec::new(),
+        remote_projection_tab_hit_areas,
+        remote_projection_hit_areas,
     };
 }
 
@@ -535,42 +531,6 @@ fn compute_mobile_view(
         let switcher_viewport_h = area.height.saturating_sub(header_h + 1);
         let max_scroll = mobile_switcher_max_scroll_for_height(app, switcher_viewport_h);
         app.mobile_switcher_scroll = app.mobile_switcher_scroll.min(max_scroll);
-    }
-
-    // A projected remote space renders read-only on mobile too: no local split
-    // borders, pane infos, or background pane resizing.
-    if app.selected_remote_space.is_some() {
-        let toast_hit_area = app
-            .toast
-            .as_ref()
-            .map(|_| mobile_toast_banner_rect(area, app.config_diagnostic.is_some()))
-            .unwrap_or_default();
-        let remote_projection_tab_hit_areas =
-            compute_remote_projection_tab_hit_areas(app, terminal_area);
-        let remote_projection_hit_areas = compute_remote_projection_hit_areas(app, terminal_area);
-        app.view = crate::app::ViewState {
-            layout: ViewLayout::Mobile,
-            sidebar_rect: Rect::default(),
-            host_rail_rect: Rect::default(),
-            host_rail_visually_suppressed: false,
-            glass_sidebar_yielded: false,
-            sidebar_panel_rect: Rect::default(),
-            workspace_card_areas: Vec::new(),
-            tab_bar_rect: Rect::default(),
-            tab_hit_areas: Vec::new(),
-            tab_scroll_left_hit_area: Rect::default(),
-            tab_scroll_right_hit_area: Rect::default(),
-            new_tab_hit_area: Rect::default(),
-            terminal_area,
-            mobile_header_rect: header_rect,
-            mobile_menu_hit_area: Rect::default(),
-            toast_hit_area,
-            pane_infos: Vec::new(),
-            split_borders: Vec::new(),
-            remote_projection_tab_hit_areas,
-            remote_projection_hit_areas,
-        };
-        return;
     }
 
     let split_borders = app
@@ -602,6 +562,15 @@ fn compute_mobile_view(
         .as_ref()
         .map(|_| mobile_toast_banner_rect(area, app.config_diagnostic.is_some()))
         .unwrap_or_default();
+    let (remote_projection_tab_hit_areas, remote_projection_hit_areas) =
+        if app.selected_remote_space.is_some() {
+            (
+                compute_remote_projection_tab_hit_areas(app, terminal_area),
+                compute_remote_projection_hit_areas(app, terminal_area),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
     app.view = crate::app::ViewState {
         layout: ViewLayout::Mobile,
@@ -622,8 +591,8 @@ fn compute_mobile_view(
         toast_hit_area,
         pane_infos,
         split_borders,
-        remote_projection_tab_hit_areas: Vec::new(),
-        remote_projection_hit_areas: Vec::new(),
+        remote_projection_tab_hit_areas,
+        remote_projection_hit_areas,
     };
 }
 
@@ -665,14 +634,11 @@ pub(crate) fn render_with_runtime_registry_and_glass(
             render_sidebar(app, terminal_runtimes, frame, sidebar_area);
         }
     }
-    let remote_projection_active = app.remote_projection_surface_active();
-    if app.view.layout != ViewLayout::Mobile && !remote_projection_active {
+    if app.view.layout != ViewLayout::Mobile && !app.host_glass_surface_active() {
         render_tab_bar(app, frame, tab_bar_area);
     }
     if app.host_glass_surface_active() {
         render_host_glass(app, glass_surfaces, frame, terminal_area);
-    } else if remote_projection_active {
-        render_remote_projection(app, frame, terminal_area);
     } else {
         render_panes(app, terminal_runtimes, frame, terminal_area);
     }
@@ -929,18 +895,18 @@ fn host_glass_stale_banner_lines(
 }
 
 // ---------------------------------------------------------------------------
-// Projection geometry — shared between compute_view and render
+// Deferred projection input geometry
 // ---------------------------------------------------------------------------
 
-/// Recursively decompose a layout tree into `(pane, rect, is_focused)` tuples
-/// using the same split math as the renderer. The `focused_pane_id` argument
-/// marks which leaf is the remote-focused pane.
-pub(crate) fn project_layout_rects<'a>(
+/// Decompose the cached remote layout for the projection action path retained
+/// until S2. Projection presentation no longer consumes these rectangles.
+fn project_layout_rects<'a>(
     node: &'a crate::api::schema::LayoutNode,
     area: Rect,
     focused_pane_id: &str,
 ) -> Vec<(&'a crate::api::schema::LayoutPane, Rect, bool)> {
     use crate::api::schema::{LayoutNode, SplitDirection};
+
     match node {
         LayoutNode::Pane { pane } => {
             let is_focused = pane
@@ -975,7 +941,7 @@ pub(crate) fn project_layout_rects<'a>(
     }
 }
 
-fn remote_projection_tab_strip(
+fn remote_projection_tab_hit_context(
     app: &crate::app::AppState,
 ) -> Option<(
     crate::remote_source::RemoteSpaceKey,
@@ -1005,34 +971,16 @@ fn remote_projection_tab_strip(
     Some((selected.clone(), tabs, capabilities))
 }
 
-fn remote_projection_chrome_rows(app: &crate::app::AppState) -> u16 {
-    if remote_projection_tab_strip(app).is_some() {
-        2
-    } else {
-        1
-    }
-}
-
-fn remote_projection_body_area(app: &crate::app::AppState, area: Rect) -> Option<Rect> {
-    let header_rows = remote_projection_chrome_rows(app);
-    if area.height <= header_rows {
-        return None;
-    }
-    let [_, body] =
-        Layout::vertical([Constraint::Length(header_rows), Constraint::Min(1)]).areas(area);
-    Some(body)
-}
-
 fn compute_remote_projection_tab_hit_areas(
     app: &crate::app::AppState,
     area: Rect,
 ) -> Vec<crate::app::state::RemoteProjectionTabHitArea> {
     use crate::app::state::{RemoteProjectionTabAction, RemoteProjectionTabHitArea};
 
-    let Some((selected, tabs, capabilities)) = remote_projection_tab_strip(app) else {
+    let Some((selected, tabs, capabilities)) = remote_projection_tab_hit_context(app) else {
         return Vec::new();
     };
-    if area.height <= remote_projection_chrome_rows(app) || area.width == 0 {
+    if area.height <= 1 || area.width == 0 {
         return Vec::new();
     }
 
@@ -1090,9 +1038,9 @@ fn compute_remote_projection_tab_hit_areas(
         let width = 5u16.min(right.saturating_sub(x));
         hits.push(RemoteProjectionTabHitArea {
             rect: Rect::new(x, row, width, 1),
-            host: selected.host.clone(),
-            session: selected.session.clone(),
-            workspace_id: selected.workspace_id.clone(),
+            host: selected.host,
+            session: selected.session,
+            workspace_id: selected.workspace_id,
             tab_id: None,
             label: "new tab".to_string(),
             action: RemoteProjectionTabAction::New,
@@ -1102,13 +1050,12 @@ fn compute_remote_projection_tab_hit_areas(
     hits
 }
 
-/// Build the projection hit-area list for `compute_view`. Called only when
-/// `selected_remote_space` is Some.
 fn compute_remote_projection_hit_areas(
     app: &crate::app::AppState,
-    body_area: Rect,
+    area: Rect,
 ) -> Vec<crate::app::state::RemoteProjectionHitArea> {
     use crate::remote_source::RemoteProjectionStatus;
+
     let Some(selected) = app.selected_remote_space.as_ref() else {
         return Vec::new();
     };
@@ -1119,12 +1066,18 @@ fn compute_remote_projection_hit_areas(
     let Some(layout) = &projection.layout else {
         return Vec::new();
     };
-
-    let Some(actual_body) = remote_projection_body_area(app, body_area) else {
-        return Vec::new();
+    let header_rows = if remote_projection_tab_hit_context(app).is_some() {
+        2
+    } else {
+        1
     };
+    if area.height <= header_rows {
+        return Vec::new();
+    }
+    let [_, body] =
+        Layout::vertical([Constraint::Length(header_rows), Constraint::Min(1)]).areas(area);
 
-    project_layout_rects(&layout.root, actual_body, &layout.focused_pane_id)
+    project_layout_rects(&layout.root, body, &layout.focused_pane_id)
         .into_iter()
         .map(
             |(pane, rect, focused)| crate::app::state::RemoteProjectionHitArea {
@@ -1143,344 +1096,6 @@ fn compute_remote_projection_hit_areas(
             },
         )
         .collect()
-}
-
-/// Render a read-only projected remote workspace in the main area.
-///
-/// This is intentionally non-interactive: it draws the host/session/workspace/
-/// tab identity, a live/stale/unavailable status, and (when available) the remote
-/// layout as plain bordered boxes. It never forwards input or mutates any local
-/// or remote terminal runtime.
-fn render_remote_projection(app: &AppState, frame: &mut Frame, terminal_area: Rect) {
-    use ratatui::layout::Alignment;
-    use ratatui::text::Line;
-    use ratatui::widgets::Paragraph;
-
-    use crate::remote_source::RemoteProjectionStatus;
-
-    let Some(selected) = app.selected_remote_space.as_ref() else {
-        let host = match app.effective_sidebar_source() {
-            crate::app::state::SidebarSource::Remote(host) => host,
-            crate::app::state::SidebarSource::Local => return,
-        };
-        let host_label = if host.session == crate::session::DEFAULT_SESSION_NAME {
-            host.host
-        } else {
-            format!("{} / {}", host.host, host.session)
-        };
-        let header = Line::from(vec![
-            Span::raw("remote  "),
-            Span::styled(host_label, Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("   workspace <waiting>   "),
-            Span::styled("no local pane active", Style::default()),
-        ]);
-        if terminal_area.height <= 1 {
-            frame.render_widget(
-                Paragraph::new(vec![header]).alignment(Alignment::Left),
-                terminal_area,
-            );
-            return;
-        }
-        let [header_area, body_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(terminal_area);
-        frame.render_widget(
-            Paragraph::new(vec![header]).alignment(Alignment::Left),
-            header_area,
-        );
-        frame.render_widget(
-            Paragraph::new(vec![Line::from(vec![Span::raw(
-                "waiting for authoritative remote workspace snapshot",
-            )])])
-            .alignment(Alignment::Center),
-            body_area,
-        );
-        return;
-    };
-    let projection = app.remote_sources.projection_for_space(selected);
-    let status = projection.as_ref().map(|projection| projection.status);
-    let workspace_label = projection
-        .as_ref()
-        .map(|projection| projection.workspace_id.clone())
-        .unwrap_or_else(|| selected.workspace_id.clone());
-    let tab_label = projection
-        .as_ref()
-        .and_then(|projection| {
-            projection
-                .tab_label
-                .clone()
-                .or_else(|| projection.tab_id.clone())
-        })
-        .unwrap_or_else(|| "<no active tab>".to_string());
-    let layout = projection
-        .as_ref()
-        .and_then(|projection| projection.layout.as_ref())
-        .cloned();
-    let layout_root = layout.as_ref().map(|l| l.root.clone());
-    let focused_pane_id = layout
-        .as_ref()
-        .map(|l| l.focused_pane_id.as_str())
-        .unwrap_or("");
-    let live = matches!(status, Some(RemoteProjectionStatus::Available));
-
-    let (status_label, status_style) = match status {
-        Some(RemoteProjectionStatus::Available) => {
-            ("live", Style::default().add_modifier(Modifier::BOLD))
-        }
-        Some(RemoteProjectionStatus::StaleLastKnown) => ("stale (last known)", Style::default()),
-        Some(RemoteProjectionStatus::Unavailable) | None => ("unavailable", Style::default()),
-    };
-
-    let header = Line::from(vec![
-        Span::raw("remote  "),
-        Span::styled(
-            format!("{} / {}", selected.host, selected.session),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("   workspace "),
-        Span::raw(workspace_label),
-        Span::raw("   tab "),
-        Span::raw(tab_label),
-        Span::raw("   "),
-        Span::styled(status_label, status_style),
-    ]);
-
-    let chrome_rows = remote_projection_chrome_rows(app);
-    if terminal_area.height <= chrome_rows {
-        frame.render_widget(
-            Paragraph::new(vec![header]).alignment(Alignment::Left),
-            terminal_area,
-        );
-        return;
-    }
-
-    let [chrome_area, body_area] =
-        Layout::vertical([Constraint::Length(chrome_rows), Constraint::Min(1)])
-            .areas(terminal_area);
-    let [header_area, tab_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(chrome_area);
-    frame.render_widget(
-        Paragraph::new(vec![header]).alignment(Alignment::Left),
-        header_area,
-    );
-    if chrome_rows > 1 {
-        render_remote_projection_tab_strip(app, frame, tab_area);
-    }
-
-    match status {
-        Some(RemoteProjectionStatus::Available) | Some(RemoteProjectionStatus::StaleLastKnown)
-            if layout_root.is_some() =>
-        {
-            render_projection_layout(
-                app,
-                frame,
-                &layout_root.expect("layout root"),
-                body_area,
-                focused_pane_id,
-                live,
-            );
-        }
-        _ => frame.render_widget(
-            Paragraph::new(vec![Line::from(vec![Span::raw(format!(
-                "remote projection {status_label}"
-            ))])])
-            .alignment(Alignment::Center),
-            body_area,
-        ),
-    }
-}
-
-fn render_remote_projection_tab_strip(app: &AppState, frame: &mut Frame, area: Rect) {
-    use ratatui::text::Line;
-    use ratatui::widgets::Paragraph;
-
-    let Some((_selected, tabs, capabilities)) = remote_projection_tab_strip(app) else {
-        return;
-    };
-    let mut spans = vec![Span::raw("tabs ")];
-    for tab in tabs.tabs {
-        let label_style = if tab.focused {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        spans.push(Span::styled(
-            if tab.focused {
-                format!("[{}]", tab.label)
-            } else {
-                format!(" {} ", tab.label)
-            },
-            label_style,
-        ));
-        if capabilities.tab_close {
-            spans.push(Span::raw(" × "));
-        }
-        spans.push(Span::raw(" "));
-    }
-    if capabilities.tab_create {
-        spans.push(Span::styled(
-            " + ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-/// Draw projected remote layout panes using the shared geometry helper.
-/// Live panes (attachable) and the focused pane get distinct visual treatment.
-fn render_projection_layout(
-    app: &AppState,
-    frame: &mut Frame,
-    node: &crate::api::schema::LayoutNode,
-    area: Rect,
-    focused_pane_id: &str,
-    live: bool,
-) {
-    use ratatui::style::Color;
-    use ratatui::widgets::{Block, Borders, Paragraph};
-
-    let Some(selected) = app.selected_remote_space.as_ref() else {
-        return;
-    };
-    for (pane, rect, is_focused) in project_layout_rects(node, area, focused_pane_id) {
-        let title = pane
-            .label
-            .clone()
-            .or_else(|| pane.pane_id.clone())
-            .unwrap_or_else(|| "pane".to_string());
-        let stream = pane
-            .terminal_id
-            .as_deref()
-            .and_then(|terminal_id| app.remote_projection_frame(selected, terminal_id));
-        let status = stream.map(|entry| entry.status).unwrap_or_else(|| {
-            if live && pane.terminal_id.is_some() {
-                crate::remote_source::RemoteProjectionStreamStatus::Connecting
-            } else {
-                crate::remote_source::RemoteProjectionStreamStatus::StaleLastKnown
-            }
-        });
-        let (color, bold) = match status {
-            crate::remote_source::RemoteProjectionStreamStatus::LiveController => {
-                (Color::Green, true)
-            }
-            crate::remote_source::RemoteProjectionStreamStatus::LiveObserver => {
-                (Color::DarkGray, false)
-            }
-            crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly => {
-                (Color::Yellow, true)
-            }
-            crate::remote_source::RemoteProjectionStreamStatus::Connecting => (Color::Cyan, false),
-            crate::remote_source::RemoteProjectionStreamStatus::StaleLastKnown
-            | crate::remote_source::RemoteProjectionStreamStatus::Disconnected => {
-                (Color::DarkGray, false)
-            }
-            crate::remote_source::RemoteProjectionStreamStatus::Unsupported
-            | crate::remote_source::RemoteProjectionStreamStatus::NeedsAttention => {
-                (Color::Red, false)
-            }
-        };
-        let mut title_style = Style::default().fg(color);
-        if bold || (is_focused && status.accepts_input()) {
-            title_style = title_style.add_modifier(Modifier::BOLD);
-        }
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(color))
-            .title(Span::styled(
-                format!(" {title} · {} ", status.concise_label()),
-                title_style,
-            ));
-        let inner = block.inner(rect);
-        frame.render_widget(block, rect);
-
-        let Some(entry) = stream else {
-            if inner.width > 0 && inner.height > 0 {
-                frame.render_widget(
-                    Paragraph::new(status.concise_label()).style(Style::default().fg(color)),
-                    inner,
-                );
-            }
-            continue;
-        };
-        let Some(remote_frame) = entry.frame.as_ref() else {
-            if inner.width > 0 && inner.height > 0 {
-                frame.render_widget(
-                    Paragraph::new(
-                        entry
-                            .message
-                            .as_deref()
-                            .unwrap_or_else(|| status.concise_label()),
-                    )
-                    .style(Style::default().fg(color)),
-                    inner,
-                );
-            }
-            continue;
-        };
-
-        // Copy exact semantic cells/styles into this projected pane interior,
-        // clipped in both dimensions. No parser PTY/local pane exists. Kitty
-        // graphics bytes are deliberately ignored in this unit; text cells,
-        // styles and cursor remain live. The copied dimensions come from the
-        // shared visible-grid helper so the render copy/clip path and the
-        // projected-selection input bounds agree on exactly which frame
-        // cells are visible.
-        let (_, _, copy_width, copy_height) =
-            crate::selection::projected_visible_grid(rect, remote_frame.width, remote_frame.height);
-        {
-            let buffer = frame.buffer_mut();
-            for row in 0..copy_height {
-                for col in 0..copy_width {
-                    let index = row as usize * remote_frame.width as usize + col as usize;
-                    let Some(source) = remote_frame.cells.get(index) else {
-                        continue;
-                    };
-                    let destination = &mut buffer[(inner.x + col, inner.y + row)];
-                    destination.set_symbol(&source.symbol);
-                    destination.fg = crate::protocol::u32_to_color(source.fg);
-                    destination.bg = crate::protocol::u32_to_color(source.bg);
-                    destination.modifier = crate::protocol::u16_to_modifier(source.modifier);
-                    destination.skip = source.skip;
-                }
-            }
-        }
-        // Projected selection overlay: repaint the uniform automatic-selection
-        // style only for cells inside a visible projected selection whose
-        // exact (host, session, workspace_id, terminal_id) key matches this
-        // pane. The validated row ranges are clipped to the exact copied
-        // frame interior and fail closed — no highlight at all — on a
-        // malformed frame, impossible `skip` topology, a selection exceeding
-        // the visible grid (a mid-gesture shrink), or a visible edge cutting
-        // a wide grapheme from its required continuation, exactly matching
-        // clipboard extraction; valid wide-grapheme tails are included so
-        // the whole displayed grapheme is highlighted. Local panes and
-        // non-matching projected panes are never touched.
-        if let Some(selection) = app.projected_selection.as_ref().filter(|selection| {
-            selection.is_visible()
-                && selection.key.host == selected.host
-                && selection.key.session == selected.session
-                && selection.key.workspace_id == selected.workspace_id
-                && Some(selection.key.terminal_id.as_str()) == pane.terminal_id.as_deref()
-        }) {
-            if let Some(ranges) =
-                selection.highlighted_row_ranges(remote_frame, copy_width, copy_height)
-            {
-                let style = panes::automatic_selection_style(&app.palette, app.host_terminal_theme);
-                let buffer = frame.buffer_mut();
-                for (row, start, end) in ranges {
-                    for col in start..=end {
-                        buffer[(inner.x + col, inner.y + row)].set_style(style);
-                    }
-                }
-            }
-        }
-        if is_focused && status.accepts_input() {
-            if let Some(cursor) = remote_frame.cursor.as_ref().filter(|cursor| cursor.visible) {
-                if cursor.x < copy_width && cursor.y < copy_height {
-                    frame.set_cursor_position((inner.x + cursor.x, inner.y + cursor.y));
-                }
-            }
-        }
-    }
 }
 
 fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) {
@@ -1603,567 +1218,43 @@ mod tests {
     use ratatui::style::Color;
     use ratatui::{backend::TestBackend, Terminal};
 
-    #[test]
-    fn projected_live_and_stale_frames_render_remote_cells_without_local_fallthrough() {
-        let mut app = crate::app::state::AppState::test_new();
-        let selected = crate::remote_source::RemoteSpaceKey {
-            host: "remote-a".into(),
-            session: "default".into(),
-            workspace_id: "ws-a".into(),
-        };
-        app.selected_remote_space = Some(selected.clone());
-        let generation = app.begin_remote_projection_generation(Some(&selected), false);
-        let key = crate::remote_source::RemoteProjectionTerminalKey {
-            host: "remote-a".into(),
-            session: "default".into(),
-            workspace_id: "ws-a".into(),
-            terminal_id: "term-a".into(),
-        };
-        app.seed_remote_projection_streams(
-            generation,
-            [(
-                key.clone(),
-                crate::remote_source::RemoteProjectionStreamRole::Control,
-                crate::remote_source::RemoteProjectionStreamStatus::Connecting,
-                None,
-            )],
-        );
-        let frame_data = crate::protocol::FrameData {
-            cells: vec![crate::protocol::CellData {
-                symbol: "R".into(),
-                fg: crate::protocol::color_to_u32(Color::LightGreen),
-                bg: crate::protocol::color_to_u32(Color::Black),
-                modifier: crate::protocol::modifier_to_u16(Modifier::BOLD),
-                skip: false,
-                hyperlink: Some(0),
-            }],
-            width: 1,
-            height: 1,
-            cursor: Some(crate::protocol::CursorState {
-                x: 0,
-                y: 0,
-                visible: true,
-                shape: 2,
-            }),
-            hyperlinks: vec!["https://example.com/remote".into()],
-            graphics: Vec::new(),
-        };
-        app.apply_remote_projection_stream_event(
-            key.clone(),
-            generation,
-            crate::remote_source::RemoteProjectionStreamRole::Control,
-            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
-            Some(frame_data),
-            None,
-        );
-        app.view.remote_projection_hit_areas = vec![crate::app::state::RemoteProjectionHitArea {
-            rect: Rect::new(0, 0, 30, 5),
-            host: "remote-a".into(),
-            session: "default".into(),
-            pane_id: Some("pane-a".into()),
-            terminal_id: Some("term-a".into()),
-            label: "remote".into(),
-            focused: true,
-            live: true,
-        }];
-        assert_eq!(
-            app.remote_projection_url_at(1, 1).as_deref(),
-            Some("https://example.com/remote")
-        );
-        let node = crate::api::schema::LayoutNode::Pane {
-            pane: crate::api::schema::LayoutPane {
-                pane_id: Some("pane-a".into()),
-                terminal_id: Some("term-a".into()),
-                label: Some("remote".into()),
-                ..Default::default()
-            },
-        };
-        let backend = TestBackend::new(30, 5);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| {
-                render_projection_layout(
-                    &app,
-                    frame,
-                    &node,
-                    Rect::new(0, 0, 30, 5),
-                    "pane-a",
-                    true,
-                );
-            })
-            .expect("render live frame");
-        let live = terminal.backend().buffer();
-        assert_eq!(live[(1, 1)].symbol(), "R");
-        assert_eq!(live[(1, 1)].fg, Color::LightGreen);
-        assert!(live[(1, 1)].modifier.contains(Modifier::BOLD));
-
-        app.apply_remote_projection_stream_event(
-            key,
-            generation,
-            crate::remote_source::RemoteProjectionStreamRole::Control,
-            crate::remote_source::RemoteProjectionStreamStatus::StaleLastKnown,
-            None,
-            Some("disconnected".into()),
-        );
-        terminal
-            .draw(|frame| {
-                render_projection_layout(
-                    &app,
-                    frame,
-                    &node,
-                    Rect::new(0, 0, 30, 5),
-                    "pane-a",
-                    false,
-                );
-            })
-            .expect("render stale frame");
-        assert_eq!(terminal.backend().buffer()[(1, 1)].symbol(), "R");
-    }
-
-    fn projected_overlay_app(
-        frame_data: crate::protocol::FrameData,
-    ) -> (
-        AppState,
-        crate::remote_source::RemoteProjectionTerminalKey,
-        u64,
-    ) {
-        let mut app = crate::app::state::AppState::test_new();
-        let selected = crate::remote_source::RemoteSpaceKey {
-            host: "remote-a".into(),
-            session: "default".into(),
-            workspace_id: "ws-a".into(),
-        };
-        app.selected_remote_space = Some(selected.clone());
-        let generation = app.begin_remote_projection_generation(Some(&selected), false);
-        let key = crate::remote_source::RemoteProjectionTerminalKey {
-            host: "remote-a".into(),
-            session: "default".into(),
-            workspace_id: "ws-a".into(),
-            terminal_id: "term-a".into(),
-        };
-        app.seed_remote_projection_streams(
-            generation,
-            [(
-                key.clone(),
-                crate::remote_source::RemoteProjectionStreamRole::Control,
-                crate::remote_source::RemoteProjectionStreamStatus::Connecting,
-                None,
-            )],
-        );
-        app.apply_remote_projection_stream_event(
-            key.clone(),
-            generation,
-            crate::remote_source::RemoteProjectionStreamRole::Control,
-            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
-            Some(frame_data),
-            None,
-        );
-        (app, key, generation)
-    }
-
-    /// Build a projected frame from exact-width ASCII rows in a fixed color.
-    fn projected_overlay_frame(width: u16, rows: &[&str]) -> crate::protocol::FrameData {
-        let mut cells = Vec::new();
-        for row in rows {
-            assert_eq!(row.chars().count(), usize::from(width));
-            for ch in row.chars() {
-                cells.push(crate::protocol::CellData {
-                    symbol: ch.to_string(),
-                    fg: crate::protocol::color_to_u32(Color::LightGreen),
-                    bg: crate::protocol::color_to_u32(Color::Black),
-                    modifier: 0,
-                    skip: false,
-                    hyperlink: None,
-                });
-            }
-        }
-        crate::protocol::FrameData {
-            cells,
-            width,
-            height: rows.len() as u16,
-            cursor: None,
-            hyperlinks: Vec::new(),
-            graphics: Vec::new(),
-        }
-    }
-
-    fn projected_overlay_node(terminal_id: &str) -> crate::api::schema::LayoutNode {
-        crate::api::schema::LayoutNode::Pane {
-            pane: crate::api::schema::LayoutPane {
-                pane_id: Some("pane-a".into()),
-                terminal_id: Some(terminal_id.into()),
-                label: Some("remote".into()),
-                ..Default::default()
-            },
-        }
-    }
-
-    /// A finalized (mouse-released) visible projected selection, the state the
-    /// render overlay draws.
-    fn visible_projected_selection(
-        key: crate::remote_source::RemoteProjectionTerminalKey,
-        anchor: (u16, u16),
-        cursor: (u16, u16),
-        width: u16,
-        height: u16,
-    ) -> crate::selection::ProjectedSelection {
-        let mut selection = crate::selection::ProjectedSelection::anchor(key, anchor.0, anchor.1);
-        selection.drag(cursor.0, cursor.1, width, height);
-        assert!(selection.finish());
-        selection
-    }
-
-    fn render_projected_node(app: &AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
-        let node = projected_overlay_node("term-a");
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|frame| {
-                render_projection_layout(
-                    app,
-                    frame,
-                    &node,
-                    Rect::new(0, 0, width, height),
-                    "pane-a",
-                    true,
-                );
-            })
-            .expect("render projection");
-        terminal.backend().buffer().clone()
-    }
-
-    #[test]
-    fn projected_selection_overlay_styles_only_matching_key_with_shared_style() {
-        let (mut app, key, _generation) =
-            projected_overlay_app(projected_overlay_frame(6, &["abcdef", "ghijkl"]));
-        app.projected_selection = Some(visible_projected_selection(
-            key.clone(),
-            (0, 1),
-            (0, 3),
-            6,
-            2,
-        ));
-        let expected = panes::automatic_selection_style(&app.palette, app.host_terminal_theme);
-
-        let buffer = render_projected_node(&app, 10, 5);
-
-        // Bordered interior is (1,1,8,3); the 6x2 frame copies to x 1..=6, y 1..=2.
-        for col in 1..=3u16 {
-            let style = buffer[(1 + col, 1)].style();
-            assert_eq!(style.fg, expected.fg, "selected col {col} fg");
-            assert_eq!(style.bg, expected.bg, "selected col {col} bg");
-        }
-        // Cells outside the selection keep the copied frame style: no bleed.
-        for (x, y) in [(1u16, 1u16), (5, 1), (6, 1), (2, 2), (4, 2)] {
-            let cell = &buffer[(x, y)];
-            assert_eq!(cell.fg, Color::LightGreen, "unselected cell ({x},{y}) fg");
-            assert_eq!(cell.bg, Color::Black, "unselected cell ({x},{y}) bg");
-        }
-
-        // A selection keyed to a different terminal id must paint nowhere in
-        // this pane (a local pane never enters this render path at all).
-        let mut mismatched = key.clone();
-        mismatched.terminal_id = "term-b".into();
-        app.projected_selection = Some(visible_projected_selection(
-            mismatched,
-            (0, 1),
-            (0, 3),
-            6,
-            2,
-        ));
-        let buffer = render_projected_node(&app, 10, 5);
-        for y in 0..5u16 {
-            for x in 0..10u16 {
-                let style = buffer[(x, y)].style();
-                assert_ne!(style.bg, expected.bg, "mismatched key styled ({x},{y})");
-            }
-        }
-    }
-
-    #[test]
-    fn projected_selection_overlay_fails_closed_when_selection_exceeds_visible_grid() {
-        // Frame (10x4) is larger than the bordered interior (6x2 of an 8x4
-        // area). A selection reaching outside the copied interior can only
-        // come from a mid-gesture shrink; it must fail closed with no
-        // highlight at all, exactly like clipboard extraction — never a
-        // silently clipped partial subset.
-        let (mut app, key, _generation) = projected_overlay_app(projected_overlay_frame(
-            10,
-            &["aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd"],
-        ));
-        app.projected_selection = Some(visible_projected_selection(
-            key.clone(),
-            (0, 0),
-            (3, 9),
-            10,
-            4,
-        ));
-        let expected = panes::automatic_selection_style(&app.palette, app.host_terminal_theme);
-
-        let buffer = render_projected_node(&app, 8, 4);
-
-        for y in 0..4u16 {
-            for x in 0..8u16 {
-                let style = buffer[(x, y)].style();
-                assert_ne!(style.bg, expected.bg, "fail-closed styled ({x},{y})");
-            }
-        }
-
-        // A selection fully inside the copied 6x2 interior still highlights.
-        app.projected_selection = Some(visible_projected_selection(
-            key.clone(),
-            (0, 0),
-            (1, 5),
-            10,
-            4,
-        ));
-        let buffer = render_projected_node(&app, 8, 4);
-        for y in [1u16, 2] {
-            for x in 1..=6u16 {
-                let style = buffer[(x, y)].style();
-                assert_eq!(style.bg, expected.bg, "in-grid cell ({x},{y}) highlighted");
-            }
-        }
-        // Right/bottom border cells stay untouched.
-        for (x, y) in [(7u16, 1u16), (7, 2), (1, 3), (6, 3)] {
-            let style = buffer[(x, y)].style();
-            assert_ne!(style.bg, expected.bg, "outside copied interior ({x},{y})");
-        }
-    }
-
-    #[test]
-    fn projected_selection_overlay_never_paints_a_partial_wide_grapheme() {
-        // Frame row [a][好][skip]: the wide grapheme needs columns 1..=2.
-        let cell = |symbol: &str, skip: bool| crate::protocol::CellData {
-            symbol: symbol.into(),
-            fg: crate::protocol::color_to_u32(Color::LightGreen),
-            bg: crate::protocol::color_to_u32(Color::Black),
-            modifier: 0,
-            skip,
-            hyperlink: None,
-        };
-        let (mut app, key, _generation) = projected_overlay_app(crate::protocol::FrameData {
-            cells: vec![cell("a", false), cell("好", false), cell("", true)],
-            width: 3,
-            height: 1,
-            cursor: None,
-            hyperlinks: Vec::new(),
-            graphics: Vec::new(),
-        });
-        app.projected_selection = Some(visible_projected_selection(
-            key.clone(),
-            (0, 0),
-            (0, 1),
-            3,
-            1,
-        ));
-        let expected = panes::automatic_selection_style(&app.palette, app.host_terminal_theme);
-
-        // A 4x3 area leaves a 2x1 bordered interior: the visible edge cuts
-        // the wide grapheme's required continuation, so nothing is painted.
-        let buffer = render_projected_node(&app, 4, 3);
-        for y in 0..3u16 {
-            for x in 0..4u16 {
-                let style = buffer[(x, y)].style();
-                assert_ne!(style.bg, expected.bg, "partial-wide styled ({x},{y})");
-            }
-        }
-
-        // A 5x3 area leaves a 3x1 interior covering the whole grapheme: lead
-        // and continuation are both highlighted. The continuation cell is
-        // marked `skip`, so ratatui's backend diff never flushes it — assert
-        // against the frame buffer the overlay actually painted.
-        let node = projected_overlay_node("term-a");
-        let mut terminal = Terminal::new(TestBackend::new(5, 3)).expect("terminal");
-        let completed = terminal
-            .draw(|frame| {
-                render_projection_layout(&app, frame, &node, Rect::new(0, 0, 5, 3), "pane-a", true);
-            })
-            .expect("render projection");
-        for x in 1..=3u16 {
-            let cell = &completed.buffer[(x, 1)];
-            assert_eq!(
-                Some(cell.bg),
-                expected.bg,
-                "full wide grapheme col {x} highlighted"
-            );
-        }
-        assert!(
-            completed.buffer[(3, 1)].skip,
-            "the highlighted range must cover the continuation cell, not just the lead"
-        );
-    }
-
-    #[test]
-    fn projected_selection_overlay_highlights_cached_read_only_and_stale_frames() {
-        let (mut app, key, generation) =
-            projected_overlay_app(projected_overlay_frame(6, &["abcdef", "ghijkl"]));
-        let expected = panes::automatic_selection_style(&app.palette, app.host_terminal_theme);
-
-        for status in [
-            crate::remote_source::RemoteProjectionStreamStatus::OwnedReadOnly,
-            crate::remote_source::RemoteProjectionStreamStatus::StaleLastKnown,
-        ] {
-            // Keep the cached frame (None frame) while the stream degrades.
-            app.apply_remote_projection_stream_event(
-                key.clone(),
-                generation,
-                crate::remote_source::RemoteProjectionStreamRole::Control,
-                status,
-                None,
-                Some("remote stream unavailable".into()),
-            );
-            app.projected_selection = Some(visible_projected_selection(
-                key.clone(),
-                (0, 1),
-                (0, 3),
-                6,
-                2,
-            ));
-
-            let buffer = render_projected_node(&app, 10, 5);
-
-            for col in 1..=3u16 {
-                let style = buffer[(1 + col, 1)].style();
-                assert_eq!(
-                    style.bg, expected.bg,
-                    "{status:?} cached frame col {col} stays highlightable"
-                );
-            }
-            app.projected_selection = None;
-        }
-    }
-
-    #[test]
-    fn projected_selection_overlay_fails_closed_on_malformed_frame_or_skip_topology() {
-        let (mut app, key, generation) =
-            projected_overlay_app(projected_overlay_frame(6, &["abcdef", "ghijkl"]));
-        let expected = panes::automatic_selection_style(&app.palette, app.host_terminal_theme);
-        app.projected_selection = Some(visible_projected_selection(
-            key.clone(),
-            (0, 0),
-            (0, 5),
-            6,
-            2,
-        ));
-
-        let assert_no_highlight = |app: &AppState| {
-            let buffer = render_projected_node(app, 10, 5);
-            for y in 0..5u16 {
-                for x in 0..10u16 {
-                    let style = buffer[(x, y)].style();
-                    assert_ne!(style.bg, expected.bg, "fail-closed styled ({x},{y})");
-                }
-            }
-        };
-
-        // Malformed frame: cell count does not match width * height.
-        app.apply_remote_projection_stream_event(
-            key.clone(),
-            generation,
-            crate::remote_source::RemoteProjectionStreamRole::Control,
-            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
-            Some(crate::protocol::FrameData {
-                cells: vec![crate::protocol::CellData {
-                    symbol: "z".into(),
-                    fg: crate::protocol::color_to_u32(Color::LightGreen),
-                    bg: crate::protocol::color_to_u32(Color::Black),
-                    modifier: 0,
-                    skip: false,
-                    hyperlink: None,
-                }],
-                width: 3,
-                height: 2,
-                cursor: None,
-                hyperlinks: Vec::new(),
-                graphics: Vec::new(),
-            }),
-            None,
-        );
-        assert_no_highlight(&app);
-
-        // Impossible skip topology inside the selection: a continuation cell
-        // after a width-1 grapheme.
-        app.apply_remote_projection_stream_event(
-            key.clone(),
-            generation,
-            crate::remote_source::RemoteProjectionStreamRole::Control,
-            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
-            Some(crate::protocol::FrameData {
-                cells: vec![
-                    crate::protocol::CellData {
-                        symbol: "a".into(),
-                        fg: crate::protocol::color_to_u32(Color::LightGreen),
-                        bg: crate::protocol::color_to_u32(Color::Black),
-                        modifier: 0,
-                        skip: false,
-                        hyperlink: None,
-                    },
-                    crate::protocol::CellData {
-                        symbol: String::new(),
-                        fg: 0,
-                        bg: 0,
-                        modifier: 0,
-                        skip: true,
-                        hyperlink: None,
-                    },
-                ],
-                width: 2,
-                height: 1,
-                cursor: None,
-                hyperlinks: Vec::new(),
-                graphics: Vec::new(),
-            }),
-            None,
-        );
-        app.projected_selection = Some(visible_projected_selection(
-            key.clone(),
-            (0, 0),
-            (0, 1),
-            2,
-            1,
-        ));
-        assert_no_highlight(&app);
-    }
-
     #[tokio::test]
-    async fn desktop_view_with_selected_remote_space_hides_local_hit_targets_and_skips_resize() {
+    async fn desktop_view_with_host_glass_hides_local_hit_targets_and_skips_resize() {
         let mut app = crate::app::state::AppState::test_new();
         let mut ws = Workspace::test_new("test");
+        let root = ws.tabs[0].root_pane;
         let _ = ws.test_split(ratatui::layout::Direction::Horizontal);
         ws.insert_test_runtime(
-            ws.tabs[0].root_pane,
+            root,
             crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"local"),
         );
         app.workspaces = vec![ws];
         app.active = Some(0);
         app.selected = 0;
         app.mode = Mode::Terminal;
-        app.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
-            host: "jafar".to_string(),
-            session: "default".to_string(),
-            workspace_id: "ws-remote".to_string(),
-        });
+        app.host_glass_enabled = true;
+        app.select_sidebar_source(crate::app::state::SidebarSource::Remote(
+            crate::remote_source::RemoteHostKey::new("jafar", "default"),
+        ));
+        let size_before = app.workspaces[0].test_runtimes[&root].current_size();
 
         compute_view(&mut app, Rect::new(0, 0, 80, 20));
 
-        // No local tab bar or tab hit targets while a projected remote space is
-        // selected.
+        assert!(app.host_glass_surface_active());
         assert_eq!(app.view.tab_bar_rect, Rect::default());
         assert!(app.view.tab_hit_areas.is_empty());
         assert_eq!(app.view.tab_scroll_left_hit_area, Rect::default());
         assert_eq!(app.view.tab_scroll_right_hit_area, Rect::default());
         assert_eq!(app.view.new_tab_hit_area, Rect::default());
-        // No local pane hit targets or split-border resize handles: because the
-        // projection branch skips compute_pane_infos and the background/desktop
-        // pane resize entirely, no local pane is resized and no mouse click/drag
-        // can resolve a local pane.
         assert!(app.view.pane_infos.is_empty());
         assert!(app.view.split_borders.is_empty());
-        // The projection renders across the whole main area.
+        assert_eq!(
+            app.workspaces[0].test_runtimes[&root].current_size(),
+            size_before,
+            "glass ownership must skip local pane resizing",
+        );
         assert!(app.view.terminal_area.width > 0);
     }
-
     #[test]
     fn project_layout_rects_partitions_area_and_identifies_focused_pane() {
         use crate::api::schema::{LayoutNode, LayoutPane, SplitDirection};
@@ -3415,17 +2506,10 @@ mod tests {
         );
         app.reconcile_remote_content_surfaces(cell_size);
 
-        // Match the production order: projection retires before compute, then
-        // glass reconciles from the newly computed remote takeover geometry
-        // before the frame is rendered.
+        // Match the production order: compute the remote takeover geometry,
+        // then reconcile glass before rendering the frame.
         app.state
             .select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
-        app.remote_projection_runtime.reconcile(
-            &mut app.state,
-            &app.remote_hosts,
-            &app.event_tx,
-            &mut app.selected_host_bridge_runtime,
-        );
         compute_view_with_runtime_registry(&mut app.state, &app.terminal_runtimes, area);
         let expected_body = host_glass_body_area(app.state.view.terminal_area);
         let geometry = app.reconcile_remote_content_surfaces(cell_size);
@@ -3529,148 +2613,6 @@ mod tests {
             buffer_row_text(terminal.backend().buffer(), body, detail_row).trim(),
             "no live frame received · INPUT DROPPED · not queued"
         );
-    }
-
-    #[test]
-    fn host_glass_flag_round_trip_restores_projection_view_hits_and_render_exactly() {
-        let mut app = crate::app::state::AppState::test_new();
-        app.workspaces = vec![Workspace::test_new("local")];
-        app.active = Some(0);
-        app.selected = 0;
-        app.mode = Mode::Terminal;
-
-        let host = crate::remote_source::RemoteHostKey::new(
-            "remote-a",
-            crate::session::DEFAULT_SESSION_NAME,
-        );
-        app.remote_sources.replace_workspace_snapshot(
-            host.clone(),
-            vec![crate::api::schema::WorkspaceInfo {
-                workspace_id: "ws-a".into(),
-                number: 1,
-                label: "remote space".into(),
-                focused: true,
-                pane_count: 1,
-                tab_count: 1,
-                active_tab_id: "tab-a".into(),
-                agent_status: crate::api::schema::AgentStatus::Unknown,
-                worktree: None,
-            }],
-        );
-        app.remote_sources.replace_tab_snapshot(
-            &host,
-            "ws-a",
-            vec![crate::api::schema::TabInfo {
-                tab_id: "tab-a".into(),
-                workspace_id: "ws-a".into(),
-                number: 1,
-                label: "remote tab".into(),
-                focused: true,
-                pane_count: 1,
-                agent_status: crate::api::schema::AgentStatus::Unknown,
-            }],
-        );
-        app.remote_sources.set_capabilities(
-            &host,
-            crate::remote_source::RemoteSourceCapabilities {
-                layout_export: true,
-                tab_focus: true,
-                tab_close: true,
-                tab_create: true,
-                ..Default::default()
-            },
-        );
-        app.remote_sources.apply_projection_snapshot(
-            &host,
-            vec![crate::remote_source::RemoteProjectionSnapshot {
-                workspace_id: "ws-a".into(),
-                tab_id: Some("tab-a".into()),
-                tab_label: Some("remote tab".into()),
-                status: crate::remote_source::RemoteProjectionStatus::Available,
-                layout: Some(crate::api::schema::LayoutDescription {
-                    workspace_id: "ws-a".into(),
-                    tab_id: "tab-a".into(),
-                    zoomed: false,
-                    focused_pane_id: "pane-a".into(),
-                    root: crate::api::schema::LayoutNode::Pane {
-                        pane: crate::api::schema::LayoutPane {
-                            pane_id: Some("pane-a".into()),
-                            terminal_id: Some("term-a".into()),
-                            label: Some("remote shell".into()),
-                            ..Default::default()
-                        },
-                    },
-                }),
-            }],
-        );
-        app.select_sidebar_source(crate::app::state::SidebarSource::Remote(host));
-
-        let area = Rect::new(0, 0, 100, 20);
-        compute_view(&mut app, area);
-        assert!(!app.host_glass_surface_active());
-        assert!(!app.view.remote_projection_tab_hit_areas.is_empty());
-        assert!(!app.view.remote_projection_hit_areas.is_empty());
-        let baseline_help = keybind_help_groups(&app);
-        assert!(baseline_help.iter().all(|(_, entries)| entries
-            .iter()
-            .all(|(_, label)| label.as_ref() != "exit host glass")));
-
-        let baseline_layout = app.view.layout;
-        let baseline_sidebar_rect = app.view.sidebar_rect;
-        let baseline_host_rail_rect = app.view.host_rail_rect;
-        let baseline_sidebar_panel_rect = app.view.sidebar_panel_rect;
-        let baseline_terminal_area = app.view.terminal_area;
-        let baseline_tab_bar_rect = app.view.tab_bar_rect;
-        let baseline_tab_hit_areas = app.view.tab_hit_areas.clone();
-        let baseline_remote_tab_hits = app.view.remote_projection_tab_hit_areas.clone();
-        let baseline_remote_pane_hits = app.view.remote_projection_hit_areas.clone();
-        let mut baseline_terminal =
-            Terminal::new(TestBackend::new(area.width, area.height)).expect("baseline terminal");
-        baseline_terminal
-            .draw(|frame| render(&app, frame))
-            .expect("render baseline projection");
-        let baseline_buffer = baseline_terminal.backend().buffer().clone();
-
-        app.host_glass_enabled = true;
-        compute_view(&mut app, area);
-        assert!(app.host_glass_surface_active());
-        assert!(app.view.remote_projection_tab_hit_areas.is_empty());
-        assert!(app.view.remote_projection_hit_areas.is_empty());
-        assert!(keybind_help_groups(&app).iter().any(|(_, entries)| entries
-            .iter()
-            .any(|(_, label)| label.as_ref() == "exit host glass")));
-        let mut glass_terminal =
-            Terminal::new(TestBackend::new(area.width, area.height)).expect("glass terminal");
-        glass_terminal
-            .draw(|frame| render(&app, frame))
-            .expect("render glass takeover");
-        assert_ne!(glass_terminal.backend().buffer(), &baseline_buffer);
-
-        app.host_glass_enabled = false;
-        compute_view(&mut app, area);
-        assert_eq!(app.view.layout, baseline_layout);
-        assert_eq!(app.view.sidebar_rect, baseline_sidebar_rect);
-        assert_eq!(app.view.host_rail_rect, baseline_host_rail_rect);
-        assert_eq!(app.view.sidebar_panel_rect, baseline_sidebar_panel_rect);
-        assert_eq!(app.view.terminal_area, baseline_terminal_area);
-        assert_eq!(app.view.tab_bar_rect, baseline_tab_bar_rect);
-        assert_eq!(app.view.tab_hit_areas, baseline_tab_hit_areas);
-        assert_eq!(
-            app.view.remote_projection_tab_hit_areas,
-            baseline_remote_tab_hits
-        );
-        assert_eq!(
-            app.view.remote_projection_hit_areas,
-            baseline_remote_pane_hits
-        );
-        assert_eq!(keybind_help_groups(&app), baseline_help);
-
-        let mut restored_terminal =
-            Terminal::new(TestBackend::new(area.width, area.height)).expect("restored terminal");
-        restored_terminal
-            .draw(|frame| render(&app, frame))
-            .expect("render restored projection");
-        assert_eq!(restored_terminal.backend().buffer(), &baseline_buffer);
     }
 
     fn temp_git_repo(branch: &str) -> std::path::PathBuf {
@@ -3839,97 +2781,44 @@ switch_workspace = "ctrl+1..9"
         assert_eq!(switch_workspace_key, "ctrl+1..9");
     }
 
-    #[test]
-    fn remote_source_without_workspace_snapshot_hides_local_surface() {
+    #[tokio::test]
+    async fn glass_disabled_remote_source_keeps_local_panes_visible() {
         let mut app = crate::app::state::AppState::test_new();
-        app.workspaces = vec![Workspace::test_new("one")];
+        let mut workspace = Workspace::test_new("local");
+        let root = workspace.tabs[0].root_pane;
+        workspace.insert_test_runtime(
+            root,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"LOCAL-SURFACE"),
+        );
+        app.workspaces = vec![workspace];
         app.active = Some(0);
         app.selected = 0;
         app.mode = Mode::Terminal;
         let host =
             crate::remote_source::RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
-        app.remote_sources.mark_status(
-            &host,
-            crate::remote_source::RemoteConnectionStatus::Connected,
-        );
-        app.sidebar_source = crate::app::state::SidebarSource::Remote(host);
-        app.selected_remote_space = None;
-
-        compute_view(&mut app, Rect::new(0, 0, 140, 20));
-
-        assert!(app.remote_projection_surface_active());
-        assert!(app.view.pane_infos.is_empty());
-        assert!(app.view.split_borders.is_empty());
-        assert_eq!(app.view.tab_bar_rect, Rect::default());
-
-        let backend = TestBackend::new(140, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(&app, frame)).unwrap();
-        let buffer = terminal.backend().buffer();
-
-        let top_row = buffer_row_text(buffer, app.view.terminal_area, app.view.terminal_area.y);
-        assert!(
-            top_row.contains("jafar"),
-            "remote source header not rendered: {top_row:?}"
-        );
-        assert!(
-            top_row.contains("no local pane active"),
-            "remote source header must not leave local active: {top_row:?}"
-        );
-        let body_row = buffer_row_text(
-            buffer,
-            app.view.terminal_area,
-            app.view.terminal_area.y.saturating_add(1),
-        );
-        assert!(
-            body_row.contains("waiting for authoritative remote workspace snapshot"),
-            "waiting state missing: {body_row:?}"
-        );
-    }
-
-    #[test]
-    fn remote_source_with_projected_space_does_not_show_waiting_state() {
-        let mut app = crate::app::state::AppState::test_new();
-        app.workspaces = vec![Workspace::test_new("one")];
-        app.active = Some(0);
-        app.selected = 0;
-        app.mode = Mode::Terminal;
-        let host =
-            crate::remote_source::RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
-        app.remote_sources.mark_status(
-            &host,
-            crate::remote_source::RemoteConnectionStatus::Connected,
-        );
         app.sidebar_source = crate::app::state::SidebarSource::Remote(host.clone());
         app.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
-            host: host.host.clone(),
-            session: host.session.clone(),
+            host: host.host,
+            session: host.session,
             workspace_id: "remote-ws".to_string(),
         });
 
-        // Wide enough that the fixed 10-col host rail + 26-col sidebar panel
-        // still leave room for the full projected header line (host/session,
-        // workspace, tab, status) — mirrors the neighboring waiting-state test
-        // above, which needs the same rail+panel headroom for its own header.
         compute_view(&mut app, Rect::new(0, 0, 140, 20));
 
-        let backend = TestBackend::new(140, 20);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| render(&app, frame)).unwrap();
-        let buffer = terminal.backend().buffer();
-
-        let top_row = buffer_row_text(buffer, app.view.terminal_area, app.view.terminal_area.y);
-        assert!(
-            top_row.contains("workspace remote-ws"),
-            "selected remote workspace header missing: {top_row:?}"
-        );
-        assert!(
-            !top_row.contains("no local pane active"),
-            "waiting header should not replace a selected remote workspace: {top_row:?}"
-        );
+        assert!(!app.host_glass_surface_active());
+        assert!(!app.view.pane_infos.is_empty());
+        assert_ne!(app.view.tab_bar_rect, Rect::default());
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| render(&app, frame))
+            .expect("render local panes");
+        assert!(buffer_row_text(
+            terminal.backend().buffer(),
+            app.view.terminal_area,
+            app.view.terminal_area.y,
+        )
+        .contains("LOCAL-SURFACE"));
     }
-
-    // ── glass-sidebar-yield tests ─────────────────────────────────────────────
 
     fn make_glass_app() -> (
         crate::app::state::AppState,

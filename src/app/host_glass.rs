@@ -823,7 +823,7 @@ impl HostGlassRuntime {
         surfaces: &mut HostGlassSurfaceRegistry,
         hosts: &crate::remote_target::RemoteHostRegistry,
         event_tx: &tokio::sync::mpsc::Sender<crate::events::AppEvent>,
-        bridge_owner: &mut crate::app::remote_projection::SelectedHostBridgeRuntime,
+        bridge_owner: &mut crate::app::selected_host_bridge::SelectedHostBridgeRuntime,
         geometry: GlassGeometry,
     ) {
         self.drain_worker_updates(state, surfaces, event_tx);
@@ -853,7 +853,7 @@ impl HostGlassRuntime {
             }
             self.retire_stream();
             bridge_owner
-                .release(crate::app::remote_projection::SelectedHostBridgeConsumer::HostGlass);
+                .release(crate::app::selected_host_bridge::SelectedHostBridgeConsumer::HostGlass);
             self.source = next_source.clone();
             self.signature = None;
             if let Some(host) = next_source {
@@ -942,7 +942,7 @@ impl HostGlassRuntime {
             );
             self.retire_stream();
             bridge_owner
-                .release(crate::app::remote_projection::SelectedHostBridgeConsumer::HostGlass);
+                .release(crate::app::selected_host_bridge::SelectedHostBridgeConsumer::HostGlass);
             self.signature = None;
             return;
         };
@@ -954,7 +954,7 @@ impl HostGlassRuntime {
         };
         #[cfg(unix)]
         let connector_unchanged = bridge_owner.is_acquired_by(
-            crate::app::remote_projection::SelectedHostBridgeConsumer::HostGlass,
+            crate::app::selected_host_bridge::SelectedHostBridgeConsumer::HostGlass,
             &host,
             &prepared,
         ) && self.stream.is_some();
@@ -1007,8 +1007,9 @@ impl HostGlassRuntime {
                 .get(&host.host)
                 .filter(|candidate| candidate.session == host.session)
             else {
-                bridge_owner
-                    .release(crate::app::remote_projection::SelectedHostBridgeConsumer::HostGlass);
+                bridge_owner.release(
+                    crate::app::selected_host_bridge::SelectedHostBridgeConsumer::HostGlass,
+                );
                 let _ = state.set_host_glass_status(
                     &host,
                     self.generation,
@@ -1020,7 +1021,7 @@ impl HostGlassRuntime {
                 return;
             };
             match bridge_owner.acquire(
-                crate::app::remote_projection::SelectedHostBridgeConsumer::HostGlass,
+                crate::app::selected_host_bridge::SelectedHostBridgeConsumer::HostGlass,
                 &host,
                 host_config,
                 &prepared,
@@ -1180,7 +1181,7 @@ impl HostGlassRuntime {
         &mut self,
         state: &mut crate::app::state::AppState,
         surfaces: &mut HostGlassSurfaceRegistry,
-        bridge_owner: &mut crate::app::remote_projection::SelectedHostBridgeRuntime,
+        bridge_owner: &mut crate::app::selected_host_bridge::SelectedHostBridgeRuntime,
     ) {
         if let Some(host) = self.source.clone() {
             let retired_generation = state.begin_host_glass_generation(host.clone());
@@ -1203,10 +1204,11 @@ impl HostGlassRuntime {
     /// uses `deactivate` above so late predecessor updates are generation-dead.
     pub(crate) fn shutdown(
         &mut self,
-        bridge_owner: &mut crate::app::remote_projection::SelectedHostBridgeRuntime,
+        bridge_owner: &mut crate::app::selected_host_bridge::SelectedHostBridgeRuntime,
     ) {
         self.retire_stream();
-        bridge_owner.release(crate::app::remote_projection::SelectedHostBridgeConsumer::HostGlass);
+        bridge_owner
+            .release(crate::app::selected_host_bridge::SelectedHostBridgeConsumer::HostGlass);
         self.source = None;
         self.generation = 0;
         self.freshness_at = None;
@@ -3079,7 +3081,7 @@ mod tests {
         let host = RemoteHostKey::new("remote-a", "default");
         let mut runtime = HostGlassRuntime::default();
         let receiver = runtime.test_install_connected_stream(host, 7, Some(false));
-        let mut bridges = crate::app::remote_projection::SelectedHostBridgeRuntime::default();
+        let mut bridges = crate::app::selected_host_bridge::SelectedHostBridgeRuntime::default();
 
         runtime.shutdown(&mut bridges);
 
@@ -3120,7 +3122,7 @@ mod tests {
                 bytes: b"LATE-PREDECESSOR".to_vec(),
             })
             .expect("queue late predecessor frame");
-        let mut bridges = crate::app::remote_projection::SelectedHostBridgeRuntime::default();
+        let mut bridges = crate::app::selected_host_bridge::SelectedHostBridgeRuntime::default();
 
         runtime.deactivate(&mut state, &mut surfaces, &mut bridges);
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
@@ -3366,7 +3368,7 @@ mod tests {
         let mut surfaces = HostGlassSurfaceRegistry::default();
         let hosts = crate::remote_target::RemoteHostRegistry::default();
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
-        let mut bridges = crate::app::remote_projection::SelectedHostBridgeRuntime::default();
+        let mut bridges = crate::app::selected_host_bridge::SelectedHostBridgeRuntime::default();
         let mut runtime = HostGlassRuntime::default();
         let geometry = GlassGeometry {
             area: Rect::new(10, 1, 50, 19),
@@ -3406,7 +3408,7 @@ mod tests {
         let mut surfaces = HostGlassSurfaceRegistry::default();
         let hosts = crate::remote_target::RemoteHostRegistry::default();
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
-        let mut bridges = crate::app::remote_projection::SelectedHostBridgeRuntime::default();
+        let mut bridges = crate::app::selected_host_bridge::SelectedHostBridgeRuntime::default();
         let mut runtime = HostGlassRuntime::default();
         let geometry = GlassGeometry {
             area: Rect::new(10, 1, 50, 19),
@@ -3453,7 +3455,7 @@ mod tests {
         let mut surfaces = HostGlassSurfaceRegistry::default();
         let hosts = crate::remote_target::RemoteHostRegistry::default();
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
-        let mut bridges = crate::app::remote_projection::SelectedHostBridgeRuntime::default();
+        let mut bridges = crate::app::selected_host_bridge::SelectedHostBridgeRuntime::default();
         let mut runtime = HostGlassRuntime::default();
         let geometry = GlassGeometry {
             area: Rect::new(10, 1, 50, 19),

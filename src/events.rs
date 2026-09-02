@@ -203,25 +203,6 @@ pub enum AppEvent {
         host: RemoteHostKey,
         generation: u64,
     },
-    /// One in-place remote terminal-session stream published a new lifecycle
-    /// state and optionally a full semantic frame. Tagged with the exact
-    /// projection generation/source/terminal identity; the pure reducer rejects
-    /// every late event that no longer matches the selected source/generation.
-    #[cfg_attr(
-        windows,
-        expect(
-            dead_code,
-            reason = "projection runtime is Unix-only; state/render parity remains cross-platform"
-        )
-    )]
-    RemoteProjectionStream {
-        key: crate::remote_source::RemoteProjectionTerminalKey,
-        generation: u64,
-        role: crate::remote_source::RemoteProjectionStreamRole,
-        status: crate::remote_source::RemoteProjectionStreamStatus,
-        frame: Option<crate::protocol::FrameData>,
-        message: Option<String>,
-    },
     /// Wake hint for the App-owned host-glass worker mailbox. Frame bytes and
     /// lifecycle truth never travel through this bounded event queue; the App
     /// drains their single ordered, lossless mailbox before handling any event.

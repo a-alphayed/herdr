@@ -4033,39 +4033,6 @@ mod tests {
     }
 
     #[test]
-    fn projected_selection_extracts_real_full_frame_wide_topology() {
-        let (tx, _rx) = mpsc::channel(4);
-        let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();
-        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
-        {
-            let mut core = pane.core.lock().unwrap();
-            core.terminal.write("a好b".as_bytes());
-        }
-
-        let backend = ratatui::backend::TestBackend::new(20, 5);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        // Same pre-diff capture as the production render_stream seam.
-        let completed = terminal
-            .draw(|frame| pane.render(frame, Rect::new(0, 0, 20, 5), false))
-            .unwrap();
-
-        let frame = crate::protocol::FrameData::from_ratatui_buffer(completed.buffer, None);
-        let key = crate::remote_source::RemoteProjectionTerminalKey {
-            host: "remote-a".into(),
-            session: "default".into(),
-            workspace_id: "ws-a".into(),
-            terminal_id: "term-a".into(),
-        };
-        let mut selection = crate::selection::ProjectedSelection::anchor(key, 0, 0);
-        selection.drag(0, 3, frame.width, frame.height);
-        assert!(selection.finish());
-
-        // End-to-end in-process: the real produced frame must satisfy the
-        // fail-closed wide-topology validator and extract each grapheme once.
-        assert_eq!(selection.extract(&frame).as_deref(), Some("a好b"));
-    }
-
-    #[test]
     fn process_pty_bytes_orders_default_color_reply_before_following_device_attribute_reply() {
         let (tx, mut rx) = mpsc::channel(4);
         let terminal = crate::ghostty::Terminal::new(20, 5, 0).unwrap();

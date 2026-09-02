@@ -403,30 +403,13 @@ pub(crate) fn send_remote_api_request_with_prepared_state(
     Err(unsupported_remote_error("remote API request"))
 }
 
-/// Windows stub: mirrors the unix layout-pane cap so cross-platform callers
-/// (e.g. the remote-projection admission check) can reference one constant
-/// regardless of platform; never actually consulted since no bridge exists.
-#[cfg(windows)]
-#[cfg_attr(
-    windows,
-    expect(
-        dead_code,
-        reason = "read only by the cross-platform parity test in remote_projection.rs, which is not compiled into bin-only Windows builds"
-    )
-)]
-pub(crate) const BRIDGE_MAX_CONCURRENT_STREAMS: usize = 24;
-
-/// Windows stub: opaque placeholder so cross-platform callers can hold an
-/// `Option<SshStdioBridge>` field; direct in-place terminal-session
-/// projection streaming is not supported on Windows yet (no render/client
-/// bridge over SSH stdio exists there). [`start_projection_bridge`] never
-/// actually constructs one.
+/// Windows stub: opaque placeholder so the selected-host bridge owner can
+/// hold an `Option<SshStdioBridge>`. Remote host glass is not supported on
+/// Windows, so [`start_projection_bridge`] never constructs one.
 #[cfg(windows)]
 pub(crate) struct SshStdioBridge;
 
-/// Windows stub: in-place terminal-session projection streaming is not
-/// supported yet; callers must treat the projected pane as unsupported/
-/// read-only rather than claiming in-place stream support.
+/// Windows stub: selected-host glass streaming is not supported yet.
 #[cfg(windows)]
 #[cfg_attr(
     windows,
@@ -441,9 +424,7 @@ pub(crate) fn start_projection_bridge(
     _local_socket: std::path::PathBuf,
     _max_concurrent: usize,
 ) -> std::io::Result<SshStdioBridge> {
-    Err(unsupported_remote_error(
-        "in-place terminal session projection streaming",
-    ))
+    Err(unsupported_remote_error("selected-host glass streaming"))
 }
 
 /// Windows stub: pooled persistent-bridge dispatch is never reached (no remote

@@ -688,56 +688,6 @@ mod tests {
         capture_history(&state.workspaces, &state.terminals, terminal_runtimes)
     }
 
-    #[test]
-    fn projection_frames_and_stream_placement_are_not_persisted() {
-        let mut state = state_with_workspaces(&["local"]);
-        let baseline = capture_from_state(&state);
-        let selected = crate::remote_source::RemoteSpaceKey {
-            host: "remote-a".into(),
-            session: "default".into(),
-            workspace_id: "remote-ws".into(),
-        };
-        state.selected_remote_space = Some(selected.clone());
-        let generation = state.begin_remote_projection_generation(Some(&selected), false);
-        let key = crate::remote_source::RemoteProjectionTerminalKey {
-            host: "remote-a".into(),
-            session: "default".into(),
-            workspace_id: "remote-ws".into(),
-            terminal_id: "remote-term".into(),
-        };
-        state.seed_remote_projection_streams(
-            generation,
-            [(
-                key.clone(),
-                crate::remote_source::RemoteProjectionStreamRole::Control,
-                crate::remote_source::RemoteProjectionStreamStatus::Connecting,
-                None,
-            )],
-        );
-        state.apply_remote_projection_stream_event(
-            key,
-            generation,
-            crate::remote_source::RemoteProjectionStreamRole::Control,
-            crate::remote_source::RemoteProjectionStreamStatus::LiveController,
-            Some(crate::protocol::FrameData {
-                cells: Vec::new(),
-                width: 0,
-                height: 0,
-                cursor: None,
-                hyperlinks: Vec::new(),
-                graphics: Vec::new(),
-            }),
-            None,
-        );
-
-        let after = capture_from_state(&state);
-        assert_eq!(
-            serde_json::to_string(&after).unwrap(),
-            serde_json::to_string(&baseline).unwrap(),
-            "remote projection frames/stream placement must not change the persisted snapshot"
-        );
-    }
-
     fn root_split_ratio(tab: &TabSnapshot) -> Option<f32> {
         match &tab.layout {
             LayoutSnapshot::Split { ratio, .. } => Some(*ratio),

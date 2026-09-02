@@ -15,9 +15,9 @@ pub(crate) mod host_glass;
 mod ids;
 mod input;
 mod remote_attach;
-mod remote_projection;
 mod runtime;
 mod runtime_mutations;
+mod selected_host_bridge;
 mod session;
 pub mod state;
 mod terminal_targets;
@@ -167,12 +167,9 @@ pub struct App {
     #[allow(dead_code)] // S2 worker seam; host-rail activation starts in S3.
     pub(crate) host_glass_runtime: host_glass::HostGlassRuntime,
     /// The sole no-start client bridge for the currently selected remote host.
-    /// Projection leaves and host glass open independent streams through this
-    /// one owner; bridge retirement is reaped off the App loop.
-    pub(crate) selected_host_bridge_runtime: remote_projection::SelectedHostBridgeRuntime,
-    /// App-owned sockets/threads/SSH bridge for the currently selected remote
-    /// projection. Pure frame/status data alone enters `AppState`.
-    pub(crate) remote_projection_runtime: remote_projection::RemoteProjectionRuntime,
+    /// Host glass opens its one full-App stream through this owner; bridge
+    /// retirement is reaped off the App loop.
+    pub(crate) selected_host_bridge_runtime: selected_host_bridge::SelectedHostBridgeRuntime,
     /// Pending one-shot `respond_to` channels for in-flight local-only runtime
     /// lifecycle actions (`remote.connect`/`reconnect`/`disconnect`), keyed by
     /// the process-unique supervisor/lifecycle generation that will resolve
@@ -698,8 +695,6 @@ impl App {
             active,
             previous_pane_focus: None,
             selected_remote_space: None,
-            remote_projection_generation: 0,
-            remote_projection_frames: std::collections::BTreeMap::new(),
             host_glass_states: std::collections::BTreeMap::new(),
             selected,
             mode,
@@ -780,8 +775,6 @@ impl App {
             workspace_press: None,
             tab_press: None,
             selection: None,
-            projected_selection: None,
-            projected_selection_gesture_active: false,
             selection_autoscroll: None,
             context_menu: None,
             update_available,
@@ -960,8 +953,8 @@ impl App {
             remote_source_supervisors,
             host_glass_surfaces: host_glass::HostGlassSurfaceRegistry::default(),
             host_glass_runtime: host_glass::HostGlassRuntime::default(),
-            selected_host_bridge_runtime: remote_projection::SelectedHostBridgeRuntime::default(),
-            remote_projection_runtime: remote_projection::RemoteProjectionRuntime::default(),
+            selected_host_bridge_runtime: selected_host_bridge::SelectedHostBridgeRuntime::default(
+            ),
             pending_remote_lifecycle: std::collections::HashMap::new(),
             lifecycle_supervisor_starter:
                 crate::app::api::remotes::spawn_remote_lifecycle_supervisor,
@@ -1082,19 +1075,12 @@ impl App {
         self.sync_prefix_input_source(previous_mode);
     }
 
-    /// Reconcile the mutually-exclusive selected-host content runtimes from
-    /// the already-computed view. Both runtime paths are App-owned and only
-    /// dispatch local listener/worker work; render remains read-only.
+    /// Reconcile selected-host glass from the already-computed view. Runtime
+    /// work stays App-owned and render remains read-only.
     pub(crate) fn reconcile_remote_content_surfaces(
         &mut self,
         cell_size: crate::kitty_graphics::HostCellSize,
     ) -> host_glass::GlassGeometry {
-        self.remote_projection_runtime.reconcile(
-            &mut self.state,
-            &self.remote_hosts,
-            &self.event_tx,
-            &mut self.selected_host_bridge_runtime,
-        );
         let body = crate::ui::host_glass_body_area(self.state.view.terminal_area);
         let geometry = host_glass::GlassGeometry {
             area: body,
@@ -1142,19 +1128,6 @@ impl App {
             if self.drain_api_requests() {
                 needs_render = true;
             }
-
-            // Reconcile projection source/focus changes before doing any
-            // further work so its generation advances before Detach/socket
-            // shutdown; late predecessor frames are rejected from this point
-            // onward. Host glass waits for the current compute_view geometry
-            // below so retained surfaces are never resized from the previous
-            // view's terminal area.
-            self.remote_projection_runtime.reconcile(
-                &mut self.state,
-                &self.remote_hosts,
-                &self.event_tx,
-                &mut self.selected_host_bridge_runtime,
-            );
 
             self.sync_focus_events();
             self.sync_session_save_schedule();
@@ -1391,22 +1364,14 @@ impl App {
         Ok(())
     }
 
-    /// Local outer-host mouse capture decision: the existing config/local-
-    /// runtime decision, OR an explicit capture-enabled report from the
-    /// focused selected projected `Control` stream (so remote mouse
-    /// applications keep working under `ui.mouse_capture = false`).
-    /// `Some(false)`/unknown projected state never forces host capture, which
-    /// preserves ordinary `ui.mouse_capture = false` selection semantics.
+    /// Local outer-host mouse capture decision: the existing config/local
+    /// runtime decision, or the selected full-App glass report.
     pub(crate) fn desired_host_mouse_capture(&self) -> bool {
         self.state
             .should_capture_host_mouse_from(&self.terminal_runtimes)
             || self
                 .host_glass_runtime
                 .selected_mouse_capture(&self.state)
-                .unwrap_or(false)
-            || self
-                .remote_projection_runtime
-                .focused_projected_control_mouse_capture(&self.state)
                 .unwrap_or(false)
     }
 
@@ -1966,15 +1931,9 @@ impl App {
                                 text,
                             });
                     } else if self.state.remote_projection_surface_active() {
-                        // Structured paste is encoded by the authoritative
-                        // remote TerminalRuntime (including bracketed-paste
-                        // mode). Stale/observer/owned states consume
-                        // fail-closed and never fall through to a local pane.
-                        let _ = self.remote_projection_runtime.send_input(
-                            &self.state,
-                            crate::protocol::ClientInputEvent::Paste { text },
-                            &self.event_tx,
-                        );
+                        // Until the projection input/action cleanup lands,
+                        // preserve the remote authority boundary and consume
+                        // this input rather than leaking it to a local pane.
                     } else {
                         if let Some(ws_idx) = self.state.active {
                             if let Some(ws) = self.state.workspaces.get(ws_idx) {
@@ -2177,62 +2136,6 @@ mod tests {
             api_rx,
             crate::api::EventHub::default(),
         )
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn desired_host_mouse_capture_ors_focused_projected_control_enabled_only() {
-        let mut app = test_app();
-        app.state.mouse_capture = false;
-        assert!(!app.desired_host_mouse_capture());
-
-        app.state.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
-            host: "remote-a".into(),
-            session: "default".into(),
-            workspace_id: "ws".into(),
-        });
-        app.state.view.remote_projection_hit_areas = vec![state::RemoteProjectionHitArea {
-            rect: Rect::new(1, 1, 40, 12),
-            host: "remote-a".into(),
-            session: "default".into(),
-            pane_id: Some("pane-1".into()),
-            terminal_id: Some("term-1".into()),
-            label: "remote pane".into(),
-            focused: true,
-            live: true,
-        }];
-
-        // Unknown and explicit-disabled projected state never force capture,
-        // preserving ordinary `ui.mouse_capture = false` selection semantics.
-        app.remote_projection_runtime.test_insert_stream_handle(
-            "term-1",
-            crate::remote_source::RemoteProjectionStreamRole::Control,
-            None,
-        );
-        assert!(!app.desired_host_mouse_capture());
-        app.remote_projection_runtime.test_insert_stream_handle(
-            "term-1",
-            crate::remote_source::RemoteProjectionStreamRole::Control,
-            Some(false),
-        );
-        assert!(!app.desired_host_mouse_capture());
-
-        // Explicit enabled forces host capture even under the disabled config.
-        app.remote_projection_runtime.test_insert_stream_handle(
-            "term-1",
-            crate::remote_source::RemoteProjectionStreamRole::Control,
-            Some(true),
-        );
-        assert!(app.desired_host_mouse_capture());
-
-        // The config/local decision still dominates on its own.
-        app.state.mouse_capture = true;
-        app.remote_projection_runtime.test_insert_stream_handle(
-            "term-1",
-            crate::remote_source::RemoteProjectionStreamRole::Control,
-            Some(false),
-        );
-        assert!(app.desired_host_mouse_capture());
     }
 
     #[cfg(unix)]

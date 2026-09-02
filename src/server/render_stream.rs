@@ -631,7 +631,7 @@ mod tests {
     /// completed pre-diff frame: wide-glyph continuation (`skip`) topology
     /// only survives there, never in the backend's post-diff buffer. A real
     /// Ghostty `a好b` must serialize with exactly one skipped continuation
-    /// cell and project-extract each grapheme exactly once.
+    /// cell.
     #[tokio::test]
     async fn render_terminal_virtual_preserves_real_wide_skip_topology() {
         let runtime =
@@ -681,18 +681,5 @@ mod tests {
             row[4..].iter().all(|cell| !cell.skip),
             "blank cells must not be skipped: {row:?}"
         );
-
-        // Projected extraction over the produced frame satisfies the
-        // fail-closed wide-topology validator and yields each grapheme once.
-        let key = crate::remote_source::RemoteProjectionTerminalKey {
-            host: "remote-a".into(),
-            session: "default".into(),
-            workspace_id: "ws-a".into(),
-            terminal_id: "term-a".into(),
-        };
-        let mut selection = crate::selection::ProjectedSelection::anchor(key, 0, 0);
-        selection.drag(0, 3, frame.width, frame.height);
-        assert!(selection.finish());
-        assert_eq!(selection.extract(&frame).as_deref(), Some("a好b"));
     }
 }

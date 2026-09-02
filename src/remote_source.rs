@@ -223,16 +223,6 @@ impl RemoteSourceCapabilities {
             _ => false,
         }
     }
-
-    /// Whether this host's cached capabilities allow opening an in-place
-    /// terminal session projection stream (`ObserveTerminal` /
-    /// `ControlTerminal`). Distinct from `supports_route_method` because
-    /// `terminal_session_stream` gates the render/client bridge, not a JSON
-    /// API route; kept as its own named predicate so call sites read clearly
-    /// and do not need to know the raw federation method string.
-    pub(crate) fn supports_terminal_session_stream(&self) -> bool {
-        self.terminal_session_stream
-    }
 }
 
 /// Projection availability for a single remote workspace's active-tab layout.
@@ -250,108 +240,6 @@ pub(crate) enum RemoteProjectionStatus {
     /// A prior layout is cached but the most recent fetch failed or the host
     /// went non-connected. The cached layout is kept for read-only display.
     StaleLastKnown,
-}
-
-/// Exact source/terminal identity for one projected terminal-session frame.
-/// Remote terminal ids are transient and only unique within their owning
-/// host/session; workspace identity is included so late frames from an old
-/// space on the same host can never bleed into the new projection.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct RemoteProjectionTerminalKey {
-    pub(crate) host: String,
-    pub(crate) session: String,
-    pub(crate) workspace_id: String,
-    pub(crate) terminal_id: String,
-}
-
-impl RemoteProjectionTerminalKey {
-    pub(crate) fn belongs_to(&self, space: &RemoteSpaceKey) -> bool {
-        self.host == space.host
-            && self.session == space.session
-            && self.workspace_id == space.workspace_id
-    }
-}
-
-/// Requested role for one terminal-session stream. Exactly the authoritative
-/// focused leaf requests controller ownership (`takeover: false`); every
-/// other exported leaf observes read-only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RemoteProjectionStreamRole {
-    Observe,
-    Control,
-}
-
-/// Pure, renderable lifecycle state for one projected terminal frame. Live
-/// stream handles remain App/runtime-owned; only this bounded status/frame data
-/// enters `AppState` through generation-tagged events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RemoteProjectionStreamStatus {
-    Connecting,
-    #[cfg_attr(
-        windows,
-        expect(
-            dead_code,
-            reason = "unix-produced live/disconnected variant retained for render/state parity"
-        )
-    )]
-    LiveObserver,
-    #[cfg_attr(
-        windows,
-        expect(
-            dead_code,
-            reason = "unix-produced live/disconnected variant retained for render/state parity"
-        )
-    )]
-    LiveController,
-    /// `ControlTerminal { takeover: false }` was refused because another
-    /// controller owns the terminal; the focused leaf fell back to observe.
-    #[cfg_attr(
-        windows,
-        expect(
-            dead_code,
-            reason = "unix-produced live/disconnected variant retained for render/state parity"
-        )
-    )]
-    OwnedReadOnly,
-    StaleLastKnown,
-    #[cfg_attr(
-        windows,
-        expect(
-            dead_code,
-            reason = "unix-produced live/disconnected variant retained for render/state parity"
-        )
-    )]
-    Disconnected,
-    Unsupported,
-    NeedsAttention,
-}
-
-impl RemoteProjectionStreamStatus {
-    pub(crate) fn accepts_input(self) -> bool {
-        matches!(self, Self::LiveController)
-    }
-
-    pub(crate) fn concise_label(self) -> &'static str {
-        match self {
-            Self::Connecting => "connecting",
-            Self::LiveObserver => "observe",
-            Self::LiveController => "control",
-            Self::OwnedReadOnly => "owned / read-only",
-            Self::StaleLastKnown => "stale / read-only",
-            Self::Disconnected => "disconnected / read-only",
-            Self::Unsupported => "unsupported / read-only",
-            Self::NeedsAttention => "needs attention / read-only",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RemoteProjectionFrameEntry {
-    pub(crate) generation: u64,
-    pub(crate) role: RemoteProjectionStreamRole,
-    pub(crate) status: RemoteProjectionStreamStatus,
-    pub(crate) frame: Option<crate::protocol::FrameData>,
-    pub(crate) message: Option<String>,
 }
 
 /// One remote workspace's projected layout, cached for read-only display.
@@ -1189,8 +1077,6 @@ mod tests {
         assert!(capabilities.supports_route_method(F::PANE_FOCUS_DIRECTION));
         assert!(!capabilities.supports_route_method(F::LAYOUT_EXPORT));
         assert!(capabilities.supports_route_method(F::TERMINAL_SESSION_STREAM));
-        assert!(capabilities.supports_terminal_session_stream());
-
         // Required ping methods, persistent bridge, and terminal attach are not
         // route-relevant cached capabilities, so they always return false even
         // when the host is otherwise fully capable.

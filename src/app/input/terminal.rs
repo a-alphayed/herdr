@@ -56,23 +56,10 @@ impl App {
             return None;
         }
 
-        // A projected remote space is an authority-routing boundary. Terminal
-        // keys go only to the current live controller stream as STRUCTURED
-        // input; the authoritative remote TerminalRuntime encodes its keyboard
-        // protocol/modes. Unsupported/stale/owned states consume fail-closed and
-        // never fall through to a local pane.
+        // Until S2 removes the projection input/action path, a selected remote
+        // source remains an authority boundary. Consume terminal input rather
+        // than leaking it into a local pane.
         if self.state.remote_projection_surface_active() {
-            if let Some(code) = crate::protocol::ClientKeyCode::from_crossterm(key_event.code) {
-                let _ = self.remote_projection_runtime.send_input(
-                    &self.state,
-                    crate::protocol::ClientInputEvent::Key {
-                        code,
-                        modifiers: key_event.modifiers.bits(),
-                        kind: crate::protocol::ClientKeyKind::from_crossterm(key_event.kind),
-                    },
-                    &self.event_tx,
-                );
-            }
             return None;
         }
 
