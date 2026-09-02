@@ -114,12 +114,6 @@ impl App {
                 Mode::ConfirmRemoveWorktree => self.handle_worktree_remove_key(key_event),
                 Mode::Resize => self.handle_resize_key_via_api(key),
                 Mode::ConfirmClose => self.handle_confirm_close_key_via_api(key_event),
-                Mode::ConfirmRemoteProjectedPaneClose => {
-                    self.handle_confirm_remote_projected_pane_close_key(key_event)
-                }
-                Mode::ConfirmRemoteProjectedTabClose => {
-                    self.handle_confirm_remote_projected_tab_close_key(key_event)
-                }
                 Mode::ContextMenu => {
                     self.handle_context_menu_key_via_api(key_event);
                 }
@@ -142,17 +136,11 @@ impl App {
             return;
         }
 
-        // Glass uses the full-App structured input path. Until S2 removes the
-        // projection input/action path, a selected remote source remains a
-        // fail-closed authority boundary and never pastes into a local pane.
+        // Glass uses the full-App structured input path.
         if self.state.host_glass_surface_active() {
             let _ = self.route_host_glass_input(crate::protocol::ClientInputEvent::Paste { text });
             return;
         }
-        if self.state.remote_projection_surface_active() {
-            return;
-        }
-
         if let Some(ws_idx) = self.state.active {
             if let Some(rt) = self
                 .state
@@ -261,33 +249,6 @@ impl App {
         }
     }
 
-    /// Keep the projection-era mouse authority boundary until S2 removes its
-    /// action/data path. Presentation no longer consumes these hit areas, but
-    /// a retained hit still consumes focused-pane terminal input fail-closed
-    /// while right-click chrome and non-focused focus actions stay local.
-    fn handle_remote_projection_terminal_mouse(&mut self, mouse: MouseEvent) -> bool {
-        if self.state.mode != Mode::Terminal || self.state.selected_remote_space.is_none() {
-            return false;
-        }
-
-        let Some(hit) = self
-            .state
-            .view
-            .remote_projection_hit_areas
-            .iter()
-            .find(|hit| {
-                mouse.column >= hit.rect.x
-                    && mouse.column < hit.rect.x.saturating_add(hit.rect.width)
-                    && mouse.row >= hit.rect.y
-                    && mouse.row < hit.rect.y.saturating_add(hit.rect.height)
-            })
-        else {
-            return false;
-        };
-
-        !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right)) && hit.focused
-    }
-
     /// Forward mouse input over the selected full-App glass using the exact
     /// PTY-free body geometry advertised in Hello/Resize. The persistent
     /// local indicator and host rail are never forwarded; the rail therefore
@@ -343,10 +304,6 @@ impl App {
         }
 
         if self.handle_host_glass_mouse(mouse) {
-            return;
-        }
-
-        if self.handle_remote_projection_terminal_mouse(mouse) {
             return;
         }
 
@@ -430,15 +387,6 @@ impl App {
                     MouseAction::FocusPane { ws_idx, pane_id } => {
                         self.focus_pane_internal_via_api(ws_idx, pane_id)
                     }
-                    MouseAction::RemoteProjectedTabCreate { target } => {
-                        self.create_remote_projected_tab_via_api(target);
-                    }
-                    MouseAction::RemoteProjectedTabFocus { target } => {
-                        self.focus_remote_projected_tab_via_api(target);
-                    }
-                    MouseAction::RemoteProjectedPaneFocus { target } => {
-                        self.focus_remote_projected_pane_via_api(target);
-                    }
                     MouseAction::FocusToastTarget => self.focus_toast_target_via_api(),
                     MouseAction::MoveWorkspace {
                         source_ws_idx,
@@ -490,10 +438,6 @@ impl App {
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             || !mouse.modifiers.contains(modified_url_click_modifier())
         {
-            return false;
-        }
-
-        if self.state.selected_remote_space.is_some() {
             return false;
         }
 
@@ -1264,36 +1208,6 @@ host_glass = true
 
         assert_eq!(app.state.name_input, "feature/logs");
         assert!(!app.state.name_input_replace_on_type);
-    }
-
-    #[tokio::test]
-    async fn paste_does_nothing_while_remote_space_projected() {
-        let mut app = test_app();
-        let mut ws = crate::workspace::Workspace::test_new("test");
-        let root_pane = ws.tabs[0].root_pane;
-        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(20, 5);
-        ws.insert_test_runtime(root_pane, runtime);
-        app.state.workspaces = vec![ws];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-        app.state.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
-            host: "jafar".to_string(),
-            session: "default".to_string(),
-            workspace_id: "ws-remote".to_string(),
-        });
-
-        // The projection guard must short-circuit before any local runtime or
-        // remote session receives the paste, so no bytes reach the runtime's
-        // input channel.
-        app.handle_paste("injected".into()).await;
-
-        assert!(
-            input_rx.try_recv().is_err(),
-            "paste must not reach the focused pane runtime while a remote space is projected"
-        );
-        assert_eq!(app.state.mode, Mode::Terminal);
-        assert!(app.state.selected_remote_space.is_some());
     }
 
     #[tokio::test]

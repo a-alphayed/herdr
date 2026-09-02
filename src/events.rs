@@ -9,8 +9,7 @@ use crate::api::schema::{AgentInfo, WorkspaceInfo};
 use crate::detect::{Agent, AgentState};
 use crate::layout::PaneId;
 use crate::remote_source::{
-    RemoteAgentKey, RemoteConnectionStatus, RemoteHostKey, RemoteProjectionSnapshot,
-    RemoteSourceCapabilities,
+    RemoteAgentKey, RemoteConnectionStatus, RemoteHostKey, RemoteSourceCapabilities,
 };
 use crate::workspace::{GitStatusCacheEntry, WorkspaceGitStatus};
 
@@ -141,8 +140,6 @@ pub enum AppEvent {
         agents: Vec<AgentInfo>,
         workspaces: Option<Vec<WorkspaceInfo>>,
         capabilities: RemoteSourceCapabilities,
-        projections: Vec<RemoteProjectionSnapshot>,
-        tabs: Vec<crate::remote_source::RemoteTabSnapshot>,
     },
     /// A connected authoritative remote host/session reported one newer agent entry.
     #[allow(dead_code)]
@@ -208,39 +205,6 @@ pub enum AppEvent {
     /// drains their single ordered, lossless mailbox before handling any event.
     #[cfg_attr(windows, allow(dead_code))]
     HostGlassWake,
-    /// A routed remote request sequence (primary + refresh legs) completed on
-    /// its IO worker — there is no deadline anywhere in this executor (v11;
-    /// see `app::api::routed_exec`'s module contract), so "completed" here
-    /// means the transport genuinely returned a result or an error, not that
-    /// a bound expired. Generation-stamped with the descriptor's source
-    /// generation; the reducer applies refresh data / stale marking
-    /// atomically in one step and records the reconciliation. The legacy
-    // Windows keeps this event in the shared reducer taxonomy even though
-    // only the Unix routed executor can construct it.
-    #[cfg_attr(windows, allow(dead_code))]
-    RemoteRoutedSequenceCompleted {
-        host: RemoteHostKey,
-        generation: u64,
-        // Boxed: `RoutedCompletion` is large (refresh-leg tab/layout data),
-        // and every `AppEvent` value sizes to its largest variant — boxing
-        // here keeps the common, frequent event variants small.
-        outcome: Box<crate::remote::RoutedCompletion>,
-    },
-    /// A routed sequence's primary leg failed at or after the first write
-    /// attempt — an ordinary transport error, or (FIX-2) a primary response
-    /// that failed to parse even though the transport itself reported `Ok` —
-    /// with no authoritative result: escalate to the named recovery
-    /// transition (the `remote.reconnect` generation-retiring path), which
-    /// force-reconnects and re-syncs full state. There is no timeout
-    /// anywhere in this executor (v11); this event fires only on a genuine
-    /// transport/protocol failure, never on an elapsed bound.
-    // Windows keeps this event in the shared reducer taxonomy even though
-    // only the Unix routed executor can construct it.
-    #[cfg_attr(windows, allow(dead_code))]
-    RemoteRoutedRecoveryNeeded {
-        host: RemoteHostKey,
-        generation: u64,
-    },
     /// Remote agent detection manifest update check finished.
     AgentDetectionManifestsUpdated {
         updated: Vec<crate::detect::manifest_update::ManifestUpdateCommit>,

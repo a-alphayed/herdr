@@ -761,79 +761,6 @@ pub struct ViewState {
     pub toast_hit_area: Rect,
     pub pane_infos: Vec<PaneInfo>,
     pub split_borders: Vec<SplitBorder>,
-    /// Hit areas for projected remote tab controls; non-empty only while a live
-    /// remote projection with fresh tab metadata is selected. These stay
-    /// separate from the local tab hit areas, which are suppressed for remote
-    /// projections.
-    pub remote_projection_tab_hit_areas: Vec<RemoteProjectionTabHitArea>,
-    /// Hit areas for projected remote panes; non-empty only while a remote
-    /// projection is selected. Computed by `compute_view` so both the mouse
-    /// handler and keyboard handler can use them without re-running the
-    /// recursive layout math.
-    pub remote_projection_hit_areas: Vec<RemoteProjectionHitArea>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemoteProjectionTabAction {
-    Focus,
-    Close,
-    New,
-}
-
-/// A projected remote tab strip control and routing metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteProjectionTabHitArea {
-    pub rect: Rect,
-    pub host: String,
-    pub session: String,
-    pub workspace_id: String,
-    pub tab_id: Option<String>,
-    pub label: String,
-    pub action: RemoteProjectionTabAction,
-    pub live: bool,
-}
-
-/// A single projected pane's screen rect and attach metadata.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RemoteProjectionHitArea {
-    pub rect: Rect,
-    pub host: String,
-    pub session: String,
-    pub pane_id: Option<String>,
-    pub terminal_id: Option<String>,
-    pub label: String,
-    /// True when this pane is the remote-focused pane.
-    pub focused: bool,
-    /// True when the projection is live (Available status) and `terminal_id`
-    /// is present so an attach can be scheduled.
-    pub live: bool,
-}
-
-/// Projection-derived identity for a remote pane context-menu action.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteProjectedPaneTarget {
-    pub host: String,
-    pub session: String,
-    pub terminal_id: String,
-    pub label: String,
-}
-
-/// Projection-derived identity for a remote tab action.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteProjectedTabTarget {
-    pub host: String,
-    pub session: String,
-    pub workspace_id: String,
-    pub tab_id: String,
-    pub label: String,
-}
-
-/// Projection-derived identity for creating a remote tab in a workspace.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteProjectedWorkspaceTarget {
-    pub host: String,
-    pub session: String,
-    pub workspace_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -853,8 +780,6 @@ pub enum Mode {
     ConfirmRemoveWorktree,
     Resize,
     ConfirmClose,
-    ConfirmRemoteProjectedPaneClose,
-    ConfirmRemoteProjectedTabClose,
     ContextMenu,
     Settings,
     GlobalMenu,
@@ -1189,13 +1114,10 @@ pub enum ContextMenuKind {
         has_manual_label: bool,
         remote_attach_pane: Option<RemoteAttachPaneTarget>,
     },
-    RemoteProjectedPane {
-        target: RemoteProjectedPaneTarget,
-    },
-    /// A projected remote source (source-rail row) context menu. Carries the
+    /// A remote source (source-rail row) context menu. Carries the
     /// configured-host alias so copy actions can resolve the host config. It is
     /// copy-only and never runs remote commands; right-clicking a rail row must
-    /// not switch the active projected source.
+    /// not switch the active remote source.
     RemoteSource {
         host: crate::remote_source::RemoteHostKey,
     },
@@ -1353,14 +1275,6 @@ impl ContextMenuState {
                 "Zoom",
                 "Close pane",
             ],
-            ContextMenuKind::RemoteProjectedPane { .. } => &[
-                "Focus pane",
-                "Rename pane",
-                "Clear pane name",
-                "Split right",
-                "Split down",
-                "Close pane",
-            ],
             ContextMenuKind::RemoteSource { .. } => &[
                 "Copy remote diagnostics command",
                 "Copy full remote command",
@@ -1481,7 +1395,6 @@ pub struct AppState {
     pub(crate) sidebar_source: SidebarSource,
     pub active: Option<usize>,
     pub(crate) previous_pane_focus: Option<PaneFocusTarget>,
-    pub(crate) selected_remote_space: Option<crate::remote_source::RemoteSpaceKey>,
     /// Pure per-host glass existence/status metadata. PTY-free VT surfaces,
     /// streams, sockets, and workers remain App-owned runtime state.
     pub(crate) host_glass_states: std::collections::BTreeMap<
@@ -1513,21 +1426,9 @@ pub struct AppState {
     /// handled by the outer App/event loop instead of directly from AppState.
     pub request_clipboard_write: Option<Vec<u8>>,
     pub(crate) request_remote_detach_view: Option<RemoteAttachPaneTarget>,
-    pub(crate) pending_remote_projected_pane_close: Option<RemoteProjectedPaneTarget>,
-    pub(crate) pending_remote_projected_tab_close: Option<RemoteProjectedTabTarget>,
-    /// Reducer-side reconciliation record (test-observability only — see
-    /// `apply_routed_completion` in `app::api::routed_exec`): the last
-    /// generation of a routed-sequence completion event the reducer has
-    /// applied per host.
-    // Windows retains the shared reducer state shape even though only the
-    // Unix routed executor can produce and reconcile routed completions.
-    #[cfg_attr(windows, allow(dead_code))]
-    pub(crate) remote_routed_reconciled:
-        std::collections::BTreeMap<crate::remote_source::RemoteHostKey, u64>,
     pub creating_new_tab: bool,
     pub requested_new_tab_name: Option<String>,
     pub rename_pane_target: Option<PaneId>,
-    pub(crate) rename_remote_pane_target: Option<RemoteProjectedPaneTarget>,
     pub worktree_create: Option<WorktreeCreateState>,
     pub worktree_open: Option<WorktreeOpenState>,
     pub worktree_remove: Option<WorktreeRemoveState>,
@@ -1679,19 +1580,7 @@ impl AppState {
             return;
         }
 
-        // Source selection is an authority-routing boundary. Compute the
-        // selected remote workspace BEFORE storing the new source so switching
-        // local -> remote A -> remote B replaces the projection atomically and
-        // never leaves the unchanged local workspace visible underneath. The
-        // authoritative remotely-focused workspace wins; if the remote marks
-        // none focused, choose the deterministic first workspace by its remote
-        // display number then id. Local focus/layout state is never mutated.
-        let selected_remote_space = match &source {
-            SidebarSource::Local => None,
-            SidebarSource::Remote(host) => self.focused_remote_space_for_host(host),
-        };
         self.sidebar_source = source;
-        self.selected_remote_space = selected_remote_space;
         self.workspace_scroll = 0;
         self.agent_panel_scroll = 0;
         // The host list viewport is intentionally NOT reset here: its content
@@ -1700,48 +1589,6 @@ impl AppState {
         // a scrolled list. Keyboard navigation keeps the selection reachable via
         // `ensure_host_visible`, and render-time `normalized_host_list_scroll`
         // clamps the offset.
-    }
-
-    fn focused_remote_space_for_host(
-        &self,
-        host: &crate::remote_source::RemoteHostKey,
-    ) -> Option<crate::remote_source::RemoteSpaceKey> {
-        let mut workspaces = self.remote_sources.workspace_entries_for_host(host)?;
-        workspaces.sort_by(|left, right| {
-            left.workspace
-                .number
-                .cmp(&right.workspace.number)
-                .then_with(|| {
-                    left.workspace
-                        .workspace_id
-                        .cmp(&right.workspace.workspace_id)
-                })
-        });
-        let workspace = workspaces
-            .iter()
-            .find(|entry| entry.workspace.focused)
-            .or_else(|| workspaces.first())?;
-        Some(crate::remote_source::RemoteSpaceKey {
-            host: host.host.clone(),
-            session: host.session.clone(),
-            workspace_id: workspace.workspace.workspace_id.clone(),
-        })
-    }
-
-    /// If a remote source was selected before its first workspace snapshot
-    /// arrived, select its authoritative focused workspace as soon as that
-    /// snapshot becomes available. Never replaces a deliberate existing
-    /// selection and never touches local workspace focus/layout.
-    pub(crate) fn select_remote_focused_workspace_if_missing(
-        &mut self,
-        host: &crate::remote_source::RemoteHostKey,
-    ) {
-        if self.selected_remote_space.is_some()
-            || self.sidebar_source != SidebarSource::Remote(host.clone())
-        {
-            return;
-        }
-        self.selected_remote_space = self.focused_remote_space_for_host(host);
     }
 
     /// Start a new generation for one host and publish its truthful initial
@@ -1881,16 +1728,6 @@ impl AppState {
         }
 
         self.sidebar_source.clone()
-    }
-
-    /// Whether the main workspace control surface is currently reserved for a
-    /// remote source. This remains true even while a selected remote host is
-    /// waiting for its first authoritative workspace snapshot, so local panes,
-    /// hit targets, and terminal input never bleed through the remote source
-    /// boundary.
-    pub(crate) fn remote_projection_surface_active(&self) -> bool {
-        self.selected_remote_space.is_some()
-            || matches!(self.effective_sidebar_source(), SidebarSource::Remote(_))
     }
 
     pub(crate) fn remove_alias_shadowed_by_new_pane(&mut self, pane_id: PaneId) {
@@ -2088,7 +1925,6 @@ impl AppState {
             sidebar_source: SidebarSource::Local,
             active: None,
             previous_pane_focus: None,
-            selected_remote_space: None,
             host_glass_states: std::collections::BTreeMap::new(),
             selected: 0,
             mode: Mode::Navigate,
@@ -2108,13 +1944,9 @@ impl AppState {
             request_client_config_reload: false,
             request_clipboard_write: None,
             request_remote_detach_view: None,
-            pending_remote_projected_pane_close: None,
-            pending_remote_projected_tab_close: None,
-            remote_routed_reconciled: std::collections::BTreeMap::new(),
             creating_new_tab: false,
             requested_new_tab_name: None,
             rename_pane_target: None,
-            rename_remote_pane_target: None,
             worktree_create: None,
             worktree_open: None,
             worktree_remove: None,
@@ -2153,8 +1985,6 @@ impl AppState {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
-                remote_projection_tab_hit_areas: Vec::new(),
-                remote_projection_hit_areas: Vec::new(),
             },
             drag: None,
             workspace_press: None,
@@ -2565,8 +2395,7 @@ impl AppState {
                         assert_live_pane(source_pane_id, "context menu source pane");
                     }
                 }
-                ContextMenuKind::RemoteProjectedPane { .. }
-                | ContextMenuKind::RemoteSource { .. } => {}
+                ContextMenuKind::RemoteSource { .. } => {}
             }
         }
     }
@@ -2716,45 +2545,7 @@ mod tests {
     }
 
     #[test]
-    fn projected_pane_menu_has_no_takeover_or_new_split_affordance() {
-        let menu = ContextMenuState {
-            kind: ContextMenuKind::RemoteProjectedPane {
-                target: RemoteProjectedPaneTarget {
-                    host: "remote-a".into(),
-                    session: "default".into(),
-                    terminal_id: "term-a".into(),
-                    label: "pane".into(),
-                },
-            },
-            x: 0,
-            y: 0,
-            list: MenuListState::new(0),
-        };
-        assert!(!menu.items().contains(&"Attach in new split"));
-        assert!(!menu.items().iter().any(|item| item.contains("takeover")));
-        assert!(menu.items().contains(&"Focus pane"));
-    }
-
-    fn remote_workspace_info(
-        id: &str,
-        number: usize,
-        focused: bool,
-    ) -> crate::api::schema::WorkspaceInfo {
-        crate::api::schema::WorkspaceInfo {
-            workspace_id: id.into(),
-            number,
-            label: id.into(),
-            focused,
-            pane_count: 1,
-            tab_count: 1,
-            active_tab_id: format!("tab-{id}"),
-            agent_status: crate::api::schema::AgentStatus::Unknown,
-            worktree: None,
-        }
-    }
-
-    #[test]
-    fn source_switch_auto_projects_focused_remote_and_restores_unchanged_local_workspace() {
+    fn source_switch_preserves_unchanged_local_workspace() {
         let mut state = AppState::test_new();
         let local = crate::workspace::Workspace::test_new("local");
         let local_focus = local.focused_pane_id();
@@ -2762,46 +2553,19 @@ mod tests {
         state.active = Some(0);
         let remote_a = crate::remote_source::RemoteHostKey::new("remote-a", "default");
         let remote_b = crate::remote_source::RemoteHostKey::new("remote-b", "default");
-        state.remote_sources.replace_workspace_snapshot(
-            remote_a.clone(),
-            vec![
-                remote_workspace_info("a-first", 1, false),
-                remote_workspace_info("a-focused", 2, true),
-            ],
-        );
-        state.remote_sources.replace_workspace_snapshot(
-            remote_b.clone(),
-            vec![
-                remote_workspace_info("b-second", 2, false),
-                remote_workspace_info("b-first", 1, false),
-            ],
-        );
 
-        state.select_sidebar_source(SidebarSource::Remote(remote_a));
-        assert_eq!(
-            state
-                .selected_remote_space
-                .as_ref()
-                .map(|space| space.workspace_id.as_str()),
-            Some("a-focused")
-        );
+        state.select_sidebar_source(SidebarSource::Remote(remote_a.clone()));
+        assert_eq!(state.sidebar_source, SidebarSource::Remote(remote_a));
         assert_eq!(state.active, Some(0));
         assert_eq!(state.workspaces[0].focused_pane_id(), local_focus);
 
-        state.select_sidebar_source(SidebarSource::Remote(remote_b));
-        assert_eq!(
-            state
-                .selected_remote_space
-                .as_ref()
-                .map(|space| space.workspace_id.as_str()),
-            Some("b-first"),
-            "no authoritative focus uses deterministic number/id fallback"
-        );
+        state.select_sidebar_source(SidebarSource::Remote(remote_b.clone()));
+        assert_eq!(state.sidebar_source, SidebarSource::Remote(remote_b));
         assert_eq!(state.active, Some(0));
         assert_eq!(state.workspaces[0].focused_pane_id(), local_focus);
 
         state.select_sidebar_source(SidebarSource::Local);
-        assert!(state.selected_remote_space.is_none());
+        assert_eq!(state.sidebar_source, SidebarSource::Local);
         assert_eq!(state.active, Some(0));
         assert_eq!(state.workspaces[0].focused_pane_id(), local_focus);
     }

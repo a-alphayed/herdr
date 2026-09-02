@@ -3039,22 +3039,6 @@ impl HeadlessServer {
                 respond_to,
             } => (*request, respond_to),
         };
-        // Routed remote mutations (pane/tab/workspace ops): deferred through
-        // the per-host serial mutation executor; must not block the headless
-        // loop on remote SSH. Falls through if not owned here. Unix-only:
-        // the routed executor (`api::routed_exec`) does not exist on Windows
-        // (federation transport is Unix-only by design).
-        #[cfg(unix)]
-        let (request, respond_to) = match self
-            .app
-            .handle_deferred_remote_routed_api_request(request, respond_to)
-        {
-            crate::app::DeferredRoutedOutcome::Handled => return changed,
-            crate::app::DeferredRoutedOutcome::NotHandled {
-                request,
-                respond_to,
-            } => (*request, respond_to),
-        };
         // Local-only runtime lifecycle seam (connect/reconnect/disconnect):
         // deferred, off-loop. Must not block the headless loop on remote
         // SSH/reap. Falls through to the synchronous path if not owned here.

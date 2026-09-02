@@ -22,8 +22,7 @@ mod text;
 mod widgets;
 
 use self::dialogs::{
-    render_confirm_close_overlay, render_confirm_remote_projected_pane_close_overlay,
-    render_confirm_remote_projected_tab_close_overlay, render_new_linked_worktree_overlay,
+    render_confirm_close_overlay, render_new_linked_worktree_overlay,
     render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
 };
 use self::keybind_help::render_keybind_help_overlay;
@@ -65,11 +64,7 @@ use self::status::{
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
     dialogs::{
-        confirm_close_button_rects, confirm_close_popup_rect,
-        confirm_remote_projected_pane_close_button_rects,
-        confirm_remote_projected_pane_close_inner_rect,
-        confirm_remote_projected_tab_close_button_rects,
-        confirm_remote_projected_tab_close_inner_rect, new_linked_worktree_button_rects,
+        confirm_close_button_rects, confirm_close_popup_rect, new_linked_worktree_button_rects,
         new_linked_worktree_inner_rect, open_existing_worktree_button_rects,
         open_existing_worktree_inner_rect, open_existing_worktree_max_visible_rows,
         open_existing_worktree_visible_start, remove_worktree_button_rects,
@@ -421,8 +416,6 @@ fn compute_view_internal(
             toast_hit_area,
             pane_infos: Vec::new(),
             split_borders: Vec::new(),
-            remote_projection_tab_hit_areas: Vec::new(),
-            remote_projection_hit_areas: Vec::new(),
         };
         return;
     }
@@ -477,16 +470,6 @@ fn compute_view_internal(
             )
         })
         .unwrap_or_default();
-    let (remote_projection_tab_hit_areas, remote_projection_hit_areas) =
-        if app.selected_remote_space.is_some() {
-            (
-                compute_remote_projection_tab_hit_areas(app, main_area),
-                compute_remote_projection_hit_areas(app, main_area),
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
-
     app.view = crate::app::ViewState {
         layout: ViewLayout::Desktop,
         sidebar_rect: sidebar_area,
@@ -506,8 +489,6 @@ fn compute_view_internal(
         toast_hit_area,
         pane_infos,
         split_borders,
-        remote_projection_tab_hit_areas,
-        remote_projection_hit_areas,
     };
 }
 
@@ -562,16 +543,6 @@ fn compute_mobile_view(
         .as_ref()
         .map(|_| mobile_toast_banner_rect(area, app.config_diagnostic.is_some()))
         .unwrap_or_default();
-    let (remote_projection_tab_hit_areas, remote_projection_hit_areas) =
-        if app.selected_remote_space.is_some() {
-            (
-                compute_remote_projection_tab_hit_areas(app, terminal_area),
-                compute_remote_projection_hit_areas(app, terminal_area),
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
-
     app.view = crate::app::ViewState {
         layout: ViewLayout::Mobile,
         sidebar_rect: Rect::default(),
@@ -591,8 +562,6 @@ fn compute_mobile_view(
         toast_hit_area,
         pane_infos,
         split_borders,
-        remote_projection_tab_hit_areas,
-        remote_projection_hit_areas,
     };
 }
 
@@ -658,12 +627,6 @@ pub(crate) fn render_with_runtime_registry_and_glass(
         Mode::Copy => render_copy_mode_overlay(app, frame, terminal_area),
         Mode::Resize => render_resize_overlay(app, frame, terminal_area),
         Mode::ConfirmClose => render_confirm_close_overlay(app, frame, terminal_area),
-        Mode::ConfirmRemoteProjectedPaneClose => {
-            render_confirm_remote_projected_pane_close_overlay(app, frame, terminal_area)
-        }
-        Mode::ConfirmRemoteProjectedTabClose => {
-            render_confirm_remote_projected_tab_close_overlay(app, frame, terminal_area)
-        }
         Mode::ContextMenu => {
             render_context_menu(app, frame);
         }
@@ -894,210 +857,6 @@ fn host_glass_stale_banner_lines(
     [format!(" STALE · {host_label} "), format!(" {detail} ")]
 }
 
-// ---------------------------------------------------------------------------
-// Deferred projection input geometry
-// ---------------------------------------------------------------------------
-
-/// Decompose the cached remote layout for the projection action path retained
-/// until S2. Projection presentation no longer consumes these rectangles.
-fn project_layout_rects<'a>(
-    node: &'a crate::api::schema::LayoutNode,
-    area: Rect,
-    focused_pane_id: &str,
-) -> Vec<(&'a crate::api::schema::LayoutPane, Rect, bool)> {
-    use crate::api::schema::{LayoutNode, SplitDirection};
-
-    match node {
-        LayoutNode::Pane { pane } => {
-            let is_focused = pane
-                .pane_id
-                .as_deref()
-                .is_some_and(|id| id == focused_pane_id);
-            vec![(pane, area, is_focused)]
-        }
-        LayoutNode::Split {
-            direction,
-            ratio,
-            first,
-            second,
-        } => {
-            if area.width < 2 || area.height < 2 {
-                return Vec::new();
-            }
-            let weight = ((*ratio).clamp(0.05, 0.95) * 1000.0).round() as u32;
-            let other = 1000u32.saturating_sub(weight);
-            let constraints = [
-                Constraint::Ratio(weight, 1000),
-                Constraint::Ratio(other.max(1), 1000),
-            ];
-            let [first_area, second_area] = match direction {
-                SplitDirection::Right => Layout::horizontal(constraints).areas(area),
-                SplitDirection::Down => Layout::vertical(constraints).areas(area),
-            };
-            let mut out = project_layout_rects(first, first_area, focused_pane_id);
-            out.extend(project_layout_rects(second, second_area, focused_pane_id));
-            out
-        }
-    }
-}
-
-fn remote_projection_tab_hit_context(
-    app: &crate::app::AppState,
-) -> Option<(
-    crate::remote_source::RemoteSpaceKey,
-    crate::remote_source::RemoteTabSnapshotEntry,
-    crate::remote_source::RemoteSourceCapabilities,
-)> {
-    use crate::remote_source::{RemoteHostKey, RemoteProjectionStatus};
-
-    let selected = app.selected_remote_space.as_ref()?;
-    let projection = app.remote_sources.projection_for_space(selected)?;
-    if projection.status != RemoteProjectionStatus::Available {
-        return None;
-    }
-    let host = RemoteHostKey::new(selected.host.clone(), selected.session.clone());
-    if !app
-        .remote_sources
-        .host_status(&host)
-        .is_some_and(|status| status.is_connected())
-    {
-        return None;
-    }
-    let tabs = app.remote_sources.tab_snapshot_for_space(selected)?;
-    if tabs.status != RemoteProjectionStatus::Available {
-        return None;
-    }
-    let capabilities = app.remote_sources.host_capabilities(&host);
-    Some((selected.clone(), tabs, capabilities))
-}
-
-fn compute_remote_projection_tab_hit_areas(
-    app: &crate::app::AppState,
-    area: Rect,
-) -> Vec<crate::app::state::RemoteProjectionTabHitArea> {
-    use crate::app::state::{RemoteProjectionTabAction, RemoteProjectionTabHitArea};
-
-    let Some((selected, tabs, capabilities)) = remote_projection_tab_hit_context(app) else {
-        return Vec::new();
-    };
-    if area.height <= 1 || area.width == 0 {
-        return Vec::new();
-    }
-
-    let mut hits = Vec::new();
-    let mut x = area
-        .x
-        .saturating_add(5)
-        .min(area.x.saturating_add(area.width));
-    let row = area.y.saturating_add(1);
-    let right = area.x.saturating_add(area.width);
-    for tab in tabs.tabs {
-        if x >= right {
-            break;
-        }
-        let label = if tab.focused {
-            format!("[{}]", tab.label)
-        } else {
-            format!(" {} ", tab.label)
-        };
-        let width = (label.chars().count() as u16)
-            .max(1)
-            .min(right.saturating_sub(x));
-        if capabilities.tab_focus && width > 0 {
-            hits.push(RemoteProjectionTabHitArea {
-                rect: Rect::new(x, row, width, 1),
-                host: selected.host.clone(),
-                session: selected.session.clone(),
-                workspace_id: selected.workspace_id.clone(),
-                tab_id: Some(tab.tab_id.clone()),
-                label: tab.label.clone(),
-                action: RemoteProjectionTabAction::Focus,
-                live: true,
-            });
-        }
-        x = x.saturating_add(width);
-        if capabilities.tab_close && x < right {
-            let close_width = 3u16.min(right.saturating_sub(x));
-            hits.push(RemoteProjectionTabHitArea {
-                rect: Rect::new(x, row, close_width, 1),
-                host: selected.host.clone(),
-                session: selected.session.clone(),
-                workspace_id: selected.workspace_id.clone(),
-                tab_id: Some(tab.tab_id.clone()),
-                label: tab.label.clone(),
-                action: RemoteProjectionTabAction::Close,
-                live: true,
-            });
-            x = x.saturating_add(close_width);
-        }
-        if x < right {
-            x = x.saturating_add(1);
-        }
-    }
-    if capabilities.tab_create && x < right {
-        let width = 5u16.min(right.saturating_sub(x));
-        hits.push(RemoteProjectionTabHitArea {
-            rect: Rect::new(x, row, width, 1),
-            host: selected.host,
-            session: selected.session,
-            workspace_id: selected.workspace_id,
-            tab_id: None,
-            label: "new tab".to_string(),
-            action: RemoteProjectionTabAction::New,
-            live: true,
-        });
-    }
-    hits
-}
-
-fn compute_remote_projection_hit_areas(
-    app: &crate::app::AppState,
-    area: Rect,
-) -> Vec<crate::app::state::RemoteProjectionHitArea> {
-    use crate::remote_source::RemoteProjectionStatus;
-
-    let Some(selected) = app.selected_remote_space.as_ref() else {
-        return Vec::new();
-    };
-    let Some(projection) = app.remote_sources.projection_for_space(selected) else {
-        return Vec::new();
-    };
-    let live = projection.status == RemoteProjectionStatus::Available;
-    let Some(layout) = &projection.layout else {
-        return Vec::new();
-    };
-    let header_rows = if remote_projection_tab_hit_context(app).is_some() {
-        2
-    } else {
-        1
-    };
-    if area.height <= header_rows {
-        return Vec::new();
-    }
-    let [_, body] =
-        Layout::vertical([Constraint::Length(header_rows), Constraint::Min(1)]).areas(area);
-
-    project_layout_rects(&layout.root, body, &layout.focused_pane_id)
-        .into_iter()
-        .map(
-            |(pane, rect, focused)| crate::app::state::RemoteProjectionHitArea {
-                rect,
-                host: selected.host.clone(),
-                session: selected.session.clone(),
-                pane_id: pane.pane_id.clone(),
-                terminal_id: pane.terminal_id.clone(),
-                label: pane
-                    .label
-                    .clone()
-                    .or_else(|| pane.pane_id.clone())
-                    .unwrap_or_else(|| "pane".to_string()),
-                focused,
-                live: live && pane.terminal_id.is_some(),
-            },
-        )
-        .collect()
-}
-
 fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) {
     let has_config_diagnostic = app.config_diagnostic.is_some();
     if let Some(message) = &app.config_diagnostic {
@@ -1255,82 +1014,6 @@ mod tests {
         );
         assert!(app.view.terminal_area.width > 0);
     }
-    #[test]
-    fn project_layout_rects_partitions_area_and_identifies_focused_pane() {
-        use crate::api::schema::{LayoutNode, LayoutPane, SplitDirection};
-
-        let left_id = "left-pane";
-        let right_id = "right-pane";
-        let area = Rect::new(0, 0, 80, 24);
-
-        let node = LayoutNode::Split {
-            direction: SplitDirection::Right,
-            ratio: 0.5,
-            first: Box::new(LayoutNode::Pane {
-                pane: LayoutPane {
-                    pane_id: Some(left_id.to_string()),
-                    terminal_id: Some("term-left".to_string()),
-                    ..Default::default()
-                },
-            }),
-            second: Box::new(LayoutNode::Pane {
-                pane: LayoutPane {
-                    pane_id: Some(right_id.to_string()),
-                    terminal_id: Some("term-right".to_string()),
-                    ..Default::default()
-                },
-            }),
-        };
-
-        let rects = project_layout_rects(&node, area, right_id);
-
-        assert_eq!(rects.len(), 2, "two leaf panes");
-
-        // Non-overlapping: each rect must not contain any point of the other.
-        let (_, r0, _) = rects[0];
-        let (_, r1, _) = rects[1];
-        let overlap_x = r0.x < r1.x + r1.width && r1.x < r0.x + r0.width;
-        let overlap_y = r0.y < r1.y + r1.height && r1.y < r0.y + r0.height;
-        assert!(!overlap_x || !overlap_y, "rects must not overlap");
-
-        // Together they must cover the full area width (horizontal split).
-        assert_eq!(r0.width + r1.width, area.width);
-        assert_eq!(r0.height, area.height);
-        assert_eq!(r1.height, area.height);
-
-        // Focused flag is only on the right pane.
-        let focused_ids: Vec<_> = rects
-            .iter()
-            .filter(|(_, _, focused)| *focused)
-            .map(|(p, _, _)| p.pane_id.as_deref())
-            .collect();
-        assert_eq!(focused_ids, vec![Some(right_id)]);
-    }
-
-    #[test]
-    fn project_layout_rects_minimum_size_guard_returns_empty_for_tiny_area() {
-        use crate::api::schema::{LayoutNode, LayoutPane, SplitDirection};
-
-        let area = Rect::new(0, 0, 1, 1);
-        let node = LayoutNode::Split {
-            direction: SplitDirection::Right,
-            ratio: 0.5,
-            first: Box::new(LayoutNode::Pane {
-                pane: LayoutPane {
-                    ..Default::default()
-                },
-            }),
-            second: Box::new(LayoutNode::Pane {
-                pane: LayoutPane {
-                    ..Default::default()
-                },
-            }),
-        };
-
-        let rects = project_layout_rects(&node, area, "");
-        assert!(rects.is_empty(), "below minimum size must yield no rects");
-    }
-
     #[test]
     fn copy_feedback_offset_only_increases_when_toast_rect_overlaps() {
         let area = Rect::new(0, 0, 80, 24);
@@ -1869,7 +1552,7 @@ mod tests {
             app.view.host_rail_rect.x + app.view.host_rail_rect.width
         );
         assert_eq!(app.view.sidebar_panel_rect.y, app.view.host_rail_rect.y);
-        // The projected remote selection is still effective (no local fallback).
+        // The remote selection is still effective (no local fallback).
         assert_eq!(
             app.effective_sidebar_source(),
             crate::app::state::SidebarSource::Remote(host)
@@ -2290,8 +1973,6 @@ mod tests {
         assert!(app.state.view.tab_hit_areas.is_empty());
         assert!(app.state.view.pane_infos.is_empty());
         assert!(app.state.view.split_borders.is_empty());
-        assert!(app.state.view.remote_projection_tab_hit_areas.is_empty());
-        assert!(app.state.view.remote_projection_hit_areas.is_empty());
 
         let generation = app.state.begin_host_glass_generation(host.clone());
         let body = host_glass_body_area(app.state.view.terminal_area);
@@ -2797,12 +2478,6 @@ switch_workspace = "ctrl+1..9"
         let host =
             crate::remote_source::RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
         app.sidebar_source = crate::app::state::SidebarSource::Remote(host.clone());
-        app.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
-            host: host.host,
-            session: host.session,
-            workspace_id: "remote-ws".to_string(),
-        });
-
         compute_view(&mut app, Rect::new(0, 0, 140, 20));
 
         assert!(!app.host_glass_surface_active());

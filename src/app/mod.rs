@@ -148,13 +148,6 @@ pub struct App {
     pub(crate) local_terminal_notifications: bool,
     pub(crate) config_reloaded_from_disk: bool,
     pub(crate) remote_hosts: crate::remote_target::RemoteHostRegistry,
-    /// Per-host serial mutation executor for routed remote requests (see
-    /// `api::routed_exec`). Constructed with the production environment;
-    /// tests replace it with a local-env pool (no real SSH). Unix-only:
-    /// federation transport is Unix-only by design, so routed execution is
-    /// simply absent on Windows.
-    #[cfg(unix)]
-    pub(crate) routed_executor: std::sync::Arc<api::routed_exec::RoutedExecutorPool>,
     pub(crate) remote_source_supervisors:
         Vec<crate::remote_supervisor::RemoteSourceSupervisorHandle>,
     /// App-owned PTY-free VT surfaces for host glass. Pure existence/status
@@ -694,7 +687,6 @@ impl App {
             sidebar_source: state::SidebarSource::Local,
             active,
             previous_pane_focus: None,
-            selected_remote_space: None,
             host_glass_states: std::collections::BTreeMap::new(),
             selected,
             mode,
@@ -714,10 +706,6 @@ impl App {
             request_client_config_reload: false,
             request_clipboard_write: None,
             request_remote_detach_view: None,
-            pending_remote_projected_pane_close: None,
-            pending_remote_projected_tab_close: None,
-            rename_remote_pane_target: None,
-            remote_routed_reconciled: std::collections::BTreeMap::new(),
             creating_new_tab: false,
             requested_new_tab_name: None,
             rename_pane_target: None,
@@ -768,8 +756,6 @@ impl App {
                 toast_hit_area: Rect::default(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
-                remote_projection_tab_hit_areas: Vec::new(),
-                remote_projection_hit_areas: Vec::new(),
             },
             drag: None,
             workspace_press: None,
@@ -893,11 +879,6 @@ impl App {
 
         let remote_source_supervisors =
             start_remote_source_supervisors_if_enabled(no_session, &remote_hosts, event_tx.clone());
-        #[cfg(unix)]
-        let routed_executor = api::routed_exec::RoutedExecutorPool::new(
-            api::routed_exec::RoutedEnv::production(event_tx.clone()),
-        );
-
         Self {
             config_diagnostic_deadline: None,
             toast_deadline: None,
@@ -948,8 +929,6 @@ impl App {
             local_terminal_notifications: true,
             config_reloaded_from_disk: false,
             remote_hosts,
-            #[cfg(unix)]
-            routed_executor,
             remote_source_supervisors,
             host_glass_surfaces: host_glass::HostGlassSurfaceRegistry::default(),
             host_glass_runtime: host_glass::HostGlassRuntime::default(),
@@ -1794,8 +1773,8 @@ impl App {
             }
 
             // Mark every still-configured host that had a prior active cache
-            // entry `Disconnected` (keeps last-known agent/workspace/
-            // projection/tab data as stale, drops prepared state). A
+            // entry `Disconnected` (keeps last-known agent/workspace data as
+            // stale, drops prepared state). A
             // still-configured manual/on_demand host remains visible but
             // disconnected with no prepared state; a switched-away auto host
             // is not silently dropped mid-session.
@@ -1930,10 +1909,6 @@ impl App {
                             self.route_host_glass_input(crate::protocol::ClientInputEvent::Paste {
                                 text,
                             });
-                    } else if self.state.remote_projection_surface_active() {
-                        // Until the projection input/action cleanup lands,
-                        // preserve the remote authority boundary and consume
-                        // this input rather than leaking it to a local pane.
                     } else {
                         if let Some(ws_idx) = self.state.active {
                             if let Some(ws) = self.state.workspaces.get(ws_idx) {
@@ -2021,12 +1996,6 @@ impl App {
             Mode::ConfirmClose => {
                 self.handle_confirm_close_key_via_api(key_event);
             }
-            Mode::ConfirmRemoteProjectedPaneClose => {
-                self.handle_confirm_remote_projected_pane_close_key(key_event);
-            }
-            Mode::ConfirmRemoteProjectedTabClose => {
-                self.handle_confirm_remote_projected_tab_close_key(key_event);
-            }
             Mode::ContextMenu => {
                 self.handle_context_menu_key_via_api(key_event);
             }
@@ -2067,9 +2036,6 @@ impl App {
         self.handle_mouse(mouse);
     }
 }
-
-#[cfg(unix)]
-pub(crate) use api::routed_exec::DeferredRoutedOutcome;
 
 #[cfg(test)]
 mod tests {
@@ -2821,8 +2787,6 @@ mod tests {
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
-            projections: Vec::new(),
-            tabs: Vec::new(),
         });
 
         assert!(app.state.remote_sources.list_entries().is_empty());
@@ -2844,8 +2808,6 @@ mod tests {
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
-            projections: Vec::new(),
-            tabs: Vec::new(),
         });
 
         assert!(app.state.remote_sources.list_entries().is_empty());
@@ -2870,8 +2832,6 @@ mod tests {
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
-            projections: Vec::new(),
-            tabs: Vec::new(),
         });
 
         assert_eq!(app.state.remote_sources.list_entries().len(), 1);
@@ -3828,8 +3788,6 @@ auto_connect = false
             agents: vec![remote_agent_info("term-1")],
             workspaces: None,
             capabilities: crate::remote_source::RemoteSourceCapabilities::default(),
-            projections: Vec::new(),
-            tabs: Vec::new(),
         });
         assert_eq!(
             app.state.remote_sources.host_status(&host),
@@ -3907,7 +3865,7 @@ connection_policy = "manual"
         // Reviewer B finding: a configured manual/on_demand no-cache host is
         // visible/selectable, but reload cleanup previously compared only
         // auto-start hosts. Removing the host from config (or disabling remote)
-        // must clear a stale `sidebar_source` projection, update the configured
+        // must clear a stale `sidebar_source` selection, update the configured
         // display collection, and never synthetically insert a cache entry.
         let _guard = config_env_lock().lock().unwrap();
         let path = temp_config_path("reload-config-manual-host-removed");
@@ -3958,7 +3916,7 @@ connection_policy = "manual"
         assert_eq!(
             app.state.sidebar_source,
             crate::app::state::SidebarSource::Local,
-            "stale projection must fall back to Local when the selected display-only host disappears"
+            "stale selection must fall back to Local when the selected display-only host disappears"
         );
         assert!(!app.state.configured_remote_hosts.contains(&brain));
         assert!(app.state.remote_sources.host_status(&brain).is_none());
@@ -3972,7 +3930,7 @@ connection_policy = "manual"
 
     #[test]
     fn reload_config_clears_selection_when_remote_disabled() {
-        // Disabling remote must also clear a stale projection onto an on_demand
+        // Disabling remote must also clear a stale selection of an on_demand
         // display-only host and empty the configured display collection, with no
         // synthetic cache insertion.
         let _guard = config_env_lock().lock().unwrap();
@@ -6375,38 +6333,6 @@ last_pane = "prefix+tab"
         app.route_client_input(b"\x1b]".to_vec());
 
         assert!(rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn route_client_events_paste_does_nothing_while_remote_space_projected() {
-        let mut app = test_app();
-        let mut ws = Workspace::test_new("test");
-        let root_pane = ws.tabs[0].root_pane;
-        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(20, 5);
-        ws.insert_test_runtime(root_pane, runtime);
-        app.state.workspaces = vec![ws];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::Terminal;
-        app.state.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
-            host: "jafar".to_string(),
-            session: "default".to_string(),
-            workspace_id: "ws-remote".to_string(),
-        });
-
-        app.route_client_events(
-            vec![crate::raw_input::RawInputEvent::Paste("injected".into())],
-            true,
-        );
-
-        assert!(
-            input_rx.try_recv().is_err(),
-            "route_client_events paste must not reach runtime while a remote space is projected"
-        );
-        assert!(
-            app.state.selected_remote_space.is_some(),
-            "projection selection must remain after dropped paste"
-        );
     }
 
     #[test]

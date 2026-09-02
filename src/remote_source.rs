@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::api::schema::{AgentInfo, LayoutDescription, TabInfo, WorkspaceInfo};
+use crate::api::schema::{AgentInfo, WorkspaceInfo};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RemoteHostKey {
@@ -39,13 +39,6 @@ impl RemoteAgentKey {
             terminal_id: terminal_id.into(),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct RemoteSpaceKey {
-    pub(crate) host: String,
-    pub(crate) session: String,
-    pub(crate) workspace_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,10 +136,10 @@ pub(crate) struct RemoteSourceCapabilities {
     pub(crate) pane_focus_direction: bool,
     pub(crate) layout_export: bool,
     /// Optional additive capability gating in-place terminal session
-    /// projection streams (`ObserveTerminal` / `ControlTerminal` over the
+    /// terminal-session streams (`ObserveTerminal` / `ControlTerminal` over the
     /// existing render bridge). Independent of `terminal_attach`: a remote
     /// advertising `terminal_attach` but not this method still fails closed
-    /// for projection streaming. Never a supervisor-ping prerequisite.
+    /// for terminal streaming. Never a supervisor-ping prerequisite.
     pub(crate) terminal_session_stream: bool,
 }
 
@@ -196,7 +189,7 @@ impl RemoteSourceCapabilities {
     /// `FederationCapabilities`, so the disconnect/stale lifecycle stays
     /// authoritative.
     ///
-    /// Exhaustive over the cached fields relevant to projection/control routes
+    /// Exhaustive over the cached fields relevant to remote control routes
     /// (workspace create/list_local/rename, tab list/create/focus/close/rename,
     /// pane split/close/rename/focus/focus_direction, layout export). Returns
     /// `false` for required ping methods (`remote_api_bridge`,
@@ -225,57 +218,6 @@ impl RemoteSourceCapabilities {
     }
 }
 
-/// Projection availability for a single remote workspace's active-tab layout.
-///
-/// Projections are rebuildable soft state, like the rest of this cache: a fetch
-/// failure never disconnects the host or drops agents/workspaces, and a
-/// disconnect preserves the last-known layout but marks it stale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RemoteProjectionStatus {
-    /// A fresh `layout.export` succeeded for the workspace's active tab.
-    Available,
-    /// The most recent projection fetch failed (or there is no active tab) and
-    /// no prior layout is cached.
-    Unavailable,
-    /// A prior layout is cached but the most recent fetch failed or the host
-    /// went non-connected. The cached layout is kept for read-only display.
-    StaleLastKnown,
-}
-
-/// One remote workspace's projected layout, cached for read-only display.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RemoteProjectionEntry {
-    pub(crate) workspace_id: String,
-    pub(crate) tab_id: Option<String>,
-    pub(crate) tab_label: Option<String>,
-    pub(crate) status: RemoteProjectionStatus,
-    pub(crate) layout: Option<LayoutDescription>,
-}
-
-/// A projection snapshot flowing from a supervisor into the cache reducer.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct RemoteProjectionSnapshot {
-    pub(crate) workspace_id: String,
-    pub(crate) tab_id: Option<String>,
-    pub(crate) tab_label: Option<String>,
-    pub(crate) status: RemoteProjectionStatus,
-    pub(crate) layout: Option<LayoutDescription>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RemoteTabSnapshotEntry {
-    pub(crate) workspace_id: String,
-    pub(crate) status: RemoteProjectionStatus,
-    pub(crate) tabs: Vec<TabInfo>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RemoteTabSnapshot {
-    pub(crate) workspace_id: String,
-    pub(crate) status: RemoteProjectionStatus,
-    pub(crate) tabs: Vec<TabInfo>,
-}
-
 impl RemoteAgentEntry {
     pub(crate) fn stale(&self) -> bool {
         !self.status.is_connected()
@@ -293,8 +235,6 @@ struct RemoteHostCache {
     agents: BTreeMap<String, AgentInfo>,
     workspaces: Option<BTreeMap<String, WorkspaceInfo>>,
     capabilities: RemoteSourceCapabilities,
-    projections: BTreeMap<String, RemoteProjectionEntry>,
-    tabs: BTreeMap<String, RemoteTabSnapshotEntry>,
     /// Supervisor-prepared bridge state (prepared shell path + advertised
     /// federation capabilities) for reuse by routed agent dispatch while the
     /// host stays `Connected`. Rebuildable soft state: dropped when the host
@@ -309,42 +249,7 @@ impl Default for RemoteHostCache {
             agents: BTreeMap::new(),
             workspaces: None,
             capabilities: RemoteSourceCapabilities::default(),
-            projections: BTreeMap::new(),
-            tabs: BTreeMap::new(),
             bridge_state: None,
-        }
-    }
-}
-
-fn projection_entry_from_snapshot(
-    host_cache: &RemoteHostCache,
-    snapshot: &RemoteProjectionSnapshot,
-) -> RemoteProjectionEntry {
-    match snapshot.status {
-        RemoteProjectionStatus::Available => RemoteProjectionEntry {
-            workspace_id: snapshot.workspace_id.clone(),
-            tab_id: snapshot.tab_id.clone(),
-            tab_label: snapshot.tab_label.clone(),
-            status: RemoteProjectionStatus::Available,
-            layout: snapshot.layout.clone(),
-        },
-        RemoteProjectionStatus::Unavailable | RemoteProjectionStatus::StaleLastKnown => {
-            // A fetch failure keeps the last-known layout when present so the
-            // read-only view can still show it (marked stale); otherwise the
-            // projection is simply unavailable for this workspace.
-            let (status, layout) = host_cache
-                .projections
-                .get(&snapshot.workspace_id)
-                .and_then(|existing| existing.layout.clone())
-                .map(|layout| (RemoteProjectionStatus::StaleLastKnown, Some(layout)))
-                .unwrap_or((RemoteProjectionStatus::Unavailable, None));
-            RemoteProjectionEntry {
-                workspace_id: snapshot.workspace_id.clone(),
-                tab_id: snapshot.tab_id.clone(),
-                tab_label: snapshot.tab_label.clone(),
-                status,
-                layout,
-            }
         }
     }
 }
@@ -411,141 +316,6 @@ impl RemoteSourceCache {
         }
     }
 
-    pub(crate) fn replace_tab_snapshot(
-        &mut self,
-        host: &RemoteHostKey,
-        workspace_id: impl Into<String>,
-        tabs: Vec<TabInfo>,
-    ) {
-        let workspace_id = workspace_id.into();
-        let host_cache = self.hosts.entry(host.clone()).or_default();
-        host_cache.tabs.insert(
-            workspace_id.clone(),
-            RemoteTabSnapshotEntry {
-                workspace_id,
-                status: RemoteProjectionStatus::Available,
-                tabs,
-            },
-        );
-    }
-
-    pub(crate) fn mark_tab_snapshot_unavailable(
-        &mut self,
-        host: &RemoteHostKey,
-        workspace_id: impl Into<String>,
-    ) {
-        let workspace_id = workspace_id.into();
-        let host_cache = self.hosts.entry(host.clone()).or_default();
-        match host_cache.tabs.get_mut(&workspace_id) {
-            Some(entry) => {
-                entry.status = if entry.tabs.is_empty() {
-                    RemoteProjectionStatus::Unavailable
-                } else {
-                    RemoteProjectionStatus::StaleLastKnown
-                };
-            }
-            None => {
-                host_cache.tabs.insert(
-                    workspace_id.clone(),
-                    RemoteTabSnapshotEntry {
-                        workspace_id,
-                        status: RemoteProjectionStatus::Unavailable,
-                        tabs: Vec::new(),
-                    },
-                );
-            }
-        }
-    }
-
-    pub(crate) fn apply_tab_snapshots(
-        &mut self,
-        host: &RemoteHostKey,
-        snapshots: Vec<RemoteTabSnapshot>,
-    ) {
-        let host_cache = self.hosts.entry(host.clone()).or_default();
-        let mut next = BTreeMap::new();
-        for snapshot in snapshots {
-            let (status, tabs) = if snapshot.status == RemoteProjectionStatus::Available {
-                (RemoteProjectionStatus::Available, snapshot.tabs)
-            } else {
-                host_cache
-                    .tabs
-                    .get(&snapshot.workspace_id)
-                    .filter(|existing| !existing.tabs.is_empty())
-                    .map(|existing| {
-                        (
-                            RemoteProjectionStatus::StaleLastKnown,
-                            existing.tabs.clone(),
-                        )
-                    })
-                    .unwrap_or((RemoteProjectionStatus::Unavailable, Vec::new()))
-            };
-            next.insert(
-                snapshot.workspace_id.clone(),
-                RemoteTabSnapshotEntry {
-                    workspace_id: snapshot.workspace_id,
-                    status,
-                    tabs,
-                },
-            );
-        }
-        host_cache.tabs = next;
-    }
-
-    pub(crate) fn upsert_tab(&mut self, host: &RemoteHostKey, tab: TabInfo) {
-        let host_cache = self.hosts.entry(host.clone()).or_default();
-        let entry = host_cache
-            .tabs
-            .entry(tab.workspace_id.clone())
-            .or_insert_with(|| RemoteTabSnapshotEntry {
-                workspace_id: tab.workspace_id.clone(),
-                status: RemoteProjectionStatus::Available,
-                tabs: Vec::new(),
-            });
-        entry.status = RemoteProjectionStatus::Available;
-        if let Some(existing) = entry
-            .tabs
-            .iter_mut()
-            .find(|existing| existing.tab_id == tab.tab_id)
-        {
-            *existing = tab;
-        } else {
-            entry.tabs.push(tab);
-            entry.tabs.sort_by_key(|tab| tab.number);
-        }
-    }
-
-    pub(crate) fn remove_tab(&mut self, host: &RemoteHostKey, tab_id: &str) -> Option<TabInfo> {
-        let host_cache = self.hosts.get_mut(host)?;
-        for entry in host_cache.tabs.values_mut() {
-            if let Some(index) = entry.tabs.iter().position(|tab| tab.tab_id == tab_id) {
-                return Some(entry.tabs.remove(index));
-            }
-        }
-        None
-    }
-
-    pub(crate) fn tab_snapshot_for_space(
-        &self,
-        key: &RemoteSpaceKey,
-    ) -> Option<RemoteTabSnapshotEntry> {
-        let host = RemoteHostKey::new(key.host.clone(), key.session.clone());
-        self.hosts
-            .get(&host)
-            .and_then(|host_cache| host_cache.tabs.get(&key.workspace_id))
-            .cloned()
-    }
-
-    pub(crate) fn tab_snapshots_for_host(
-        &self,
-        host: &RemoteHostKey,
-    ) -> Vec<&RemoteTabSnapshotEntry> {
-        self.hosts
-            .get(host)
-            .map(|host_cache| host_cache.tabs.values().collect())
-            .unwrap_or_default()
-    }
-
     pub(crate) fn set_capabilities(
         &mut self,
         host: &RemoteHostKey,
@@ -574,29 +344,17 @@ impl RemoteSourceCache {
     pub(crate) fn mark_status(&mut self, host: &RemoteHostKey, status: RemoteConnectionStatus) {
         let host_cache = self.hosts.entry(host.clone()).or_default();
         host_cache.status = status;
-        // A non-connected host keeps its cached projections for read-only display
-        // but they are no longer fresh, so available projections become stale.
         if !status.is_connected() {
             // Prepared bridge state is safety-relevant for mutating dispatch:
             // a stale prepared binary/capabilities must never be reused to skip
             // probes after a disconnect/incompatibility. Drop it while keeping
-            // display caches (agents/workspaces/projections/tabs) stale as today.
+            // display caches (agents/workspaces) stale as today.
             host_cache.bridge_state = None;
             // Phase G.10: also retire idle persistent bridges for this host so
             // they are not reused after a disconnect. Mark-only and cheap; the
             // actual child reap happens lazily on the next checkout/return, so
             // this never stalls the reducer loop on process cleanup.
             crate::remote::invalidate_remote_bridge_pool_host(host);
-            for projection in host_cache.projections.values_mut() {
-                if projection.status == RemoteProjectionStatus::Available {
-                    projection.status = RemoteProjectionStatus::StaleLastKnown;
-                }
-            }
-            for tabs in host_cache.tabs.values_mut() {
-                if tabs.status == RemoteProjectionStatus::Available {
-                    tabs.status = RemoteProjectionStatus::StaleLastKnown;
-                }
-            }
         }
     }
 
@@ -638,62 +396,12 @@ impl RemoteSourceCache {
         }
     }
 
-    /// Replace the cached projections for a host with a fresh supervisor snapshot.
-    ///
-    /// Per-workspace projection fetch failures never disconnect the host or drop
-    /// agents/workspaces: they only turn the affected workspace's projection
-    /// unavailable, or stale-last-known when a prior layout is still cached.
-    pub(crate) fn apply_projection_snapshot(
-        &mut self,
-        host: &RemoteHostKey,
-        projections: Vec<RemoteProjectionSnapshot>,
-    ) {
-        let host_cache = self.hosts.entry(host.clone()).or_default();
-        let mut next: BTreeMap<String, RemoteProjectionEntry> = BTreeMap::new();
-        for snapshot in projections {
-            let entry = projection_entry_from_snapshot(host_cache, &snapshot);
-            next.insert(snapshot.workspace_id, entry);
-        }
-        host_cache.projections = next;
-    }
-
-    pub(crate) fn upsert_projection_snapshot(
-        &mut self,
-        host: &RemoteHostKey,
-        snapshot: RemoteProjectionSnapshot,
-    ) {
-        let host_cache = self.hosts.entry(host.clone()).or_default();
-        let entry = projection_entry_from_snapshot(host_cache, &snapshot);
-        host_cache.projections.insert(snapshot.workspace_id, entry);
-    }
-
-    /// Look up the cached projection for a selected remote space.
-    pub(crate) fn projection_for_space(
-        &self,
-        key: &RemoteSpaceKey,
-    ) -> Option<RemoteProjectionEntry> {
-        let host = RemoteHostKey::new(key.host.clone(), key.session.clone());
-        self.hosts
-            .get(&host)
-            .and_then(|host_cache| host_cache.projections.get(&key.workspace_id))
-            .cloned()
-    }
-
-    pub(crate) fn projections_for_host(&self, host: &RemoteHostKey) -> Vec<&RemoteProjectionEntry> {
-        self.hosts
-            .get(host)
-            .map(|host_cache| host_cache.projections.values().collect())
-            .unwrap_or_default()
-    }
-
     pub(crate) fn ensure_host(&mut self, host: RemoteHostKey, status: RemoteConnectionStatus) {
         self.hosts.entry(host).or_insert_with(|| RemoteHostCache {
             status,
             agents: BTreeMap::new(),
             workspaces: None,
             capabilities: RemoteSourceCapabilities::default(),
-            projections: BTreeMap::new(),
-            tabs: BTreeMap::new(),
             bridge_state: None,
         });
     }
@@ -704,8 +412,6 @@ impl RemoteSourceCache {
             agents: BTreeMap::new(),
             workspaces: None,
             capabilities: RemoteSourceCapabilities::default(),
-            projections: BTreeMap::new(),
-            tabs: BTreeMap::new(),
             bridge_state: None,
         });
         host_cache.status = RemoteConnectionStatus::Connected;
@@ -782,9 +488,7 @@ impl RemoteSourceCache {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::api::schema::{
-        AgentInfo, AgentStatus, LayoutDescription, LayoutNode, LayoutPane, TabInfo, WorkspaceInfo,
-    };
+    use crate::api::schema::{AgentInfo, AgentStatus, WorkspaceInfo};
 
     use super::*;
 
@@ -821,18 +525,6 @@ mod tests {
             active_tab_id: "t1".to_string(),
             agent_status: AgentStatus::Unknown,
             worktree: None,
-        }
-    }
-
-    fn tab(workspace_id: &str, tab_id: &str, focused: bool) -> TabInfo {
-        TabInfo {
-            tab_id: tab_id.to_string(),
-            workspace_id: workspace_id.to_string(),
-            number: if focused { 1 } else { 2 },
-            label: tab_id.to_string(),
-            focused,
-            pane_count: 1,
-            agent_status: AgentStatus::Unknown,
         }
     }
 
@@ -899,52 +591,6 @@ mod tests {
                 ("ws-b", "blank shell", RemoteConnectionStatus::Connected),
             ]
         );
-    }
-
-    #[test]
-    fn remote_source_tab_snapshot_stores_authoritative_tabs() {
-        let mut cache = RemoteSourceCache::default();
-        let host = RemoteHostKey::new("jafar", "default");
-
-        cache.replace_tab_snapshot(
-            &host,
-            "ws-a",
-            vec![tab("ws-a", "tab-2", false), tab("ws-a", "tab-1", true)],
-        );
-
-        let key = RemoteSpaceKey {
-            host: "jafar".to_string(),
-            session: "default".to_string(),
-            workspace_id: "ws-a".to_string(),
-        };
-        let snapshot = cache.tab_snapshot_for_space(&key).expect("tab snapshot");
-        assert_eq!(snapshot.status, RemoteProjectionStatus::Available);
-        assert_eq!(
-            snapshot
-                .tabs
-                .iter()
-                .map(|tab| (tab.tab_id.as_str(), tab.focused))
-                .collect::<Vec<_>>(),
-            vec![("tab-2", false), ("tab-1", true)]
-        );
-    }
-
-    #[test]
-    fn remote_source_disconnect_marks_tab_metadata_stale() {
-        let mut cache = RemoteSourceCache::default();
-        let host = RemoteHostKey::new("jafar", "default");
-        cache.replace_tab_snapshot(&host, "ws-a", vec![tab("ws-a", "tab-1", true)]);
-
-        cache.mark_status(&host, RemoteConnectionStatus::Disconnected);
-
-        let key = RemoteSpaceKey {
-            host: "jafar".to_string(),
-            session: "default".to_string(),
-            workspace_id: "ws-a".to_string(),
-        };
-        let snapshot = cache.tab_snapshot_for_space(&key).expect("tab snapshot");
-        assert_eq!(snapshot.status, RemoteProjectionStatus::StaleLastKnown);
-        assert_eq!(snapshot.tabs[0].tab_id, "tab-1");
     }
 
     #[test]
@@ -1427,229 +1073,12 @@ mod tests {
         assert!(cache.workspace_entries_for_host(&remove).is_none());
     }
 
-    fn layout_for(tab_id: &str) -> LayoutDescription {
-        LayoutDescription {
-            workspace_id: "w1".to_string(),
-            tab_id: tab_id.to_string(),
-            zoomed: false,
-            focused_pane_id: format!("{tab_id}-1"),
-            root: LayoutNode::Pane {
-                pane: LayoutPane {
-                    label: Some("shell".to_string()),
-                    ..Default::default()
-                },
-            },
-        }
-    }
-
     #[test]
-    fn remote_source_apply_projection_snapshot_caches_available_layout() {
+    fn remote_source_unreachable_status_preserves_agent_and_workspace_state() {
         let mut cache = RemoteSourceCache::default();
         let host = RemoteHostKey::new("jafar", "default");
-
-        cache.apply_projection_snapshot(
-            &host,
-            vec![RemoteProjectionSnapshot {
-                workspace_id: "ws-1".to_string(),
-                tab_id: Some("w1:1".to_string()),
-                tab_label: Some("dev".to_string()),
-                status: RemoteProjectionStatus::Available,
-                layout: Some(layout_for("w1:1")),
-            }],
-        );
-
-        let entry = cache
-            .projection_for_space(&RemoteSpaceKey {
-                host: "jafar".to_string(),
-                session: "default".to_string(),
-                workspace_id: "ws-1".to_string(),
-            })
-            .expect("projection cached");
-        assert_eq!(entry.status, RemoteProjectionStatus::Available);
-        assert_eq!(entry.workspace_id, "ws-1");
-        assert_eq!(entry.tab_label.as_deref(), Some("dev"));
-        assert_eq!(entry.layout.as_ref().unwrap().tab_id, "w1:1");
-    }
-
-    #[test]
-    fn remote_source_projections_for_host_returns_all_cached_projections_for_host_session() {
-        let mut cache = RemoteSourceCache::default();
-        let host = RemoteHostKey::new("jafar", "default");
-        let other = RemoteHostKey::new("jafar", "agents");
-
-        cache.apply_projection_snapshot(
-            &host,
-            vec![
-                RemoteProjectionSnapshot {
-                    workspace_id: "ws-b".to_string(),
-                    tab_id: Some("w2:1".to_string()),
-                    tab_label: None,
-                    status: RemoteProjectionStatus::Available,
-                    layout: Some(layout_for("w2:1")),
-                },
-                RemoteProjectionSnapshot {
-                    workspace_id: "ws-a".to_string(),
-                    tab_id: Some("w1:1".to_string()),
-                    tab_label: None,
-                    status: RemoteProjectionStatus::Available,
-                    layout: Some(layout_for("w1:1")),
-                },
-            ],
-        );
-        cache.apply_projection_snapshot(
-            &other,
-            vec![RemoteProjectionSnapshot {
-                workspace_id: "ws-other".to_string(),
-                tab_id: Some("other:1".to_string()),
-                tab_label: None,
-                status: RemoteProjectionStatus::Available,
-                layout: Some(layout_for("other:1")),
-            }],
-        );
-
-        let workspace_ids: Vec<_> = cache
-            .projections_for_host(&host)
-            .into_iter()
-            .map(|entry| entry.workspace_id.as_str())
-            .collect();
-
-        assert_eq!(workspace_ids, vec!["ws-a", "ws-b"]);
-    }
-
-    #[test]
-    fn remote_source_apply_projection_snapshot_keeps_last_known_layout_as_stale_on_failure() {
-        let mut cache = RemoteSourceCache::default();
-        let host = RemoteHostKey::new("jafar", "default");
-
-        // First snapshot delivers an available projection for ws-1 and a fresh
-        // unavailable one for ws-2 (no prior layout).
-        cache.apply_projection_snapshot(
-            &host,
-            vec![
-                RemoteProjectionSnapshot {
-                    workspace_id: "ws-1".to_string(),
-                    tab_id: Some("w1:1".to_string()),
-                    tab_label: None,
-                    status: RemoteProjectionStatus::Available,
-                    layout: Some(layout_for("w1:1")),
-                },
-                RemoteProjectionSnapshot {
-                    workspace_id: "ws-2".to_string(),
-                    tab_id: Some("w2:1".to_string()),
-                    tab_label: None,
-                    status: RemoteProjectionStatus::Unavailable,
-                    layout: None,
-                },
-            ],
-        );
-
-        // Second snapshot reports both as unavailable (fetch failures). ws-1 must
-        // keep its last-known layout but become stale; ws-2 has no prior layout
-        // and stays unavailable.
-        cache.apply_projection_snapshot(
-            &host,
-            vec![
-                RemoteProjectionSnapshot {
-                    workspace_id: "ws-1".to_string(),
-                    tab_id: Some("w1:1".to_string()),
-                    tab_label: None,
-                    status: RemoteProjectionStatus::Unavailable,
-                    layout: None,
-                },
-                RemoteProjectionSnapshot {
-                    workspace_id: "ws-2".to_string(),
-                    tab_id: Some("w2:1".to_string()),
-                    tab_label: None,
-                    status: RemoteProjectionStatus::Unavailable,
-                    layout: None,
-                },
-            ],
-        );
-
-        let ws1 = cache
-            .projection_for_space(&RemoteSpaceKey {
-                host: "jafar".to_string(),
-                session: "default".to_string(),
-                workspace_id: "ws-1".to_string(),
-            })
-            .expect("ws-1 projection");
-        assert_eq!(ws1.status, RemoteProjectionStatus::StaleLastKnown);
-        assert_eq!(ws1.layout.as_ref().unwrap().tab_id, "w1:1");
-
-        let ws2 = cache
-            .projection_for_space(&RemoteSpaceKey {
-                host: "jafar".to_string(),
-                session: "default".to_string(),
-                workspace_id: "ws-2".to_string(),
-            })
-            .expect("ws-2 projection");
-        assert_eq!(ws2.status, RemoteProjectionStatus::Unavailable);
-        assert!(ws2.layout.is_none());
-    }
-
-    #[test]
-    fn remote_source_disconnect_marks_available_projection_stale_and_preserves_layout() {
-        let mut cache = RemoteSourceCache::default();
-        let host = RemoteHostKey::new("jafar", "default");
-        cache.apply_projection_snapshot(
-            &host,
-            vec![RemoteProjectionSnapshot {
-                workspace_id: "ws-1".to_string(),
-                tab_id: Some("w1:1".to_string()),
-                tab_label: None,
-                status: RemoteProjectionStatus::Available,
-                layout: Some(layout_for("w1:1")),
-            }],
-        );
-
-        // Disconnect must preserve agents/workspaces/projections; it only marks
-        // the available projection stale.
-        cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
-        cache.mark_status(&host, RemoteConnectionStatus::Disconnected);
-
-        let entry = cache
-            .projection_for_space(&RemoteSpaceKey {
-                host: "jafar".to_string(),
-                session: "default".to_string(),
-                workspace_id: "ws-1".to_string(),
-            })
-            .expect("projection kept");
-        assert_eq!(entry.status, RemoteProjectionStatus::StaleLastKnown);
-        assert_eq!(entry.layout.as_ref().unwrap().tab_id, "w1:1");
-        assert_eq!(cache.list_entries().len(), 1);
-    }
-
-    #[test]
-    fn remote_source_unreachable_status_preserves_cached_state_as_stale_or_unavailable() {
-        let mut cache = RemoteSourceCache::default();
-        let host = RemoteHostKey::new("jafar", "default");
-
-        // Seed a fully connected host: agents, workspaces, an available
-        // projection, and an available tab snapshot.
         cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
         cache.replace_workspace_snapshot(host.clone(), vec![workspace("ws-1", "tmp")]);
-        cache.apply_projection_snapshot(
-            &host,
-            vec![RemoteProjectionSnapshot {
-                workspace_id: "ws-1".to_string(),
-                tab_id: Some("w1:1".to_string()),
-                tab_label: None,
-                status: RemoteProjectionStatus::Available,
-                layout: Some(layout_for("w1:1")),
-            }],
-        );
-        cache.apply_tab_snapshots(
-            &host,
-            vec![RemoteTabSnapshot {
-                workspace_id: "ws-1".to_string(),
-                status: RemoteProjectionStatus::Available,
-                tabs: vec![tab("ws-1", "w1:1", true)],
-            }],
-        );
-
-        // Going unreachable must NOT drop any cached state: agents/workspaces
-        // keep their data but carry the unreachable status, and available
-        // projections/tabs become stale-last-known with layouts/tabs preserved.
         cache.mark_status(&host, RemoteConnectionStatus::Unreachable);
 
         let agents = cache.list_entries();
@@ -1663,29 +1092,6 @@ mod tests {
             .expect("workspace snapshot kept");
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0].status, RemoteConnectionStatus::Unreachable);
-
-        let projection = cache
-            .projection_for_space(&RemoteSpaceKey {
-                host: "jafar".to_string(),
-                session: "default".to_string(),
-                workspace_id: "ws-1".to_string(),
-            })
-            .expect("projection kept");
-        assert_eq!(projection.status, RemoteProjectionStatus::StaleLastKnown);
-        assert_eq!(projection.layout.as_ref().unwrap().tab_id, "w1:1");
-
-        let tabs = cache
-            .tab_snapshot_for_space(&RemoteSpaceKey {
-                host: "jafar".to_string(),
-                session: "default".to_string(),
-                workspace_id: "ws-1".to_string(),
-            })
-            .expect("tab snapshot kept");
-        assert_eq!(tabs.status, RemoteProjectionStatus::StaleLastKnown);
-        assert_eq!(tabs.tabs.len(), 1);
-        assert_eq!(tabs.tabs[0].tab_id, "w1:1");
-
-        // The host itself stays visible with no fresh data.
         let statuses = cache.list_host_statuses();
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].host, host);
@@ -1693,84 +1099,12 @@ mod tests {
     }
 
     #[test]
-    fn remote_source_available_snapshot_reconciles_stale_state_back_to_available() {
+    fn remote_source_connected_snapshot_reconciles_stale_agent_state() {
         let mut cache = RemoteSourceCache::default();
         let host = RemoteHostKey::new("jafar", "default");
-        let space = RemoteSpaceKey {
-            host: "jafar".to_string(),
-            session: "default".to_string(),
-            workspace_id: "ws-1".to_string(),
-        };
-
-        // Connected host with an available projection and tab snapshot.
         cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);
-        cache.apply_projection_snapshot(
-            &host,
-            vec![RemoteProjectionSnapshot {
-                workspace_id: "ws-1".to_string(),
-                tab_id: Some("w1:1".to_string()),
-                tab_label: None,
-                status: RemoteProjectionStatus::Available,
-                layout: Some(layout_for("w1:1")),
-            }],
-        );
-        cache.apply_tab_snapshots(
-            &host,
-            vec![RemoteTabSnapshot {
-                workspace_id: "ws-1".to_string(),
-                status: RemoteProjectionStatus::Available,
-                tabs: vec![tab("ws-1", "w1:1", true)],
-            }],
-        );
-
-        // Disconnect: projection/tab become stale-last-known, agents stale.
         cache.mark_status(&host, RemoteConnectionStatus::Disconnected);
-        assert_eq!(
-            cache.projection_for_space(&space).unwrap().status,
-            RemoteProjectionStatus::StaleLastKnown
-        );
-        assert_eq!(
-            cache.tab_snapshot_for_space(&space).unwrap().status,
-            RemoteProjectionStatus::StaleLastKnown
-        );
-
-        // A later reconnect delivers a fresh available projection and tab
-        // snapshot: the stale-last-known state reconciles back to available with
-        // the new data, and agents are fresh again.
         cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 2)]);
-        cache.apply_projection_snapshot(
-            &host,
-            vec![RemoteProjectionSnapshot {
-                workspace_id: "ws-1".to_string(),
-                tab_id: Some("w1:2".to_string()),
-                tab_label: Some("dev".to_string()),
-                status: RemoteProjectionStatus::Available,
-                layout: Some(layout_for("w1:2")),
-            }],
-        );
-        cache.apply_tab_snapshots(
-            &host,
-            vec![RemoteTabSnapshot {
-                workspace_id: "ws-1".to_string(),
-                status: RemoteProjectionStatus::Available,
-                tabs: vec![tab("ws-1", "w1:2", true)],
-            }],
-        );
-
-        let projection = cache
-            .projection_for_space(&space)
-            .expect("projection reconciled");
-        assert_eq!(projection.status, RemoteProjectionStatus::Available);
-        assert_eq!(projection.tab_id.as_deref(), Some("w1:2"));
-        assert_eq!(projection.tab_label.as_deref(), Some("dev"));
-        assert_eq!(projection.layout.as_ref().unwrap().tab_id, "w1:2");
-
-        let tabs = cache
-            .tab_snapshot_for_space(&space)
-            .expect("tab snapshot reconciled");
-        assert_eq!(tabs.status, RemoteProjectionStatus::Available);
-        assert_eq!(tabs.tabs[0].tab_id, "w1:2");
-
         let agents = cache.list_entries();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].status, RemoteConnectionStatus::Connected);
@@ -1842,7 +1176,7 @@ mod tests {
     fn remote_source_mark_status_invalidates_prepared_state_but_preserves_display() {
         // C5/test 3: mark_status(Disconnected|Unreachable|NeedsUpdate) drops the
         // prepared bridge state (safety-relevant for mutating dispatch) while
-        // keeping display caches (agents/workspaces/projections) stale as today.
+        // keeping display caches (agents/workspaces) stale as today.
         let mut cache = RemoteSourceCache::default();
         let host = RemoteHostKey::new("jafar", "default");
         cache.replace_connected_snapshot(host.clone(), vec![agent("term-1", "codex", 1)]);

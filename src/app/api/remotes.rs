@@ -337,14 +337,7 @@ impl App {
 
     /// `remote.reconnect`: always retire the current supervisor, mark cached
     /// data disconnected/stale, drop prepared state, and start exactly one
-    /// fresh generated supervisor. REQ-2: also cancels every still-queued
-    /// routed descriptor for the host (see
-    /// `App::cancel_queued_routed_for_reconnect`) — this is THE reconnect
-    /// transition regardless of trigger, reached both by an explicit
-    /// user-issued `remote.reconnect` (this method's `request_id`/`params`
-    /// callers) and by the internal `RemoteRoutedRecoveryNeeded` escalation
-    /// (`App::start_remote_routed_recovery`), so cancelling here covers both
-    /// without a second, duplicated call site.
+    /// fresh generated supervisor.
     pub(super) fn start_remote_lifecycle_reconnect(
         &mut self,
         request_id: String,
@@ -359,10 +352,8 @@ impl App {
         };
         self.supersede_pending_remote_lifecycle_for_host(&host_key);
         self.retire_supervisor_for_host(&host_key);
-        #[cfg(unix)]
-        self.cancel_queued_routed_for_reconnect(&host_key);
         // Mark cached aggregation disconnected/stale now (drops prepared state,
-        // keeps last-known agent/workspace/projection/tab data as stale) so a
+        // keeps last-known agent/workspace data as stale) so a
         // transient window cannot show stale `Connected` data while the fresh
         // supervisor's first ping is in flight. A successful first ping's
         // generation-tagged bridge-state/snapshot events flip it back to

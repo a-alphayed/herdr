@@ -12,8 +12,8 @@ use crate::workspace::NewPane;
 
 use super::responses::{encode_error, encode_success};
 
-/// Authoritative layout pane cap, shared with (mirrored by) remote-projection
-/// stream admission so an exported projection can never open more concurrent
+/// Authoritative layout pane cap, shared with (mirrored by) remote terminal
+/// stream admission so an exported layout can never open more concurrent
 /// terminal-session streams than a layout could ever validly contain.
 pub(crate) const MAX_LAYOUT_PANES: usize = 24;
 const MAX_LAYOUT_DEPTH: usize = 16;

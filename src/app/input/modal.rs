@@ -7,7 +7,6 @@ use crate::{
     app::{
         state::{
             AppState, ContextMenuKind, ContextMenuState, MenuListState, Mode, NavigatorStateFilter,
-            RemoteProjectedPaneTarget, RemoteProjectedTabTarget, RemoteProjectedWorkspaceTarget,
             ToastKind, ToastNotification,
         },
         App,
@@ -383,67 +382,6 @@ pub(super) fn leave_modal(state: &mut AppState) {
     }
 }
 
-fn remote_projected_pane_focus_method(
-    target: &RemoteProjectedPaneTarget,
-) -> crate::api::schema::Method {
-    crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
-        pane_id: format!("{}/terminal:{}", target.host, target.terminal_id),
-    })
-}
-
-fn remote_projected_pane_split_method(
-    target: &RemoteProjectedPaneTarget,
-    direction: crate::api::schema::SplitDirection,
-) -> crate::api::schema::Method {
-    crate::api::schema::Method::PaneSplit(crate::api::schema::PaneSplitParams {
-        workspace_id: None,
-        target_pane_id: Some(format!("{}/terminal:{}", target.host, target.terminal_id)),
-        direction,
-        ratio: None,
-        cwd: None,
-        focus: true,
-        env: Default::default(),
-    })
-}
-
-fn remote_projected_pane_close_method(
-    target: &RemoteProjectedPaneTarget,
-) -> crate::api::schema::Method {
-    crate::api::schema::Method::PaneClose(crate::api::schema::PaneCloseParams {
-        pane_id: format!("{}/terminal:{}", target.host, target.terminal_id),
-        confirm: true,
-    })
-}
-
-fn remote_projected_tab_create_method(
-    target: &RemoteProjectedWorkspaceTarget,
-) -> crate::api::schema::Method {
-    crate::api::schema::Method::TabCreate(crate::api::schema::TabCreateParams {
-        workspace_id: Some(format!("{}/workspace:{}", target.host, target.workspace_id)),
-        cwd: None,
-        focus: true,
-        label: None,
-        env: Default::default(),
-    })
-}
-
-fn remote_projected_tab_focus_method(
-    target: &RemoteProjectedTabTarget,
-) -> crate::api::schema::Method {
-    crate::api::schema::Method::TabFocus(crate::api::schema::TabTarget {
-        tab_id: format!("{}/tab:{}", target.host, target.tab_id),
-    })
-}
-
-fn remote_projected_tab_close_method(
-    target: &RemoteProjectedTabTarget,
-) -> crate::api::schema::Method {
-    crate::api::schema::Method::TabClose(crate::api::schema::TabCloseParams {
-        tab_id: format!("{}/tab:{}", target.host, target.tab_id),
-        confirm: true,
-    })
-}
-
 pub(super) const ONBOARDING_WELCOME_ACTIONS: &[ModalActionSpec<ModalAction>] = &[ModalActionSpec {
     action: ModalAction::Continue,
     bindings: &[ModalKeyBinding::Enter],
@@ -566,7 +504,6 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
             }
             state.creating_new_tab = false;
             state.rename_pane_target = None;
-            state.rename_remote_pane_target = None;
             state.name_input.clear();
             state.name_input_replace_on_type = false;
             leave_modal(state);
@@ -579,7 +516,6 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
             state.creating_new_tab = false;
             state.requested_new_tab_name = None;
             state.rename_pane_target = None;
-            state.rename_remote_pane_target = None;
             state.name_input.clear();
             state.name_input_replace_on_type = false;
             leave_modal(state);
@@ -1005,137 +941,6 @@ pub(crate) fn handle_context_menu_key(
 }
 
 impl App {
-    fn split_remote_projected_pane_via_api(
-        &mut self,
-        target: RemoteProjectedPaneTarget,
-        direction: crate::api::schema::SplitDirection,
-    ) -> String {
-        self.dispatch_runtime_mutation(
-            "tui.remote_projection.pane.split",
-            remote_projected_pane_split_method(&target, direction),
-        )
-    }
-
-    fn close_remote_projected_pane_via_api(&mut self, target: RemoteProjectedPaneTarget) -> String {
-        self.dispatch_runtime_mutation(
-            "tui.remote_projection.pane.close",
-            remote_projected_pane_close_method(&target),
-        )
-    }
-
-    pub(crate) fn focus_remote_projected_pane_via_api(
-        &mut self,
-        target: RemoteProjectedPaneTarget,
-    ) -> String {
-        self.dispatch_runtime_mutation(
-            "tui.remote_projection.pane.focus",
-            remote_projected_pane_focus_method(&target),
-        )
-    }
-
-    fn open_rename_remote_projected_pane(
-        state: &mut crate::app::state::AppState,
-        target: RemoteProjectedPaneTarget,
-    ) {
-        let current_label = target.label.clone();
-        state.creating_new_tab = false;
-        state.requested_new_tab_name = None;
-        state.rename_pane_target = None;
-        state.rename_remote_pane_target = Some(target);
-        state.name_input = current_label;
-        state.name_input_replace_on_type = false;
-        state.mode = crate::app::Mode::RenamePane;
-    }
-
-    fn clear_remote_projected_pane_name_via_api(
-        &mut self,
-        target: RemoteProjectedPaneTarget,
-    ) -> String {
-        let pane_id = format!("{}/terminal:{}", target.host, target.terminal_id);
-        self.dispatch_runtime_mutation(
-            "tui.remote_projection.pane.clear_name",
-            crate::api::schema::Method::PaneRename(crate::api::schema::PaneRenameParams {
-                pane_id,
-                label: None,
-            }),
-        )
-    }
-
-    pub(crate) fn confirm_remote_projected_pane_close_accept_via_api(&mut self) {
-        let Some(target) = self.state.pending_remote_projected_pane_close.take() else {
-            leave_modal(&mut self.state);
-            return;
-        };
-        self.close_remote_projected_pane_via_api(target);
-        leave_modal(&mut self.state);
-    }
-
-    pub(crate) fn confirm_remote_projected_pane_close_cancel(&mut self) {
-        self.state.pending_remote_projected_pane_close = None;
-        leave_modal(&mut self.state);
-    }
-
-    pub(crate) fn handle_confirm_remote_projected_pane_close_key(&mut self, key: KeyEvent) {
-        match modal_action_from_key(&key, CONFIRM_CLOSE_ACTIONS) {
-            Some(ModalAction::Confirm) => {
-                self.confirm_remote_projected_pane_close_accept_via_api();
-            }
-            Some(ModalAction::Cancel) => self.confirm_remote_projected_pane_close_cancel(),
-            _ => {}
-        }
-    }
-
-    pub(crate) fn create_remote_projected_tab_via_api(
-        &mut self,
-        target: RemoteProjectedWorkspaceTarget,
-    ) -> String {
-        self.dispatch_runtime_mutation(
-            "tui.remote_projection.tab.create",
-            remote_projected_tab_create_method(&target),
-        )
-    }
-
-    pub(crate) fn focus_remote_projected_tab_via_api(
-        &mut self,
-        target: RemoteProjectedTabTarget,
-    ) -> String {
-        self.dispatch_runtime_mutation(
-            "tui.remote_projection.tab.focus",
-            remote_projected_tab_focus_method(&target),
-        )
-    }
-
-    fn close_remote_projected_tab_via_api(&mut self, target: RemoteProjectedTabTarget) -> String {
-        self.dispatch_runtime_mutation(
-            "tui.remote_projection.tab.close",
-            remote_projected_tab_close_method(&target),
-        )
-    }
-
-    pub(crate) fn confirm_remote_projected_tab_close_accept_via_api(&mut self) {
-        let Some(target) = self.state.pending_remote_projected_tab_close.take() else {
-            leave_modal(&mut self.state);
-            return;
-        };
-        self.close_remote_projected_tab_via_api(target);
-        leave_modal(&mut self.state);
-    }
-
-    pub(crate) fn confirm_remote_projected_tab_close_cancel(&mut self) {
-        self.state.pending_remote_projected_tab_close = None;
-        leave_modal(&mut self.state);
-    }
-
-    pub(crate) fn handle_confirm_remote_projected_tab_close_key(&mut self, key: KeyEvent) {
-        match modal_action_from_key(&key, CONFIRM_CLOSE_ACTIONS) {
-            Some(ModalAction::Confirm) => {
-                self.confirm_remote_projected_tab_close_accept_via_api();
-            }
-            Some(ModalAction::Cancel) => self.confirm_remote_projected_tab_close_cancel(),
-            _ => {}
-        }
-    }
-
     pub(crate) fn handle_rename_key_via_api(&mut self, key: KeyEvent) {
         if let Some(action) = modal_action_from_key(&key, RENAME_ACTIONS) {
             self.apply_rename_mouse_action_via_api(action);
@@ -1211,18 +1016,7 @@ impl App {
                 }
             }
             Mode::RenamePane => {
-                if let Some(target) = self.state.rename_remote_pane_target.clone() {
-                    let pane_id = format!("{}/terminal:{}", target.host, target.terminal_id);
-                    self.dispatch_runtime_mutation(
-                        "tui.remote_projection.pane.rename",
-                        crate::api::schema::Method::PaneRename(
-                            crate::api::schema::PaneRenameParams {
-                                pane_id,
-                                label: Some(new_name),
-                            },
-                        ),
-                    );
-                } else if let (Some(ws_idx), Some(pane_id)) =
+                if let (Some(ws_idx), Some(pane_id)) =
                     (self.state.active, self.state.rename_pane_target)
                 {
                     if let Some(pane_id) = self.public_pane_id(ws_idx, pane_id) {
@@ -1411,35 +1205,6 @@ impl App {
                 // mode, so unconditional leave_modal is correct here.
                 leave_modal(&mut self.state);
             }
-            (ContextMenuKind::RemoteProjectedPane { target }, Some("Focus pane")) => {
-                self.focus_remote_projected_pane_via_api(target);
-                leave_modal(&mut self.state);
-            }
-            (ContextMenuKind::RemoteProjectedPane { target }, Some("Rename pane")) => {
-                Self::open_rename_remote_projected_pane(&mut self.state, target);
-            }
-            (ContextMenuKind::RemoteProjectedPane { target }, Some("Clear pane name")) => {
-                self.clear_remote_projected_pane_name_via_api(target);
-                leave_modal(&mut self.state);
-            }
-            (ContextMenuKind::RemoteProjectedPane { target }, Some("Split right")) => {
-                self.split_remote_projected_pane_via_api(
-                    target,
-                    crate::api::schema::SplitDirection::Right,
-                );
-                leave_modal(&mut self.state);
-            }
-            (ContextMenuKind::RemoteProjectedPane { target }, Some("Split down")) => {
-                self.split_remote_projected_pane_via_api(
-                    target,
-                    crate::api::schema::SplitDirection::Down,
-                );
-                leave_modal(&mut self.state);
-            }
-            (ContextMenuKind::RemoteProjectedPane { target }, Some("Close pane")) => {
-                self.state.pending_remote_projected_pane_close = Some(target);
-                self.state.mode = Mode::ConfirmRemoteProjectedPaneClose;
-            }
             (ContextMenuKind::Pane { pane_id, .. }, Some("Rename pane")) => {
                 open_rename_pane(&mut self.state, pane_id);
             }
@@ -1559,9 +1324,9 @@ impl App {
     }
 
     /// Resolve the configured remote host for a copy action, requiring the
-    /// configured session to match the projected session. Without this guard
-    /// a copied command could target a different session than the projected
-    /// space the user actually clicked. Returns an owned clone so callers can
+    /// configured session to match the selected host session. Without this
+    /// guard a copied command could target a different session than the source
+    /// the user actually clicked. Returns an owned clone so callers can
     /// build a command string and call `copy_command_to_clipboard` without
     /// holding a borrow of `self.remote_hosts`. Shared by both the full
     /// remote copy action and the diagnostics copy action so they apply the
@@ -1569,17 +1334,17 @@ impl App {
     fn resolve_remote_command_config(
         &self,
         alias: &str,
-        projected_session: &str,
+        selected_session: &str,
     ) -> Option<crate::remote_target::RemoteHostConfig> {
         self.remote_hosts
             .get(alias)
-            .filter(|config| config.session == projected_session)
+            .filter(|config| config.session == selected_session)
             .cloned()
     }
 
     /// Show the shared "remote command unavailable" `NeedsAttention` toast
     /// used by both remote copy actions when the host config is missing/stale
-    /// or the projected session no longer matches the configured session, and
+    /// or the selected session no longer matches the configured session, and
     /// leave the context menu/modal cleanly.
     fn show_remote_command_unavailable_toast(&mut self) {
         self.state.toast = Some(ToastNotification {
@@ -1595,13 +1360,13 @@ impl App {
     /// Build and copy the explicit full remote Herdr command (`herdr --remote
     /// <target> --session <session>`) from the configured host's SSH target and
     /// configured session. If the host config is missing/stale, or the
-    /// projected session does not match the configured session (which would
-    /// make the copied command target a different session than the projected
-    /// space the user clicked), show a `NeedsAttention` toast and do not copy a
+    /// selected session does not match the configured session (which would
+    /// make the copied command target a different session than the source the
+    /// user clicked), show a `NeedsAttention` toast and do not copy a
     /// misleading command. Never runs the command, opens a pane/window, SSHes,
     /// probes, connects, or mutates local/remote state.
-    fn copy_remote_full_command(&mut self, alias: String, projected_session: String) {
-        match self.resolve_remote_command_config(&alias, &projected_session) {
+    fn copy_remote_full_command(&mut self, alias: String, selected_session: String) {
+        match self.resolve_remote_command_config(&alias, &selected_session) {
             Some(config) => {
                 let command =
                     crate::remote_target::remote_full_command(&config.target, &config.session);
@@ -1615,12 +1380,12 @@ impl App {
     /// remote status <alias> && herdr remote check <alias>`) for a configured
     /// remote host. Applies the same stale/mismatch guard as
     /// `copy_remote_full_command`: if the host config is missing/stale, or the
-    /// projected session does not match the configured session, show a
+    /// selected session does not match the configured session, show a
     /// `NeedsAttention` toast and do not queue a clipboard write for a
     /// possibly-misleading command. Never runs the command, opens a
     /// pane/window, SSHes, probes, connects, or mutates local/remote state.
-    fn copy_remote_diagnostics_command(&mut self, alias: String, projected_session: String) {
-        match self.resolve_remote_command_config(&alias, &projected_session) {
+    fn copy_remote_diagnostics_command(&mut self, alias: String, selected_session: String) {
+        match self.resolve_remote_command_config(&alias, &selected_session) {
             Some(config) => {
                 let command = crate::remote_target::remote_diagnostics_command(&config.name);
                 self.copy_command_to_clipboard(command);
@@ -1634,7 +1399,6 @@ fn cancel_rename_modal(state: &mut AppState) {
     state.creating_new_tab = false;
     state.requested_new_tab_name = None;
     state.rename_pane_target = None;
-    state.rename_remote_pane_target = None;
     state.name_input.clear();
     state.name_input_replace_on_type = false;
     leave_modal(state);
@@ -2177,296 +1941,6 @@ mod tests {
         assert_eq!(state.mode, Mode::Navigate);
     }
 
-    fn remote_projected_pane_target() -> RemoteProjectedPaneTarget {
-        RemoteProjectedPaneTarget {
-            host: "jafar".into(),
-            session: crate::session::DEFAULT_SESSION_NAME.into(),
-            terminal_id: "remote-term-1".into(),
-            label: "remote pane".into(),
-        }
-    }
-
-    fn remote_projected_tab_target() -> RemoteProjectedTabTarget {
-        RemoteProjectedTabTarget {
-            host: "jafar".into(),
-            session: crate::session::DEFAULT_SESSION_NAME.into(),
-            workspace_id: "remote-ws".into(),
-            tab_id: "remote-tab-1".into(),
-            label: "remote tab".into(),
-        }
-    }
-
-    fn remote_projected_workspace_target() -> RemoteProjectedWorkspaceTarget {
-        RemoteProjectedWorkspaceTarget {
-            host: "jafar".into(),
-            session: crate::session::DEFAULT_SESSION_NAME.into(),
-            workspace_id: "remote-ws".into(),
-        }
-    }
-
-    fn app_with_remote_host_for_projected_split() -> App {
-        let mut config = crate::config::Config::default();
-        config.remote.enabled = true;
-        config.remote.hosts = vec![crate::remote_target::RemoteHostConfig::new(
-            "jafar", "jafar", "default", true,
-        )];
-        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new(&config, true, None, api_rx, crate::api::EventHub::default())
-    }
-
-    #[test]
-    fn remote_projected_pane_split_method_uses_host_terminal_target_and_safe_defaults() {
-        for (direction, expected_direction) in [
-            (
-                crate::api::schema::SplitDirection::Right,
-                crate::api::schema::SplitDirection::Right,
-            ),
-            (
-                crate::api::schema::SplitDirection::Down,
-                crate::api::schema::SplitDirection::Down,
-            ),
-        ] {
-            let crate::api::schema::Method::PaneSplit(params) =
-                remote_projected_pane_split_method(&remote_projected_pane_target(), direction)
-            else {
-                panic!("expected pane.split method");
-            };
-            assert_eq!(params.workspace_id, None);
-            assert_eq!(
-                params.target_pane_id.as_deref(),
-                Some("jafar/terminal:remote-term-1")
-            );
-            assert_eq!(params.direction, expected_direction);
-            assert_eq!(params.ratio, None);
-            assert_eq!(params.cwd, None);
-            assert!(params.env.is_empty());
-            assert!(params.focus);
-        }
-    }
-
-    #[test]
-    fn remote_projected_pane_close_method_uses_host_terminal_target_and_confirm() {
-        let crate::api::schema::Method::PaneClose(params) =
-            remote_projected_pane_close_method(&remote_projected_pane_target())
-        else {
-            panic!("expected pane.close method");
-        };
-
-        assert_eq!(params.pane_id, "jafar/terminal:remote-term-1");
-        assert!(params.confirm);
-    }
-
-    #[test]
-    fn remote_projected_tab_methods_use_host_qualified_targets_and_confirm() {
-        let crate::api::schema::Method::TabCreate(create) =
-            remote_projected_tab_create_method(&remote_projected_workspace_target())
-        else {
-            panic!("expected tab.create method");
-        };
-        assert_eq!(
-            create.workspace_id.as_deref(),
-            Some("jafar/workspace:remote-ws")
-        );
-        assert!(create.focus);
-        assert!(create.cwd.is_none());
-        assert!(create.env.is_empty());
-
-        let crate::api::schema::Method::TabFocus(focus) =
-            remote_projected_tab_focus_method(&remote_projected_tab_target())
-        else {
-            panic!("expected tab.focus method");
-        };
-        assert_eq!(focus.tab_id, "jafar/tab:remote-tab-1");
-
-        let crate::api::schema::Method::TabClose(close) =
-            remote_projected_tab_close_method(&remote_projected_tab_target())
-        else {
-            panic!("expected tab.close method");
-        };
-        assert_eq!(close.tab_id, "jafar/tab:remote-tab-1");
-        assert!(close.confirm);
-    }
-
-    #[test]
-    fn remote_projected_tab_close_confirmation_dispatches_and_preserves_selection() {
-        let mut app = app_with_remote_host_for_projected_split();
-        let selected = crate::remote_source::RemoteSpaceKey {
-            host: "jafar".into(),
-            session: crate::session::DEFAULT_SESSION_NAME.into(),
-            workspace_id: "remote-ws".into(),
-        };
-        app.state.workspaces = vec![crate::workspace::Workspace::test_new("local")];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.selected_remote_space = Some(selected.clone());
-        app.state.pending_remote_projected_tab_close = Some(remote_projected_tab_target());
-        app.state.mode = Mode::ConfirmRemoteProjectedTabClose;
-
-        app.handle_confirm_remote_projected_tab_close_key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::empty(),
-        ));
-
-        assert_eq!(app.state.pending_remote_projected_tab_close, None);
-        assert_eq!(app.state.selected_remote_space, Some(selected));
-        assert_eq!(app.state.mode, Mode::Terminal);
-    }
-
-    #[test]
-    fn remote_projected_tab_close_cancel_preserves_state_without_dispatch() {
-        let mut app = app_with_remote_host_for_projected_split();
-        app.state.workspaces = vec![crate::workspace::Workspace::test_new("local")];
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.pending_remote_projected_tab_close = Some(remote_projected_tab_target());
-        app.state.mode = Mode::ConfirmRemoteProjectedTabClose;
-
-        app.handle_confirm_remote_projected_tab_close_key(KeyEvent::new(
-            KeyCode::Esc,
-            KeyModifiers::empty(),
-        ));
-
-        assert_eq!(app.state.pending_remote_projected_tab_close, None);
-        assert_eq!(app.state.mode, Mode::Terminal);
-    }
-
-    #[test]
-    fn remote_projected_pane_split_action_routes_remote_and_preserves_local_state() {
-        let mut app = app_with_remote_host_for_projected_split();
-        let mut workspace = crate::workspace::Workspace::test_new("local");
-        let focused = workspace.tabs[0].root_pane;
-        workspace.test_split(Direction::Horizontal);
-        workspace.tabs[0].layout.focus_pane(focused);
-        app.state.workspaces = vec![workspace];
-        app.state.ensure_test_terminals();
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.mode = Mode::ContextMenu;
-        let selected = crate::remote_source::RemoteSpaceKey {
-            host: "jafar".into(),
-            session: crate::session::DEFAULT_SESSION_NAME.into(),
-            workspace_id: "remote-ws".into(),
-        };
-        app.state.selected_remote_space = Some(selected.clone());
-
-        let response = app.split_remote_projected_pane_via_api(
-            remote_projected_pane_target(),
-            crate::api::schema::SplitDirection::Right,
-        );
-        let error: crate::api::schema::ErrorResponse = serde_json::from_str(&response).unwrap();
-        assert_eq!(error.error.code, "remote_host_not_connected");
-        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
-        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
-
-        for idx in [3, 4] {
-            app.state.mode = Mode::ContextMenu;
-            let menu = ContextMenuState {
-                kind: ContextMenuKind::RemoteProjectedPane {
-                    target: remote_projected_pane_target(),
-                },
-                x: 0,
-                y: 0,
-                list: MenuListState::new(idx),
-            };
-
-            app.apply_context_menu_action_via_api(menu, idx);
-
-            assert_eq!(app.state.selected_remote_space, Some(selected.clone()));
-            assert_eq!(app.state.active, Some(0));
-            assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
-            assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
-            assert_eq!(app.state.mode, Mode::Terminal);
-        }
-    }
-
-    #[test]
-    fn remote_projected_pane_close_context_menu_confirms_dispatch_and_preserves_local_state() {
-        let mut app = app_with_remote_host_for_projected_split();
-        let mut workspace = crate::workspace::Workspace::test_new("local");
-        let focused = workspace.tabs[0].root_pane;
-        workspace.test_split(Direction::Horizontal);
-        workspace.tabs[0].layout.focus_pane(focused);
-        app.state.workspaces = vec![workspace];
-        app.state.ensure_test_terminals();
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        let selected = crate::remote_source::RemoteSpaceKey {
-            host: "jafar".into(),
-            session: crate::session::DEFAULT_SESSION_NAME.into(),
-            workspace_id: "remote-ws".into(),
-        };
-        app.state.selected_remote_space = Some(selected.clone());
-        app.state.mode = Mode::ContextMenu;
-        let menu = ContextMenuState {
-            kind: ContextMenuKind::RemoteProjectedPane {
-                target: remote_projected_pane_target(),
-            },
-            x: 0,
-            y: 0,
-            list: MenuListState::new(0),
-        };
-        let close_idx = menu
-            .items()
-            .iter()
-            .position(|item| *item == "Close pane")
-            .expect("close pane item");
-        let menu = ContextMenuState {
-            list: MenuListState::new(close_idx),
-            ..menu
-        };
-
-        app.apply_context_menu_action_via_api(menu, close_idx);
-
-        assert_eq!(app.state.mode, Mode::ConfirmRemoteProjectedPaneClose);
-        assert_eq!(
-            app.state.pending_remote_projected_pane_close,
-            Some(remote_projected_pane_target())
-        );
-        assert_eq!(app.state.selected_remote_space, Some(selected.clone()));
-        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
-        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
-
-        app.handle_confirm_remote_projected_pane_close_key(KeyEvent::new(
-            KeyCode::Enter,
-            KeyModifiers::empty(),
-        ));
-
-        assert_eq!(app.state.pending_remote_projected_pane_close, None);
-        assert_eq!(app.state.selected_remote_space, Some(selected));
-        assert_eq!(app.state.active, Some(0));
-        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
-        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
-        assert_eq!(app.state.mode, Mode::Terminal);
-    }
-
-    #[test]
-    fn remote_projected_pane_close_cancel_preserves_state_without_dispatch() {
-        let mut app = app_with_remote_host_for_projected_split();
-        let workspace = crate::workspace::Workspace::test_new("local");
-        let focused = workspace.tabs[0].root_pane;
-        app.state.workspaces = vec![workspace];
-        app.state.ensure_test_terminals();
-        app.state.active = Some(0);
-        app.state.selected = 0;
-        app.state.selected_remote_space = Some(crate::remote_source::RemoteSpaceKey {
-            host: "jafar".into(),
-            session: crate::session::DEFAULT_SESSION_NAME.into(),
-            workspace_id: "remote-ws".into(),
-        });
-        app.state.pending_remote_projected_pane_close = Some(remote_projected_pane_target());
-        app.state.mode = Mode::ConfirmRemoteProjectedPaneClose;
-
-        app.handle_confirm_remote_projected_pane_close_key(KeyEvent::new(
-            KeyCode::Esc,
-            KeyModifiers::empty(),
-        ));
-
-        assert_eq!(app.state.pending_remote_projected_pane_close, None);
-        assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(focused));
-        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 1);
-        assert_eq!(app.state.mode, Mode::Terminal);
-    }
-
     #[test]
     fn context_menu_close_pane_last_parent_group_pane_keeps_confirmation_mode() {
         let mut state = state_with_workspaces(&["main", "issue"]);
@@ -2512,52 +1986,6 @@ mod tests {
         assert_eq!(state.selected, 0);
         assert_eq!(state.mode, Mode::ConfirmClose);
         assert_eq!(state.workspaces.len(), 2);
-    }
-
-    #[test]
-    fn cancel_rename_clears_remote_pane_target() {
-        let mut state = state_with_workspaces(&["test"]);
-        state.mode = Mode::RenamePane;
-        state.rename_remote_pane_target = Some(crate::app::state::RemoteProjectedPaneTarget {
-            host: "jafar".into(),
-            session: "default".into(),
-            terminal_id: "term-1".into(),
-            label: "old label".into(),
-        });
-        state.name_input = "old label".into();
-
-        handle_rename_key(
-            &mut state,
-            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
-        );
-
-        assert_eq!(state.mode, Mode::Terminal);
-        assert!(state.rename_remote_pane_target.is_none());
-        assert!(state.name_input.is_empty());
-    }
-
-    #[test]
-    fn open_rename_remote_projected_pane_sets_rename_state() {
-        let mut state = state_with_workspaces(&["test"]);
-        let target = crate::app::state::RemoteProjectedPaneTarget {
-            host: "jafar".into(),
-            session: "default".into(),
-            terminal_id: "term-1".into(),
-            label: "my pane".into(),
-        };
-
-        super::App::open_rename_remote_projected_pane(&mut state, target.clone());
-
-        assert_eq!(state.mode, Mode::RenamePane);
-        assert_eq!(state.name_input, "my pane");
-        assert!(!state.name_input_replace_on_type);
-        assert!(state.rename_pane_target.is_none());
-        let stored = state
-            .rename_remote_pane_target
-            .as_ref()
-            .expect("target set");
-        assert_eq!(stored.host, "jafar");
-        assert_eq!(stored.terminal_id, "term-1");
     }
 
     #[test]

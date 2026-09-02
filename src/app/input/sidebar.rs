@@ -432,8 +432,6 @@ impl AppState {
                 | Mode::RenameWorkspace
                 | Mode::Resize
                 | Mode::ConfirmClose
-                | Mode::ConfirmRemoteProjectedPaneClose
-                | Mode::ConfirmRemoteProjectedTabClose
                 | Mode::ContextMenu
                 | Mode::Settings
                 | Mode::GlobalMenu
@@ -598,14 +596,6 @@ mod tests {
         remote_source::{RemoteHostKey, RemoteSourceCapabilities},
         workspace::Workspace,
     };
-
-    fn remote_space_key() -> crate::remote_source::RemoteSpaceKey {
-        crate::remote_source::RemoteSpaceKey {
-            host: "jafar".into(),
-            session: crate::session::DEFAULT_SESSION_NAME.into(),
-            workspace_id: "remote-ws".into(),
-        }
-    }
 
     fn compute_desktop_view(app: &mut crate::app::App) {
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 32));
@@ -821,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_host_row_switches_projection_without_touching_local_focus_or_dirty_state() {
+    fn clicking_host_row_switches_source_without_touching_local_focus_or_dirty_state() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
         app.state.ensure_test_terminals();
@@ -839,7 +829,6 @@ mod tests {
             &second,
             crate::remote_source::RemoteConnectionStatus::Connected,
         );
-        app.state.selected_remote_space = Some(remote_space_key());
         app.state.workspace_scroll = 2;
         app.state.agent_panel_scroll = 1;
         app.state.session_dirty = false;
@@ -873,7 +862,6 @@ mod tests {
         );
         assert_eq!(app.state.active, Some(1));
         assert_eq!(app.state.workspaces[1].focused_pane_id(), focused_before);
-        assert!(app.state.selected_remote_space.is_none());
         assert_eq!(app.state.workspace_scroll, 0);
         assert_eq!(app.state.agent_panel_scroll, 0);
         assert!(!app.state.session_dirty);
@@ -883,7 +871,6 @@ mod tests {
             remote_cache_before
         );
 
-        app.state.selected_remote_space = Some(remote_space_key());
         app.state.workspace_scroll = 3;
         app.state.agent_panel_scroll = 2;
         app.handle_mouse(mouse(
@@ -896,7 +883,6 @@ mod tests {
             app.state.sidebar_source,
             crate::app::state::SidebarSource::Remote(second)
         );
-        assert!(app.state.selected_remote_space.is_none());
         assert_eq!(app.state.workspace_scroll, 0);
         assert_eq!(app.state.agent_panel_scroll, 0);
         assert_eq!(app.state.active, Some(1));
@@ -924,7 +910,6 @@ mod tests {
             &RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
             crate::remote_source::RemoteConnectionStatus::Connected,
         );
-        app.state.selected_remote_space = Some(remote_space_key());
         compute_desktop_view(&mut app);
         let focused_before = app.state.workspaces[1].focused_pane_id();
         let names_before: Vec<_> = app
@@ -950,7 +935,6 @@ mod tests {
         assert_eq!(app.state.selected, 1);
         assert_eq!(app.state.mode, Mode::Terminal);
         assert_eq!(app.state.workspaces[1].focused_pane_id(), focused_before);
-        assert_eq!(app.state.selected_remote_space, Some(remote_space_key()));
         assert!(!app.state.request_new_workspace);
         assert!(app.state.context_menu.is_none());
         assert!(app.state.workspace_press.is_none());
@@ -1223,8 +1207,8 @@ mod tests {
             crate::remote_source::RemoteConnectionStatus::Connected,
         );
         compute_desktop_view(&mut app);
-        // Stay on the local projection so we can prove right-click does not
-        // switch the active projected source.
+        // Stay on the local source so we can prove right-click does not
+        // switch the active remote source.
         app.state
             .select_sidebar_source(crate::app::state::SidebarSource::Local);
         compute_desktop_view(&mut app);
@@ -1263,7 +1247,7 @@ mod tests {
                 "Copy full remote command"
             ]
         );
-        // Right-click must not switch the active projected source.
+        // Right-click must not switch the active remote source.
         assert_eq!(
             app.state.sidebar_source,
             crate::app::state::SidebarSource::Local
