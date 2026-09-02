@@ -234,7 +234,7 @@ fn tab_command() -> Command {
         .subcommand(
             Command::new("close")
                 .about("Close a tab")
-                .arg(required("tab_id", "TAB_ID|HOST/TAB:ID"))
+                .arg(required("tab_id", "TAB_ID"))
                 .arg(flag("confirm")),
         )
 }
@@ -416,8 +416,8 @@ fn pane_command() -> Command {
         .subcommand(
             Command::new("split")
                 .about("Split a pane")
-                .arg(Arg::new("pane_id").value_name("PANE_ID|HOST/TARGET"))
-                .arg(option("pane", "PANE_ID|HOST/TARGET"))
+                .arg(Arg::new("pane_id").value_name("PANE_ID"))
+                .arg(option("pane", "PANE_ID"))
                 .arg(flag("current"))
                 .arg(split_direction_option())
                 .arg(option("ratio", "FLOAT"))
@@ -453,7 +453,7 @@ fn pane_command() -> Command {
         .subcommand(
             Command::new("close")
                 .about("Close a pane")
-                .arg(required("pane_id", "PANE_ID|HOST/TARGET"))
+                .arg(required("pane_id", "PANE_ID"))
                 .arg(flag("confirm")),
         )
         .subcommand(

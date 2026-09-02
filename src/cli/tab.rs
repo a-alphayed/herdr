@@ -225,12 +225,12 @@ fn parse_tab_close_args(
                 tab_id = Some(super::normalize_tab_id(other));
                 index += 1;
             }
-            _ => return Err("usage: herdr tab close <tab_id>|<host>/tab:<id> [--confirm]".into()),
+            _ => return Err("usage: herdr tab close <tab_id> [--confirm]".into()),
         }
     }
 
     let Some(tab_id) = tab_id else {
-        return Err("usage: herdr tab close <tab_id>|<host>/tab:<id> [--confirm]".into());
+        return Err("usage: herdr tab close <tab_id> [--confirm]".into());
     };
 
     if !confirm && tab_close_target_uses_configured_remote_host(&tab_id, remote_hosts) {
@@ -264,7 +264,7 @@ fn print_tab_help() {
     eprintln!("  herdr tab get <tab_id>");
     eprintln!("  herdr tab focus <tab_id>");
     eprintln!("  herdr tab rename <tab_id> <label>");
-    eprintln!("  herdr tab close <tab_id>|<host>/tab:<id> [--confirm]");
+    eprintln!("  herdr tab close <tab_id> [--confirm]");
 }
 
 #[cfg(test)]
@@ -287,28 +287,6 @@ mod tests {
         let params = parse_tab_close_args(&args(&["local/tab-label"]), None).unwrap();
         assert_eq!(params.tab_id, "local/tab-label");
         assert!(!params.confirm);
-    }
-
-    #[test]
-    fn parse_tab_close_args_requires_confirm_for_configured_remote_tab_target() {
-        let registry = registry();
-        let err =
-            parse_tab_close_args(&args(&["jafar/tab:remote-tab"]), Some(&registry)).unwrap_err();
-
-        assert!(err.contains("pass --confirm"));
-    }
-
-    #[test]
-    fn parse_tab_close_args_accepts_confirm_for_configured_remote_tab_target() {
-        let registry = registry();
-        let params = parse_tab_close_args(
-            &args(&["jafar/tab:remote-tab", "--confirm"]),
-            Some(&registry),
-        )
-        .unwrap();
-
-        assert_eq!(params.tab_id, "jafar/tab:remote-tab");
-        assert!(params.confirm);
     }
 
     #[test]

@@ -628,7 +628,7 @@ fn parse_pane_split_args(
 
     let Some(direction) = direction else {
         return Err(
-            "usage: herdr pane split [<pane_id>|<host>/<target>|--pane ID|--current] --direction right|down [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]"
+            "usage: herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]"
                 .into(),
         );
     };
@@ -955,14 +955,12 @@ fn parse_pane_close_args(
                 pane_id = Some(super::normalize_pane_id(other));
                 index += 1;
             }
-            _ => {
-                return Err("usage: herdr pane close <pane_id>|<host>/<target> [--confirm]".into())
-            }
+            _ => return Err("usage: herdr pane close <pane_id> [--confirm]".into()),
         }
     }
 
     let Some(pane_id) = pane_id else {
-        return Err("usage: herdr pane close <pane_id>|<host>/<target> [--confirm]".into());
+        return Err("usage: herdr pane close <pane_id> [--confirm]".into());
     };
 
     if !confirm && pane_close_target_uses_configured_remote_host(&pane_id, remote_hosts) {
@@ -1506,14 +1504,14 @@ fn print_pane_help() {
     eprintln!("  herdr pane rename <pane_id> <label>|--clear");
     eprintln!("  herdr pane read <pane_id> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!(
-        "  herdr pane split [<pane_id>|<host>/<target>|--pane ID|--current] --direction right|down [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]"
+        "  herdr pane split [<pane_id>|--pane ID|--current] --direction right|down [--ratio FLOAT] [--cwd PATH] [--env KEY=VALUE] [--focus] [--no-focus]"
     );
     eprintln!("  herdr pane swap --direction left|right|up|down [--pane ID|--current]");
     eprintln!("  herdr pane swap --source-pane ID --target-pane ID");
     eprintln!("  herdr pane move <pane_id> --tab <tab_id> --split right|down [--target-pane ID] [--ratio FLOAT] [--focus|--no-focus]");
     eprintln!("  herdr pane move <pane_id> --new-tab [--workspace ID] [--label TEXT] [--focus|--no-focus]");
     eprintln!("  herdr pane move <pane_id> --new-workspace [--label TEXT] [--tab-label TEXT] [--focus|--no-focus]");
-    eprintln!("  herdr pane close <pane_id>|<host>/<target> [--confirm]");
+    eprintln!("  herdr pane close <pane_id> [--confirm]");
     eprintln!("  herdr pane send-text <pane_id> <text>");
     eprintln!("  herdr pane send-keys <pane_id> <key> [key ...]");
     eprintln!("  herdr pane report-agent <pane_id> --source ID --agent LABEL --state idle|working|blocked|unknown [--message TEXT] [--custom-status TEXT] [--seq N] [--agent-session-id ID] [--agent-session-path PATH]");
@@ -1584,30 +1582,6 @@ mod tests {
         assert_eq!(params.direction, crate::api::schema::SplitDirection::Right);
     }
 
-    #[test]
-    fn parse_pane_split_args_preserves_host_qualified_positional_target() {
-        let params = parse_pane_split_args(
-            &args(&["jafar/terminal:term-1", "--direction", "right"]),
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(params.target_pane_id, Some("jafar/terminal:term-1".into()));
-        assert_eq!(params.direction, crate::api::schema::SplitDirection::Right);
-    }
-
-    #[test]
-    fn parse_pane_split_args_preserves_host_qualified_pane_option_target() {
-        let params = parse_pane_split_args(
-            &args(&["--pane", "jafar/pane:remote-pane", "--direction", "down"]),
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(params.target_pane_id, Some("jafar/pane:remote-pane".into()));
-        assert_eq!(params.direction, crate::api::schema::SplitDirection::Down);
-    }
-
     fn remote_registry() -> crate::remote_target::RemoteHostRegistry {
         crate::remote_target::RemoteHostRegistry::from_configs(vec![
             crate::remote_target::RemoteHostConfig::new("jafar", "jafar", "default", true),
@@ -1621,28 +1595,6 @@ mod tests {
 
         assert_eq!(params.pane_id, "local/pane-label");
         assert!(!params.confirm);
-    }
-
-    #[test]
-    fn parse_pane_close_args_requires_confirm_for_configured_remote_target() {
-        let registry = remote_registry();
-        let err = parse_pane_close_args(&args(&["jafar/terminal:remote-term"]), Some(&registry))
-            .unwrap_err();
-
-        assert!(err.contains("pass --confirm"));
-    }
-
-    #[test]
-    fn parse_pane_close_args_accepts_confirm_for_configured_remote_target() {
-        let registry = remote_registry();
-        let params = parse_pane_close_args(
-            &args(&["jafar/terminal:remote-term", "--confirm"]),
-            Some(&registry),
-        )
-        .unwrap();
-
-        assert_eq!(params.pane_id, "jafar/terminal:remote-term");
-        assert!(params.confirm);
     }
 
     #[test]
