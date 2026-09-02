@@ -947,7 +947,12 @@ mod tests {
             clear_display_agent: false,
             clear_custom_status: false,
             clear_state_labels: false,
-            ttl: Some(Duration::from_millis(1)),
+            // Long TTL: this test asserts the deadline is RETAINED and the
+            // title is still visible after a clear-only update, so the
+            // deadline must stay in the future for the whole test. A
+            // millisecond-scale TTL races real elapsed time under parallel
+            // test load and expires the title before the assertion.
+            ttl: Some(Duration::from_secs(60)),
             seq: None,
         });
         let old_deadline = terminal.next_agent_metadata_expiry().unwrap();
