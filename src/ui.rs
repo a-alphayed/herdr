@@ -284,11 +284,10 @@ fn compute_view_internal(
     //
     // `host_glass_surface_active()` reads `view.layout` / `host_rail_rect`
     // which haven't been written yet, so we replicate its preconditions
-    // directly: glass enabled, sidebar expanded, embedded context not active
-    // (rail not suppressed), and a remote source is selected.
+    // directly: sidebar expanded, embedded context not active (rail not
+    // suppressed), and a remote source is selected.
     let glass_sidebar_yielded = !app.sidebar_collapsed
         && !host_rail_visually_suppressed
-        && app.host_glass_enabled
         && rail_w > 0
         && matches!(
             app.sidebar_source,
@@ -991,7 +990,6 @@ mod tests {
         app.active = Some(0);
         app.selected = 0;
         app.mode = Mode::Terminal;
-        app.host_glass_enabled = true;
         app.select_sidebar_source(crate::app::state::SidebarSource::Remote(
             crate::remote_source::RemoteHostKey::new("jafar", "default"),
         ));
@@ -1424,7 +1422,6 @@ mod tests {
         app.active = Some(0);
         app.selected = 0;
         app.mode = Mode::Terminal;
-        app.host_glass_enabled = true;
         let host = crate::remote_source::RemoteHostKey::new(
             "remote-a",
             crate::session::DEFAULT_SESSION_NAME,
@@ -1433,22 +1430,15 @@ mod tests {
             &host,
             crate::remote_source::RemoteConnectionStatus::Connected,
         );
-        app.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
-
-        // Glass sidebar yield is active in the normal standalone context
-        // (glass enabled + remote selected). Take a glass-OFF snapshot for the
-        // geometry reference so the embedded-vs-standalone reflow assertions
-        // can compare rail-plus-panel standalone geometry against the
-        // rail-suppressed embedded geometry — the invariant the test was
-        // written to verify.
+        // Take a local-source standalone snapshot so the embedded-vs-standalone
+        // reflow assertions can compare rail-plus-panel geometry against the
+        // rail-suppressed embedded geometry.
         let area = Rect::new(0, 0, 100, 20);
-        app.host_glass_enabled = false;
         compute_view(&mut app, area);
         let standalone_sidebar = app.view.sidebar_rect;
         let standalone_panel = app.view.sidebar_panel_rect;
         let standalone_main = app.view.terminal_area;
         let standalone_rail = app.view.host_rail_rect;
-        app.host_glass_enabled = true;
         let mut standalone_terminal =
             Terminal::new(TestBackend::new(area.width, area.height)).expect("standalone terminal");
         standalone_terminal
@@ -1456,6 +1446,7 @@ mod tests {
             .expect("render standalone host rail");
         let standalone_buffer = standalone_terminal.backend().buffer().clone();
 
+        app.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
         let terminal_runtimes = TerminalRuntimeRegistry::new();
         compute_view_with_context(
             &mut app,
@@ -1518,11 +1509,14 @@ mod tests {
 
     #[test]
     fn compute_view_keeps_host_rail_on_narrow_expanded_desktop() {
-        // Ahmed's 2026-07-20 correction: an ordinary narrow EXPANDED-DESKTOP
-        // width (just above the mobile threshold) must still show the fixed
-        // 10-column host rail beside the panel. The rail is never suppressed
-        // for width alone on desktop (only the mobile layout and the
-        // collapsed sidebar drop it).
+        // Ahmed's 2026-07-20 correction, updated for always-on host glass: an
+        // ordinary narrow EXPANDED-DESKTOP width (just above the mobile
+        // threshold) must still show the fixed 10-column host rail. The rail
+        // is never suppressed for width alone on desktop (only the mobile
+        // layout and the collapsed sidebar drop it). With the local source
+        // selected the panel sits directly beside the rail; with a remote
+        // source selected the glass surface yields the panel and the rail
+        // alone remains as the un-trappable escape hatch.
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
@@ -1534,15 +1528,19 @@ mod tests {
             &host,
             crate::remote_source::RemoteConnectionStatus::Connected,
         );
-        app.sidebar_source = crate::app::state::SidebarSource::Remote(host.clone());
 
         // Width 70 is above the mobile threshold (64) but still a narrow
         // desktop sidebar.
         compute_view(&mut app, Rect::new(0, 0, 70, 20));
 
         assert_eq!(app.view.layout, ViewLayout::Desktop);
-        // The rail is present (not Rect::default()), fixed at 10 columns, and
-        // full sidebar height; the panel sits directly beside it (never below).
+        assert_eq!(
+            app.effective_sidebar_source(),
+            crate::app::state::SidebarSource::Local
+        );
+        // Local source: the rail is present (not Rect::default()), fixed at
+        // 10 columns, and full sidebar height; the panel sits directly beside
+        // it (never below).
         assert_ne!(app.view.host_rail_rect, Rect::default());
         assert_eq!(app.view.host_rail_rect.width, 10);
         assert_eq!(app.view.host_rail_rect.height, app.view.sidebar_rect.height);
@@ -1552,6 +1550,20 @@ mod tests {
             app.view.host_rail_rect.x + app.view.host_rail_rect.width
         );
         assert_eq!(app.view.sidebar_panel_rect.y, app.view.host_rail_rect.y);
+
+        app.sidebar_source = crate::app::state::SidebarSource::Remote(host.clone());
+        compute_view(&mut app, Rect::new(0, 0, 70, 20));
+
+        // Remote source: glass is active on the same narrow width; the rail
+        // is still kept at full height and is now the whole sidebar, while
+        // the local panel yields to the glass surface.
+        assert_eq!(app.view.layout, ViewLayout::Desktop);
+        assert!(app.host_glass_surface_active());
+        assert_ne!(app.view.host_rail_rect, Rect::default());
+        assert_eq!(app.view.host_rail_rect.width, 10);
+        assert_eq!(app.view.host_rail_rect.height, app.view.sidebar_rect.height);
+        assert_eq!(app.view.sidebar_rect.width, app.view.host_rail_rect.width);
+        assert_eq!(app.view.sidebar_panel_rect, Rect::default());
         // The remote selection is still effective (no local fallback).
         assert_eq!(
             app.effective_sidebar_source(),
@@ -1956,7 +1968,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.host_glass_enabled = true;
         let host =
             crate::remote_source::RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
         app.state
@@ -2147,7 +2158,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.host_glass_enabled = true;
         assert!(!app.state.kitty_graphics_enabled);
 
         let host = crate::remote_source::RemoteHostKey::new(
@@ -2247,7 +2257,6 @@ mod tests {
         app.workspaces = vec![Workspace::test_new("local")];
         app.active = Some(0);
         app.selected = 0;
-        app.host_glass_enabled = true;
         let host = crate::remote_source::RemoteHostKey::new(
             "remote-a",
             crate::session::DEFAULT_SESSION_NAME,
@@ -2462,37 +2471,18 @@ switch_workspace = "ctrl+1..9"
         assert_eq!(switch_workspace_key, "ctrl+1..9");
     }
 
-    #[tokio::test]
-    async fn glass_disabled_remote_source_keeps_local_panes_visible() {
-        let mut app = crate::app::state::AppState::test_new();
-        let mut workspace = Workspace::test_new("local");
-        let root = workspace.tabs[0].root_pane;
-        workspace.insert_test_runtime(
-            root,
-            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"LOCAL-SURFACE"),
-        );
-        app.workspaces = vec![workspace];
-        app.active = Some(0);
-        app.selected = 0;
-        app.mode = Mode::Terminal;
-        let host =
-            crate::remote_source::RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
-        app.sidebar_source = crate::app::state::SidebarSource::Remote(host.clone());
-        compute_view(&mut app, Rect::new(0, 0, 140, 20));
+    #[test]
+    fn keybind_help_always_includes_host_glass_exit() {
+        let app = crate::app::state::AppState::test_new();
+        let global = keybind_help_groups(&app)
+            .into_iter()
+            .find(|(name, _)| *name == "global")
+            .expect("global group")
+            .1;
 
-        assert!(!app.host_glass_surface_active());
-        assert!(!app.view.pane_infos.is_empty());
-        assert_ne!(app.view.tab_bar_rect, Rect::default());
-        let mut terminal = Terminal::new(TestBackend::new(140, 20)).expect("test terminal");
-        terminal
-            .draw(|frame| render(&app, frame))
-            .expect("render local panes");
-        assert!(buffer_row_text(
-            terminal.backend().buffer(),
-            app.view.terminal_area,
-            app.view.terminal_area.y,
-        )
-        .contains("LOCAL-SURFACE"));
+        assert!(global.iter().any(|(key, label)| {
+            key == "ctrl+shift+f12" && label.as_ref() == "exit host glass"
+        }));
     }
 
     fn make_glass_app() -> (
@@ -2504,7 +2494,6 @@ switch_workspace = "ctrl+1..9"
         app.active = Some(0);
         app.selected = 0;
         app.mode = Mode::Terminal;
-        app.host_glass_enabled = true;
         let host = crate::remote_source::RemoteHostKey::new(
             "remote-host",
             crate::session::DEFAULT_SESSION_NAME,
@@ -2519,18 +2508,18 @@ switch_workspace = "ctrl+1..9"
 
     #[test]
     fn glass_active_sidebar_yields_panel_and_widens_terminal_area() {
-        let (mut app, _host) = make_glass_app();
+        let (mut app, host) = make_glass_app();
         let area = Rect::new(0, 0, 100, 20);
 
-        // Baseline: glass disabled — full sidebar (rail + panel).
-        app.host_glass_enabled = false;
+        // Baseline: local source selected — full sidebar (rail + panel).
+        app.select_sidebar_source(crate::app::state::SidebarSource::Local);
         compute_view(&mut app, area);
         let baseline_terminal_x = app.view.terminal_area.x;
         let baseline_terminal_w = app.view.terminal_area.width;
         let baseline_sidebar_w = app.view.sidebar_rect.width;
 
-        // Glass on: sidebar should shrink to just the rail.
-        app.host_glass_enabled = true;
+        // Remote glass selected: sidebar should shrink to just the rail.
+        app.select_sidebar_source(crate::app::state::SidebarSource::Remote(host));
         compute_view(&mut app, area);
 
         assert!(
@@ -2571,14 +2560,12 @@ switch_workspace = "ctrl+1..9"
 
     #[test]
     fn glass_inactive_sidebar_unchanged() {
-        // Local source selected — glass is never active regardless of
-        // host_glass_enabled; sidebar should be the full rail + panel.
+        // Local source selected: sidebar should be the full rail + panel.
         let mut app = crate::app::state::AppState::test_new();
         app.workspaces = vec![Workspace::test_new("one")];
         app.active = Some(0);
         app.selected = 0;
         app.mode = Mode::Terminal;
-        app.host_glass_enabled = true; // enabled but local source
         let host = crate::remote_source::RemoteHostKey::new(
             "remote-host",
             crate::session::DEFAULT_SESSION_NAME,

@@ -905,15 +905,10 @@ impl SettingsSection {
 pub(crate) enum ExperimentSetting {
     PaneHistory,
     SwitchAsciiInputSourceInPrefix,
-    HostGlass,
 }
 
 impl ExperimentSetting {
-    pub(crate) const ALL: [Self; 3] = [
-        Self::PaneHistory,
-        Self::SwitchAsciiInputSourceInPrefix,
-        Self::HostGlass,
-    ];
+    pub(crate) const ALL: [Self; 2] = [Self::PaneHistory, Self::SwitchAsciiInputSourceInPrefix];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -921,7 +916,6 @@ impl ExperimentSetting {
             Self::SwitchAsciiInputSourceInPrefix => {
                 "switch to ascii input source in prefix (macOS)"
             }
-            Self::HostGlass => "host glass",
         }
     }
 
@@ -931,7 +925,6 @@ impl ExperimentSetting {
             Self::SwitchAsciiInputSourceInPrefix => {
                 state.switch_ascii_input_source_in_prefix_enabled()
             }
-            Self::HostGlass => state.host_glass_enabled,
         }
     }
 }
@@ -1501,9 +1494,6 @@ pub struct AppState {
     pub show_agent_labels_on_pane_borders: bool,
     pub hide_tab_bar_when_single_tab: bool,
     pub pane_history_persistence: bool,
-    /// Enables selected-host glass mode. Default false; see
-    /// `[experimental] host_glass`.
-    pub(crate) host_glass_enabled: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
     pub reveal_hidden_cursor_for_cjk_ime: bool,
@@ -1660,9 +1650,6 @@ impl AppState {
         &mut self,
         reason: crate::app::host_glass::GlassInputDropReason,
     ) -> bool {
-        if !self.host_glass_enabled {
-            return false;
-        }
         let SidebarSource::Remote(host) = self.effective_sidebar_source() else {
             return false;
         };
@@ -1692,30 +1679,26 @@ impl AppState {
         changed
     }
 
-    /// Return selected-host glass metadata only when the experimental mode is
-    /// enabled and the effective desktop host-rail source is remote.
+    /// Return selected-host glass metadata when the effective desktop
+    /// host-rail source is remote.
     pub(crate) fn selected_host_glass_mode(
         &self,
     ) -> Option<(
         &crate::remote_source::RemoteHostKey,
         &crate::app::host_glass::HostGlassState,
     )> {
-        if !self.host_glass_enabled {
-            return None;
-        }
         let SidebarSource::Remote(host) = self.effective_sidebar_source() else {
             return None;
         };
         self.host_glass_states.get_key_value(&host)
     }
 
-    /// Whether the experimental full-App glass owns the desktop content area.
+    /// Whether the full-App glass owns the desktop content area.
     /// This is keyed directly from the effective host-rail source so the first
     /// selection takes over immediately, before runtime reconciliation has
     /// created its generation metadata or received a frame.
     pub(crate) fn host_glass_surface_active(&self) -> bool {
-        self.host_glass_enabled
-            && matches!(self.effective_sidebar_source(), SidebarSource::Remote(_))
+        matches!(self.effective_sidebar_source(), SidebarSource::Remote(_))
     }
 
     pub(crate) fn effective_sidebar_source(&self) -> SidebarSource {
@@ -2027,7 +2010,6 @@ impl AppState {
             show_agent_labels_on_pane_borders: false,
             hide_tab_bar_when_single_tab: false,
             pane_history_persistence: false,
-            host_glass_enabled: false,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,
             cjk_ime_agents: Vec::new(),
@@ -2571,7 +2553,7 @@ mod tests {
     }
 
     #[test]
-    fn host_glass_status_is_generation_gated_and_feature_gated() {
+    fn host_glass_status_is_generation_gated_and_source_gated() {
         let mut state = AppState::test_new();
         let host = crate::remote_source::RemoteHostKey::new("remote-a", "default");
         state.view.host_rail_rect = Rect::new(0, 0, 3, 20);
@@ -2590,9 +2572,6 @@ mod tests {
                 input_drop_cue: None,
             })
         );
-        assert!(state.selected_host_glass_mode().is_none());
-
-        state.host_glass_enabled = true;
         assert_eq!(
             state
                 .selected_host_glass_mode()
@@ -2636,7 +2615,6 @@ mod tests {
     #[test]
     fn first_attach_input_drop_metadata_is_connecting_and_survives_generation_start() {
         let mut state = AppState::test_new();
-        state.host_glass_enabled = true;
         state.view.layout = ViewLayout::Desktop;
         state.view.host_rail_rect = Rect::new(0, 0, 8, 20);
         let host = crate::remote_source::RemoteHostKey::new("remote-a", "default");

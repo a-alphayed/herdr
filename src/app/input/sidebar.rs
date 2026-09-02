@@ -1105,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_remote_source_keeps_local_footer_new_and_menu_hit_targets() {
+    fn desktop_remote_source_suppresses_local_footer_hit_targets_until_local_selected() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("local")];
         app.state.active = Some(0);
@@ -1117,38 +1117,70 @@ mod tests {
             crate::remote_source::RemoteConnectionStatus::Connected,
         );
         compute_desktop_view(&mut app);
+
+        // Local source: the footer new/menu hit targets are present.
+        assert_ne!(app.state.sidebar_new_button_rect(), Rect::default());
+        assert_ne!(app.state.global_launcher_rect(), Rect::default());
+
+        // Selecting a remote host activates the full-App glass: the local
+        // Spaces/Agents panel yields, and with it the local footer new/menu
+        // hit targets.
         app.state
             .select_sidebar_source(crate::app::state::SidebarSource::Remote(host));
         compute_desktop_view(&mut app);
 
-        assert_ne!(app.state.sidebar_new_button_rect(), Rect::default());
-        assert_ne!(app.state.global_launcher_rect(), Rect::default());
+        assert!(app.state.host_glass_surface_active());
+        assert_eq!(app.state.sidebar_footer_rect(), Rect::default());
+        assert_eq!(app.state.sidebar_new_button_rect(), Rect::default());
+        assert_eq!(app.state.global_launcher_rect(), Rect::default());
 
-        let footer = app.state.sidebar_footer_rect();
+        // A click where the local footer used to be is consumed by the glass
+        // authority boundary and never reaches local new-workspace/menu
+        // actions.
+        let terminal_area = app.state.view.terminal_area;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            terminal_area.x.saturating_add(2),
+            terminal_area
+                .y
+                .saturating_add(terminal_area.height)
+                .saturating_sub(1),
+        ));
+        assert!(!app.state.request_new_workspace);
+        assert!(app.state.context_menu.is_none());
+        assert_eq!(app.state.mode, Mode::Terminal);
+
+        // Returning to the local source restores the footer hit targets and
+        // their actions.
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Local);
+        compute_desktop_view(&mut app);
+
+        let new_button = app.state.sidebar_new_button_rect();
+        let launcher = app.state.global_launcher_rect();
+        assert_ne!(new_button, Rect::default());
+        assert_ne!(launcher, Rect::default());
+
         let action = app.state.handle_mouse(
             &mut app.terminal_runtimes,
             mouse(
                 MouseEventKind::Down(MouseButton::Left),
-                footer.x.saturating_add(1),
-                footer.y,
+                new_button.x.saturating_add(1),
+                new_button.y,
             ),
         );
-
         assert!(action.is_none());
         assert!(app.state.request_new_workspace);
-        assert_eq!(app.state.mode, Mode::Terminal);
 
         app.state.handle_mouse(
             &mut app.terminal_runtimes,
             mouse(
                 MouseEventKind::Down(MouseButton::Left),
-                footer.x + footer.width.saturating_sub(1),
-                footer.y,
+                launcher.x + launcher.width.saturating_sub(1),
+                launcher.y,
             ),
         );
-
         assert_eq!(app.state.mode, Mode::GlobalMenu);
-        assert!(app.state.context_menu.is_none());
     }
 
     #[test]

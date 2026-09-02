@@ -873,9 +873,6 @@ pub struct AdvancedConfig {
 pub struct ExperimentalConfig {
     /// Allow launching herdr inside an existing herdr pane. Default: false.
     pub allow_nested: bool,
-    /// Show the selected remote host as a streamed full-App glass surface.
-    /// Default: false.
-    pub host_glass: bool,
     /// Experimental local Kitty graphics rendering for attached clients. Default: false.
     pub kitty_graphics: bool,
     /// Persist pane screen history to session-history.json. Default: false.
@@ -1776,26 +1773,16 @@ kitty_graphics = true
     }
 
     #[test]
-    fn host_glass_default_off_and_parse() {
-        assert!(!Config::default().experimental.host_glass);
-
-        let config: Config = toml::from_str("[experimental]\nhost_glass = true\n").unwrap();
-        assert!(config.experimental.host_glass);
-    }
-
-    #[test]
     fn experimental_config_parses() {
         let toml = r#"
 [experimental]
 allow_nested = true
-host_glass = true
 kitty_graphics = true
 pane_history = true
 switch_ascii_input_source_in_prefix = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.experimental.allow_nested);
-        assert!(config.experimental.host_glass);
         assert!(config.experimental.kitty_graphics);
         assert!(config.experimental.pane_history);
         assert!(config.experimental.switch_ascii_input_source_in_prefix);

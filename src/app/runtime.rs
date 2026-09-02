@@ -1088,7 +1088,6 @@ mod tests {
         let (mut app, pane_id) = test_app_with_pane();
         app.state.mode = Mode::Terminal;
         app.state.mouse_capture = false;
-        app.state.host_glass_enabled = true;
         app.state.view.layout = state::ViewLayout::Desktop;
         app.state.view.sidebar_rect = ratatui::layout::Rect::new(0, 0, 26, 20);
         app.state.view.host_rail_rect = ratatui::layout::Rect::new(0, 0, 8, 20);

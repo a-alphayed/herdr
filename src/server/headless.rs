@@ -4705,7 +4705,6 @@ mod tests {
             &host,
             crate::remote_source::RemoteConnectionStatus::Connected,
         );
-        server.app.state.host_glass_enabled = true;
         server
             .app
             .state
@@ -8582,7 +8581,6 @@ next_tab = ""
         server.foreground_client_id = Some(1);
 
         let host = crate::remote_source::RemoteHostKey::new("remote-a", "default");
-        server.app.state.host_glass_enabled = true;
         server.app.state.view.layout = crate::app::state::ViewLayout::Desktop;
         server.app.state.view.host_rail_rect = ratatui::layout::Rect::new(0, 0, 8, 24);
         server

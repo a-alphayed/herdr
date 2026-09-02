@@ -447,7 +447,6 @@ impl Config {
             } else {
                 BindingSource::Default
             },
-            self.experimental.host_glass,
         );
 
         macro_rules! empty_action {
@@ -808,7 +807,6 @@ fn resolve_host_glass_exit_binding(
     registry: &mut BindingRegistry,
     diagnostics: &mut Vec<String>,
     source: BindingSource,
-    reserve: bool,
 ) -> ActionKeybinds {
     const FIELD: &str = "keys.host_glass_exit";
     let raw = raw.trim();
@@ -846,17 +844,15 @@ fn resolve_host_glass_exit_binding(
         }
     });
 
-    if reserve {
-        if let Some(conflict) = registry.conflict(&binding) {
-            let diag = format!(
-                "reserved host glass exit keybinding {} takes priority over {} while glass is selected",
-                binding.label, conflict.field
-            );
-            warn!(message = %diag, "config diagnostic");
-            diagnostics.push(diag);
-        }
-        registry.register(&binding, FIELD, source);
+    if let Some(conflict) = registry.conflict(&binding) {
+        let diag = format!(
+            "reserved host glass exit keybinding {} takes priority over {} while glass is selected",
+            binding.label, conflict.field
+        );
+        warn!(message = %diag, "config diagnostic");
+        diagnostics.push(diag);
     }
+    registry.register(&binding, FIELD, source);
     ActionKeybinds {
         bindings: vec![binding],
     }
@@ -2326,9 +2322,6 @@ host_glass_exit = "ctrl+alt+f11"
             r#"
 [keys]
 new_workspace = "ctrl+shift+f12"
-
-[experimental]
-host_glass = true
 "#,
         )
         .expect("colliding config parses");
@@ -2344,25 +2337,5 @@ host_glass = true
             diagnostic.contains("kept keys.host_glass_exit")
                 && diagnostic.contains("disabled keys.new_workspace")
         }));
-    }
-
-    #[test]
-    fn host_glass_flag_off_does_not_reserve_its_hidden_exit_chord() {
-        let config: Config = toml::from_str(
-            r#"
-[keys]
-new_workspace = "ctrl+shift+f12"
-"#,
-        )
-        .expect("flag-off collision config parses");
-        let keybinds = config.keybinds();
-
-        assert!(!config.experimental.host_glass);
-        assert_eq!(keybinds.host_glass_exit.bindings.len(), 1);
-        assert_eq!(keybinds.new_workspace.bindings.len(), 1);
-        assert!(config
-            .collect_diagnostics()
-            .iter()
-            .all(|diagnostic| !diagnostic.contains("keys.host_glass_exit")));
     }
 }

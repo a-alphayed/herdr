@@ -375,7 +375,6 @@ impl App {
                         SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
                             self.save_switch_ascii_input_source_in_prefix(enabled)
                         }
-                        SettingsAction::SaveHostGlass(enabled) => self.save_host_glass(enabled),
                         SettingsAction::InstallRecommendedIntegrations => {
                             self.install_recommended_integrations()
                         }
@@ -832,7 +831,6 @@ mod tests {
         app.state.active = Some(0);
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
-        app.state.host_glass_enabled = true;
         let host = crate::remote_source::RemoteHostKey::new(
             "remote-a",
             crate::session::DEFAULT_SESSION_NAME,
@@ -932,9 +930,6 @@ mod tests {
             r#"
 [keys]
 new_workspace = "ctrl+shift+f12"
-
-[experimental]
-host_glass = true
 "#,
         )
         .expect("colliding glass escape config parses");
@@ -1016,7 +1011,6 @@ host_glass = true
         app.state.selected = 0;
         app.state.mode = Mode::Terminal;
         app.state.mouse_capture = false;
-        app.state.host_glass_enabled = true;
         let host = crate::remote_source::RemoteHostKey::new(
             "remote-a",
             crate::session::DEFAULT_SESSION_NAME,

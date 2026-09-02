@@ -473,10 +473,8 @@ impl App {
         // Source selection changes authority immediately, before the next
         // compute_view() replaces local pane geometry. Never let stale
         // pane_infos route a later event from the same drained batch into a
-        // local PTY once an enabled glass host is selected.
-        if self.state.host_glass_enabled
-            && matches!(self.state.sidebar_source, state::SidebarSource::Remote(_))
-        {
+        // local PTY once a remote glass host is selected.
+        if matches!(self.state.sidebar_source, state::SidebarSource::Remote(_)) {
             return false;
         }
         if self.state.mouse_capture || self.state.mode != Mode::Terminal {
@@ -798,7 +796,6 @@ impl App {
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
             hide_tab_bar_when_single_tab: config.ui.hide_tab_bar_when_single_tab,
             pane_history_persistence: config.experimental.pane_history,
-            host_glass_enabled: config.experimental.host_glass,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
             cjk_ime_agents: parse_cjk_ime_agents(&config.experimental.cjk_ime_agents),
@@ -1645,19 +1642,7 @@ impl App {
 
         if !invalid_section("experimental") {
             let was_kitty_graphics_enabled = self.state.kitty_graphics_enabled;
-            let was_host_glass_enabled = self.state.host_glass_enabled;
             self.state.kitty_graphics_enabled = config.experimental.kitty_graphics;
-            self.state.host_glass_enabled = config.experimental.host_glass;
-            if was_host_glass_enabled && !self.state.host_glass_enabled {
-                self.host_glass_runtime.deactivate(
-                    &mut self.state,
-                    &mut self.host_glass_surfaces,
-                    &mut self.selected_host_bridge_runtime,
-                );
-                self.host_glass_status_refresh_deadline = None;
-                self.host_glass_input_drop_cue_deadline = None;
-                let _ = self.state.clear_host_glass_input_drop_cues();
-            }
             crate::kitty_graphics::set_enabled(config.experimental.kitty_graphics);
             if was_kitty_graphics_enabled && !config.experimental.kitty_graphics {
                 let _ = crate::kitty_graphics::clear_all_host_graphics();
@@ -2109,7 +2094,6 @@ mod tests {
     fn desired_host_mouse_capture_honors_selected_live_glass_report_only() {
         let mut app = test_app();
         app.state.mouse_capture = false;
-        app.state.host_glass_enabled = true;
         app.state.view.layout = state::ViewLayout::Desktop;
         app.state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
         let host = crate::remote_source::RemoteHostKey::new("remote-a", "default");
@@ -2139,56 +2123,6 @@ mod tests {
             None,
         ));
         assert!(!app.desired_host_mouse_capture());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn live_config_disable_immediately_retires_host_glass_stream_and_queue() {
-        let mut app = test_app();
-        app.state.host_glass_enabled = true;
-        app.state.view.layout = state::ViewLayout::Desktop;
-        app.state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
-        let host = crate::remote_source::RemoteHostKey::new("remote-a", "default");
-        app.state
-            .select_sidebar_source(state::SidebarSource::Remote(host.clone()));
-        let generation = app.state.begin_host_glass_generation(host.clone());
-        assert!(app.state.set_host_glass_status(
-            &host,
-            generation,
-            crate::app::host_glass::GlassStatus::Live,
-            None,
-        ));
-        let receiver = app.host_glass_runtime.test_install_connected_stream(
-            host.clone(),
-            generation,
-            Some(false),
-        );
-
-        let config = crate::config::Config::default();
-        assert!(!config.experimental.host_glass);
-        let report = app.apply_live_config(&config, &[], &[], false);
-
-        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
-        assert!(!app.state.host_glass_enabled);
-        assert!(!app.state.host_glass_surface_active());
-        assert!(app.host_glass_runtime.test_is_idle());
-        assert!(app.state.host_glass_states.get(&host).is_some_and(|glass| {
-            glass.generation == generation + 1
-                && matches!(
-                    glass.status,
-                    crate::app::host_glass::GlassStatus::Stale { .. }
-                )
-        }));
-        assert!(app.host_glass_status_refresh_deadline.is_none());
-        assert!(app.host_glass_input_drop_cue_deadline.is_none());
-        assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(1)),
-            Ok(crate::protocol::ClientMessage::Detach)
-        );
-        assert!(matches!(
-            receiver.recv_timeout(Duration::from_secs(1)),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
-        ));
     }
 
     /// Register an inert stub supervisor handle (no worker thread) for `host`
@@ -2366,7 +2300,6 @@ mod tests {
     #[tokio::test]
     async fn headless_client_batch_glass_selection_blocks_stale_local_pane_mouse_routing() {
         let mut fixture = app_with_focused_mouse_reporting_split(false);
-        fixture.app.state.host_glass_enabled = true;
         let host = crate::remote_source::RemoteHostKey::new(
             "remote-a",
             crate::session::DEFAULT_SESSION_NAME,
@@ -3078,7 +3011,6 @@ mod tests {
         std::sync::mpsc::Receiver<crate::protocol::ClientMessage>,
     ) {
         let host = crate::remote_source::RemoteHostKey::new("remote-a", "default");
-        app.state.host_glass_enabled = true;
         app.state.view.layout = state::ViewLayout::Desktop;
         app.state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
         app.state
@@ -3134,12 +3066,9 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn host_glass_clipboard_final_gate_rejects_deselect_disable_retire_and_replace() {
+    fn host_glass_clipboard_final_gate_rejects_deselect_retire_and_replace() {
         assert_host_glass_clipboard_final_gate_rejects(|app| {
             app.state.select_sidebar_source(state::SidebarSource::Local);
-        });
-        assert_host_glass_clipboard_final_gate_rejects(|app| {
-            app.state.host_glass_enabled = false;
         });
         assert_host_glass_clipboard_final_gate_rejects(|app| {
             app.host_glass_runtime.test_retire_connection();

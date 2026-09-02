@@ -4431,6 +4431,11 @@ mod tests {
 
     #[test]
     fn switch_workspace_keeps_selected_visible_when_remote_host_is_selected() {
+        // With host glass always on, selecting a remote host yields the local
+        // workspace panel to the glass surface: no workspace cards render
+        // while the remote selection is active, but workspace switching still
+        // tracks the selection, and returning to the local source restores
+        // the panel with the selected workspace kept visible.
         let mut state = app_with_workspaces(&["a", "b", "c", "d", "e", "f", "g", "h"]);
         let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
         state.remote_sources.mark_status(
@@ -4440,6 +4445,17 @@ mod tests {
         state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host));
         crate::ui::compute_view(&mut state, ratatui::layout::Rect::new(0, 0, 80, 14));
 
+        assert!(state.host_glass_surface_active());
+        assert!(state.view.workspace_card_areas.is_empty());
+
+        state.switch_workspace(7);
+        crate::ui::compute_view(&mut state, ratatui::layout::Rect::new(0, 0, 80, 14));
+
+        assert_eq!(state.active, Some(7));
+        assert!(state.view.workspace_card_areas.is_empty());
+
+        state.select_sidebar_source(crate::app::state::SidebarSource::Local);
+        crate::ui::compute_view(&mut state, ratatui::layout::Rect::new(0, 0, 80, 14));
         state.switch_workspace(7);
         crate::ui::compute_view(&mut state, ratatui::layout::Rect::new(0, 0, 80, 14));
 

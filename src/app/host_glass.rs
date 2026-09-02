@@ -827,13 +827,9 @@ impl HostGlassRuntime {
         geometry: GlassGeometry,
     ) {
         self.drain_worker_updates(state, surfaces, event_tx);
-        let next_source = if state.host_glass_enabled {
-            match state.effective_sidebar_source() {
-                crate::app::state::SidebarSource::Remote(host) => Some(host),
-                crate::app::state::SidebarSource::Local => None,
-            }
-        } else {
-            None
+        let next_source = match state.effective_sidebar_source() {
+            crate::app::state::SidebarSource::Remote(host) => Some(host),
+            crate::app::state::SidebarSource::Local => None,
         };
 
         if self.source != next_source {
@@ -1175,33 +1171,7 @@ impl HostGlassRuntime {
     ) {
     }
 
-    /// Retire the selected stream and its bridge lease without joining or
-    /// dropping either worker on the App/event loop. Cached surfaces remain.
-    pub(crate) fn deactivate(
-        &mut self,
-        state: &mut crate::app::state::AppState,
-        surfaces: &mut HostGlassSurfaceRegistry,
-        bridge_owner: &mut crate::app::selected_host_bridge::SelectedHostBridgeRuntime,
-    ) {
-        if let Some(host) = self.source.clone() {
-            let retired_generation = state.begin_host_glass_generation(host.clone());
-            let _ = state.set_host_glass_status(
-                &host,
-                retired_generation,
-                GlassStatus::Stale {
-                    since: Instant::now(),
-                },
-                Some("host glass disabled; cached frame retained".into()),
-            );
-            if let Some(surface) = surfaces.get_mut(&host) {
-                surface.retag_generation(retired_generation);
-            }
-        }
-        self.shutdown(bridge_owner);
-    }
-
-    /// Retire all runtime ownership during app/process shutdown. Config reload
-    /// uses `deactivate` above so late predecessor updates are generation-dead.
+    /// Retire all runtime ownership during app/process shutdown.
     pub(crate) fn shutdown(
         &mut self,
         bridge_owner: &mut crate::app::selected_host_bridge::SelectedHostBridgeRuntime,
@@ -1277,15 +1247,6 @@ impl HostGlassRuntime {
             },
         });
         receiver
-    }
-
-    #[cfg(all(test, unix))]
-    pub(crate) fn test_is_idle(&self) -> bool {
-        self.source.is_none()
-            && self.generation == 0
-            && self.signature.is_none()
-            && self.stream.is_none()
-            && self.freshness_at.is_none()
     }
 
     #[cfg(all(test, unix))]
@@ -2043,7 +2004,6 @@ mod tests {
         ));
 
         let host = RemoteHostKey::new("remote-a", "default");
-        app.state.host_glass_enabled = true;
         app.state.view.layout = crate::app::state::ViewLayout::Desktop;
         app.state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
         app.state
@@ -2089,7 +2049,6 @@ mod tests {
         assert!(GLASS_LIVENESS_PROBE_INTERVAL < HOST_GLASS_STALE_AFTER);
         let host = RemoteHostKey::new("remote-a", "default");
         let mut state = crate::app::state::AppState::test_new();
-        state.host_glass_enabled = true;
         state.view.layout = crate::app::state::ViewLayout::Desktop;
         state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
         state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
@@ -2190,7 +2149,6 @@ mod tests {
     fn clipboard_requires_current_generation_and_connection_and_safe_decode() {
         let host = RemoteHostKey::new("remote-a", "default");
         let mut state = crate::app::state::AppState::test_new();
-        state.host_glass_enabled = true;
         state.view.layout = crate::app::state::ViewLayout::Desktop;
         state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
         state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
@@ -2260,7 +2218,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn clipboard_admission_requires_enabled_effective_selected_connected_glass() {
+    fn clipboard_admission_requires_effective_selected_connected_glass() {
         let host = RemoteHostKey::new("remote-a", "default");
         let other = RemoteHostKey::new("remote-b", "default");
         let mut state = crate::app::state::AppState::test_new();
@@ -2271,9 +2229,6 @@ mod tests {
         let _receiver =
             runtime.test_install_connected_stream(host.clone(), generation, Some(false));
 
-        assert!(!runtime.clipboard_provenance_is_current(&state, &host, generation, 1));
-
-        state.host_glass_enabled = true;
         assert!(!runtime.clipboard_provenance_is_current(&state, &host, generation, 1));
 
         state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
@@ -2296,7 +2251,6 @@ mod tests {
     fn clipboard_admission_rejects_replaced_connection() {
         let host = RemoteHostKey::new("remote-a", "default");
         let mut state = crate::app::state::AppState::test_new();
-        state.host_glass_enabled = true;
         state.view.layout = crate::app::state::ViewLayout::Desktop;
         state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
         state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
@@ -2317,7 +2271,6 @@ mod tests {
     fn live_input_is_structured_fire_and_forget_and_stale_input_never_replays() {
         let host = RemoteHostKey::new("remote-a", "default");
         let mut state = crate::app::state::AppState::test_new();
-        state.host_glass_enabled = true;
         state.view.layout = crate::app::state::ViewLayout::Desktop;
         state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
         state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
@@ -2398,7 +2351,6 @@ mod tests {
     fn disconnect_drain_reconnect_admission_interleaving_cannot_replay_input() {
         let host = RemoteHostKey::new("remote-a", "default");
         let mut state = crate::app::state::AppState::test_new();
-        state.host_glass_enabled = true;
         state.view.layout = crate::app::state::ViewLayout::Desktop;
         state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
         state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
@@ -2484,7 +2436,6 @@ mod tests {
     fn bounded_input_admission_reports_full_and_closed_without_queueing() {
         let host = RemoteHostKey::new("remote-a", "default");
         let mut state = crate::app::state::AppState::test_new();
-        state.host_glass_enabled = true;
         state.view.layout = crate::app::state::ViewLayout::Desktop;
         state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
         state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
@@ -2525,7 +2476,6 @@ mod tests {
     fn selected_live_stream_exposes_only_its_vt_reported_mouse_capture_mode() {
         let host = RemoteHostKey::new("remote-a", "default");
         let mut state = crate::app::state::AppState::test_new();
-        state.host_glass_enabled = true;
         state.view.layout = crate::app::state::ViewLayout::Desktop;
         state.view.host_rail_rect = Rect::new(0, 0, 8, 24);
         state.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
@@ -3102,48 +3052,6 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn deactivate_generation_rejects_late_predecessor_frame() {
-        let host = RemoteHostKey::new("remote-a", "default");
-        let mut state = crate::app::state::AppState::test_new();
-        let generation = state.begin_host_glass_generation(host.clone());
-        let mut surfaces = HostGlassSurfaceRegistry::default();
-        surfaces.insert(
-            host.clone(),
-            GlassSurfaceCore::new(Rect::new(0, 0, 12, 4), generation).expect("test surface"),
-        );
-        let mut runtime = HostGlassRuntime::default();
-        let receiver = runtime.test_install_connected_stream(host.clone(), generation, Some(false));
-        runtime
-            .worker_update_tx
-            .send(GlassWorkerUpdate::Frame {
-                host: host.clone(),
-                generation,
-                received_at: Instant::now(),
-                bytes: b"LATE-PREDECESSOR".to_vec(),
-            })
-            .expect("queue late predecessor frame");
-        let mut bridges = crate::app::selected_host_bridge::SelectedHostBridgeRuntime::default();
-
-        runtime.deactivate(&mut state, &mut surfaces, &mut bridges);
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
-        runtime.drain_worker_updates(&mut state, &mut surfaces, &event_tx);
-
-        let retired = state.host_glass_states.get(&host).expect("retired state");
-        assert_eq!(retired.generation, generation + 1);
-        assert!(matches!(retired.status, GlassStatus::Stale { .. }));
-        assert!(!surfaces
-            .get(&host)
-            .expect("cached surface retained")
-            .visible_text()
-            .contains("LATE-PREDECESSOR"));
-        assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(1)),
-            Ok(ClientMessage::Detach)
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
     fn app_owned_runtime_drop_detaches_stream_without_retaining_queue() {
         let host = RemoteHostKey::new("remote-a", "default");
         let mut runtime = HostGlassRuntime::default();
@@ -3359,7 +3267,6 @@ mod tests {
     #[test]
     fn repeated_first_attach_without_a_frame_remains_connecting() {
         let mut state = crate::app::state::AppState::test_new();
-        state.host_glass_enabled = true;
         state.view.layout = crate::app::state::ViewLayout::Desktop;
         state.view.host_rail_rect = Rect::new(0, 0, 10, 20);
         let host = RemoteHostKey::new("remote-a", crate::session::DEFAULT_SESSION_NAME);
@@ -3399,7 +3306,6 @@ mod tests {
     #[test]
     fn first_attach_stale_deadline_is_not_reset_by_reconciliation() {
         let mut state = crate::app::state::AppState::test_new();
-        state.host_glass_enabled = true;
         state.view.layout = crate::app::state::ViewLayout::Desktop;
         state.view.host_rail_rect = Rect::new(0, 0, 10, 20);
         let host = RemoteHostKey::new("remote-a", crate::session::DEFAULT_SESSION_NAME);
@@ -3446,7 +3352,6 @@ mod tests {
     #[test]
     fn host_switch_retains_cached_surface_stale_until_a_fresh_frame() {
         let mut state = crate::app::state::AppState::test_new();
-        state.host_glass_enabled = true;
         state.view.layout = crate::app::state::ViewLayout::Desktop;
         state.view.host_rail_rect = Rect::new(0, 0, 10, 20);
         let host = RemoteHostKey::new("remote-a", crate::session::DEFAULT_SESSION_NAME);

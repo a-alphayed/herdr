@@ -19,7 +19,6 @@ pub(super) enum SettingsAction {
     SaveAgentBorderLabels(bool),
     SavePaneHistory(bool),
     SaveSwitchAsciiInputSourceInPrefix(bool),
-    SaveHostGlass(bool),
     InstallRecommendedIntegrations,
 }
 
@@ -34,9 +33,6 @@ fn experiment_toggle_action(state: &AppState, idx: usize) -> Option<SettingsActi
                 !ExperimentSetting::SwitchAsciiInputSourceInPrefix.enabled(state),
             ))
         }
-        ExperimentSetting::HostGlass => Some(SettingsAction::SaveHostGlass(
-            !ExperimentSetting::HostGlass.enabled(state),
-        )),
     }
 }
 
@@ -57,7 +53,6 @@ impl App {
                 SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
                     self.save_switch_ascii_input_source_in_prefix(enabled)
                 }
-                SettingsAction::SaveHostGlass(enabled) => self.save_host_glass(enabled),
                 SettingsAction::InstallRecommendedIntegrations => {
                     self.install_recommended_integrations()
                 }
@@ -693,50 +688,6 @@ mod tests {
             Some(SettingsAction::SaveSwitchAsciiInputSourceInPrefix(true))
         );
         assert_eq!(app.state.settings.list.selected, 1);
-    }
-
-    #[test]
-    fn settings_experiments_down_down_then_toggle_enables_host_glass() {
-        let mut state = state_with_workspaces(&["test"]);
-        state.host_glass_enabled = false;
-        open_settings_at(&mut state, SettingsSection::Experiments);
-
-        // navigate to the third row (index 2)
-        update_settings_state(
-            &mut state,
-            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
-        );
-        update_settings_state(
-            &mut state,
-            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
-        );
-        assert_eq!(state.settings.list.selected, 2);
-
-        let action = update_settings_state(
-            &mut state,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
-        );
-
-        assert_eq!(action, Some(SettingsAction::SaveHostGlass(true)));
-        assert_eq!(state.mode, Mode::Settings);
-    }
-
-    #[test]
-    fn settings_mouse_click_toggles_host_glass_row() {
-        let mut app = app_for_mouse_test();
-        app.state.host_glass_enabled = false;
-        open_settings_at(&mut app.state, SettingsSection::Experiments);
-
-        let area = app.state.settings_content_rect();
-        // row offset 3 = list_y base; +2 = third row (index 2)
-        let action = app.state.handle_settings_mouse(mouse(
-            MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            area.x + 2,
-            area.y + 5,
-        ));
-
-        assert_eq!(action, Some(SettingsAction::SaveHostGlass(true)));
-        assert_eq!(app.state.settings.list.selected, 2);
     }
 
     #[test]
