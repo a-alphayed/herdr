@@ -1168,6 +1168,38 @@ pub(crate) fn workspace_drop_indicator_row(
     None
 }
 
+/// Glass-yielded sidebar: host rail only, no Spaces/Agents panel.
+///
+/// When the host glass is active the remote's streamed UI includes its own
+/// sidebar, so the local Spaces/Agents sections are hidden. Only the host rail
+/// stays visible as the un-trappable escape hatch for switching hosts. The
+/// right-edge separator is drawn exactly as in the full sidebar so the visual
+/// boundary remains consistent.
+pub(super) fn render_sidebar_glass_yielded(app: &AppState, frame: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let p = &app.palette;
+    let is_navigating = matches!(app.mode, crate::app::Mode::Navigate);
+    let sep_style = if is_navigating {
+        Style::default().fg(p.accent)
+    } else {
+        Style::default().fg(p.surface_dim)
+    };
+
+    // Outer right-edge separator — same as render_sidebar.
+    let sep_x = area.x + area.width.saturating_sub(1);
+    let buf = frame.buffer_mut();
+    for y in area.y..area.y + area.height {
+        buf[(sep_x, y)].set_symbol("│");
+        buf[(sep_x, y)].set_style(sep_style);
+    }
+
+    // Host rail fills the entire sidebar area (no panel beside it).
+    render_host_rail(app, frame, app.view.host_rail_rect);
+}
+
 pub(super) fn render_sidebar(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,

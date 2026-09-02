@@ -741,6 +741,11 @@ pub struct ViewState {
     /// This is distinct from collapsed/mobile/tiny layouts, where an absent
     /// rail continues to make the effective source local.
     pub host_rail_visually_suppressed: bool,
+    /// True when the host glass is active and the local sidebar has yielded
+    /// its Spaces/Agents panel to the remote's streamed sidebar. In this state
+    /// the sidebar rect covers only the host rail, `sidebar_panel_rect` is
+    /// `Rect::default()`, and the terminal area gains the difference.
+    pub glass_sidebar_yielded: bool,
     /// Sidebar content panel rect (Spaces/Agents). This is the area used by
     /// workspace and agent panel render/input helpers.
     pub sidebar_panel_rect: Rect,
@@ -2322,6 +2327,7 @@ impl AppState {
                 sidebar_rect: Rect::default(),
                 host_rail_rect: Rect::default(),
                 host_rail_visually_suppressed: false,
+                glass_sidebar_yielded: false,
                 sidebar_panel_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),

@@ -759,6 +759,7 @@ impl App {
                 sidebar_rect: Rect::default(),
                 host_rail_rect: Rect::default(),
                 host_rail_visually_suppressed: false,
+                glass_sidebar_yielded: false,
                 sidebar_panel_rect: Rect::default(),
                 workspace_card_areas: Vec::new(),
                 tab_bar_rect: Rect::default(),

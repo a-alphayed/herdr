@@ -57,7 +57,7 @@ use self::settings::render_settings_overlay;
 pub(crate) use self::sidebar::host_list_entries;
 #[cfg(test)]
 pub(crate) use self::sidebar::host_list_row_areas;
-use self::sidebar::{render_sidebar, render_sidebar_collapsed};
+use self::sidebar::{render_sidebar, render_sidebar_collapsed, render_sidebar_glass_yielded};
 use self::status::{
     copy_feedback_rect, render_config_diagnostic, render_copy_feedback, render_toast_notification,
     toast_notification_rect,
@@ -280,11 +280,35 @@ fn compute_view_internal(
     } else {
         host_rail_width()
     };
+
+    // Glass-sidebar-yield: when the host glass is active and the sidebar is
+    // expanded, the local Spaces/Agents panel is hidden so the remote's
+    // streamed sidebar serves as "the sidebar for that host". The rail always
+    // stays visible as the un-trappable escape hatch. We detect this before
+    // computing sidebar_w so the geometry is correct from the start.
+    //
+    // `host_glass_surface_active()` reads `view.layout` / `host_rail_rect`
+    // which haven't been written yet, so we replicate its preconditions
+    // directly: glass enabled, sidebar expanded, embedded context not active
+    // (rail not suppressed), and a remote source is selected.
+    let glass_sidebar_yielded = !app.sidebar_collapsed
+        && !host_rail_visually_suppressed
+        && app.host_glass_enabled
+        && rail_w > 0
+        && matches!(
+            app.sidebar_source,
+            crate::app::state::SidebarSource::Remote(_)
+        );
+
     let sidebar_w = if app.sidebar_collapsed {
         match app.sidebar_collapsed_mode {
             crate::config::SidebarCollapsedModeConfig::Compact => COLLAPSED_WIDTH,
             crate::config::SidebarCollapsedModeConfig::Hidden => 0,
         }
+    } else if glass_sidebar_yielded {
+        // Sidebar shrinks to just the rail; the panel disappears and the
+        // terminal/glass area gains the freed columns.
+        rail_w
     } else {
         let max_panel_w = area.width.saturating_sub(rail_w).saturating_sub(1);
         let panel_w = if max_panel_w == 0 {
@@ -301,13 +325,17 @@ fn compute_view_internal(
         Layout::horizontal([Constraint::Length(sidebar_w), Constraint::Min(1)]).areas(area);
     let host_rail_rect = if app.sidebar_collapsed {
         Rect::default()
+    } else if glass_sidebar_yielded && rail_w > 0 && sidebar_area.width >= rail_w {
+        // The entire sidebar IS the rail when yielded.
+        Rect::new(sidebar_area.x, sidebar_area.y, rail_w, sidebar_area.height)
     } else if rail_w > 0 && sidebar_area.width > rail_w {
         Rect::new(sidebar_area.x, sidebar_area.y, rail_w, sidebar_area.height)
     } else {
         Rect::default()
     };
-    let sidebar_panel_rect = if app.sidebar_collapsed {
-        sidebar_area
+    let sidebar_panel_rect = if app.sidebar_collapsed || glass_sidebar_yielded {
+        // Collapsed or yielded: no panel.
+        Rect::default()
     } else if host_rail_rect != Rect::default() {
         Rect::new(
             sidebar_area.x + host_rail_rect.width,
@@ -323,6 +351,7 @@ fn compute_view_internal(
     app.view.sidebar_rect = sidebar_area;
     app.view.host_rail_rect = host_rail_rect;
     app.view.host_rail_visually_suppressed = host_rail_visually_suppressed;
+    app.view.glass_sidebar_yielded = glass_sidebar_yielded;
     app.view.sidebar_panel_rect = sidebar_panel_rect;
 
     let (tab_bar_rect, terminal_area) = app
@@ -391,6 +420,7 @@ fn compute_view_internal(
             sidebar_rect: sidebar_area,
             host_rail_rect,
             host_rail_visually_suppressed,
+            glass_sidebar_yielded,
             sidebar_panel_rect,
             workspace_card_areas,
             tab_bar_rect: Rect::default(),
@@ -466,6 +496,7 @@ fn compute_view_internal(
         sidebar_rect: sidebar_area,
         host_rail_rect,
         host_rail_visually_suppressed,
+        glass_sidebar_yielded,
         sidebar_panel_rect,
         workspace_card_areas,
         tab_bar_rect,
@@ -522,6 +553,7 @@ fn compute_mobile_view(
             sidebar_rect: Rect::default(),
             host_rail_rect: Rect::default(),
             host_rail_visually_suppressed: false,
+            glass_sidebar_yielded: false,
             sidebar_panel_rect: Rect::default(),
             workspace_card_areas: Vec::new(),
             tab_bar_rect: Rect::default(),
@@ -576,6 +608,7 @@ fn compute_mobile_view(
         sidebar_rect: Rect::default(),
         host_rail_rect: Rect::default(),
         host_rail_visually_suppressed: false,
+        glass_sidebar_yielded: false,
         sidebar_panel_rect: Rect::default(),
         workspace_card_areas: Vec::new(),
         tab_bar_rect: Rect::default(),
@@ -624,6 +657,10 @@ pub(crate) fn render_with_runtime_registry_and_glass(
     } else if sidebar_area.width > 0 {
         if app.sidebar_collapsed {
             render_sidebar_collapsed(app, frame, sidebar_area);
+        } else if app.view.glass_sidebar_yielded {
+            // Glass is active: local sidebar yields its Spaces/Agents panel;
+            // only the host rail (the un-trappable escape hatch) remains.
+            render_sidebar_glass_yielded(app, frame, sidebar_area);
         } else {
             render_sidebar(app, terminal_runtimes, frame, sidebar_area);
         }
@@ -2624,12 +2661,20 @@ mod tests {
         );
         app.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
 
+        // Glass sidebar yield is active in the normal standalone context
+        // (glass enabled + remote selected). Take a glass-OFF snapshot for the
+        // geometry reference so the embedded-vs-standalone reflow assertions
+        // can compare rail-plus-panel standalone geometry against the
+        // rail-suppressed embedded geometry — the invariant the test was
+        // written to verify.
         let area = Rect::new(0, 0, 100, 20);
+        app.host_glass_enabled = false;
         compute_view(&mut app, area);
         let standalone_sidebar = app.view.sidebar_rect;
         let standalone_panel = app.view.sidebar_panel_rect;
         let standalone_main = app.view.terminal_area;
         let standalone_rail = app.view.host_rail_rect;
+        app.host_glass_enabled = true;
         let mut standalone_terminal =
             Terminal::new(TestBackend::new(area.width, area.height)).expect("standalone terminal");
         standalone_terminal
@@ -3881,6 +3926,214 @@ switch_workspace = "ctrl+1..9"
         assert!(
             !top_row.contains("no local pane active"),
             "waiting header should not replace a selected remote workspace: {top_row:?}"
+        );
+    }
+
+    // ── glass-sidebar-yield tests ─────────────────────────────────────────────
+
+    fn make_glass_app() -> (
+        crate::app::state::AppState,
+        crate::remote_source::RemoteHostKey,
+    ) {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.host_glass_enabled = true;
+        let host = crate::remote_source::RemoteHostKey::new(
+            "remote-host",
+            crate::session::DEFAULT_SESSION_NAME,
+        );
+        app.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        app.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+        (app, host)
+    }
+
+    #[test]
+    fn glass_active_sidebar_yields_panel_and_widens_terminal_area() {
+        let (mut app, _host) = make_glass_app();
+        let area = Rect::new(0, 0, 100, 20);
+
+        // Baseline: glass disabled — full sidebar (rail + panel).
+        app.host_glass_enabled = false;
+        compute_view(&mut app, area);
+        let baseline_terminal_x = app.view.terminal_area.x;
+        let baseline_terminal_w = app.view.terminal_area.width;
+        let baseline_sidebar_w = app.view.sidebar_rect.width;
+
+        // Glass on: sidebar should shrink to just the rail.
+        app.host_glass_enabled = true;
+        compute_view(&mut app, area);
+
+        assert!(
+            app.view.glass_sidebar_yielded,
+            "glass_sidebar_yielded must be true when glass is active"
+        );
+        assert_eq!(
+            app.view.sidebar_rect.width,
+            host_rail_width(),
+            "sidebar collapses to rail width when yielded"
+        );
+        assert_eq!(
+            app.view.host_rail_rect,
+            Rect::new(0, 0, host_rail_width(), area.height),
+            "host rail occupies the entire (shrunken) sidebar"
+        );
+        assert_eq!(
+            app.view.sidebar_panel_rect,
+            Rect::default(),
+            "panel disappears when sidebar is yielded"
+        );
+        assert!(
+            app.view.terminal_area.x < baseline_terminal_x,
+            "terminal area starts earlier when panel is hidden"
+        );
+        assert!(
+            app.view.terminal_area.width > baseline_terminal_w,
+            "terminal area is wider when panel is hidden"
+        );
+        // Combined: sidebar_w + terminal_w + tab/no-tab bar should equal area
+        // width. Both must add up correctly.
+        assert_eq!(
+            app.view.sidebar_rect.width + app.view.terminal_area.width,
+            baseline_sidebar_w + baseline_terminal_w,
+            "total width is conserved across yield"
+        );
+    }
+
+    #[test]
+    fn glass_inactive_sidebar_unchanged() {
+        // Local source selected — glass is never active regardless of
+        // host_glass_enabled; sidebar should be the full rail + panel.
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.host_glass_enabled = true; // enabled but local source
+        let host = crate::remote_source::RemoteHostKey::new(
+            "remote-host",
+            crate::session::DEFAULT_SESSION_NAME,
+        );
+        app.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        // Keep local selected (don't call select_sidebar_source(Remote(...))).
+        let area = Rect::new(0, 0, 100, 20);
+        compute_view(&mut app, area);
+
+        assert!(
+            !app.view.glass_sidebar_yielded,
+            "glass_sidebar_yielded must be false when local is selected"
+        );
+        assert!(
+            app.view.sidebar_panel_rect != Rect::default(),
+            "panel present when glass is inactive"
+        );
+        assert_eq!(
+            app.view.host_rail_rect.width,
+            host_rail_width(),
+            "host rail present when glass is inactive"
+        );
+        // sidebar = rail + panel + separator
+        assert!(
+            app.view.sidebar_rect.width > host_rail_width(),
+            "sidebar wider than just the rail when glass is inactive"
+        );
+    }
+
+    #[test]
+    fn glass_sidebar_yield_renders_rail_hides_spaces_agents() {
+        let (mut app, _host) = make_glass_app();
+        let area = Rect::new(0, 0, 100, 20);
+        compute_view(&mut app, area);
+        assert!(app.view.glass_sidebar_yielded);
+
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        // The host rail header " hosts" must appear in the sidebar area.
+        let rail_rect = app.view.host_rail_rect;
+        let header_row = buffer_row_text(&buf, rail_rect, rail_rect.y);
+        assert!(
+            header_row.contains("hosts"),
+            "host rail header must be present in yielded sidebar: {header_row:?}"
+        );
+
+        // No " spaces" or " agents" header should appear in the (yielded) sidebar.
+        let sidebar_rect = app.view.sidebar_rect;
+        for y in sidebar_rect.y..sidebar_rect.y + sidebar_rect.height {
+            let row = buffer_row_text(&buf, sidebar_rect, y);
+            assert!(
+                !row.contains("spaces"),
+                "spaces header must not appear in yielded sidebar (row {y}): {row:?}"
+            );
+            assert!(
+                !row.contains("agents"),
+                "agents header must not appear in yielded sidebar (row {y}): {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn glass_sidebar_yield_rail_click_targets_preserved() {
+        // host_target_at uses app.view.host_rail_rect, which is computed by
+        // compute_view. Even in the yielded state, the rail is present and
+        // its row areas must be populated so clicks route correctly.
+        let (mut app, host) = make_glass_app();
+        let area = Rect::new(0, 0, 100, 20);
+        compute_view(&mut app, area);
+        assert!(app.view.glass_sidebar_yielded);
+
+        // Row 0 is the ` hosts` header, row 1 is its breathing buffer.
+        assert_eq!(
+            host_target_at(&app, 0, 0),
+            None,
+            "header row is not a host target in yielded sidebar"
+        );
+        assert_eq!(
+            host_target_at(&app, 0, 1),
+            None,
+            "breathing row is not a host target in yielded sidebar"
+        );
+        // Row 2 is local, row 3 is the remote host.
+        assert_eq!(
+            host_target_at(&app, 0, 2),
+            Some(crate::app::state::SidebarSource::Local),
+            "local row clickable in yielded sidebar"
+        );
+        assert_eq!(
+            host_target_at(&app, 0, 3),
+            Some(crate::app::state::SidebarSource::Remote(host)),
+            "remote host row clickable in yielded sidebar"
+        );
+    }
+
+    #[test]
+    fn glass_sidebar_yield_collapsed_sidebar_not_yielded() {
+        // When the sidebar is collapsed, glass_sidebar_yielded must be false:
+        // collapsed + glass = still the compact collapsed variant, not yielded.
+        let (mut app, _host) = make_glass_app();
+        app.sidebar_collapsed = true;
+        let area = Rect::new(0, 0, 100, 20);
+        compute_view(&mut app, area);
+
+        assert!(
+            !app.view.glass_sidebar_yielded,
+            "collapsed sidebar must not trigger glass_sidebar_yielded"
+        );
+        // Collapsed sidebar drops the rail entirely per existing policy.
+        assert_eq!(
+            app.view.host_rail_rect,
+            Rect::default(),
+            "collapsed sidebar has no host rail"
         );
     }
 }
