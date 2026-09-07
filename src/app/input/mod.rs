@@ -136,8 +136,10 @@ impl App {
             return;
         }
 
-        // Glass uses the full-App structured input path.
-        if self.state.host_glass_surface_active() {
+        // Glass uses the full-App structured input path — but only when this
+        // view actually presents the glass. An Embedded render shows local
+        // panes, so its paste is local.
+        if self.state.host_glass_presented() {
             let _ = self.route_host_glass_input(crate::protocol::ClientInputEvent::Paste { text });
             return;
         }
@@ -254,7 +256,7 @@ impl App {
     /// local indicator and host rail are never forwarded; the rail therefore
     /// remains the unconditional mouse escape hatch.
     fn handle_host_glass_mouse(&mut self, mouse: MouseEvent) -> bool {
-        if self.state.mode != Mode::Terminal || !self.state.host_glass_surface_active() {
+        if self.state.mode != Mode::Terminal || !self.state.host_glass_presented() {
             return false;
         }
 
@@ -962,6 +964,102 @@ new_workspace = "ctrl+shift+f12"
             crate::app::state::SidebarSource::Local
         );
         assert!(receiver.try_recv().is_err(), "escape chord stays local");
+    }
+
+    /// Recompute this App's view the way the headless server does for a viewer
+    /// that streams this host through its own glass, and install a channel
+    /// runtime on the focused local pane so local delivery is observable.
+    #[cfg(unix)]
+    fn embedded_glass_view(app: &mut App) -> tokio::sync::mpsc::Receiver<bytes::Bytes> {
+        let pane_id = app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("focused local pane");
+        let (runtime, local_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 10);
+        app.state.insert_test_runtime(pane_id, runtime);
+        crate::ui::compute_view_with_context(
+            &mut app.state,
+            &app.terminal_runtimes,
+            ratatui::layout::Rect::new(0, 0, 106, 20),
+            true,
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::protocol::ViewContext::Embedded,
+        );
+        assert!(
+            !app.state.host_glass_presented(),
+            "an embedded render never presents a nested glass"
+        );
+        assert!(
+            app.state.host_glass_surface_active(),
+            "App-level glass authority survives the embedded render"
+        );
+        local_rx
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn embedded_view_routes_body_mouse_and_paste_locally_not_to_glass() {
+        let (mut app, receiver, host) =
+            glass_input_test_app(crate::app::host_glass::GlassStatus::Live);
+        let mut local_rx = embedded_glass_view(&mut app);
+
+        let area = app.state.view.terminal_area;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x + 4,
+            area.y + 2,
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "an embedded viewer's body mouse acts on the viewed host, not its remote"
+        );
+        assert!(
+            local_rx.try_recv().is_err(),
+            "a non-reporting local pane consumes the click as local UI input"
+        );
+
+        app.handle_paste("pasted locally".into()).await;
+        assert!(
+            receiver.try_recv().is_err(),
+            "an embedded viewer's paste is never forwarded over the glass"
+        );
+        let delivered = local_rx.try_recv().expect("local pane receives the paste");
+        assert!(String::from_utf8_lossy(&delivered).contains("pasted locally"));
+
+        // The viewed host keeps its own remote selection and glass authority.
+        assert_eq!(
+            app.state.sidebar_source,
+            crate::app::state::SidebarSource::Remote(host)
+        );
+        assert!(app.state.host_glass_surface_active());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn embedded_view_exit_chord_is_a_plain_key_and_keeps_remote_selected() {
+        let (mut app, receiver, host) =
+            glass_input_test_app(crate::app::host_glass::GlassStatus::Live);
+        let mut local_rx = embedded_glass_view(&mut app);
+
+        app.handle_terminal_key_headless(crate::input::TerminalKey::new(
+            KeyCode::F(12),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+
+        // The glass-exit chord belongs to the viewer's own App. Here it is an
+        // ordinary key: it must not deselect the viewed host's remote source.
+        assert_eq!(
+            app.state.sidebar_source,
+            crate::app::state::SidebarSource::Remote(host)
+        );
+        assert_eq!(
+            app.state.effective_sidebar_source(),
+            app.state.sidebar_source
+        );
+        assert!(receiver.try_recv().is_err(), "no key reaches the glass");
+        assert!(
+            local_rx.try_recv().is_ok(),
+            "the chord is forwarded to the local pane like any other key"
+        );
     }
 
     #[tokio::test]

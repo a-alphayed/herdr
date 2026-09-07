@@ -1693,12 +1693,44 @@ impl AppState {
         self.host_glass_states.get_key_value(&host)
     }
 
-    /// Whether the full-App glass owns the desktop content area.
+    /// App-level glass authority: whether the selected remote source owns this
+    /// App's content surface for bridge/stream lifecycle, clipboard
+    /// provenance, structured-input gating, and host mouse-capture derivation.
     /// This is keyed directly from the effective host-rail source so the first
     /// selection takes over immediately, before runtime reconciliation has
     /// created its generation metadata or received a frame.
+    ///
+    /// This is deliberately client-agnostic and stays true across an
+    /// Embedded-context render, so the server's post-render reconcile keeps the
+    /// bridge alive. Render and input routing must instead use
+    /// [`AppState::host_glass_presented`], which is false for Embedded renders
+    /// so glass never nests.
     pub(crate) fn host_glass_surface_active(&self) -> bool {
         matches!(self.effective_sidebar_source(), SidebarSource::Remote(_))
+    }
+
+    /// Whether the glass is presented to the client this view was computed
+    /// for. Presentation (tab bar, panes vs glass, render cursor) and input
+    /// routing (keys, paste, mouse, exit chord) key off this, never off
+    /// [`AppState::host_glass_surface_active`], so glass never nests: an
+    /// Embedded render shows this host's own local content and routes that
+    /// viewer's input to local panes.
+    ///
+    /// Deliberately derived from the live source rather than recorded on
+    /// `ViewState` at compute time: source selection and sidebar collapse
+    /// change authority immediately, before the next `compute_view()` replaces
+    /// pane geometry, and a later event from the same drained input batch must
+    /// never be routed against the superseded decision.
+    ///
+    /// `host_rail_visually_suppressed` is the "this view is an embedded
+    /// render" bit — its only production writer is `compute_view_internal`,
+    /// which sets it from the rendered client's `ViewContext`. Every other
+    /// rail-less layout (mobile, collapsed, tiny) already makes the effective
+    /// source local, so this predicate matches the branch `compute_view_internal`
+    /// actually took (pinned by
+    /// `host_glass_presented_matches_the_view_branch_actually_built`).
+    pub(crate) fn host_glass_presented(&self) -> bool {
+        self.host_glass_surface_active() && !self.view.host_rail_visually_suppressed
     }
 
     pub(crate) fn effective_sidebar_source(&self) -> SidebarSource {
@@ -2610,6 +2642,30 @@ mod tests {
 
         state.select_sidebar_source(SidebarSource::Local);
         assert!(state.selected_host_glass_mode().is_none());
+    }
+
+    #[test]
+    fn host_glass_presented_defaults_false_and_never_moves_source_authority() {
+        let mut state = AppState::test_new();
+        assert!(!state.host_glass_presented());
+        assert_eq!(state.effective_sidebar_source(), SidebarSource::Local);
+
+        let host = crate::remote_source::RemoteHostKey::new("remote-a", "default");
+        state.view.host_rail_rect = Rect::new(0, 0, 10, 20);
+        state.select_sidebar_source(SidebarSource::Remote(host.clone()));
+        assert!(state.host_glass_presented());
+        assert!(state.host_glass_surface_active());
+
+        // Suppressing the rail for an embedded viewer takes presentation away
+        // without touching the App-level authority the bridge/stream reads.
+        state.view.host_rail_rect = Rect::default();
+        state.view.host_rail_visually_suppressed = true;
+        assert!(!state.host_glass_presented());
+        assert!(state.host_glass_surface_active());
+        assert_eq!(
+            state.effective_sidebar_source(),
+            SidebarSource::Remote(host)
+        );
     }
 
     #[test]

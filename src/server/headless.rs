@@ -10083,4 +10083,99 @@ new_tab = "prefix+t"
             bypass_lines.join("\n  ")
         );
     }
+
+    #[tokio::test]
+    async fn embedded_foreground_render_keeps_app_level_glass_authority() {
+        // Glass does not nest: the embedded viewer sees this host's own local
+        // workspace while the human terminal on this host still sees the
+        // glass. Crucially, presenting local content to the embedded client
+        // must not disturb the App-level source authority —
+        // `reconcile_remote_content_surfaces()` runs right after every render
+        // and reads `effective_sidebar_source()` to decide whether to keep or
+        // retire this host's SSH bridge and stream. The embedded client is
+        // foreground here so it renders LAST, the worst case for that hazard.
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("test");
+        let root = workspace.tabs[0].root_pane;
+        workspace.tabs[0].runtimes.insert(
+            root,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"local"),
+        );
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let host =
+            crate::remote_source::RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        server
+            .app
+            .state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+
+        let (standalone_tx, _standalone_control_rx, standalone_rx) = test_client_writer();
+        let (embedded_tx, _embedded_control_rx, embedded_rx) = test_client_writer();
+        server.clients.insert(
+            1,
+            ClientConnection::new_with_view_context(
+                (100, 20),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                2,
+                RenderEncoding::SemanticFrame,
+                crate::protocol::ViewContext::Standalone,
+                Some(standalone_tx),
+            ),
+        );
+        server.clients.insert(
+            2,
+            ClientConnection::new_with_view_context(
+                (100, 20),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::SemanticFrame,
+                crate::protocol::ViewContext::Embedded,
+                Some(embedded_tx),
+            ),
+        );
+        server.foreground_client_id = Some(2);
+        server.sync_foreground_client_state();
+        server.resize_shared_runtime_to_effective_size();
+
+        server.render_and_stream();
+
+        assert_eq!(
+            server.app.state.effective_sidebar_source(),
+            crate::app::state::SidebarSource::Remote(host),
+            "the post-render reconcile must still see the selected remote"
+        );
+
+        let embedded_text = frame_text(&read_server_frame(
+            embedded_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("embedded frame"),
+        ));
+        assert!(
+            embedded_text.contains("local"),
+            "embedded viewer sees this host's local pane: {embedded_text}"
+        );
+        assert!(
+            !embedded_text.contains(" glass "),
+            "embedded viewer must never see a nested glass: {embedded_text}"
+        );
+
+        let standalone_text = frame_text(&read_server_frame(
+            standalone_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("standalone frame"),
+        ));
+        assert!(
+            standalone_text.contains(" glass "),
+            "the human terminal on this host still sees the glass: {standalone_text}"
+        );
+
+        shutdown_test_runtimes(&mut server);
+    }
 }

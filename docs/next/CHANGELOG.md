@@ -22,6 +22,7 @@
 
 ### Fixed
 - Host glass viewers no longer take the remote's pane size while a terminal is attached there; pane sizes stop flapping and the remote's terminal keeps display ownership. Glass still sizes the remote when no terminal is attached.
+- Viewing a host through the host glass now shows that host's own local workspace even when it has a remote host selected itself; glass no longer nests, and a glass viewer's keys, paste, mouse, and exit chord act locally on the viewed host instead of on its selected remote.
 - `prefix+e` scrollback editor panes now open on Windows without trying to run `/bin/sh`; Windows uses `VISUAL`, then `EDITOR`, then `notepad.exe` as the fallback editor. (#914)
 - `herdr pane split --current` now resolves to the calling Herdr pane instead of the UI-focused pane when run inside a pane. (#902)
 - Native Windows clients running inside Alacritty now preserve mouse reports and `ctrl+j` input instead of leaking mouse escape sequences into panes. `shift+enter` remains dependent on whether the outer terminal reports it as a distinct modified Enter key. (#792)

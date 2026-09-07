@@ -1889,7 +1889,7 @@ impl App {
                 crate::raw_input::RawInputEvent::Paste(text) => {
                     if self.state.mode != Mode::Terminal {
                         self.paste_into_active_text_input(&text);
-                    } else if self.state.host_glass_surface_active() {
+                    } else if self.state.host_glass_presented() {
                         let _ =
                             self.route_host_glass_input(crate::protocol::ClientInputEvent::Paste {
                                 text,

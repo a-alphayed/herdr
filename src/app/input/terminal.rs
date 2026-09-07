@@ -38,7 +38,11 @@ impl App {
         // supported key is structured input for the authoritative remote App,
         // which applies its own keybindings and focused VT modes. Repeats of
         // the escape press remain suppressed after the local deselection.
-        if self.state.host_glass_surface_active() {
+        //
+        // Keyed off presentation, not App-level authority: an Embedded render
+        // shows local panes, so its keys — including the exit chord — stay
+        // local and must never deselect this host's own remote source.
+        if self.state.host_glass_presented() {
             if self.state.keybinds.host_glass_exit.matches_direct_key(key) {
                 self.suppressed_repeat_keys
                     .insert(super::super::repeat_key_identity(&key));

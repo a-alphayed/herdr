@@ -341,6 +341,26 @@ fn compute_view_internal(
         sidebar_area
     };
 
+    // Glass does not nest. `host_glass_surface_active()` is the App-level
+    // authority for the bridge/stream lifecycle and stays true across an
+    // Embedded render, but PRESENTATION follows the client being rendered: a
+    // viewer streaming this host through its own glass must see this host's
+    // local content, not a mirror of the remote this host has selected.
+    //
+    // Computed locally rather than through `AppState::host_glass_presented()`
+    // because `app.view` still holds the PREVIOUS view here (see the note above
+    // `glass_sidebar_yielded`); this mirrors the Standalone branch of
+    // `effective_sidebar_source()` from the CURRENT inputs. Layout is Desktop
+    // here (mobile returned earlier) and a collapsed sidebar already yields a
+    // default rail rect. `host_glass_presented_matches_the_view_branch_actually_built`
+    // pins this against the accessor every render path uses afterwards.
+    let host_glass_presented = view_context == ViewContext::Standalone
+        && host_rail_rect != Rect::default()
+        && matches!(
+            app.sidebar_source,
+            crate::app::state::SidebarSource::Remote(_)
+        );
+
     app.view.layout = ViewLayout::Desktop;
     app.view.sidebar_rect = sidebar_area;
     app.view.host_rail_rect = host_rail_rect;
@@ -383,7 +403,7 @@ fn compute_view_internal(
     // split borders, and background pane resizing are suppressed so no local
     // terminal runtime can be touched through mouse/keyboard while glass is
     // active.
-    if app.host_glass_surface_active() {
+    if host_glass_presented {
         let toast_hit_area = app
             .toast
             .as_ref()
@@ -602,10 +622,10 @@ pub(crate) fn render_with_runtime_registry_and_glass(
             render_sidebar(app, terminal_runtimes, frame, sidebar_area);
         }
     }
-    if app.view.layout != ViewLayout::Mobile && !app.host_glass_surface_active() {
+    if app.view.layout != ViewLayout::Mobile && !app.host_glass_presented() {
         render_tab_bar(app, frame, tab_bar_area);
     }
-    if app.host_glass_surface_active() {
+    if app.host_glass_presented() {
         render_host_glass(app, glass_surfaces, frame, terminal_area);
     } else {
         render_panes(app, terminal_runtimes, frame, terminal_area);
@@ -1012,6 +1032,351 @@ mod tests {
         );
         assert!(app.view.terminal_area.width > 0);
     }
+
+    fn glass_no_nest_test_app(
+        runtime_screen: &[u8],
+    ) -> (
+        crate::app::state::AppState,
+        crate::layout::PaneId,
+        crate::remote_source::RemoteHostKey,
+    ) {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("test");
+        let root = ws.tabs[0].root_pane;
+        ws.insert_test_runtime(
+            root,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, runtime_screen),
+        );
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        let host =
+            crate::remote_source::RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+        (app, root, host)
+    }
+
+    #[tokio::test]
+    async fn embedded_context_with_remote_selected_presents_local_panes() {
+        // Glass does not nest. A viewer streaming this host through its own
+        // glass must see THIS host's local workspace, even though this host
+        // has a remote source selected itself.
+        let (mut app, root, host) = glass_no_nest_test_app(b"local");
+        let size_before = app.workspaces[0].test_runtimes[&root].current_size();
+
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        compute_view_with_context(
+            &mut app,
+            &terminal_runtimes,
+            Rect::new(0, 0, 80, 20),
+            true,
+            crate::kitty_graphics::HostCellSize::default(),
+            ViewContext::Embedded,
+        );
+
+        assert!(!app.host_glass_presented());
+        // The App-level authority is deliberately preserved so the server's
+        // post-render reconcile keeps this host's own bridge and stream alive
+        // instead of retiring and reconnecting it after every embedded frame.
+        assert!(app.host_glass_surface_active());
+        assert_eq!(
+            app.effective_sidebar_source(),
+            crate::app::state::SidebarSource::Remote(host)
+        );
+        // The embedded layout itself is unchanged: rail suppressed, panel kept.
+        assert!(app.view.host_rail_visually_suppressed);
+        assert_eq!(app.view.host_rail_rect, Rect::default());
+        assert!(!app.view.glass_sidebar_yielded);
+        // Local content is presented and interactive.
+        assert!(!app.view.pane_infos.is_empty());
+        assert_ne!(app.view.tab_bar_rect, Rect::default());
+        assert_ne!(
+            app.workspaces[0].test_runtimes[&root].current_size(),
+            size_before,
+            "an embedded render lays out and resizes local panes",
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_context_with_remote_selected_presents_glass() {
+        // The human terminal on this host still gets the glass: only the
+        // embedded (viewer) context is redirected to local content.
+        let (mut app, _root, _host) = glass_no_nest_test_app(b"local");
+
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        compute_view_with_context(
+            &mut app,
+            &terminal_runtimes,
+            Rect::new(0, 0, 80, 20),
+            true,
+            crate::kitty_graphics::HostCellSize::default(),
+            ViewContext::Standalone,
+        );
+
+        assert!(app.host_glass_presented());
+        assert!(app.host_glass_surface_active());
+        assert!(!app.view.host_rail_visually_suppressed);
+        assert!(app.view.pane_infos.is_empty());
+    }
+
+    #[tokio::test]
+    async fn host_glass_presented_matches_the_view_branch_actually_built() {
+        // `AppState::host_glass_presented()` is derived live rather than
+        // recorded on `ViewState`, so it must still agree with the branch
+        // `compute_view_internal` actually took. The glass branch builds a
+        // glass-only view with no local hit targets; every other branch builds
+        // the normal view with panes. Pin that across context, collapse state,
+        // source, and desktop/mobile widths.
+        let (mut app, _root, _host) = glass_no_nest_test_app(b"local");
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+
+        for context in [ViewContext::Standalone, ViewContext::Embedded] {
+            for collapsed in [false, true] {
+                for source in [
+                    crate::app::state::SidebarSource::Local,
+                    crate::app::state::SidebarSource::Remote(
+                        crate::remote_source::RemoteHostKey::new(
+                            "jafar",
+                            crate::session::DEFAULT_SESSION_NAME,
+                        ),
+                    ),
+                ] {
+                    for area in [Rect::new(0, 0, 80, 20), Rect::new(0, 0, 40, 20)] {
+                        app.sidebar_collapsed = collapsed;
+                        app.select_sidebar_source(source.clone());
+                        compute_view_with_context(
+                            &mut app,
+                            &terminal_runtimes,
+                            area,
+                            false,
+                            crate::kitty_graphics::HostCellSize::default(),
+                            context,
+                        );
+                        assert_eq!(
+                            app.host_glass_presented(),
+                            app.view.pane_infos.is_empty(),
+                            "the live predicate must match the computed branch \
+                             (context={context:?}, collapsed={collapsed}, \
+                             source={source:?}, area={area:?})",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// One writer of `host_rail_visually_suppressed`, and it must key off the
+    /// rendered client's `ViewContext`.
+    ///
+    /// `host_glass_presented_matches_the_view_branch_actually_built` pins the
+    /// predicate against the branch `compute_view_internal` takes. This pins
+    /// the other half: that the flag the predicate reads still *means* what it
+    /// claims to. Nothing in the type system enforces it — the field is a
+    /// plain `pub bool` on `ViewState` — so this walks the crate source and
+    /// classifies every site that binds, assigns, or initialises it.
+    ///
+    /// Test code is excluded by truncating each file at its
+    /// `#[cfg(test)] mod tests` boundary. `#[cfg(test)]` helper items sitting
+    /// BEFORE that boundary (`AppState::test_new`, for one) are still scanned
+    /// and held to the production rule, which they already satisfy by
+    /// initialising the field to `false`. That is deliberate: the failure mode
+    /// is a loud false positive naming the exact offending line, never a
+    /// silent miss. Same reason the scan walks all of `src/` rather than a
+    /// whitelist — a new file constructing `ViewState` is precisely the case
+    /// worth catching.
+    #[test]
+    fn host_rail_visually_suppressed_has_exactly_one_embedded_writer() {
+        const FIELD: &str = "host_rail_visually_suppressed";
+        const STAKE: &str = "\
+`AppState::host_glass_presented()` derives \"is this render for an embedded viewer\" from \
+`ViewState::host_rail_visually_suppressed`, and both rendering and input routing key off \
+that predicate. When the flag is true the host glass is deliberately NOT presented, so the \
+viewer sees this host's own local panes and its keys, paste and mouse act on them. A second \
+writer -- a new layout mode, a narrow-width heuristic, a \"hide chrome\" option -- silently \
+changes which content the host glass shows and where a viewer's input lands, and no other \
+test in the suite would fail. If you need to suppress the rail for a reason that is not \
+\"this client is embedded\", introduce a separate field instead of overloading this one.";
+
+        // (path relative to the crate root, production region of the file)
+        let mut sources: Vec<(String, String)> = Vec::new();
+        collect_rust_sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
+        assert!(
+            sources.iter().any(|(path, _)| path == "src/ui.rs"),
+            "source scan found no src/ui.rs; the scan is not reading the crate source",
+        );
+
+        let mut bindings: Vec<String> = Vec::new();
+        let mut literal_inits: Vec<String> = Vec::new();
+        let mut assignments: Vec<String> = Vec::new();
+        let mut shorthand_files: Vec<String> = Vec::new();
+
+        for (path, source) in &sources {
+            let lines: Vec<&str> = source.lines().collect();
+            let end = production_region_end(&lines);
+            for (idx, raw) in lines[..end].iter().enumerate() {
+                let line = raw.trim();
+                if !line.contains(FIELD) || line.starts_with("//") {
+                    continue;
+                }
+                let at = format!("{path}:{}: {line}", idx + 1);
+
+                if line.starts_with(&format!("let {FIELD}")) {
+                    // The binding may wrap; gather through the terminating `;`.
+                    let mut expr = String::new();
+                    for continued in lines[idx..end].iter().take(10) {
+                        expr.push(' ');
+                        expr.push_str(continued.trim());
+                        if continued.trim_end().ends_with(';') {
+                            break;
+                        }
+                    }
+                    bindings.push(format!("{path}:{}:{expr}", idx + 1));
+                    assert!(
+                        expr.contains("ViewContext::Embedded"),
+                        "{FIELD} is bound at {path}:{} by an expression that never mentions \
+                         `ViewContext::Embedded`:\n {expr}\n\n{STAKE}",
+                        idx + 1,
+                    );
+                } else if line.contains(&format!("{FIELD} ="))
+                    && !line.contains(&format!("{FIELD} =="))
+                {
+                    let rhs = line
+                        .split_once('=')
+                        .map(|(_, rhs)| rhs.trim().trim_end_matches(';').trim())
+                        .unwrap_or_default()
+                        .to_string();
+                    assert_eq!(
+                        rhs, FIELD,
+                        "{at}\nassigns {FIELD} from something other than the single \
+                         embedded-context binding of the same name.\n\n{STAKE}",
+                    );
+                    assignments.push(at);
+                } else if line.starts_with(&format!("{FIELD}:")) {
+                    let value = line
+                        .split_once(':')
+                        .map(|(_, value)| value.trim().trim_end_matches(',').trim())
+                        .unwrap_or_default()
+                        .to_string();
+                    assert_eq!(
+                        value, "false",
+                        "{at}\ninitialises {FIELD} to something other than `false`. Only \
+                         `compute_view_internal` may compute this flag; every other \
+                         `ViewState` literal must set it false.\n\n{STAKE}",
+                    );
+                    literal_inits.push(at);
+                } else if line == format!("{FIELD},") {
+                    shorthand_files.push(path.clone());
+                }
+                // Anything else mentioning the field is a read, which is free.
+            }
+        }
+
+        assert_eq!(
+            bindings.len(),
+            1,
+            "expected exactly one production binding of {FIELD}, found {}:\n  {}\n\n{STAKE}",
+            bindings.len(),
+            bindings.join("\n  "),
+        );
+        assert!(
+            bindings[0].starts_with("src/ui.rs:"),
+            "the only binding of {FIELD} must live in compute_view_internal \
+             (src/ui.rs), found it at {}\n\n{STAKE}",
+            bindings[0],
+        );
+        for path in &shorthand_files {
+            assert_eq!(
+                path, "src/ui.rs",
+                "{path} sets {FIELD} by struct-literal shorthand, which carries a local of \
+                 that name from a file other than the one holding the single binding.\n\n{STAKE}",
+            );
+        }
+        assert!(
+            !literal_inits.is_empty() && !assignments.is_empty(),
+            "the scan matched no {FIELD} literals or assignments at all, so it is no longer \
+             classifying the code it is meant to guard; fix the scan before trusting it",
+        );
+    }
+
+    /// Collect `(path relative to the crate root, production region)` for every
+    /// `.rs` file under `dir`, in a stable order.
+    fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("read source dir {}: {err}", dir.display()))
+            .map(|entry| {
+                entry
+                    .unwrap_or_else(|err| panic!("read entry in {}: {err}", dir.display()))
+                    .path()
+            })
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+                let label = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((label, source));
+            }
+        }
+    }
+
+    /// Index of the first line of the file's `#[cfg(test)] mod tests` block, or
+    /// the line count when the file has no test module. Everything before it is
+    /// treated as production.
+    fn production_region_end(lines: &[&str]) -> usize {
+        lines
+            .windows(2)
+            .position(|pair| {
+                pair[0].trim() == "#[cfg(test)]" && pair[1].trim_start().starts_with("mod tests")
+            })
+            .unwrap_or(lines.len())
+    }
+
+    #[tokio::test]
+    async fn embedded_render_draws_local_panes_not_glass_indicator() {
+        let (mut app, _root, _host) = glass_no_nest_test_app(b"local");
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        let area = Rect::new(0, 0, 80, 20);
+
+        let (embedded, _cursor) =
+            crate::server::render_stream::render_virtual_with_runtime_registry_and_glass_in_context(
+                &mut app,
+                &terminal_runtimes,
+                None,
+                area,
+                true,
+                crate::kitty_graphics::HostCellSize::default(),
+                ViewContext::Embedded,
+            );
+        let embedded_text = buffer_text(&embedded, area);
+        assert!(embedded_text.contains("local"));
+        assert!(!embedded_text.contains(" glass "));
+
+        let (standalone, _cursor) =
+            crate::server::render_stream::render_virtual_with_runtime_registry_and_glass_in_context(
+                &mut app,
+                &terminal_runtimes,
+                None,
+                area,
+                true,
+                crate::kitty_graphics::HostCellSize::default(),
+                ViewContext::Standalone,
+            );
+        let standalone_text = buffer_text(&standalone, area);
+        assert!(standalone_text.contains(" glass "));
+    }
+
     #[test]
     fn copy_feedback_offset_only_increases_when_toast_rect_overlaps() {
         let area = Rect::new(0, 0, 80, 24);
@@ -1945,6 +2310,13 @@ mod tests {
         let grab = scrollbar_thumb_grab_offset(metrics, track, row).expect("grab");
 
         assert_eq!(scrollbar_offset_from_drag_row(metrics, track, row, grab), 7);
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer, area: Rect) -> String {
+        (area.y..area.y + area.height)
+            .map(|row| buffer_row_text(buffer, area, row))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn buffer_row_text(buffer: &ratatui::buffer::Buffer, area: Rect, row: u16) -> String {

@@ -367,7 +367,7 @@ pub(crate) fn render_virtual_with_runtime_registry_and_glass_in_context(
         .expect("render to TestBackend should never fail")
         .buffer
         .clone();
-    let cursor = if app_state.host_glass_surface_active() {
+    let cursor = if app_state.host_glass_presented() {
         // Glass owns the whole content body, so its PTY-free VT cursor is the
         // only render cursor that can be authoritative. A retained local pane
         // must not override or suppress it in headless App-client frames.
