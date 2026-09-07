@@ -47,6 +47,15 @@ fn unique_test_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/hlh-{}-{n}", std::process::id()))
 }
 
+/// Every test here uses `<base>/config` as `XDG_CONFIG_HOME`, so keep
+/// `XDG_STATE_HOME` at `<base>/state`. Without it a spawned herdr falls back to
+/// the real `~/.local/state/herdr-dev`; `cleanup_test_base` removes both.
+fn test_state_home(config_home: &Path) -> PathBuf {
+    let state_home = config_home.with_file_name("state");
+    fs::create_dir_all(&state_home).unwrap();
+    state_home
+}
+
 fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket: &Path) -> SpawnedHerdr {
     spawn_server_with_env(config_home, runtime_dir, api_socket, &[])
 }
@@ -76,6 +85,7 @@ fn spawn_server_with_env(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_STATE_HOME", test_state_home(config_home));
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("HERDR_SOCKET_PATH", api_socket);
     cmd.env(
@@ -119,6 +129,7 @@ fn spawn_named_session_server(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_STATE_HOME", test_state_home(config_home));
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("HERDR_SESSION", session_name);
     cmd.env_remove("HERDR_SOCKET_PATH");
@@ -153,6 +164,7 @@ fn spawn_default_session_server(config_home: &Path, runtime_dir: &Path) -> Spawn
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_STATE_HOME", test_state_home(config_home));
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env_remove("HERDR_SESSION");
     cmd.env_remove("HERDR_SOCKET_PATH");

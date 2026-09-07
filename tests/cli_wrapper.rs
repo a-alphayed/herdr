@@ -26,6 +26,15 @@ fn unique_test_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/hcli-{}-{nanos}", std::process::id()))
 }
 
+/// Every test here uses `<base>/config` as `XDG_CONFIG_HOME`, so keep
+/// `XDG_STATE_HOME` at `<base>/state`. Without it a spawned herdr falls back to
+/// the real `~/.local/state/herdr-dev`; `cleanup_test_base` removes both.
+fn test_state_home(config_home: &Path) -> PathBuf {
+    let state_home = config_home.with_file_name("state");
+    fs::create_dir_all(&state_home).unwrap();
+    state_home
+}
+
 fn managed_github_plugin_dir(config_home: &Path) -> PathBuf {
     config_home.join("herdr-dev").join("plugins").join("github")
 }
@@ -177,6 +186,7 @@ fn spawn_named_server(
     command
         .args(["--session", session, "server"])
         .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_STATE_HOME", test_state_home(config_home))
         .env("XDG_RUNTIME_DIR", runtime_dir)
         .env_remove("HERDR_SOCKET_PATH")
         .env_remove("HERDR_CLIENT_SOCKET_PATH")
@@ -223,6 +233,7 @@ fn run_named_cli_with_env_and_socket_override(
     command
         .args(args)
         .env("XDG_CONFIG_HOME", config_home)
+        .env("XDG_STATE_HOME", test_state_home(config_home))
         .env("XDG_RUNTIME_DIR", runtime_dir)
         .env_remove("HERDR_CLIENT_SOCKET_PATH")
         .env_remove("HERDR_ENV");
@@ -293,6 +304,7 @@ fn spawn_herdr_with_config(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_STATE_HOME", test_state_home(config_home));
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("HERDR_SOCKET_PATH", socket_path);
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
@@ -1208,7 +1220,10 @@ fn explicit_client_command_respects_nested_guard() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
         .arg("client")
         .env("HERDR_ENV", "1")
+        // This test passes `base` itself as the config home, so point the state
+        // home at `base/state` directly instead of `test_state_home`.
         .env("XDG_CONFIG_HOME", &base)
+        .env("XDG_STATE_HOME", base.join("state"))
         .env_remove("HERDR_CONFIG_PATH")
         .output()
         .unwrap();

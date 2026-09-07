@@ -22,6 +22,15 @@ fn unique_test_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/hapi-{}-{nanos}", std::process::id()))
 }
 
+/// Every test here uses `<base>/config` as `XDG_CONFIG_HOME`, so keep
+/// `XDG_STATE_HOME` at `<base>/state`. Without it a spawned herdr falls back to
+/// the real `~/.local/state/herdr-dev`; `cleanup_test_base` removes both.
+fn test_state_home(config_home: &Path) -> PathBuf {
+    let state_home = config_home.with_file_name("state");
+    fs::create_dir_all(&state_home).unwrap();
+    state_home
+}
+
 struct SpawnedHerdr {
     _master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -138,6 +147,7 @@ fn spawn_herdr_with_options(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_STATE_HOME", test_state_home(config_home));
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("HERDR_CONFIG_PATH", config_path);
     cmd.env("HERDR_SOCKET_PATH", socket_path);

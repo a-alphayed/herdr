@@ -31,6 +31,15 @@ fn unique_test_dir() -> PathBuf {
     ))
 }
 
+/// Every test here uses `<base>/config` as `XDG_CONFIG_HOME`, so keep
+/// `XDG_STATE_HOME` at `<base>/state`. Without it a spawned herdr falls back to
+/// the real `~/.local/state/herdr-dev`; `cleanup_test_base` removes both.
+fn test_state_home(config_home: &Path) -> PathBuf {
+    let state_home = config_home.with_file_name("state");
+    fs::create_dir_all(&state_home).unwrap();
+    state_home
+}
+
 struct SpawnedHerdr {
     _master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
@@ -108,6 +117,7 @@ fn spawn_server(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_STATE_HOME", test_state_home(config_home));
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("HERDR_SOCKET_PATH", api_socket_path);
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
@@ -152,6 +162,7 @@ fn spawn_herdr_auto(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
     // No subcommand, no --no-session → auto-detect launch
     cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_STATE_HOME", test_state_home(config_home));
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("HERDR_SOCKET_PATH", api_socket_path);
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
@@ -195,6 +206,7 @@ fn spawn_herdr_no_session(
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
     cmd.arg("--no-session");
     cmd.env("XDG_CONFIG_HOME", config_home);
+    cmd.env("XDG_STATE_HOME", test_state_home(config_home));
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
     cmd.env("HERDR_SOCKET_PATH", api_socket_path);
     cmd.env("SHELL", "/bin/sh");
@@ -621,6 +633,7 @@ fn auto_detect_default_socket_path_from_config_dir() {
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", &config_home);
+    cmd.env("XDG_STATE_HOME", test_state_home(&config_home));
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_ENV");
@@ -757,6 +770,7 @@ fn auto_detect_respects_nested_guard_before_auto_attach() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
         .env("XDG_CONFIG_HOME", &config_home)
+        .env("XDG_STATE_HOME", test_state_home(&config_home))
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("HERDR_SOCKET_PATH", &api_socket)
         .env_remove("HERDR_CLIENT_SOCKET_PATH")
