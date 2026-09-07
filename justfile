@@ -2,7 +2,14 @@
 
 # Prevent tests launched from a live Herdr pane from inheriting that server's
 # socket/session authority and accidentally mutating the live workflow.
-herdr-test-env := "env -u HERDR_ENV -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH -u HERDR_CONFIG_PATH -u HERDR_STARTUP_CWD -u HERDR_SESSION -u HERDR_BIN_PATH -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID"
+#
+# The agent-config vars matter for the same reason. Each one overrides $HOME in
+# src/integration/env.rs::config_dir_from_env_or_home, so a test that asserts an
+# agent is *not* installed under a temporary HOME still finds the real config
+# when the surrounding shell exports one. A coding agent running the suite in
+# its own session exports these, so leaving them set makes `just test` fail on a
+# clean tree for reasons that have nothing to do with the code.
+herdr-test-env := "env -u HERDR_ENV -u HERDR_SOCKET_PATH -u HERDR_CLIENT_SOCKET_PATH -u HERDR_CONFIG_PATH -u HERDR_STARTUP_CWD -u HERDR_SESSION -u HERDR_BIN_PATH -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID -u PI_CODING_AGENT_DIR -u CLAUDE_CONFIG_DIR -u CODEX_HOME -u KIMI_CODE_HOME -u COPILOT_HOME -u QODER_CONFIG_DIR -u CURSOR_CONFIG_DIR"
 
 # Run tests
 test:
