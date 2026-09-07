@@ -90,17 +90,28 @@ fn test_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Mirrors `src/config/io.rs::app_dir_name`. A debug test binary spawns a debug
+/// `herdr`, which reads `$XDG_CONFIG_HOME/herdr-dev`, so tests must write their
+/// config under the same name or it is silently ignored.
+fn app_dir_name() -> &'static str {
+    if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    }
+}
+
 fn spawn_server(
     config_home: &Path,
     runtime_dir: &Path,
     api_socket_path: &Path,
     _client_socket_path: &Path,
 ) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join(app_dir_name()).join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -141,11 +152,11 @@ fn spawn_herdr_auto(
     api_socket_path: &Path,
     _client_socket_path: &Path,
 ) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join(app_dir_name()).join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -185,11 +196,11 @@ fn spawn_herdr_no_session(
     runtime_dir: &Path,
     api_socket_path: &Path,
 ) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join(app_dir_name()).join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -603,20 +614,15 @@ fn auto_detect_default_socket_path_from_config_dir() {
 
     // Don't set HERDR_SOCKET_PATH or HERDR_CLIENT_SOCKET_PATH.
     // The default paths should come from the app config directory, not XDG_RUNTIME_DIR.
-    let app_dir_name = if cfg!(debug_assertions) {
-        "herdr-dev"
-    } else {
-        "herdr"
-    };
-    let api_socket = config_home.join(app_dir_name).join("herdr.sock");
-    let client_socket = config_home.join(app_dir_name).join("herdr-client.sock");
+    let api_socket = config_home.join(app_dir_name()).join("herdr.sock");
+    let client_socket = config_home.join(app_dir_name()).join("herdr-client.sock");
 
     // Spawn server with XDG_RUNTIME_DIR set to a different directory to prove it is ignored.
-    fs::create_dir_all(config_home.join(app_dir_name)).unwrap();
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
     register_runtime_dir(&runtime_dir);
     fs::write(
-        config_home.join(app_dir_name).join("config.toml"),
+        config_home.join(app_dir_name()).join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -683,12 +689,7 @@ fn auto_detect_writes_client_and_server_logs_to_separate_files() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
-    let app_dir_name = if cfg!(debug_assertions) {
-        "herdr-dev"
-    } else {
-        "herdr"
-    };
-    let log_dir = config_home.join(app_dir_name);
+    let log_dir = config_home.join(app_dir_name());
     let client_log = log_dir.join("herdr-client.log");
     let server_log = log_dir.join("herdr-server.log");
     let monolith_log = log_dir.join("herdr.log");
@@ -724,12 +725,7 @@ fn no_session_writes_startup_logs_to_monolith_file() {
     let spawned = spawn_herdr_no_session(&config_home, &runtime_dir, &api_socket);
     wait_for_socket(&api_socket, Duration::from_secs(10));
 
-    let app_dir_name = if cfg!(debug_assertions) {
-        "herdr-dev"
-    } else {
-        "herdr"
-    };
-    let log_dir = config_home.join(app_dir_name);
+    let log_dir = config_home.join(app_dir_name());
     let monolith_log = log_dir.join("herdr.log");
 
     wait_for_log_contains(

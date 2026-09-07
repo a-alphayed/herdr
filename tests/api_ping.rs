@@ -122,6 +122,17 @@ fn spawn_herdr_with_shell(
     spawn_herdr_with_options(config_home, runtime_dir, socket_path, None, shell)
 }
 
+/// Mirrors `src/config/io.rs::app_dir_name`. A debug test binary spawns a debug
+/// `herdr`, which reads `$XDG_CONFIG_HOME/herdr-dev`, so tests must write their
+/// config under the same name or it is silently ignored.
+fn app_dir_name() -> &'static str {
+    if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    }
+}
+
 fn spawn_herdr_with_options(
     config_home: &Path,
     runtime_dir: &Path,
@@ -129,7 +140,7 @@ fn spawn_herdr_with_options(
     path_override: Option<&Path>,
     shell: &str,
 ) -> SpawnedHerdr {
-    let config_path = config_home.join("herdr/config.toml");
+    let config_path = config_home.join(app_dir_name()).join("config.toml");
     fs::create_dir_all(config_path.parent().unwrap()).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
@@ -329,7 +340,7 @@ fn server_reload_agent_manifests_reports_runtime_override() {
     let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
     wait_for_socket(&socket_path, Duration::from_secs(5));
 
-    let override_dir = config_home.join("herdr-dev").join("agent-detection");
+    let override_dir = config_home.join(app_dir_name()).join("agent-detection");
     fs::create_dir_all(&override_dir).unwrap();
     let override_path = override_dir.join("codex.toml");
     fs::write(

@@ -95,6 +95,17 @@ fn wait_for_socket(path: &Path, timeout: Duration) {
     panic!("socket did not appear at {}", path.display());
 }
 
+/// Mirrors `src/config/io.rs::app_dir_name`. A debug test binary spawns a debug
+/// `herdr`, which reads `$XDG_CONFIG_HOME/herdr-dev`, so tests must write their
+/// config under the same name or it is silently ignored.
+fn app_dir_name() -> &'static str {
+    if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    }
+}
+
 fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket_path: &Path) -> SpawnedHerdr {
     spawn_server_with_path(config_home, runtime_dir, api_socket_path, None)
 }
@@ -105,11 +116,11 @@ fn spawn_server_with_path(
     api_socket_path: &Path,
     path_override: Option<&Path>,
 ) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join(app_dir_name()).join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -202,12 +213,19 @@ fn ping_socket(socket_path: &Path) -> String {
     response.to_string()
 }
 
-fn workspace_create(socket_path: &Path, label: &str) -> Value {
+/// `workspace.create` defaults to `focus: false`, which leaves the new workspace
+/// in the background behind the default workspace the server seeds on startup.
+/// Client input then goes to the focused workspace, and a background pane never
+/// counts as "seen", so its completed agent status renders as `done` rather than
+/// `idle`. The TUI's own new-workspace action sends `focus: true`
+/// (`src/app/input/navigate.rs`), so a test that drives the workspace it creates
+/// must do the same.
+fn workspace_create(socket_path: &Path, label: &str, focus: bool) -> Value {
     send_json_request(
         socket_path,
         "workspace_create",
         "workspace.create",
-        json!({ "label": label }),
+        json!({ "label": label, "focus": focus }),
     )
 }
 
@@ -703,7 +721,7 @@ fn cross_area_detach_and_reattach_preserves_state() {
     assert!(wait_for_frame(&mut client_a, Duration::from_secs(2)));
 
     // Use herdr: create a workspace and write output into its pane.
-    let create = workspace_create(&api_socket, "cross-ssh-state");
+    let create = workspace_create(&api_socket, "cross-ssh-state", false);
     let workspace_id = create["result"]["workspace"]["workspace_id"]
         .as_str()
         .expect("workspace id")
@@ -795,7 +813,7 @@ fn cross_area_agent_process_survives_detach_and_reattach() {
     client_handshake(&mut client_a, CURRENT_PROTOCOL, 100, 30);
     assert!(wait_for_frame(&mut client_a, Duration::from_secs(2)));
 
-    let created = workspace_create(&api_socket, "agent-persist");
+    let created = workspace_create(&api_socket, "agent-persist", true);
     let pane_id = created["result"]["root_pane"]["pane_id"]
         .as_str()
         .expect("root pane id")
@@ -897,7 +915,7 @@ fn cross_area_client_and_api_workspace_views_are_consistent() {
     let before = workspace_count(&api_socket);
 
     // Create a workspace via API while the client is attached.
-    let created = workspace_create(&api_socket, "api-visible-workspace");
+    let created = workspace_create(&api_socket, "api-visible-workspace", false);
     let created_workspace_id = created["result"]["workspace"]["workspace_id"]
         .as_str()
         .expect("workspace.create should return workspace_id")
@@ -962,7 +980,7 @@ fn cross_area_two_clients_shared_view_and_single_detach_stability() {
     drain_server_messages(&mut client_a, Duration::from_millis(250));
     drain_server_messages(&mut client_b, Duration::from_millis(250));
 
-    let created = workspace_create(&api_socket, "shared-view");
+    let created = workspace_create(&api_socket, "shared-view", true);
     let pane_id = created["result"]["root_pane"]["pane_id"]
         .as_str()
         .expect("root pane id")

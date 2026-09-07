@@ -105,17 +105,28 @@ fn wait_for_file(path: &Path, timeout: Duration) {
     panic!("socket did not accept connections at {}", path.display());
 }
 
+/// Mirrors `src/config/io.rs::app_dir_name`. A debug test binary spawns a debug
+/// `herdr`, which reads `$XDG_CONFIG_HOME/herdr-dev`, so tests must write their
+/// config under the same name or it is silently ignored.
+fn app_dir_name() -> &'static str {
+    if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    }
+}
+
 fn spawn_server(
     config_home: &Path,
     runtime_dir: &Path,
     api_socket_path: &Path,
     _client_socket_path: &Path,
 ) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join(app_dir_name()).join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();

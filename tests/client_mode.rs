@@ -127,11 +127,11 @@ fn spawn_server(
     api_socket_path: &PathBuf,
     _client_socket_path: &PathBuf,
 ) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join(app_dir_name()).join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -348,14 +348,9 @@ fn client_sees_headless_startup_config_diagnostic() {
     let api_socket = runtime_dir.join("herdr.sock");
     let client_socket = runtime_dir.join("herdr-client.sock");
 
-    let app_dir = if cfg!(debug_assertions) {
-        "herdr-dev"
-    } else {
-        "herdr"
-    };
-    fs::create_dir_all(config_home.join(app_dir)).unwrap();
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::write(
-        config_home.join(app_dir).join("config.toml"),
+        config_home.join(app_dir_name()).join("config.toml"),
         "[keys\nprefix = \"ctrl+a\"\n",
     )
     .unwrap();
@@ -435,11 +430,11 @@ fn server_unreachable_shows_clear_error() {
     let runtime_dir = base.join("runtime");
     let api_socket = runtime_dir.join("herdr.sock");
 
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
     register_runtime_dir(&runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join(app_dir_name()).join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -782,9 +777,9 @@ fn client_receives_notify_on_agent_state_change() {
     let client_socket = runtime_dir.join("herdr-client.sock");
 
     // Enable toast and sound in config so the server produces notifications.
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join(app_dir_name()).join("config.toml"),
         "onboarding = false\n[ui.toast]\nenabled = true\n[ui.sound]\nenabled = true\n",
     )
     .unwrap();

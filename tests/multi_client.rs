@@ -111,12 +111,23 @@ fn wait_for_file(path: &Path, timeout: Duration) {
     panic!("socket did not accept connections at {}", path.display());
 }
 
+/// Mirrors `src/config/io.rs::app_dir_name`. A debug test binary spawns a debug
+/// `herdr`, which reads `$XDG_CONFIG_HOME/herdr-dev`, so tests must write their
+/// config under the same name or it is silently ignored.
+fn app_dir_name() -> &'static str {
+    if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    }
+}
+
 fn spawn_server(config_home: &Path, runtime_dir: &Path, api_socket_path: &Path) -> SpawnedHerdr {
-    fs::create_dir_all(config_home.join("herdr")).unwrap();
+    fs::create_dir_all(config_home.join(app_dir_name())).unwrap();
     fs::create_dir_all(runtime_dir).unwrap();
     register_runtime_dir(runtime_dir);
     fs::write(
-        config_home.join("herdr/config.toml"),
+        config_home.join(app_dir_name()).join("config.toml"),
         "onboarding = false\n",
     )
     .unwrap();
@@ -187,12 +198,7 @@ fn spawn_client_process(
 }
 
 fn server_log_path(config_home: &Path) -> PathBuf {
-    let app_dir = if cfg!(debug_assertions) {
-        "herdr-dev"
-    } else {
-        "herdr"
-    };
-    config_home.join(app_dir).join("herdr-server.log")
+    config_home.join(app_dir_name()).join("herdr-server.log")
 }
 
 fn count_log_occurrences(path: &Path, needle: &str) -> usize {
@@ -257,11 +263,20 @@ fn send_json_request(socket_path: &Path, request: &str) -> Value {
     serde_json::from_str(&response).expect("response should be valid JSON")
 }
 
-fn create_workspace_and_root_pane(socket_path: &Path, label: &str) -> (String, String) {
+/// `workspace.create` defaults to `focus: false`, which leaves the new workspace
+/// in the background behind the default workspace the server seeds on startup,
+/// so client input keeps going to the focused workspace instead. The TUI's own
+/// new-workspace action sends `focus: true` (`src/app/input/navigate.rs`), so a
+/// test that drives the pane it creates from a client must do the same.
+fn create_workspace_and_root_pane(
+    socket_path: &Path,
+    label: &str,
+    focus: bool,
+) -> (String, String) {
     let response = send_json_request(
         socket_path,
         &format!(
-            "{{\"id\":\"ws_create\",\"method\":\"workspace.create\",\"params\":{{\"label\":\"{label}\"}}}}"
+            "{{\"id\":\"ws_create\",\"method\":\"workspace.create\",\"params\":{{\"label\":\"{label}\",\"focus\":{focus}}}}}"
         ),
     );
 
@@ -806,7 +821,8 @@ fn multi_client_effective_size_shrinks_when_smaller_client_joins() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_file(&client_socket, Duration::from_secs(10));
 
-    let (_workspace_id, pane_id) = create_workspace_and_root_pane(&api_socket, "size-shrink");
+    let (_workspace_id, pane_id) =
+        create_workspace_and_root_pane(&api_socket, "size-shrink", false);
 
     let mut large = connect_raw_client(&client_socket, 120, 40);
     assert!(wait_for_frame(&mut large, Duration::from_secs(2)));
@@ -844,7 +860,7 @@ fn multi_client_broadcasts_frame_updates_to_all_clients() {
 
     // Ensure we have an active pane that can reflect input changes.
     let (_workspace_id, pane_id) =
-        create_workspace_and_root_pane(&api_socket, "broadcast-client-a-to-b");
+        create_workspace_and_root_pane(&api_socket, "broadcast-client-a-to-b", true);
 
     // Drain initial frames so we measure the frame caused by new input.
     drain_server_messages(&mut client_a, Duration::from_millis(300));
@@ -897,7 +913,7 @@ fn multi_client_disconnect_recalculates_to_next_smallest() {
     wait_for_file(&client_socket, Duration::from_secs(10));
 
     let (_workspace_id, pane_id) =
-        create_workspace_and_root_pane(&api_socket, "size-next-smallest");
+        create_workspace_and_root_pane(&api_socket, "size-next-smallest", false);
 
     let mut c120 = connect_raw_client(&client_socket, 120, 40);
     let mut c100 = connect_raw_client(&client_socket, 100, 30);
@@ -949,7 +965,8 @@ fn multi_client_smallest_leaving_resizes_up_for_remaining_clients() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_file(&client_socket, Duration::from_secs(10));
 
-    let (_workspace_id, pane_id) = create_workspace_and_root_pane(&api_socket, "size-resize-up");
+    let (_workspace_id, pane_id) =
+        create_workspace_and_root_pane(&api_socket, "size-resize-up", false);
 
     let mut large = connect_raw_client(&client_socket, 120, 40);
     let mut small = connect_raw_client(&client_socket, 80, 24);
