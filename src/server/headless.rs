@@ -43,8 +43,8 @@ use crate::ipc::{
     SocketFileIdentity,
 };
 use crate::protocol::{
-    self, AttachScrollDirection, AttachScrollSource, FrameData, ServerMessage, MAX_FRAME_SIZE,
-    MAX_GRAPHICS_FRAME_SIZE,
+    self, AttachScrollDirection, AttachScrollSource, FrameData, ServerMessage, ViewContext,
+    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE,
 };
 #[cfg(unix)]
 use crate::server::client_accept::{
@@ -52,8 +52,9 @@ use crate::server::client_accept::{
 };
 use crate::server::client_transport::ServerEvent;
 use crate::server::clients::{
-    events_include_interaction, latest_app_client, render_targets, terminal_stream_client_ids,
-    ClientConnection, ClientConnectionMode,
+    events_include_interaction, latest_app_client, latest_display_owner_candidate, render_targets,
+    standalone_app_client_present, terminal_stream_client_ids, ClientConnection,
+    ClientConnectionMode,
 };
 use crate::server::keybindings::{app_keybindings, apply_keybindings};
 use crate::server::notifications::{
@@ -204,8 +205,17 @@ pub struct HeadlessServer {
     clients: HashMap<u64, ClientConnection>,
     #[cfg(unix)]
     next_client_id: u64,
-    /// The client currently driving the shared pane runtime size, theme, and input keybindings.
+    /// The display owner: the client driving the shared pane runtime size, the
+    /// shared layout context, theme, outer focus, and notification delivery.
+    ///
+    /// Standalone clients take priority; an embedded (host glass) client owns
+    /// the display only while no standalone full-app client is attached. A
+    /// non-owner's keybindings and view geometry are applied transiently while
+    /// its input is routed, then the owner's are restored.
     foreground_client_id: Option<u64>,
+    /// Most recent full-app client that sent Key/Mouse/Paste/focus-in; clipboard
+    /// writes target this client, falling back to the display owner.
+    last_interaction_client_id: Option<u64>,
     /// Server-owned keybindings, restored when foreground clients use server mode.
     server_keybindings: crate::config::LiveKeybindConfig,
     /// Full server config warning shown to clients that use server keybindings.
@@ -489,6 +499,7 @@ impl HeadlessServer {
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
+            last_interaction_client_id: None,
             server_keybindings,
             server_config_diagnostic,
             server_config_diagnostic_without_keybindings,
@@ -1300,12 +1311,92 @@ impl HeadlessServer {
         )
     }
 
+    /// Whether this client is allowed to own the display.
+    ///
+    /// A standalone client always may. An embedded (host glass) client may only
+    /// when no standalone full-app client is attached, so a glass viewer never
+    /// takes the remote's shared pane size away from a terminal sitting there.
+    /// Embedded clients stay fully input-capable either way.
+    fn client_may_own_display(&self, client_id: u64) -> bool {
+        let Some(client) = self.clients.get(&client_id) else {
+            return false;
+        };
+        if !client.is_full_app_client() {
+            return false;
+        }
+        match client.view_context() {
+            ViewContext::Standalone => true,
+            ViewContext::Embedded => !standalone_app_client_present(&self.clients, Some(client_id)),
+        }
+    }
+
+    /// Applies a non-owner client's keybindings and recomputes the shared view
+    /// at that client's own size and layout context, so its keys resolve with
+    /// its own bindings and its mouse coordinates hit-test against the layout it
+    /// is actually looking at. Never resizes pane runtimes.
+    fn prepare_non_owner_client_for_input(&mut self, client_id: u64) {
+        let Some(client) = self.clients.get(&client_id) else {
+            return;
+        };
+        let keybindings = client
+            .keybindings
+            .as_deref()
+            .unwrap_or(&self.server_keybindings)
+            .clone();
+        let (cols, rows) = client.terminal_size;
+        let view_context = client.view_context();
+        apply_keybindings(&mut self.app, &keybindings);
+        crate::ui::compute_view_with_context(
+            &mut self.app.state,
+            &self.app.terminal_runtimes,
+            Rect::new(0, 0, cols, rows),
+            false,
+            crate::kitty_graphics::HostCellSize::default(),
+            view_context,
+        );
+    }
+
+    /// Recomputes the display owner's view after a non-owner client's input was
+    /// routed against its own geometry. Pane runtimes are left alone; only the
+    /// view geometry is restored.
+    fn restore_display_owner_view_without_resize(&mut self) {
+        let Some(client_id) = self.foreground_client_id else {
+            return;
+        };
+        let Some(client) = self.clients.get(&client_id) else {
+            return;
+        };
+        let view_context = client.view_context();
+        let cell_size = if self.app.state.kitty_graphics_enabled && client.cell_size.is_known() {
+            client.cell_size
+        } else {
+            crate::kitty_graphics::HostCellSize::default()
+        };
+        let (cols, rows) = self.effective_size;
+        crate::ui::compute_view_with_context(
+            &mut self.app.state,
+            &self.app.terminal_runtimes,
+            Rect::new(0, 0, cols, rows),
+            false,
+            cell_size,
+            view_context,
+        );
+    }
+
     fn promote_client_to_foreground(&mut self, client_id: u64) -> bool {
         let stamp = self.allocate_activity_stamp();
         let Some(client) = self.clients.get_mut(&client_id) else {
             return false;
         };
         client.last_activity = stamp;
+
+        if !self.client_may_own_display(client_id) {
+            debug!(
+                client_id,
+                "embedded client interaction does not take the display"
+            );
+            return false;
+        }
 
         let changed = self.foreground_client_id != Some(client_id);
         self.foreground_client_id = Some(client_id);
@@ -1314,7 +1405,7 @@ impl HeadlessServer {
     }
 
     fn promote_latest_remaining_client(&mut self) -> bool {
-        let next_foreground = latest_app_client(&self.clients);
+        let next_foreground = latest_display_owner_candidate(&self.clients);
         let changed = next_foreground != self.foreground_client_id;
         self.foreground_client_id = next_foreground;
         self.sync_foreground_client_state();
@@ -1334,6 +1425,9 @@ impl HeadlessServer {
 
     fn remove_client(&mut self, client_id: u64) -> bool {
         let was_foreground = self.foreground_client_id == Some(client_id);
+        if self.last_interaction_client_id == Some(client_id) {
+            self.last_interaction_client_id = None;
+        }
         self.send_client_graphics_cleanup(client_id);
         let removed = self.clients.remove(&client_id);
         if let Some(removed) = removed {
@@ -1942,9 +2036,10 @@ impl HeadlessServer {
         match &ev {
             AppEvent::ClipboardWrite { content } => {
                 // Clipboard writes are client-local side effects. Forward them only to
-                // the foreground client instead of broadcasting to every attached client.
+                // the client that last interacted (falling back to the display owner)
+                // instead of broadcasting to every attached client.
                 let data = base64::engine::general_purpose::STANDARD.encode(content.as_slice());
-                if self.send_to_foreground_client(ServerMessage::Clipboard { data }) {
+                if self.send_to_interaction_client(ServerMessage::Clipboard { data }) {
                     self.app.show_clipboard_feedback();
                 }
                 true
@@ -1957,7 +2052,7 @@ impl HeadlessServer {
             } => {
                 // Preserve the nested glass connection's authority tags until
                 // immediately before the headless server forwards the local
-                // clipboard side effect to its foreground client.
+                // clipboard side effect to its interacting client.
                 if !self.app.host_glass_runtime.clipboard_provenance_is_current(
                     &self.app.state,
                     host,
@@ -1967,7 +2062,7 @@ impl HeadlessServer {
                     return false;
                 }
                 let data = base64::engine::general_purpose::STANDARD.encode(content.as_slice());
-                if self.send_to_foreground_client(ServerMessage::Clipboard { data }) {
+                if self.send_to_interaction_client(ServerMessage::Clipboard { data }) {
                     self.app.show_clipboard_feedback();
                 }
                 true
@@ -2341,6 +2436,24 @@ impl HeadlessServer {
         self.send_to_client(client_id, msg)
     }
 
+    /// Sends a client-local side effect to the client that most recently
+    /// interacted, falling back to the display owner. Copy results must return
+    /// to whoever asked for them, including a non-owner host glass viewer.
+    fn send_to_interaction_client(&mut self, msg: ServerMessage) -> bool {
+        let target = self
+            .last_interaction_client_id
+            .filter(|client_id| {
+                self.clients
+                    .get(client_id)
+                    .is_some_and(|client| client.writer.is_some())
+            })
+            .or(self.foreground_client_id);
+        let Some(client_id) = target else {
+            return false;
+        };
+        self.send_to_client(client_id, msg)
+    }
+
     /// Sends a message to a specific client. Returns false if the client
     /// was not found or the send failed (client removed).
     fn send_to_client(&mut self, client_id: u64, msg: ServerMessage) -> bool {
@@ -2542,6 +2655,9 @@ impl HeadlessServer {
         }
         self.update_client_outer_focus_from_events(client_id, &events);
         let interaction = events_include_interaction(&events);
+        if interaction {
+            self.last_interaction_client_id = Some(client_id);
+        }
         let foreground_changed = if interaction {
             self.promote_client_to_foreground(client_id)
         } else {
@@ -2549,6 +2665,11 @@ impl HeadlessServer {
         };
         if foreground_changed {
             self.resize_shared_runtime_to_effective_size_before_input();
+        } else if interaction && self.foreground_client_id != Some(client_id) {
+            // A client that does not own the display still routes its own input.
+            // Apply its keybindings and its view geometry for the duration of the
+            // routing, without touching the shared pane sizes.
+            self.prepare_non_owner_client_for_input(client_id);
         }
         let theme_changed = self.update_client_host_theme_from_events(client_id, &events);
         self.app
@@ -2557,6 +2678,11 @@ impl HeadlessServer {
             self.reload_server_config(false);
         } else {
             self.sync_foreground_client_state();
+        }
+        if interaction && self.foreground_client_id != Some(client_id) {
+            // `sync_foreground_client_state` restored the owner's keybindings,
+            // size, and theme; the owner's view geometry still has to follow.
+            self.restore_display_owner_view_without_resize();
         }
 
         if self.app.state.detach_requested {
@@ -2643,7 +2769,7 @@ impl HeadlessServer {
                         Some(writer),
                     ),
                 );
-                if !direct_attach_requested {
+                if !direct_attach_requested && self.client_may_own_display(client_id) {
                     self.foreground_client_id = Some(client_id);
                 }
                 if first_app_client {
@@ -2839,8 +2965,14 @@ impl HeadlessServer {
                         height_px: cell_height_px,
                     };
                 }
-                self.promote_client_to_foreground(client_id);
-                self.resize_shared_runtime_to_effective_size();
+                if self.client_may_own_display(client_id) {
+                    self.promote_client_to_foreground(client_id);
+                    self.resize_shared_runtime_to_effective_size();
+                } else if let Some(client) = self.clients.get_mut(&client_id) {
+                    // A non-owner resize only changes what that client is sent;
+                    // the shared pane runtimes stay at the owner's size.
+                    client.request_full_redraw();
+                }
                 true
             }
             ServerEvent::ClientDetach { client_id } => {
@@ -4452,6 +4584,7 @@ mod tests {
             #[cfg(unix)]
             next_client_id: 1,
             foreground_client_id: None,
+            last_interaction_client_id: None,
             server_keybindings,
             server_config_diagnostic: None,
             server_config_diagnostic_without_keybindings: None,
@@ -7041,6 +7174,502 @@ next_tab = ""
         assert_eq!(server.foreground_client_id, Some(1));
         assert_eq!(server.clients[&1].outer_terminal_focus, Some(true));
         assert_eq!(server.app.state.outer_terminal_focus, Some(true));
+    }
+
+    fn connect_app_client(
+        server: &mut HeadlessServer,
+        client_id: u64,
+        (cols, rows): (u16, u16),
+        view_context: crate::protocol::ViewContext,
+        keybindings: Option<Box<crate::config::LiveKeybindConfig>>,
+        writer: ClientWriter,
+    ) -> bool {
+        server.handle_server_event(ServerEvent::ClientConnected {
+            client_id,
+            cols,
+            rows,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::SemanticFrame,
+            view_context,
+            keybindings,
+            direct_attach_requested: false,
+            writer,
+        })
+    }
+
+    #[test]
+    fn embedded_connect_with_standalone_present_keeps_display_owner() {
+        let mut server = test_headless_server();
+        let (writer_a, _control_a, _render_a) = test_client_writer();
+        let (writer_b, _control_b, _render_b) = test_client_writer();
+
+        assert!(connect_app_client(
+            &mut server,
+            1,
+            (160, 45),
+            crate::protocol::ViewContext::Standalone,
+            None,
+            writer_a,
+        ));
+        assert!(connect_app_client(
+            &mut server,
+            2,
+            (100, 30),
+            crate::protocol::ViewContext::Embedded,
+            None,
+            writer_b,
+        ));
+
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.effective_size, (160, 45));
+        assert!(
+            server.clients[&2].last_activity > server.clients[&1].last_activity,
+            "the embedded client is still the most recently attached client"
+        );
+    }
+
+    #[test]
+    fn embedded_input_keeps_display_owner_and_records_interaction() {
+        let mut server = test_headless_server();
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let (writer_a, _control_a, _render_a) = test_client_writer();
+        let (writer_b, _control_b, _render_b) = test_client_writer();
+
+        assert!(connect_app_client(
+            &mut server,
+            1,
+            (160, 45),
+            crate::protocol::ViewContext::Standalone,
+            None,
+            writer_a,
+        ));
+        assert!(connect_app_client(
+            &mut server,
+            2,
+            (100, 30),
+            crate::protocol::ViewContext::Embedded,
+            None,
+            writer_b,
+        ));
+
+        server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 2,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('x'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+            }],
+        });
+
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.effective_size, (160, 45));
+        assert_eq!(server.last_interaction_client_id, Some(2));
+    }
+
+    #[test]
+    fn embedded_resize_does_not_change_effective_size() {
+        let mut server = test_headless_server();
+        let (writer_a, _control_a, _render_a) = test_client_writer();
+        let (writer_b, _control_b, _render_b) = test_client_writer();
+
+        assert!(connect_app_client(
+            &mut server,
+            1,
+            (160, 45),
+            crate::protocol::ViewContext::Standalone,
+            None,
+            writer_a,
+        ));
+        assert!(connect_app_client(
+            &mut server,
+            2,
+            (100, 30),
+            crate::protocol::ViewContext::Embedded,
+            None,
+            writer_b,
+        ));
+
+        assert!(server.handle_server_event(ServerEvent::ClientResize {
+            client_id: 2,
+            cols: 120,
+            rows: 35,
+            cell_width_px: 0,
+            cell_height_px: 0,
+        }));
+
+        assert_eq!(server.clients[&2].terminal_size, (120, 35));
+        assert_eq!(server.effective_size, (160, 45));
+        assert_eq!(server.foreground_client_id, Some(1));
+    }
+
+    #[test]
+    fn embedded_only_client_owns_display_at_its_size() {
+        let mut server = test_headless_server();
+        let (writer_b, _control_b, _render_b) = test_client_writer();
+
+        assert!(connect_app_client(
+            &mut server,
+            2,
+            (100, 30),
+            crate::protocol::ViewContext::Embedded,
+            None,
+            writer_b,
+        ));
+
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert_eq!(server.effective_size, (100, 30));
+    }
+
+    #[test]
+    fn standalone_connect_takes_display_from_embedded_owner() {
+        let mut server = test_headless_server();
+        let (writer_a, _control_a, _render_a) = test_client_writer();
+        let (writer_b, _control_b, _render_b) = test_client_writer();
+
+        assert!(connect_app_client(
+            &mut server,
+            2,
+            (100, 30),
+            crate::protocol::ViewContext::Embedded,
+            None,
+            writer_b,
+        ));
+        assert_eq!(server.foreground_client_id, Some(2));
+
+        assert!(connect_app_client(
+            &mut server,
+            1,
+            (160, 45),
+            crate::protocol::ViewContext::Standalone,
+            None,
+            writer_a,
+        ));
+
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.effective_size, (160, 45));
+    }
+
+    #[test]
+    fn standalone_disconnect_promotes_remaining_embedded() {
+        let mut server = test_headless_server();
+        let (writer_a, _control_a, _render_a) = test_client_writer();
+        let (writer_b, _control_b, _render_b) = test_client_writer();
+
+        assert!(connect_app_client(
+            &mut server,
+            2,
+            (100, 30),
+            crate::protocol::ViewContext::Embedded,
+            None,
+            writer_b,
+        ));
+        assert!(connect_app_client(
+            &mut server,
+            1,
+            (160, 45),
+            crate::protocol::ViewContext::Standalone,
+            None,
+            writer_a,
+        ));
+        assert_eq!(server.foreground_client_id, Some(1));
+
+        assert!(server.remove_client(1));
+
+        assert_eq!(server.foreground_client_id, Some(2));
+        assert_eq!(server.effective_size, (100, 30));
+    }
+
+    #[test]
+    fn non_owner_embedded_input_uses_own_keybindings_then_restores_owner() {
+        let mut server = test_headless_server();
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let (server_prefix_code, server_prefix_mods) = server.server_keybindings.prefix;
+        let server_prefix_wire_code =
+            crate::protocol::ClientKeyCode::from_crossterm(server_prefix_code)
+                .expect("server prefix key is representable on the wire");
+
+        let local_config: crate::config::Config = toml::from_str(
+            r#"
+[keys]
+prefix = "ctrl+a"
+new_tab = "prefix+t"
+"#,
+        )
+        .unwrap();
+        let local_keybindings = local_config.live_keybinds().unwrap();
+        assert_ne!(
+            local_keybindings.prefix.0, server_prefix_code,
+            "the owner and the glass client must disagree about the prefix key"
+        );
+        let (writer_a, _control_a, _render_a) = test_client_writer();
+        let (writer_b, _control_b, _render_b) = test_client_writer();
+
+        assert!(connect_app_client(
+            &mut server,
+            1,
+            (160, 45),
+            crate::protocol::ViewContext::Standalone,
+            Some(Box::new(local_keybindings)),
+            writer_a,
+        ));
+        assert!(connect_app_client(
+            &mut server,
+            2,
+            (100, 30),
+            crate::protocol::ViewContext::Embedded,
+            None,
+            writer_b,
+        ));
+        assert_eq!(
+            server.app.state.prefix_code,
+            crossterm::event::KeyCode::Char('a')
+        );
+
+        server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 2,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: server_prefix_wire_code,
+                modifiers: server_prefix_mods.bits(),
+                kind: crate::protocol::ClientKeyKind::Press,
+            }],
+        });
+
+        assert_eq!(
+            server.app.state.mode,
+            crate::app::Mode::Prefix,
+            "the glass client's own prefix key must be live while its input is routed"
+        );
+        assert_eq!(
+            server.app.state.prefix_code,
+            crossterm::event::KeyCode::Char('a'),
+            "the display owner's keybindings must be restored after routing"
+        );
+        assert_eq!(server.foreground_client_id, Some(1));
+    }
+
+    #[test]
+    fn clipboard_write_targets_last_interacting_client() {
+        let mut server = test_headless_server();
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let (writer_a, owner_control_rx, _render_a) = test_client_writer();
+        let (writer_b, glass_control_rx, _render_b) = test_client_writer();
+
+        assert!(connect_app_client(
+            &mut server,
+            1,
+            (160, 45),
+            crate::protocol::ViewContext::Standalone,
+            None,
+            writer_a,
+        ));
+        assert!(connect_app_client(
+            &mut server,
+            2,
+            (100, 30),
+            crate::protocol::ViewContext::Embedded,
+            None,
+            writer_b,
+        ));
+        assert_eq!(server.foreground_client_id, Some(1));
+
+        server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 2,
+            events: vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('x'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+            }],
+        });
+        assert_eq!(server.last_interaction_client_id, Some(2));
+
+        assert!(
+            server.handle_internal_event_with_forwarding(AppEvent::ClipboardWrite {
+                content: b"test".to_vec(),
+            })
+        );
+
+        let mut glass_clipboard = None;
+        while let Ok(message) = glass_control_rx.recv_timeout(Duration::from_millis(50)) {
+            if let ServerMessage::Clipboard { data } = read_server_message(message) {
+                glass_clipboard = Some(data);
+                break;
+            }
+        }
+        assert_eq!(glass_clipboard.as_deref(), Some("dGVzdA=="));
+
+        while let Ok(message) = owner_control_rx.recv_timeout(Duration::from_millis(50)) {
+            if let ServerMessage::Clipboard { .. } = read_server_message(message) {
+                panic!("the display owner must not receive the glass client's copy");
+            }
+        }
+    }
+
+    #[test]
+    fn non_owner_embedded_click_focuses_pane_in_its_own_layout() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("t");
+        let first_pane = workspace.focused_pane_id().expect("focused pane");
+        let second_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let (writer_a, _control_a, _render_a) = test_client_writer();
+        let (writer_b, _control_b, _render_b) = test_client_writer();
+        assert!(connect_app_client(
+            &mut server,
+            1,
+            (160, 45),
+            crate::protocol::ViewContext::Standalone,
+            None,
+            writer_a,
+        ));
+        assert!(connect_app_client(
+            &mut server,
+            2,
+            (100, 30),
+            crate::protocol::ViewContext::Embedded,
+            None,
+            writer_b,
+        ));
+
+        let focused_before = server.app.state.workspaces[0]
+            .focused_pane_id()
+            .expect("focused pane");
+        let target_pane = if focused_before == first_pane {
+            second_pane
+        } else {
+            first_pane
+        };
+
+        // Read the target pane's position in the client's own embedded layout,
+        // which is the geometry its mouse coordinates were produced against.
+        crate::ui::compute_view_with_context(
+            &mut server.app.state,
+            &server.app.terminal_runtimes,
+            Rect::new(0, 0, 100, 30),
+            false,
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::protocol::ViewContext::Embedded,
+        );
+        let target_rect = server
+            .app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == target_pane)
+            .expect("target pane geometry in the embedded layout")
+            .inner_rect;
+        assert!(target_rect.width > 0 && target_rect.height > 0);
+
+        server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 2,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Left,
+                ),
+                column: target_rect.x,
+                row: target_rect.y,
+                modifiers: 0,
+            }],
+        });
+
+        assert_eq!(
+            server.app.state.workspaces[0].focused_pane_id(),
+            Some(target_pane),
+            "the glass client's click must hit-test against its own layout"
+        );
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.effective_size, (160, 45));
+    }
+
+    #[tokio::test]
+    async fn non_owner_embedded_click_bytes_reach_focused_runtime() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("t");
+        let pane_id = workspace.focused_pane_id().expect("focused pane");
+        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        runtime.test_process_pty_bytes(b"\x1b[?1000h\x1b[?1006h");
+        workspace.insert_test_runtime(pane_id, runtime);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+
+        let (writer_a, _control_a, _render_a) = test_client_writer();
+        let (writer_b, _control_b, _render_b) = test_client_writer();
+        assert!(connect_app_client(
+            &mut server,
+            1,
+            (160, 45),
+            crate::protocol::ViewContext::Standalone,
+            None,
+            writer_a,
+        ));
+        assert!(connect_app_client(
+            &mut server,
+            2,
+            (100, 30),
+            crate::protocol::ViewContext::Embedded,
+            None,
+            writer_b,
+        ));
+
+        crate::ui::compute_view_with_context(
+            &mut server.app.state,
+            &server.app.terminal_runtimes,
+            Rect::new(0, 0, 100, 30),
+            false,
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::protocol::ViewContext::Embedded,
+        );
+        let pane_rect = server
+            .app
+            .state
+            .pane_info_by_id(pane_id)
+            .expect("pane geometry in the embedded layout")
+            .inner_rect;
+        let pty_size_before = server
+            .app
+            .state
+            .runtime_for_pane(&server.app.terminal_runtimes, pane_id)
+            .expect("pane runtime")
+            .current_size();
+
+        server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 2,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Left,
+                ),
+                column: pane_rect.x + 1,
+                row: pane_rect.y + 1,
+                modifiers: 0,
+            }],
+        });
+
+        let bytes = input_rx.try_recv().expect("glass click reaches the pty");
+        assert!(
+            bytes.starts_with(b"\x1b[<0;"),
+            "expected an SGR mouse press, got {bytes:?}"
+        );
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(server.effective_size, (160, 45));
+        assert_eq!(
+            server
+                .app
+                .state
+                .runtime_for_pane(&server.app.terminal_runtimes, pane_id)
+                .expect("pane runtime")
+                .current_size(),
+            pty_size_before,
+            "a non-owner click must not resize the pty"
+        );
+
+        shutdown_test_runtimes(&mut server);
     }
 
     #[test]

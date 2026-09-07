@@ -275,6 +275,43 @@ pub(crate) fn latest_app_client(clients: &HashMap<u64, ClientConnection>) -> Opt
         .map(|(&client_id, _)| client_id)
 }
 
+/// Whether a live standalone full-app client is attached, optionally ignoring
+/// one client id. Standalone clients outrank embedded (host glass) viewers for
+/// display ownership, so this is the gate an embedded client must fail to take
+/// the shared pane size.
+pub(crate) fn standalone_app_client_present(
+    clients: &HashMap<u64, ClientConnection>,
+    except: Option<u64>,
+) -> bool {
+    clients.iter().any(|(&client_id, client)| {
+        Some(client_id) != except
+            && client.is_full_app_client()
+            && client.view_context() == ViewContext::Standalone
+            && client.writer.is_some()
+    })
+}
+
+/// Picks the client that should own the display: the latest-active live
+/// standalone full-app client, falling back to the latest-active live embedded
+/// one when no standalone client is attached (the remote-with-no-terminal glass
+/// case), and finally to [`latest_app_client`] so writer-less connections keep
+/// their existing behaviour.
+pub(crate) fn latest_display_owner_candidate(
+    clients: &HashMap<u64, ClientConnection>,
+) -> Option<u64> {
+    let live_app_clients = || {
+        clients
+            .iter()
+            .filter(|(_, client)| client.is_full_app_client() && client.writer.is_some())
+    };
+    live_app_clients()
+        .filter(|(_, client)| client.view_context() == ViewContext::Standalone)
+        .max_by_key(|(_, client)| client.last_activity)
+        .or_else(|| live_app_clients().max_by_key(|(_, client)| client.last_activity))
+        .map(|(&client_id, _)| client_id)
+        .or_else(|| latest_app_client(clients))
+}
+
 pub(crate) fn terminal_stream_client_ids(
     clients: &HashMap<u64, ClientConnection>,
     terminal_id: &str,

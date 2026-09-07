@@ -21,6 +21,7 @@
 - Removed the old remote workspace projection view and its routed remote layout-mutation commands; remote hosts are now viewed through the host glass.
 
 ### Fixed
+- Host glass viewers no longer take the remote's pane size while a terminal is attached there; pane sizes stop flapping and the remote's terminal keeps display ownership. Glass still sizes the remote when no terminal is attached.
 - `prefix+e` scrollback editor panes now open on Windows without trying to run `/bin/sh`; Windows uses `VISUAL`, then `EDITOR`, then `notepad.exe` as the fallback editor. (#914)
 - `herdr pane split --current` now resolves to the calling Herdr pane instead of the UI-focused pane when run inside a pane. (#902)
 - Native Windows clients running inside Alacritty now preserve mouse reports and `ctrl+j` input instead of leaking mouse escape sequences into panes. `shift+enter` remains dependent on whether the outer terminal reports it as a distinct modified Enter key. (#792)
