@@ -7672,6 +7672,233 @@ new_tab = "prefix+t"
         shutdown_test_runtimes(&mut server);
     }
 
+    /// Selects a remote host on this host's own sidebar so the glass surface is
+    /// active at the App level, the way the two combined-context tests below
+    /// need it. Returns the selected host key.
+    fn select_remote_glass_source(
+        server: &mut HeadlessServer,
+    ) -> crate::remote_source::RemoteHostKey {
+        let host = crate::remote_source::RemoteHostKey::new(
+            "remote-a",
+            crate::session::DEFAULT_SESSION_NAME,
+        );
+        server.app.state.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        server
+            .app
+            .state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(host.clone()));
+        host
+    }
+
+    #[test]
+    fn embedded_non_owner_mouse_click_routes_to_local_pane_when_remote_selected() {
+        // Both fixes are load-bearing here, and neither could have this test on
+        // its own. Display ownership gives a non-owner embedded client its own
+        // input-routing pass against its own geometry without touching the
+        // shared pane sizes; glass-does-not-nest is what puts this host's LOCAL
+        // panes into that geometry while this host itself has a remote
+        // selected. Without the second, the 100x30 embedded layout is a glass
+        // surface with no local hit targets and the click cannot move focus.
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("t");
+        let first_pane = workspace.focused_pane_id().expect("focused pane");
+        let second_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        // `test_split` focuses the new pane; start on the first one so a click
+        // into the second is an observable focus change.
+        workspace.tabs[0].layout.focus_pane(first_pane);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let host = select_remote_glass_source(&mut server);
+
+        let (writer_a, _control_a, _render_a) = test_client_writer();
+        let (writer_b, _control_b, _render_b) = test_client_writer();
+        assert!(connect_app_client(
+            &mut server,
+            1,
+            (160, 45),
+            crate::protocol::ViewContext::Standalone,
+            None,
+            writer_a,
+        ));
+        assert!(connect_app_client(
+            &mut server,
+            2,
+            (100, 30),
+            crate::protocol::ViewContext::Embedded,
+            None,
+            writer_b,
+        ));
+        assert_eq!(server.foreground_client_id, Some(1));
+        assert_eq!(
+            server.app.state.workspaces[0].focused_pane_id(),
+            Some(first_pane)
+        );
+
+        // The glass viewer's mouse coordinates are produced against its own
+        // 100x30 embedded layout, which presents this host's local panes.
+        crate::ui::compute_view_with_context(
+            &mut server.app.state,
+            &server.app.terminal_runtimes,
+            Rect::new(0, 0, 100, 30),
+            false,
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::protocol::ViewContext::Embedded,
+        );
+        assert!(
+            server.app.state.host_glass_surface_active(),
+            "this host still owns a remote selection"
+        );
+        assert!(
+            !server.app.state.host_glass_presented(),
+            "an embedded render never presents a nested glass"
+        );
+        let target_rect = server
+            .app
+            .state
+            .view
+            .pane_infos
+            .iter()
+            .find(|info| info.id == second_pane)
+            .expect("second pane geometry in the embedded layout")
+            .inner_rect;
+        assert!(target_rect.width > 0 && target_rect.height > 0);
+
+        server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 2,
+            events: vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Down(
+                    crate::protocol::ClientMouseButton::Left,
+                ),
+                column: target_rect.x,
+                row: target_rect.y,
+                modifiers: 0,
+            }],
+        });
+
+        assert_eq!(
+            server.app.state.workspaces[0].focused_pane_id(),
+            Some(second_pane),
+            "the glass viewer's click hit-tests against its own embedded layout"
+        );
+        assert_eq!(
+            server.foreground_client_id,
+            Some(1),
+            "the human terminal on this host keeps the display"
+        );
+        assert_eq!(server.effective_size, (160, 45));
+        assert_eq!(
+            server.app.state.sidebar_source,
+            crate::app::state::SidebarSource::Remote(host),
+            "an embedded viewer's click must never disturb this host's own selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedded_non_owner_exit_chord_and_keys_stay_local_when_remote_selected() {
+        // The glass-exit chord belongs to the viewer's own App. Reaching this
+        // host as an embedded client's key, it is an ordinary key: it must be
+        // forwarded to the local pane and must never deselect the viewed host's
+        // own remote source. Ownership stays with the standalone terminal
+        // throughout, so the chord also proves the non-owner routing pass does
+        // not leak a glass decision into the owner's state.
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("t");
+        let pane_id = workspace.focused_pane_id().expect("focused pane");
+        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        workspace.insert_test_runtime(pane_id, runtime);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = crate::app::Mode::Terminal;
+        let host = select_remote_glass_source(&mut server);
+
+        let (writer_a, _control_a, _render_a) = test_client_writer();
+        let (writer_b, _control_b, _render_b) = test_client_writer();
+        assert!(connect_app_client(
+            &mut server,
+            1,
+            (160, 45),
+            crate::protocol::ViewContext::Standalone,
+            None,
+            writer_a,
+        ));
+        assert!(connect_app_client(
+            &mut server,
+            2,
+            (100, 30),
+            crate::protocol::ViewContext::Embedded,
+            None,
+            writer_b,
+        ));
+        assert_eq!(server.foreground_client_id, Some(1));
+
+        let (exit_code, exit_mods) = server
+            .app
+            .state
+            .keybinds
+            .host_glass_exit
+            .bindings
+            .first()
+            .expect("host glass exit has exactly one direct default chord")
+            .trigger
+            .combo();
+        assert_eq!(
+            (exit_code, exit_mods),
+            (
+                crossterm::event::KeyCode::F(12),
+                crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::SHIFT
+            ),
+            "default host glass exit chord is ctrl+shift+f12"
+        );
+        let exit_wire_code = crate::protocol::ClientKeyCode::from_crossterm(exit_code)
+            .expect("the exit chord key is representable on the wire");
+
+        server.handle_server_event(ServerEvent::ClientInputEvents {
+            client_id: 2,
+            events: vec![
+                crate::protocol::ClientInputEvent::Key {
+                    code: exit_wire_code,
+                    modifiers: exit_mods.bits(),
+                    kind: crate::protocol::ClientKeyKind::Press,
+                },
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('z'),
+                    modifiers: 0,
+                    kind: crate::protocol::ClientKeyKind::Press,
+                },
+            ],
+        });
+
+        assert_eq!(
+            server.app.state.sidebar_source,
+            crate::app::state::SidebarSource::Remote(host),
+            "an embedded viewer must never deselect the viewed host's own remote source"
+        );
+
+        let mut delivered = Vec::new();
+        while let Ok(bytes) = input_rx.try_recv() {
+            delivered.extend_from_slice(&bytes);
+        }
+        assert!(
+            delivered.contains(&b'z'),
+            "the printable key reaches this host's focused local runtime, got {delivered:?}"
+        );
+
+        assert_eq!(
+            server.foreground_client_id,
+            Some(1),
+            "the human terminal on this host keeps the display"
+        );
+        assert_eq!(server.effective_size, (160, 45));
+
+        shutdown_test_runtimes(&mut server);
+    }
+
     #[test]
     fn foreground_client_focus_event_updates_app_focus_state() {
         let mut server = test_headless_server();
