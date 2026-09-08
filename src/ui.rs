@@ -1687,15 +1687,17 @@ test in the suite would fail. If you need to suppress the rail for a reason that
         assert_eq!(app.view.tab_bar_rect, Rect::default());
         // Main area starts right after the rail-plus-panel sidebar
         // (a rail width wider than the panel alone).
-        assert_eq!(single_tab_terminal_area, Rect::new(36, 0, 44, 20));
+        let main_x = DEFAULT_HOST_RAIL_WIDTH + 26;
+        let main_w = 80 - main_x;
+        assert_eq!(single_tab_terminal_area, Rect::new(main_x, 0, main_w, 20));
         assert!(app.view.tab_hit_areas.is_empty());
         assert_eq!(app.view.new_tab_hit_area, Rect::default());
 
         app.workspaces[0].test_add_tab(Some("logs"));
         compute_view(&mut app, Rect::new(0, 0, 80, 20));
 
-        assert_eq!(app.view.tab_bar_rect, Rect::new(36, 0, 44, 1));
-        assert_eq!(app.view.terminal_area, Rect::new(36, 1, 44, 19));
+        assert_eq!(app.view.tab_bar_rect, Rect::new(main_x, 0, main_w, 1));
+        assert_eq!(app.view.terminal_area, Rect::new(main_x, 1, main_w, 19));
         assert_eq!(app.view.tab_hit_areas.len(), 2);
         assert!(app.view.tab_hit_areas.iter().all(|rect| rect.width > 0));
         assert!(app.view.new_tab_hit_area.width > 0);
@@ -1739,11 +1741,12 @@ test in the suite would fail. If you need to suppress the rail for a reason that
         let one_tab_size = app.workspaces[0].tabs[0].runtimes[&one_tab_pane].current_size();
         let two_tab_size =
             app.workspaces[1].tabs[background_tab].runtimes[&two_tab_pane].current_size();
-        // Column width shrinks by the rail's fixed width versus the
-        // pre-rail expectation; row counts are unaffected (the rail only
-        // consumes columns).
-        assert_eq!(one_tab_size, (20, 43));
-        assert_eq!(two_tab_size, (19, 43));
+        // Column width shrinks by the rail's width versus the pre-rail
+        // expectation; row counts are unaffected (the rail only consumes
+        // columns).
+        let cols = 53 - DEFAULT_HOST_RAIL_WIDTH;
+        assert_eq!(one_tab_size, (20, cols));
+        assert_eq!(two_tab_size, (19, cols));
     }
 
     #[tokio::test]
@@ -1853,15 +1856,29 @@ test in the suite would fail. If you need to suppress the rail for a reason that
         assert_eq!(app.view.sidebar_rect.width, host_rail_width(&app) + 22);
     }
 
-    /// Fresh state must still lay out exactly as the old fixed-width rail did,
-    /// so the default rail width can never drift from the released geometry.
+    /// Adopting upstream's `[" "][marker][" "]` row prefix spends 2 more
+    /// columns of chrome than the leading-marker rail did, so the default grows
+    /// by the same 2 to hold label room steady. A default rail keeps the 8
+    /// label columns it shows today — the alignment is paid for by the rail,
+    /// not out of the host names. (11 would instead restore the original fixed
+    /// rail's 7.)
     #[test]
-    fn default_host_rail_width_matches_the_previous_fixed_width() {
+    fn default_host_rail_width_holds_label_room_steady() {
         let app = crate::app::state::AppState::test_new();
 
         assert_eq!(app.host_rail_width, DEFAULT_HOST_RAIL_WIDTH);
-        assert_eq!(host_rail_width(&app), 10);
+        assert_eq!(host_rail_width(&app), 12);
+
+        // Content columns minus the row prefix, with no scrollbar showing. The
+        // leading-marker rail spent 2 chrome columns at width 10.
+        const LABEL_COLUMNS_BEFORE: u16 = 10 - 2;
+        let label_columns = DEFAULT_HOST_RAIL_WIDTH - 1 - HOST_ROW_LABEL_OFFSET_FOR_TEST;
+        assert_eq!(label_columns, LABEL_COLUMNS_BEFORE);
     }
+
+    /// Mirror of `sidebar::HOST_ROW_LABEL_OFFSET`, which is private to that
+    /// module.
+    const HOST_ROW_LABEL_OFFSET_FOR_TEST: u16 = 3;
 
     #[test]
     fn compute_view_uses_the_configured_host_rail_width() {
@@ -2014,11 +2031,12 @@ test in the suite would fail. If you need to suppress the rail for a reason that
 
         compute_view(&mut app, Rect::new(0, 0, 100, 20));
 
-        // The dedicated 10-column host rail sits beside the Spaces/Agents
-        // panel at full sidebar height (never a full-width section above it).
-        assert_eq!(app.view.host_rail_rect, Rect::new(0, 0, 10, 20));
-        assert_eq!(app.view.sidebar_panel_rect, Rect::new(10, 0, 26, 20));
-        assert_eq!(app.view.sidebar_rect, Rect::new(0, 0, 36, 20));
+        // The dedicated host rail sits beside the Spaces/Agents panel at full
+        // sidebar height (never a full-width section above it).
+        let rail = DEFAULT_HOST_RAIL_WIDTH;
+        assert_eq!(app.view.host_rail_rect, Rect::new(0, 0, rail, 20));
+        assert_eq!(app.view.sidebar_panel_rect, Rect::new(rail, 0, 26, 20));
+        assert_eq!(app.view.sidebar_rect, Rect::new(0, 0, rail + 26, 20));
         let labels = host_list_entries(&app)
             .into_iter()
             .map(|entry| entry.label)
@@ -2040,8 +2058,10 @@ test in the suite would fail. If you need to suppress the rail for a reason that
             host_target_at(&app, 0, 2),
             Some(crate::app::state::SidebarSource::Local)
         );
+        // Row 3 is local's trailing gap row; the remote follows on row 4.
+        assert_eq!(host_target_at(&app, 0, 3), None);
         assert_eq!(
-            host_target_at(&app, 0, 3),
+            host_target_at(&app, 0, 4),
             Some(crate::app::state::SidebarSource::Remote(default_host))
         );
     }
@@ -2169,11 +2189,11 @@ test in the suite would fail. If you need to suppress the rail for a reason that
             app.effective_sidebar_source(),
             crate::app::state::SidebarSource::Local
         );
-        // Local source: the rail is present (not Rect::default()), fixed at
-        // 10 columns, and full sidebar height; the panel sits directly beside
-        // it (never below).
+        // Local source: the rail is present (not Rect::default()), at its
+        // configured width, and full sidebar height; the panel sits directly
+        // beside it (never below).
         assert_ne!(app.view.host_rail_rect, Rect::default());
-        assert_eq!(app.view.host_rail_rect.width, 10);
+        assert_eq!(app.view.host_rail_rect.width, DEFAULT_HOST_RAIL_WIDTH);
         assert_eq!(app.view.host_rail_rect.height, app.view.sidebar_rect.height);
         assert!(app.view.sidebar_panel_rect.height > 0);
         assert_eq!(
@@ -2191,7 +2211,7 @@ test in the suite would fail. If you need to suppress the rail for a reason that
         assert_eq!(app.view.layout, ViewLayout::Desktop);
         assert!(app.host_glass_surface_active());
         assert_ne!(app.view.host_rail_rect, Rect::default());
-        assert_eq!(app.view.host_rail_rect.width, 10);
+        assert_eq!(app.view.host_rail_rect.width, DEFAULT_HOST_RAIL_WIDTH);
         assert_eq!(app.view.host_rail_rect.height, app.view.sidebar_rect.height);
         assert_eq!(app.view.sidebar_rect.width, app.view.host_rail_rect.width);
         assert_eq!(app.view.sidebar_panel_rect, Rect::default());
@@ -2216,7 +2236,10 @@ test in the suite would fail. If you need to suppress the rail for a reason that
 
         compute_view(&mut app, Rect::new(0, 0, 100, 20));
 
-        assert_eq!(app.view.host_rail_rect, Rect::new(0, 0, 10, 20));
+        assert_eq!(
+            app.view.host_rail_rect,
+            Rect::new(0, 0, DEFAULT_HOST_RAIL_WIDTH, 20)
+        );
         assert_eq!(
             app.effective_sidebar_source(),
             crate::app::state::SidebarSource::Local
@@ -3292,7 +3315,7 @@ switch_workspace = "ctrl+1..9"
             None,
             "breathing row is not a host target in yielded sidebar"
         );
-        // Row 2 is local, row 3 is the remote host.
+        // Row 2 is local, row 3 is its gap row, row 4 is the remote host.
         assert_eq!(
             host_target_at(&app, 0, 2),
             Some(crate::app::state::SidebarSource::Local),
@@ -3300,6 +3323,12 @@ switch_workspace = "ctrl+1..9"
         );
         assert_eq!(
             host_target_at(&app, 0, 3),
+            None,
+            "the blank gap row between hosts is not a click target, matching the \
+             dead gap rows in the spaces and agents panels"
+        );
+        assert_eq!(
+            host_target_at(&app, 0, 4),
             Some(crate::app::state::SidebarSource::Remote(host)),
             "remote host row clickable in yielded sidebar"
         );

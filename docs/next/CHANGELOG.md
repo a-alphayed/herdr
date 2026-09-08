@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Added
-- Added a resizable hosts rail: drag its right-edge divider to resize it, double-click that divider to reset it, and set its default width with the new `ui.host_rail_width`. The width is clamped to 7-24 columns and persists across restarts.
+- Added a resizable hosts rail: drag its right-edge divider to resize it, double-click that divider to reset it, and set its default width with the new `ui.host_rail_width`. The width is clamped to 9-24 columns and persists across restarts.
 - Added `ui.sidebar_collapsed_mode = "hidden"` to make a collapsed sidebar use zero width while keeping the existing compact rail as the default. (#842)
 - Added `herdr completion <shell>` / `herdr completions <shell>` to generate shell completion scripts for bash, elvish, fish, PowerShell, and zsh. (#435)
 - Added `session.snapshot` to bootstrap client runtime state in one socket API response before subscribing to events.
@@ -17,7 +17,7 @@
 - Added `<host>/terminal:<terminal_id>` CLI target form (`herdr agent attach <host>/terminal:<id>`) to attach directly to a specific terminal on a configured remote host using a terminal id from `layout.export`.
 
 ### Changed
-- Host rail connection status markers now lead each row instead of trailing it, matching the spaces and agents panels, which also gives host labels one more column.
+- Host rail rows now use the same layout as the spaces and agents panels: the connection status marker leads each row, indented and separated from the host name the same way, with a blank row between hosts. The default rail width grows from 10 to 12 columns so the added alignment does not cost host-name space.
 - Bumped the client/server protocol version to 16 for socket API placement mutation event and response compatibility.
 - Selected remote hosts are now always viewed through the host glass, which streams the remote Herdr UI. This is a breaking config-surface change: `experimental.host_glass` has been removed; configs that still set it remain valid, but the key is ignored.
 - Removed the old remote workspace projection view and its routed remote layout-mutation commands; remote hosts are now viewed through the host glass.

@@ -581,6 +581,22 @@ fn focused_terminal_suppresses_host_cursor(
 mod tests {
     use super::*;
 
+    /// These hashes were re-pinned once, deliberately, when the host rail
+    /// adopted upstream's `[" "][marker][" "]` row prefix. Two things moved in
+    /// the captured frame and nothing else did:
+    ///
+    /// 1. `local` shifted from `" local   "` to `"   local   "` — the row now
+    ///    opens with the same span prefix `render_workspace_list` and
+    ///    `render_agent_detail` use, so the rail's labels line up with the
+    ///    panels beside it.
+    /// 2. `DEFAULT_HOST_RAIL_WIDTH` went 10 -> 12 to pay for those 2 columns of
+    ///    chrome out of the rail instead of out of the host names, which shifts
+    ///    the sidebar 36 -> 38 and the main area 36 -> 38 (width 44 -> 42).
+    ///
+    /// The frame moves for reason 1 whichever default is chosen; the default
+    /// only changes by how much. The Spaces panel content is byte-identical,
+    /// merely translated right by 2. The previous hashes were
+    /// `76cc900b…` / `ba6d70e3…` (rail width 10, trailing-gutter `local` row).
     #[test]
     fn standalone_render_matches_pre_embedded_context_baseline() {
         use sha2::{Digest, Sha256};
@@ -617,13 +633,13 @@ mod tests {
 
         assert_eq!(
             format!("{:x}", Sha256::digest(&frame_bytes)),
-            "76cc900be42161e95f349c298f4749307b745a54defe1fdf25018d415be7a66b",
-            "complete FrameData bytes changed from the pre-S4 Standalone capture"
+            "a53d928dbe0d9f1cde12c4cbe4f35045f75ec14a80665417ee013cad639b5510",
+            "complete FrameData bytes changed from the host-rail row-prefix capture"
         );
         assert_eq!(
             format!("{:x}", Sha256::digest(&terminal_message_bytes)),
-            "ba6d70e30bb9107d21bdff6f1673d0842586784b8d5fa4a4db8a551c21646a5f",
-            "serialized TerminalAnsi message changed from the pre-S4 Standalone capture"
+            "d827521c86cc1ec8fca9bda13ba622efaba7e1cad1448c54175c11e447ff8563",
+            "serialized TerminalAnsi message changed from the host-rail row-prefix capture"
         );
     }
 

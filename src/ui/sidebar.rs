@@ -17,34 +17,56 @@ use crate::terminal::TerminalRuntimeRegistry;
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
 const HOST_RAIL_HEADER_ROWS: u16 = 2;
-/// Leading column of every host row. It holds the connection status marker for
-/// remote hosts and stays blank for `local`, which has no connection state.
-const HOST_ROW_LEADING_GUTTER: u16 = 1;
+/// Column at which a host row's label starts, mirroring the span prefix that
+/// `render_workspace_list` and `render_agent_detail` both open their rows with:
+/// `[" "][marker][" "]`, then the label. Their secondary lines indent by the
+/// matching `"   "`. Neither panel names this offset — the spans are inline
+/// literals — so the rail cannot import a constant for it; this one exists only
+/// because the rail elides its labels with `truncate_text` and therefore needs
+/// the arithmetic that upstream's clip-only rows never do.
+const HOST_ROW_LABEL_OFFSET: u16 = 3;
 /// Default width of the dedicated host-selection rail beside the Spaces/Agents
-/// panel, matching the established pre-existing rail pattern
-/// (`SOURCE_RAIL_WIDTH`). The rail is always full sidebar height on expanded
-/// desktop; it is never sized to the current host count, but the user can drag
-/// its right-edge divider — or set `ui.host_rail_width` — to resize it.
-pub(crate) const DEFAULT_HOST_RAIL_WIDTH: u16 = 10;
+/// panel. The rail is always full sidebar height on expanded desktop; it is
+/// never sized to the current host count, but the user can drag its right-edge
+/// divider — or set `ui.host_rail_width` — to resize it.
+///
+/// Chrome the rail spends outside the label, at width `W` with no scrollbar:
+///
+/// | layout                          | chrome | label at `W = 10` |
+/// |---------------------------------|--------|-------------------|
+/// | original fixed rail             | 3      | 7                 |
+/// | leading marker                  | 2      | 8                 |
+/// | upstream row prefix (current)   | 4      | 6                 |
+///
+/// The original spent a divider, a gutter and a trailing marker column; moving
+/// the marker into the gutter freed one; adopting upstream's
+/// `[" "][marker][" "]` prefix then spends two more. 12 restores the 8 label
+/// columns the rail shows today, so the alignment is paid for by the rail
+/// rather than out of the host names. 11 would instead restore the original
+/// rail's 7.
+pub(crate) const DEFAULT_HOST_RAIL_WIDTH: u16 = 12;
 /// Narrowest legible rail. At width `W`, with `s = 1` when the host-list
 /// scrollbar is showing and `0` otherwise, every column is owned:
 ///
-/// | column        | owner                                                |
-/// |---------------|------------------------------------------------------|
-/// | `W - 1`       | the rail's own internal divider                      |
-/// | `W - 2`       | the host-list scrollbar, only while `s = 1`          |
-/// | `0`           | the row's leading gutter, holding the status marker  |
-/// | `1 ..= W-2-s` | the host label, so `label_width = W - 2 - s`         |
+/// | column        | owner                                                    |
+/// |---------------|----------------------------------------------------------|
+/// | `W - 1`       | the rail's own internal divider                          |
+/// | `W - 2`       | the host-list scrollbar, only while `s = 1`              |
+/// | `0`           | upstream's row indent                                    |
+/// | `1`           | the status marker (blank for `local`)                    |
+/// | `2`           | upstream's marker/label separator                        |
+/// | `3 ..= W-2-s` | the host label, so `label_width = W - 4 - s`             |
 ///
-/// Two constraints bind, and both land on 7: the ` hosts` header is 6 columns
-/// and renders into the `W - 1` content columns (`W >= 7`), and the label needs
-/// 4 columns in the worst case so a truncated name reads `abc…` rather than
-/// `a…` (`W - 3 >= 4`, so `W >= 7`). At 6 the header is silently clipped to
-/// ` host` — a plain `Paragraph` clips rather than elides, so nothing even
-/// marks the loss — and the worst-case label falls to 3. That is where the
-/// rail actually stops working.
-/// 7 therefore spends: 1 divider + 1 scrollbar + 1 marker + 4 label.
-pub(crate) const HOST_RAIL_MIN_WIDTH: u16 = 7;
+/// Two constraints apply and the label now dominates: the ` hosts` header is 6
+/// columns rendered into the `W - 1` content columns (`W >= 7`), while the
+/// label needs 4 columns in the worst case so a truncated name reads `abc…`
+/// rather than `a…` (`W - 5 >= 4`, so `W >= 9`). The label guarantee is
+/// unchanged from the trailing-marker layout — the floor moved from 7 to 9
+/// purely because the row prefix grew by 2.
+///
+/// 9 therefore spends: 1 divider + 1 scrollbar + 1 indent + 1 marker +
+/// 1 separator + 4 label. At 8 the worst-case label falls to 3 (`ab…`).
+pub(crate) const HOST_RAIL_MIN_WIDTH: u16 = 9;
 /// Widest rail. The rail only ever lists short host aliases and is nested
 /// inside the sidebar, so past this it just starves the Spaces/Agents panel.
 pub(crate) const HOST_RAIL_MAX_WIDTH: u16 = 24;
@@ -214,14 +236,51 @@ pub(crate) fn host_list_body_rect(area: Rect, has_scrollbar: bool) -> Rect {
     Rect::new(content.x, body_y, body_width, body_height)
 }
 
+/// Rows one host entry occupies, mirroring `agent_panel_entry_content_height`
+/// and `workspace_list_entry_content_height`. A host has no subtitle to put on
+/// a second line, so unlike those it is always a single row.
+fn host_list_entry_content_height(entry: &HostListEntry) -> u16 {
+    let _ = entry;
+    1
+}
+
+/// Blank rows after each host entry, mirroring `agent_panel_entry_gap_after`
+/// and `workspace_list_entry_gap_after`, which both put one blank row between
+/// entries. The rail's rhythm is the gap alone rather than gap-plus-subtitle,
+/// so it reads airier than those panels at the same gap value.
+fn host_list_entry_gap_after(entry: &HostListEntry) -> u16 {
+    let _ = entry;
+    1
+}
+
+/// Rows one entry advances the cursor, gap included.
+fn host_list_entry_stride(entry: &HostListEntry) -> u16 {
+    host_list_entry_content_height(entry).saturating_add(host_list_entry_gap_after(entry))
+}
+
+/// How many host entries fit in `height`. Every entry but the last also has to
+/// fit its trailing gap, so the last entry's gap is added back before dividing.
+fn host_rows_that_fit(entries: &[HostListEntry], height: u16) -> usize {
+    let Some(first) = entries.first() else {
+        return 0;
+    };
+    let stride = host_list_entry_stride(first);
+    if height == 0 || stride == 0 {
+        return 0;
+    }
+    let gap = host_list_entry_gap_after(first);
+    (height.saturating_add(gap) / stride) as usize
+}
+
 fn host_list_visible_count(app: &AppState, area: Rect, scroll: usize) -> usize {
     let body = host_list_body_rect(area, false);
     if body.width == 0 || body.height == 0 {
         return 0;
     }
-    let total = host_list_entries(app).len();
+    let entries = host_list_entries(app);
+    let total = entries.len();
     let remaining = total.saturating_sub(scroll);
-    remaining.min(body.height as usize)
+    remaining.min(host_rows_that_fit(&entries, body.height))
 }
 
 pub(crate) fn host_list_scroll_metrics(app: &AppState, area: Rect) -> crate::pane::ScrollMetrics {
@@ -256,7 +315,8 @@ pub(crate) fn normalized_host_list_scroll(app: &AppState, requested: usize) -> u
     if area == Rect::default() {
         return 0;
     }
-    let entry_count = host_list_entries(app).len();
+    let entries = host_list_entries(app);
+    let entry_count = entries.len();
     if entry_count == 0 {
         return 0;
     }
@@ -265,11 +325,12 @@ pub(crate) fn normalized_host_list_scroll(app: &AppState, requested: usize) -> u
     // This prevents a stale nonzero scroll from skipping `local`/leading hosts
     // after the list shrinks until it fits (e.g. hosts disconnecting). Clamping
     // to `entry_count - 1` instead would leave a dangling offset that hides
-    // leading rows. `viewport_capacity` is the body height (scrollbar presence
-    // only narrows the body width, not its height), and every mutation path
+    // leading rows. `viewport_capacity` counts the entries that fit in the body
+    // height including the blank row after each (scrollbar presence only
+    // narrows the body width, not its height), and every mutation path
     // normalizes before metrics are read, so scrollbar/drag/wheel math stays
     // consistent.
-    let viewport_capacity = host_list_body_rect(area, false).height as usize;
+    let viewport_capacity = host_rows_that_fit(&entries, host_list_body_rect(area, false).height);
     let max_first_visible = entry_count.saturating_sub(viewport_capacity);
     requested.min(max_first_visible)
 }
@@ -291,14 +352,16 @@ pub(crate) fn host_list_row_areas(app: &AppState) -> Vec<HostRowArea> {
     let mut y = body.y;
     let body_bottom = body.y + body.height;
     for entry in entries.into_iter().skip(app.host_list_scroll) {
-        if y >= body_bottom {
+        let content_height = host_list_entry_content_height(&entry);
+        if y.saturating_add(content_height) > body_bottom {
             break;
         }
+        let stride = host_list_entry_stride(&entry);
         rows.push(HostRowArea {
             source: entry.source,
-            rect: Rect::new(body.x, y, body.width, 1),
+            rect: Rect::new(body.x, y, body.width, content_height),
         });
-        y = y.saturating_add(1);
+        y = y.saturating_add(stride);
     }
     rows
 }
@@ -1346,30 +1409,38 @@ fn render_host_row(
         }
     }
 
-    // Leading status marker for cached remote statuses, drawn in the row's
-    // leading gutter so the rail reads marker-first like the spaces and agents
-    // panels (`● Apeal`) instead of trailing the dot behind a truncated label.
-    // `local` carries no connection state, so its gutter simply stays blank and
-    // every label still starts in the same column.
-    let marker_rect = entry.status.map(|_| Rect::new(rect.x, rect.y, 1, 1));
-    let label_x = rect.x.saturating_add(HOST_ROW_LEADING_GUTTER);
-    let label_width = rect.width.saturating_sub(HOST_ROW_LEADING_GUTTER);
+    // Exactly the span sequence `render_workspace_list` and `render_agent_detail`
+    // open their rows with — indent, marker, separator, label — so the rail's
+    // rows land on the same columns as the panels beside it. `local` carries no
+    // connection state, so its marker column renders blank rather than
+    // inventing a status, and every label still starts at the same offset.
+    //
+    // `Style::default()` on the spacer spans leaves the row's highlight
+    // background intact, because ratatui patches only the fields a style sets.
+    let (marker_symbol, marker_style) = match entry.status {
+        Some(status) => {
+            let (symbol, marker_style) = host_status_marker(status, p);
+            (
+                symbol,
+                if selected {
+                    marker_style.bg(p.surface0)
+                } else {
+                    marker_style
+                },
+            )
+        }
+        None => (" ", Style::default()),
+    };
+    let label_width = rect.width.saturating_sub(HOST_ROW_LABEL_OFFSET);
     frame.render_widget(
-        Paragraph::new(truncate_text(&entry.label, label_width as usize)).style(style),
-        Rect::new(label_x, rect.y, label_width, 1),
+        Paragraph::new(Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(marker_symbol, marker_style),
+            Span::styled(" ", Style::default()),
+            Span::styled(truncate_text(&entry.label, label_width as usize), style),
+        ])),
+        Rect::new(rect.x, rect.y, rect.width, 1),
     );
-    if let (Some(status), Some(marker_rect)) = (entry.status, marker_rect) {
-        let (symbol, marker_style) = host_status_marker(status, p);
-        let marker_style = if selected {
-            marker_style.bg(p.surface0)
-        } else {
-            marker_style
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(symbol, marker_style)),
-            marker_rect,
-        );
-    }
 }
 
 fn render_workspace_list(
@@ -2053,39 +2124,45 @@ mod tests {
                 status,
             );
         }
-        // Header (row 0) + breathing row (row 1) + local (row 2) + four remote
-        // hosts (rows 3..6).
+        // Header (row 0) + breathing row (row 1) + local (row 2), then one blank
+        // gap row after each entry, so the four remotes land on rows 4/6/8/10.
         let width = 10u16;
-        let area = Rect::new(0, 0, width, 8);
+        let area = Rect::new(0, 0, width, 12);
         app.view.host_rail_rect = area;
 
         let buffer = rendered_host_rail_buffer(&app, area);
-        // Markers lead each row, in the leading gutter, matching the spaces and
-        // agents panels. `local` (row 2) has no connection state, so its gutter
-        // stays blank while every label still starts one column further right.
-        let marker_x = area.x;
+        // Markers sit in the marker column of upstream's row prefix
+        // (`[" "][marker][" "]`), one column in. `local` (row 2) has no
+        // connection state, so its marker column stays blank while every label
+        // still starts at the same offset.
+        let marker_x = area.x + 1;
         assert_eq!(buffer[(marker_x, 2)].symbol(), " ");
 
-        assert_eq!(buffer[(marker_x, 3)].symbol(), "●");
-        assert_eq!(buffer[(marker_x, 3)].style().fg, Some(app.palette.green));
-        assert_eq!(buffer[(marker_x, 4)].symbol(), "○");
-        assert_eq!(buffer[(marker_x, 4)].style().fg, Some(app.palette.overlay0));
-        assert!(buffer[(marker_x, 4)]
-            .style()
-            .add_modifier
-            .contains(Modifier::DIM));
-        assert_eq!(buffer[(marker_x, 5)].symbol(), "↑");
-        assert_eq!(buffer[(marker_x, 5)].style().fg, Some(app.palette.yellow));
-        assert!(buffer[(marker_x, 5)]
-            .style()
-            .add_modifier
-            .contains(Modifier::BOLD));
-        assert_eq!(buffer[(marker_x, 6)].symbol(), "×");
-        assert_eq!(buffer[(marker_x, 6)].style().fg, Some(app.palette.red));
+        assert_eq!(buffer[(marker_x, 4)].symbol(), "●");
+        assert_eq!(buffer[(marker_x, 4)].style().fg, Some(app.palette.green));
+        assert_eq!(buffer[(marker_x, 6)].symbol(), "○");
+        assert_eq!(buffer[(marker_x, 6)].style().fg, Some(app.palette.overlay0));
         assert!(buffer[(marker_x, 6)]
             .style()
             .add_modifier
+            .contains(Modifier::DIM));
+        assert_eq!(buffer[(marker_x, 8)].symbol(), "↑");
+        assert_eq!(buffer[(marker_x, 8)].style().fg, Some(app.palette.yellow));
+        assert!(buffer[(marker_x, 8)]
+            .style()
+            .add_modifier
             .contains(Modifier::BOLD));
+        assert_eq!(buffer[(marker_x, 10)].symbol(), "×");
+        assert_eq!(buffer[(marker_x, 10)].style().fg, Some(app.palette.red));
+        assert!(buffer[(marker_x, 10)]
+            .style()
+            .add_modifier
+            .contains(Modifier::BOLD));
+
+        // The rows between entries are the gap rows, and they stay empty.
+        for gap_row in [3, 5, 7, 9] {
+            assert_eq!(buffer[(marker_x, gap_row)].symbol(), " ");
+        }
     }
 
     #[test]
@@ -2097,15 +2174,16 @@ mod tests {
             crate::remote_source::RemoteConnectionStatus::NeedsUpdate,
         );
         let width = 10u16;
-        let area = Rect::new(0, 0, width, 4);
+        // local on row 2, its gap on row 3, charlie on row 4.
+        let area = Rect::new(0, 0, width, 6);
         app.view.host_rail_rect = area;
         app.select_sidebar_source(SidebarSource::Remote(host));
 
         let buffer = rendered_host_rail_buffer(&app, area);
-        let marker_x = area.x;
-        let marker_style = buffer[(marker_x, 3)].style();
+        let marker_x = area.x + 1;
+        let marker_style = buffer[(marker_x, 4)].style();
 
-        assert_eq!(buffer[(marker_x, 3)].symbol(), "↑");
+        assert_eq!(buffer[(marker_x, 4)].symbol(), "↑");
         assert_eq!(marker_style.fg, Some(app.palette.yellow));
         assert_eq!(marker_style.bg, Some(app.palette.surface0));
         assert!(marker_style.add_modifier.contains(Modifier::BOLD));
@@ -2119,24 +2197,23 @@ mod tests {
             crate::remote_source::RemoteConnectionStatus::Connected,
         );
         let width = 10u16;
-        let area = Rect::new(0, 0, width, 4);
+        let area = Rect::new(0, 0, width, 6);
         app.view.host_rail_rect = area;
 
         let buffer = rendered_host_rail_buffer(&app, area);
-        // Header occupies row 0, row 1 is the section breathing row, and local
-        // occupies row 2, so the remote host renders on row 3. The right-edge
-        // divider column (area.width - 1) is
+        // Header occupies row 0, row 1 is the section breathing row, local
+        // occupies row 2 and its gap row 3, so the remote host renders on row 4.
+        // The right-edge divider column (area.width - 1) is
         // the rail's own internal divider (drawn by `render_host_rail`, not
         // the outer sidebar/main-area divider from `render_sidebar`), so read
         // only the content columns.
         let row = (0..(area.width - 1))
-            .map(|x| buffer[(x, 3)].symbol())
+            .map(|x| buffer[(x, 4)].symbol())
             .collect::<String>();
 
-        // The marker leads, and the freed trailing column goes to the label:
-        // it truncates at 8 columns here where the trailing-marker layout only
-        // allowed 7 (`" verylo…●"`).
-        assert_eq!(row, "●verylon…");
+        // Upstream's `[" "][marker][" "]` prefix, then the label truncated into
+        // the 6 columns that remain of the 9 content columns.
+        assert_eq!(row, " ● veryl…");
     }
 
     #[test]
@@ -2146,7 +2223,7 @@ mod tests {
             &RemoteHostKey::new("verylongremotehost", crate::session::DEFAULT_SESSION_NAME),
             crate::remote_source::RemoteConnectionStatus::Connected,
         );
-        let area = Rect::new(0, 0, 10, 4);
+        let area = Rect::new(0, 0, 10, 6);
         app.view.host_rail_rect = area;
 
         let buffer = rendered_host_rail_buffer(&app, area);
@@ -2158,29 +2235,35 @@ mod tests {
 
         assert_eq!(row(0), " hosts   │");
         assert_eq!(row(1), "         │");
-        // `local` has no marker, so its blank gutter keeps the label column
-        // aligned with the marked remote row below it.
-        assert_eq!(row(2), " local   │");
-        assert_eq!(row(3), "●verylon…│");
+        // `local` has no connection state, so its marker column stays blank and
+        // its label still lines up with the marked remote row below it.
+        assert_eq!(row(2), "   local │");
+        // One blank gap row after each entry, the same rhythm
+        // `workspace_list_entry_gap_after` and `agent_panel_entry_gap_after`
+        // give the panels beside the rail.
+        assert_eq!(row(3), "         │");
+        assert_eq!(row(4), " ● veryl…│");
+        assert_eq!(row(5), "         │");
     }
 
     /// Pins the column budget `HOST_RAIL_MIN_WIDTH` is derived from: at the
     /// minimum width every column is spoken for, the ` hosts` header still
-    /// renders whole, the marker keeps its gutter, and the label keeps 4
-    /// columns in the worst case (scrollbar showing) so a truncated name still
-    /// reads as `abc…`.
+    /// renders whole, the row keeps upstream's full `[" "][marker][" "]` prefix,
+    /// and the label keeps 4 columns in the worst case (scrollbar showing) so a
+    /// truncated name still reads as `abc…`.
     #[test]
-    fn minimum_host_rail_width_still_fits_header_marker_and_a_readable_label() {
+    fn minimum_host_rail_width_still_fits_header_prefix_and_a_readable_label() {
         let mut app = crate::app::state::AppState::test_new();
         app.remote_sources.mark_status(
             &RemoteHostKey::new("verylongremotehost", crate::session::DEFAULT_SESSION_NAME),
             crate::remote_source::RemoteConnectionStatus::Connected,
         );
         let width = HOST_RAIL_MIN_WIDTH;
-        let area = Rect::new(0, 0, width, 4);
+        // Header rows plus local, its gap row, and the remote.
+        let area = Rect::new(0, 0, width, 6);
         app.view.host_rail_rect = area;
 
-        // No scrollbar at this height: 1 divider + 1 marker + 5 label.
+        // No scrollbar at this height: 1 divider + 3 prefix + 5 label.
         assert!(host_list_scrollbar_rect(&app, area).is_none());
         let buffer = rendered_host_rail_buffer(&app, area);
         let row = |y| {
@@ -2189,13 +2272,14 @@ mod tests {
                 .collect::<String>()
         };
 
-        // The header is 6 columns and survives whole in the 6 content columns.
-        assert_eq!(row(0), " hosts│");
-        assert_eq!(row(2), " local│");
-        assert_eq!(row(3), "●very…│");
+        // The header is 6 columns and survives whole in the 8 content columns.
+        assert_eq!(row(0), " hosts  │");
+        // `local` is 5 columns and still fits whole at the minimum width.
+        assert_eq!(row(2), "   local│");
+        assert_eq!(row(4), " ● very…│");
 
         // Worst case: enough hosts to force the scrollbar, which takes the
-        // column left of the divider and leaves the label 4.
+        // column left of the divider and leaves the label exactly 4.
         for host in ["bravo", "charlie", "delta", "echo"] {
             app.remote_sources.mark_status(
                 &RemoteHostKey::new(host, crate::session::DEFAULT_SESSION_NAME),
@@ -2205,28 +2289,33 @@ mod tests {
         let scrollbar = host_list_scrollbar_rect(&app, area).expect("scrollbar at this height");
         assert_eq!(scrollbar.x, area.x + area.width - 2);
         let body = host_list_body_rect(area, true);
-        assert_eq!(body.width, HOST_ROW_LEADING_GUTTER + 4);
+        assert_eq!(body.width, HOST_ROW_LABEL_OFFSET + 4);
         // Body, scrollbar and divider tile the rail without overlapping.
         assert_eq!(body.x + body.width, scrollbar.x);
         assert_eq!(scrollbar.x + 1, area.x + area.width - 1);
     }
 
     /// One column narrower is where the rail actually breaks, which is what
-    /// makes 7 the floor rather than a preference. The header is a plain
-    /// `Paragraph`, so it is CLIPPED rather than elided: at 6 columns the panel
-    /// silently loses its own last letter with no `…` to admit it.
+    /// makes 9 the floor rather than a preference. Note the header is NOT what
+    /// gives out first any more — at 8 it still fits. The label is the binding
+    /// constraint now, falling to 3 columns once the scrollbar appears.
     #[test]
-    fn one_column_below_the_minimum_clips_the_header() {
+    fn one_column_below_the_minimum_starves_the_label() {
         let app = crate::app::state::AppState::test_new();
-        let area = Rect::new(0, 0, HOST_RAIL_MIN_WIDTH - 1, 4);
+        let area = Rect::new(0, 0, HOST_RAIL_MIN_WIDTH - 1, 6);
 
         let buffer = rendered_host_rail_buffer(&app, area);
         let header = (0..area.width - 1)
             .map(|x| buffer[(x, 0)].symbol())
             .collect::<String>();
 
-        assert_eq!(header, " host");
-        assert!(!header.contains('…'));
+        // The header still survives one column below the minimum.
+        assert_eq!(header, " hosts ");
+        // The label does not: 3 columns renders `ab…`, below the guarantee.
+        let starved = host_list_body_rect(area, true)
+            .width
+            .saturating_sub(HOST_ROW_LABEL_OFFSET);
+        assert_eq!(starved, 3);
     }
 
     #[test]
@@ -2283,12 +2372,13 @@ mod tests {
                 crate::remote_source::RemoteConnectionStatus::Connected,
             );
         }
-        // Small host rail viewport: header + breathing row + 3 body rows.
-        let area = Rect::new(0, 0, 26, 5);
+        // Small host rail viewport: header + breathing row + 5 body rows, which
+        // is 3 entries once each one's trailing gap row is counted.
+        let area = Rect::new(0, 0, 26, 7);
         app.view.host_rail_rect = area;
 
         let metrics = host_list_scroll_metrics(&app, area);
-        // 30 remote hosts + local = 31 entries; viewport = 3 body rows.
+        // 30 remote hosts + local = 31 entries; viewport = 3 entries.
         assert_eq!(metrics.viewport_rows, 3);
         assert_eq!(metrics.max_offset_from_bottom, 31 - 3);
         assert!(should_show_scrollbar(metrics));
@@ -2322,9 +2412,9 @@ mod tests {
                 crate::remote_source::RemoteConnectionStatus::Connected,
             );
         }
-        // Header + breathing row + 2 body rows -> viewport capacity 2; 31
-        // entries overflow.
-        let area = Rect::new(0, 0, 26, 4);
+        // Header + breathing row + 3 body rows -> viewport capacity 2 entries
+        // once each one's trailing gap row is counted; 31 entries overflow.
+        let area = Rect::new(0, 0, 26, 5);
         app.view.host_rail_rect = area;
         app.host_list_scroll = 5;
         let overflow_metrics = host_list_scroll_metrics(&app, area);

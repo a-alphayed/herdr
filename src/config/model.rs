@@ -799,7 +799,7 @@ pub struct UiConfig {
     /// Maximum sidebar width (columns) when expanded. Default: 36.
     pub sidebar_max_width: u16,
     /// Width (columns) of the host rail beside the Spaces/Agents panel.
-    /// Clamped to the rail's structural bounds (7-24). Default: 10.
+    /// Clamped to the rail's structural bounds (9-24). Default: 12.
     pub host_rail_width: u16,
     /// Collapsed sidebar presentation. Default: compact.
     pub sidebar_collapsed_mode: SidebarCollapsedModeConfig,

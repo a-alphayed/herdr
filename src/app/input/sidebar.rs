@@ -2384,7 +2384,10 @@ mod tests {
             app.state.drag.as_ref().map(|drag| &drag.target),
             Some(DragTarget::SidebarDivider)
         ));
-        assert_eq!(app.state.host_rail_width, 10);
+        assert_eq!(
+            app.state.host_rail_width,
+            crate::ui::DEFAULT_HOST_RAIL_WIDTH
+        );
     }
 
     #[test]
@@ -2406,7 +2409,10 @@ mod tests {
         ));
         app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 20, 5));
 
-        assert_eq!(app.state.host_rail_width, 10);
+        assert_eq!(
+            app.state.host_rail_width,
+            crate::ui::DEFAULT_HOST_RAIL_WIDTH
+        );
     }
 
     #[test]
