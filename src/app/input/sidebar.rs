@@ -230,8 +230,30 @@ impl AppState {
         Rect::new(x, y, menu_w, menu_h)
     }
 
+    /// Whether the host rail claims the column its right edge shares with the
+    /// outer sidebar divider.
+    ///
+    /// The two edges land on the same column only while the glass yields the
+    /// sidebar, because the rail is then the entire sidebar. This is the single
+    /// place that tie is broken, so `on_sidebar_divider` and
+    /// `on_host_rail_divider` can never both claim the column or both refuse
+    /// it. While yielded the rail wins: the Spaces/Agents panel is hidden, so
+    /// the rail is the only thing that column borders and the only thing a drag
+    /// there can visibly resize.
+    fn host_rail_owns_shared_divider_column(&self) -> bool {
+        let rail = self.view.host_rail_rect;
+        let sidebar = self.view.sidebar_rect;
+        self.view.glass_sidebar_yielded
+            && rail.width > 0
+            && sidebar.width > 0
+            && rail.x + rail.width.saturating_sub(1) == sidebar.x + sidebar.width.saturating_sub(1)
+    }
+
     pub(super) fn on_sidebar_divider(&self, col: u16, row: u16) -> bool {
         if self.sidebar_collapsed {
+            return false;
+        }
+        if self.host_rail_owns_shared_divider_column() {
             return false;
         }
         let sidebar = self.view.sidebar_rect;
@@ -276,8 +298,8 @@ impl AppState {
     /// `host_rail_visually_suppressed` zeroes it) has a default rect, so it
     /// offers no drag target at all. When the host glass yields the sidebar the
     /// rail *is* the whole sidebar and the two dividers land on the same
-    /// column; the outer sidebar divider keeps that column, so one column never
-    /// means two things.
+    /// column; `host_rail_owns_shared_divider_column` breaks that tie, so one
+    /// column never means two things.
     pub(super) fn on_host_rail_divider(&self, col: u16, row: u16) -> bool {
         if self.sidebar_collapsed {
             return false;
@@ -290,7 +312,8 @@ impl AppState {
         let rail_divider_col = rail.x + rail.width.saturating_sub(1);
         let sidebar_divider_col = sidebar.x + sidebar.width.saturating_sub(1);
         sidebar.width > 0
-            && rail_divider_col != sidebar_divider_col
+            && (rail_divider_col != sidebar_divider_col
+                || self.host_rail_owns_shared_divider_column())
             && col == rail_divider_col
             && row >= rail.y
             && row < rail.y + rail.height
@@ -2388,6 +2411,160 @@ mod tests {
             app.state.host_rail_width,
             crate::ui::DEFAULT_HOST_RAIL_WIDTH
         );
+
+        // The same column stays the sidebar's while the panel is on screen:
+        // the two edges are distinct here, so each has its own single owner.
+        assert!(app.state.on_sidebar_divider(sidebar_divider_col, 5));
+        assert!(!app.state.on_host_rail_divider(sidebar_divider_col, 5));
+        let rail_col = host_rail_divider_col(&app);
+        assert!(!app.state.on_sidebar_divider(rail_col, 5));
+        assert!(app.state.on_host_rail_divider(rail_col, 5));
+    }
+
+    /// The shared divider column must have exactly one owner in every state —
+    /// never two (one column meaning two things) and never zero where a visible
+    /// edge would stop responding.
+    #[test]
+    fn divider_column_ownership_is_exclusive_in_every_state() {
+        // Expanded with local selected: two distinct edges, one owner each.
+        let app = app_with_host_rail();
+        let sidebar_col = app.state.view.sidebar_rect.x + app.state.view.sidebar_rect.width - 1;
+        let rail_col = host_rail_divider_col(&app);
+        assert_ne!(sidebar_col, rail_col);
+        assert!(app.state.on_sidebar_divider(sidebar_col, 5));
+        assert!(!app.state.on_host_rail_divider(sidebar_col, 5));
+        assert!(app.state.on_host_rail_divider(rail_col, 5));
+        assert!(!app.state.on_sidebar_divider(rail_col, 5));
+
+        // Glass-yielded: the edges coincide and the rail takes the column,
+        // because the panel behind the other claimant is not on screen.
+        let mut yielded = app_with_host_rail();
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        yielded.state.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        yielded
+            .state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(host));
+        compute_desktop_view(&mut yielded);
+        assert!(yielded.state.view.glass_sidebar_yielded);
+        let shared = yielded.state.view.sidebar_rect.x + yielded.state.view.sidebar_rect.width - 1;
+        assert_eq!(shared, host_rail_divider_col(&yielded));
+        assert!(yielded.state.on_host_rail_divider(shared, 5));
+        assert!(!yielded.state.on_sidebar_divider(shared, 5));
+
+        // Collapsed: the sidebar is not resizable at all, so neither claims it.
+        let mut collapsed = app_with_host_rail();
+        collapsed.state.sidebar_collapsed = true;
+        compute_desktop_view(&mut collapsed);
+        assert_eq!(collapsed.state.view.host_rail_rect, Rect::default());
+        let collapsed_col =
+            collapsed.state.view.sidebar_rect.x + collapsed.state.view.sidebar_rect.width - 1;
+        assert!(!collapsed.state.on_sidebar_divider(collapsed_col, 5));
+        assert!(!collapsed.state.on_host_rail_divider(collapsed_col, 5));
+
+        // Embedded: the rail is suppressed so it owns no column anywhere, but
+        // the sidebar's own edge must keep working — never zero owners.
+        let mut embedded = app_with_host_rail();
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        crate::ui::compute_view_with_context(
+            &mut embedded.state,
+            &terminal_runtimes,
+            Rect::new(0, 0, 106, 32),
+            false,
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::protocol::ViewContext::Embedded,
+        );
+        assert!(embedded.state.view.host_rail_visually_suppressed);
+        assert_eq!(embedded.state.view.host_rail_rect, Rect::default());
+        let embedded_col =
+            embedded.state.view.sidebar_rect.x + embedded.state.view.sidebar_rect.width - 1;
+        assert!(embedded.state.on_sidebar_divider(embedded_col, 5));
+        for col in 0..embedded.state.view.sidebar_rect.width {
+            assert!(!embedded.state.on_host_rail_divider(col, 5));
+        }
+    }
+
+    /// Ahmed's report: with a remote host selected the rail would not resize.
+    /// The press landed on the outer sidebar divider, which silently rewrote
+    /// the hidden panel's width instead.
+    #[test]
+    fn dragging_the_shared_divider_while_yielded_resizes_the_rail_not_the_panel() {
+        let mut app = app_with_host_rail();
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.state.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(host));
+        compute_desktop_view(&mut app);
+        assert!(app.state.view.glass_sidebar_yielded);
+        let shared = app.state.view.sidebar_rect.x + app.state.view.sidebar_rect.width - 1;
+        let panel_width_before = app.state.sidebar_width;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), shared, 5));
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(DragTarget::HostRailDivider)
+        ));
+        // The drag must keep tracking once the pointer leaves the rail, which a
+        // widening drag does immediately; the glass must not swallow it.
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            shared + 5,
+            5,
+        ));
+
+        assert_eq!(app.state.host_rail_width, shared + 6);
+        compute_desktop_view(&mut app);
+        assert_eq!(app.state.view.host_rail_rect.width, shared + 6);
+        assert_eq!(app.state.view.sidebar_rect.width, shared + 6);
+
+        // The hidden panel is untouched, so deselecting the host later does not
+        // surface a width the user never knowingly set.
+        assert_eq!(app.state.sidebar_width, panel_width_before);
+        assert_eq!(
+            app.state.sidebar_width_source,
+            crate::app::state::SidebarWidthSource::ConfigDefault
+        );
+    }
+
+    /// Drag targets latch at mouse-down and read geometry live, which is what
+    /// the sidebar divider already does. If the glass drops mid-drag and the
+    /// sidebar un-yields, the held drag stays a rail resize rather than
+    /// switching to the panel it never grabbed.
+    #[test]
+    fn host_rail_drag_survives_the_sidebar_un_yielding_mid_drag() {
+        let mut app = app_with_host_rail();
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.state.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(host));
+        compute_desktop_view(&mut app);
+        let shared = app.state.view.sidebar_rect.x + app.state.view.sidebar_rect.width - 1;
+        let panel_width_before = app.state.sidebar_width;
+
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), shared, 5));
+
+        // Glass drops while the button is still held.
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Local);
+        compute_desktop_view(&mut app);
+        assert!(!app.state.view.glass_sidebar_yielded);
+
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 18, 5));
+
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(DragTarget::HostRailDivider)
+        ));
+        assert_eq!(app.state.host_rail_width, 19);
+        assert_eq!(app.state.sidebar_width, panel_width_before);
     }
 
     #[test]
@@ -2437,11 +2614,12 @@ mod tests {
     }
 
     /// When the host glass yields the sidebar, the rail IS the whole sidebar
-    /// and both dividers would land on the same column. That column keeps its
-    /// existing owner, the outer sidebar divider, so one column never means two
-    /// things.
+    /// and both dividers would land on the same column. The rail takes it: the
+    /// Spaces/Agents panel is hidden, so the rail is the only thing that edge
+    /// borders and the only thing a drag there can visibly resize. One column
+    /// still means exactly one thing.
     #[test]
-    fn glass_yielded_sidebar_keeps_the_shared_divider_column() {
+    fn glass_yielded_sidebar_gives_the_shared_divider_column_to_the_rail() {
         let mut app = app_with_host_rail();
         let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
         app.state.remote_sources.mark_status(
@@ -2457,8 +2635,8 @@ mod tests {
         assert_eq!(sidebar.width, app.state.view.host_rail_rect.width);
 
         let shared_col = sidebar.x + sidebar.width - 1;
-        assert!(app.state.on_sidebar_divider(shared_col, 5));
-        assert!(!app.state.on_host_rail_divider(shared_col, 5));
+        assert!(app.state.on_host_rail_divider(shared_col, 5));
+        assert!(!app.state.on_sidebar_divider(shared_col, 5));
     }
 
     #[test]

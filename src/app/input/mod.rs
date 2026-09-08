@@ -260,6 +260,15 @@ impl App {
             return false;
         }
 
+        // A local drag started on the rail — its divider or its scrollbar —
+        // owns the pointer until release, including after it leaves the rail
+        // rect, which a resize drag necessarily does. Without this the glass
+        // swallows every move past the rail's edge and the rail only ever snaps
+        // to the column the press landed on.
+        if self.state.drag.is_some() {
+            return false;
+        }
+
         let rail = self.state.view.host_rail_rect;
         if mouse.column >= rail.x
             && mouse.column < rail.x.saturating_add(rail.width)
