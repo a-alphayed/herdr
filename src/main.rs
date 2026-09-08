@@ -248,7 +248,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Maximum sidebar width when expanded (columns)
 # sidebar_max_width = 36
 
-# Width of the hosts rail beside the Spaces/Agents panel (columns, 8-24).
+# Width of the hosts rail beside the Spaces/Agents panel (columns, 7-24).
 # Drag the rail's right edge to resize it; double-click that edge to reset.
 # host_rail_width = 10
 

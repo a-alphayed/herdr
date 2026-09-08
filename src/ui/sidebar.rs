@@ -17,6 +17,8 @@ use crate::terminal::TerminalRuntimeRegistry;
 const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
 const HOST_RAIL_HEADER_ROWS: u16 = 2;
+/// Leading column of every host row. It holds the connection status marker for
+/// remote hosts and stays blank for `local`, which has no connection state.
 const HOST_ROW_LEADING_GUTTER: u16 = 1;
 /// Default width of the dedicated host-selection rail beside the Spaces/Agents
 /// panel, matching the established pre-existing rail pattern
@@ -24,12 +26,25 @@ const HOST_ROW_LEADING_GUTTER: u16 = 1;
 /// desktop; it is never sized to the current host count, but the user can drag
 /// its right-edge divider — or set `ui.host_rail_width` — to resize it.
 pub(crate) const DEFAULT_HOST_RAIL_WIDTH: u16 = 10;
-/// Narrowest legible rail. The rail spends one column on its own internal
-/// divider, one on each row's leading gutter and one on the right-edge status
-/// marker, so 8 columns is the narrowest width that still fits the ` hosts`
-/// header (6 of the 7 content columns) and leaves a 4-column host label even
-/// once the scrollbar takes a column.
-pub(crate) const HOST_RAIL_MIN_WIDTH: u16 = 8;
+/// Narrowest legible rail. At width `W`, with `s = 1` when the host-list
+/// scrollbar is showing and `0` otherwise, every column is owned:
+///
+/// | column        | owner                                                |
+/// |---------------|------------------------------------------------------|
+/// | `W - 1`       | the rail's own internal divider                      |
+/// | `W - 2`       | the host-list scrollbar, only while `s = 1`          |
+/// | `0`           | the row's leading gutter, holding the status marker  |
+/// | `1 ..= W-2-s` | the host label, so `label_width = W - 2 - s`         |
+///
+/// Two constraints bind, and both land on 7: the ` hosts` header is 6 columns
+/// and renders into the `W - 1` content columns (`W >= 7`), and the label needs
+/// 4 columns in the worst case so a truncated name reads `abc…` rather than
+/// `a…` (`W - 3 >= 4`, so `W >= 7`). At 6 the header is silently clipped to
+/// ` host` — a plain `Paragraph` clips rather than elides, so nothing even
+/// marks the loss — and the worst-case label falls to 3. That is where the
+/// rail actually stops working.
+/// 7 therefore spends: 1 divider + 1 scrollbar + 1 marker + 4 label.
+pub(crate) const HOST_RAIL_MIN_WIDTH: u16 = 7;
 /// Widest rail. The rail only ever lists short host aliases and is nested
 /// inside the sidebar, so past this it just starves the Spaces/Agents panel.
 pub(crate) const HOST_RAIL_MAX_WIDTH: u16 = 24;
@@ -1331,15 +1346,14 @@ fn render_host_row(
         }
     }
 
-    // Right-edge status marker for cached remote statuses.
-    let marker_rect = entry
-        .status
-        .and_then(|_| (rect.width > 1).then_some(Rect::new(rect.x + rect.width - 1, rect.y, 1, 1)));
+    // Leading status marker for cached remote statuses, drawn in the row's
+    // leading gutter so the rail reads marker-first like the spaces and agents
+    // panels (`● Apeal`) instead of trailing the dot behind a truncated label.
+    // `local` carries no connection state, so its gutter simply stays blank and
+    // every label still starts in the same column.
+    let marker_rect = entry.status.map(|_| Rect::new(rect.x, rect.y, 1, 1));
     let label_x = rect.x.saturating_add(HOST_ROW_LEADING_GUTTER);
-    let label_width = rect
-        .width
-        .saturating_sub(HOST_ROW_LEADING_GUTTER)
-        .saturating_sub(u16::from(marker_rect.is_some()));
+    let label_width = rect.width.saturating_sub(HOST_ROW_LEADING_GUTTER);
     frame.render_widget(
         Paragraph::new(truncate_text(&entry.label, label_width as usize)).style(style),
         Rect::new(label_x, rect.y, label_width, 1),
@@ -2014,7 +2028,7 @@ mod tests {
     }
 
     #[test]
-    fn host_rail_remote_status_markers_render_in_status_column() {
+    fn host_rail_remote_status_markers_render_in_leading_gutter() {
         let mut app = crate::app::state::AppState::test_new();
         for (host, status) in [
             (
@@ -2046,7 +2060,11 @@ mod tests {
         app.view.host_rail_rect = area;
 
         let buffer = rendered_host_rail_buffer(&app, area);
-        let marker_x = area.x + area.width - 2;
+        // Markers lead each row, in the leading gutter, matching the spaces and
+        // agents panels. `local` (row 2) has no connection state, so its gutter
+        // stays blank while every label still starts one column further right.
+        let marker_x = area.x;
+        assert_eq!(buffer[(marker_x, 2)].symbol(), " ");
 
         assert_eq!(buffer[(marker_x, 3)].symbol(), "●");
         assert_eq!(buffer[(marker_x, 3)].style().fg, Some(app.palette.green));
@@ -2084,7 +2102,7 @@ mod tests {
         app.select_sidebar_source(SidebarSource::Remote(host));
 
         let buffer = rendered_host_rail_buffer(&app, area);
-        let marker_x = area.x + area.width - 2;
+        let marker_x = area.x;
         let marker_style = buffer[(marker_x, 3)].style();
 
         assert_eq!(buffer[(marker_x, 3)].symbol(), "↑");
@@ -2094,7 +2112,7 @@ mod tests {
     }
 
     #[test]
-    fn host_rail_remote_label_truncates_before_marker() {
+    fn host_rail_remote_label_truncates_after_leading_marker() {
         let mut app = crate::app::state::AppState::test_new();
         app.remote_sources.mark_status(
             &RemoteHostKey::new("verylongremotehost", crate::session::DEFAULT_SESSION_NAME),
@@ -2110,12 +2128,15 @@ mod tests {
         // divider column (area.width - 1) is
         // the rail's own internal divider (drawn by `render_host_rail`, not
         // the outer sidebar/main-area divider from `render_sidebar`), so read
-        // only the content columns up to and including the status marker.
+        // only the content columns.
         let row = (0..(area.width - 1))
             .map(|x| buffer[(x, 3)].symbol())
             .collect::<String>();
 
-        assert_eq!(row, " verylo…●");
+        // The marker leads, and the freed trailing column goes to the label:
+        // it truncates at 8 columns here where the trailing-marker layout only
+        // allowed 7 (`" verylo…●"`).
+        assert_eq!(row, "●verylon…");
     }
 
     #[test]
@@ -2137,8 +2158,75 @@ mod tests {
 
         assert_eq!(row(0), " hosts   │");
         assert_eq!(row(1), "         │");
+        // `local` has no marker, so its blank gutter keeps the label column
+        // aligned with the marked remote row below it.
         assert_eq!(row(2), " local   │");
-        assert_eq!(row(3), " verylo…●│");
+        assert_eq!(row(3), "●verylon…│");
+    }
+
+    /// Pins the column budget `HOST_RAIL_MIN_WIDTH` is derived from: at the
+    /// minimum width every column is spoken for, the ` hosts` header still
+    /// renders whole, the marker keeps its gutter, and the label keeps 4
+    /// columns in the worst case (scrollbar showing) so a truncated name still
+    /// reads as `abc…`.
+    #[test]
+    fn minimum_host_rail_width_still_fits_header_marker_and_a_readable_label() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.remote_sources.mark_status(
+            &RemoteHostKey::new("verylongremotehost", crate::session::DEFAULT_SESSION_NAME),
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        let width = HOST_RAIL_MIN_WIDTH;
+        let area = Rect::new(0, 0, width, 4);
+        app.view.host_rail_rect = area;
+
+        // No scrollbar at this height: 1 divider + 1 marker + 5 label.
+        assert!(host_list_scrollbar_rect(&app, area).is_none());
+        let buffer = rendered_host_rail_buffer(&app, area);
+        let row = |y| {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+
+        // The header is 6 columns and survives whole in the 6 content columns.
+        assert_eq!(row(0), " hosts│");
+        assert_eq!(row(2), " local│");
+        assert_eq!(row(3), "●very…│");
+
+        // Worst case: enough hosts to force the scrollbar, which takes the
+        // column left of the divider and leaves the label 4.
+        for host in ["bravo", "charlie", "delta", "echo"] {
+            app.remote_sources.mark_status(
+                &RemoteHostKey::new(host, crate::session::DEFAULT_SESSION_NAME),
+                crate::remote_source::RemoteConnectionStatus::Connected,
+            );
+        }
+        let scrollbar = host_list_scrollbar_rect(&app, area).expect("scrollbar at this height");
+        assert_eq!(scrollbar.x, area.x + area.width - 2);
+        let body = host_list_body_rect(area, true);
+        assert_eq!(body.width, HOST_ROW_LEADING_GUTTER + 4);
+        // Body, scrollbar and divider tile the rail without overlapping.
+        assert_eq!(body.x + body.width, scrollbar.x);
+        assert_eq!(scrollbar.x + 1, area.x + area.width - 1);
+    }
+
+    /// One column narrower is where the rail actually breaks, which is what
+    /// makes 7 the floor rather than a preference. The header is a plain
+    /// `Paragraph`, so it is CLIPPED rather than elided: at 6 columns the panel
+    /// silently loses its own last letter with no `…` to admit it.
+    #[test]
+    fn one_column_below_the_minimum_clips_the_header() {
+        let app = crate::app::state::AppState::test_new();
+        let area = Rect::new(0, 0, HOST_RAIL_MIN_WIDTH - 1, 4);
+
+        let buffer = rendered_host_rail_buffer(&app, area);
+        let header = (0..area.width - 1)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+
+        assert_eq!(header, " host");
+        assert!(!header.contains('…'));
     }
 
     #[test]
