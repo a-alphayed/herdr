@@ -915,7 +915,24 @@ fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) 
             ));
         }
     }
-    if let Some(feedback) = &app.copy_feedback {
+    // An embedded render presents the viewed host's CONTENT, not chrome that
+    // belongs to the viewer. Copying inside a host glass view is executed here,
+    // on the remote — it owns the PTYs and the selection — but the text lands on
+    // the clipboard of the machine the human is physically using: the payload
+    // travels down the glass stream and the VIEWER's own server writes it and
+    // raises its own confirmation. That one reports where the text actually
+    // went, so it is the meaningful one; drawing ours into the frame we stream
+    // only stacks a second, redundant box beneath it. `host_rail_visually_suppressed`
+    // is this crate's single "this render is for an embedded client" bit, the
+    // same one `AppState::host_glass_presented` reads. A Standalone client of
+    // this host — the human sitting at it — is unaffected and still sees its
+    // confirmation. The agent toast above is a different feature and is streamed
+    // either way: it reports something that happened on THIS host.
+    let copy_feedback = app
+        .copy_feedback
+        .as_ref()
+        .filter(|_| !app.view.host_rail_visually_suppressed);
+    if let Some(feedback) = copy_feedback {
         let area = if app.view.layout == ViewLayout::Mobile {
             frame.area()
         } else {
@@ -1375,6 +1392,112 @@ test in the suite would fail. If you need to suppress the rail for a reason that
             );
         let standalone_text = buffer_text(&standalone, area);
         assert!(standalone_text.contains(" glass "));
+    }
+
+    const COPY_FEEDBACK_MESSAGE: &str = "copied to clipboard";
+
+    fn copy_feedback_test_app() -> crate::app::state::AppState {
+        let mut app = crate::app::state::AppState::test_new();
+        let mut ws = Workspace::test_new("test");
+        let root = ws.tabs[0].root_pane;
+        ws.insert_test_runtime(
+            root,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(20, 5, b"local"),
+        );
+        app.workspaces = vec![ws];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.copy_feedback = Some(crate::app::state::CopyFeedback {
+            message: COPY_FEEDBACK_MESSAGE.to_string(),
+        });
+        app
+    }
+
+    /// The host being VIEWED through someone else's glass executes the copy —
+    /// it owns the PTYs and the selection — but the text lands on the clipboard
+    /// of the machine the human is physically using, and that machine's own
+    /// server raises its own confirmation. So the viewed host must keep its
+    /// confirmation out of the frame it streams, or the viewer sees two boxes
+    /// stacked at the bottom of its screen. Its own Standalone client — the
+    /// human sitting at that host — must still see exactly the one box it
+    /// always saw.
+    #[tokio::test]
+    async fn embedded_render_omits_copy_feedback_that_standalone_still_draws() {
+        let mut app = copy_feedback_test_app();
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        let area = Rect::new(0, 0, 80, 20);
+
+        let (embedded, _cursor) =
+            crate::server::render_stream::render_virtual_with_runtime_registry_and_glass_in_context(
+                &mut app,
+                &terminal_runtimes,
+                None,
+                area,
+                true,
+                crate::kitty_graphics::HostCellSize::default(),
+                ViewContext::Embedded,
+            );
+        assert!(app.view.host_rail_visually_suppressed);
+        assert!(
+            !buffer_text(&embedded, area).contains(COPY_FEEDBACK_MESSAGE),
+            "a frame streamed to an embedded viewer must not carry this host's \
+             copy confirmation; the viewer's own server draws the meaningful one",
+        );
+
+        let (standalone, _cursor) =
+            crate::server::render_stream::render_virtual_with_runtime_registry_and_glass_in_context(
+                &mut app,
+                &terminal_runtimes,
+                None,
+                area,
+                true,
+                crate::kitty_graphics::HostCellSize::default(),
+                ViewContext::Standalone,
+            );
+        assert!(!app.view.host_rail_visually_suppressed);
+        assert!(
+            buffer_text(&standalone, area).contains(COPY_FEEDBACK_MESSAGE),
+            "a standalone client must still see its copy confirmation",
+        );
+
+        // Only whether the box is DRAWN depends on the client being rendered.
+        // The feedback state and its deadline are untouched, so the standalone
+        // client attached to the same host keeps the full, unshortened toast.
+        assert!(app.copy_feedback.is_some());
+    }
+
+    /// The other half of the guarantee: exactly one confirmation, never zero.
+    /// The viewer is a Standalone client with the glass presented; the
+    /// confirmation it draws over the streamed frame is its own, raised when the
+    /// text actually reached this machine's clipboard. Suppressing the remote's
+    /// copy must not touch it.
+    #[tokio::test]
+    async fn glass_viewer_still_draws_its_own_copy_feedback_over_the_streamed_frame() {
+        let mut app = copy_feedback_test_app();
+        app.select_sidebar_source(crate::app::state::SidebarSource::Remote(
+            crate::remote_source::RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME),
+        ));
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        let area = Rect::new(0, 0, 80, 20);
+
+        let (viewer, _cursor) =
+            crate::server::render_stream::render_virtual_with_runtime_registry_and_glass_in_context(
+                &mut app,
+                &terminal_runtimes,
+                None,
+                area,
+                true,
+                crate::kitty_graphics::HostCellSize::default(),
+                ViewContext::Standalone,
+            );
+
+        assert!(app.host_glass_presented());
+        assert!(
+            buffer_text(&viewer, area).contains(COPY_FEEDBACK_MESSAGE),
+            "the viewer's own confirmation is the one that reports where the \
+             text actually went; it must survive over the streamed glass frame",
+        );
     }
 
     #[test]
