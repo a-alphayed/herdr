@@ -125,6 +125,7 @@ pub struct App {
     pub(crate) pending_api_worktree_remove_paths: HashMap<std::path::PathBuf, u64>,
     pub(crate) next_api_worktree_operation_id: u64,
     pub(crate) last_sidebar_divider_click: Option<Instant>,
+    pub(crate) last_host_rail_divider_click: Option<Instant>,
     pub(crate) last_pane_click: Option<PaneClickState>,
     pub(crate) next_resize_poll: Instant,
     pub(crate) next_animation_tick: Option<Instant>,
@@ -541,6 +542,8 @@ impl App {
             selected,
             sidebar_width,
             sidebar_width_source,
+            host_rail_width,
+            host_rail_width_source,
             sidebar_section_split,
             collapsed_space_keys,
         ) = if no_session {
@@ -549,6 +552,8 @@ impl App {
                 None,
                 0,
                 config.ui.sidebar_width,
+                state::SidebarWidthSource::ConfigDefault,
+                config.ui.host_rail_width,
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
                 std::collections::HashSet::new(),
@@ -586,6 +591,12 @@ impl App {
                     } else {
                         state::SidebarWidthSource::ConfigDefault
                     },
+                    snap.host_rail_width.unwrap_or(config.ui.host_rail_width),
+                    if snap.host_rail_width.is_some() {
+                        state::SidebarWidthSource::Persisted
+                    } else {
+                        state::SidebarWidthSource::ConfigDefault
+                    },
                     snap.sidebar_section_split.unwrap_or(0.5),
                     snap.collapsed_space_keys,
                 )
@@ -603,6 +614,12 @@ impl App {
                     } else {
                         state::SidebarWidthSource::ConfigDefault
                     },
+                    snap.host_rail_width.unwrap_or(config.ui.host_rail_width),
+                    if snap.host_rail_width.is_some() {
+                        state::SidebarWidthSource::Persisted
+                    } else {
+                        state::SidebarWidthSource::ConfigDefault
+                    },
                     snap.sidebar_section_split.unwrap_or(0.5),
                     snap.collapsed_space_keys,
                 )
@@ -613,6 +630,8 @@ impl App {
                 None,
                 0,
                 config.ui.sidebar_width,
+                state::SidebarWidthSource::ConfigDefault,
+                config.ui.host_rail_width,
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
                 std::collections::HashSet::new(),
@@ -779,6 +798,11 @@ impl App {
             mobile_width_threshold: config.ui.mobile_width_threshold,
             sidebar_width_source,
             sidebar_width_auto: false,
+            default_host_rail_width: config.ui.host_rail_width,
+            host_rail_width,
+            host_rail_min_width: crate::ui::HOST_RAIL_MIN_WIDTH,
+            host_rail_max_width: crate::ui::HOST_RAIL_MAX_WIDTH,
+            host_rail_width_source,
             sidebar_collapsed: false,
             sidebar_collapsed_mode: config.ui.sidebar_collapsed_mode,
             sidebar_section_split,
@@ -896,6 +920,7 @@ impl App {
             pending_api_worktree_remove_paths: HashMap::new(),
             next_api_worktree_operation_id: 1,
             last_sidebar_divider_click: None,
+            last_host_rail_divider_click: None,
             last_pane_click: None,
             next_resize_poll: Instant::now() + RESIZE_POLL_INTERVAL,
             next_animation_tick: None,
@@ -991,6 +1016,10 @@ impl App {
         if let Some(width) = snapshot.sidebar_width {
             app.state.sidebar_width = width;
             app.state.sidebar_width_source = state::SidebarWidthSource::Persisted;
+        }
+        if let Some(width) = snapshot.host_rail_width {
+            app.state.host_rail_width = width;
+            app.state.host_rail_width_source = state::SidebarWidthSource::Persisted;
         }
         if let Some(split) = snapshot.sidebar_section_split {
             app.state.sidebar_section_split = split;
@@ -1605,6 +1634,10 @@ impl App {
                 }
                 self.state.sidebar_min_width = config.ui.sidebar_min_width;
                 self.state.sidebar_max_width = config.ui.sidebar_max_width;
+                self.state.default_host_rail_width = config.ui.host_rail_width;
+                if self.state.host_rail_width_source == state::SidebarWidthSource::ConfigDefault {
+                    self.state.host_rail_width = config.ui.host_rail_width;
+                }
                 self.state.sidebar_collapsed_mode = config.ui.sidebar_collapsed_mode;
                 self.state.mobile_width_threshold = config.ui.mobile_width_threshold;
                 // Re-clamp the live width to the new bounds. No source guard — bounds
@@ -4209,6 +4242,42 @@ connection_policy = "manual"
         assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
         assert_eq!(app.state.default_sidebar_width, 35);
         assert_eq!(app.state.sidebar_width, 31);
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn reload_config_updates_host_rail_width_only_when_config_owned() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("reload-config-host-rail-width");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+
+        let mut app = test_app();
+        assert_eq!(
+            app.state.host_rail_width_source,
+            state::SidebarWidthSource::ConfigDefault
+        );
+        assert_eq!(
+            app.state.host_rail_width,
+            crate::ui::DEFAULT_HOST_RAIL_WIDTH
+        );
+
+        std::fs::write(&path, "[ui]\nhost_rail_width = 14\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(app.state.default_host_rail_width, 14);
+        assert_eq!(app.state.host_rail_width, 14);
+
+        // A dragged width owns itself; config only moves the reset target.
+        app.state.host_rail_width = 20;
+        app.state.host_rail_width_source = state::SidebarWidthSource::Manual;
+        std::fs::write(&path, "[ui]\nhost_rail_width = 12\n").unwrap();
+        let report = app.reload_config();
+        assert_eq!(report.status, crate::config::ConfigReloadStatus::Applied);
+        assert_eq!(app.state.default_host_rail_width, 12);
+        assert_eq!(app.state.host_rail_width, 20);
 
         std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

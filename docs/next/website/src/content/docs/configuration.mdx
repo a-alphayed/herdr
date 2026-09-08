@@ -369,6 +369,7 @@ Common options:
 sidebar_width = 32
 sidebar_min_width = 18
 sidebar_max_width = 36
+host_rail_width = 10
 sidebar_collapsed_mode = "compact"
 mobile_width_threshold = 64
 mouse_capture = true
@@ -386,6 +387,8 @@ accent = "cyan"
 ```
 
 `sidebar_min_width` and `sidebar_max_width` control the expanded sidebar's resize bounds in columns. The defaults are 18 and 36.
+
+`host_rail_width` sets the width in columns of the hosts rail beside the Spaces/Agents panel. The default is 10, and the value is clamped to 8-24. You can also drag the rail's right edge to resize it, or double-click that edge to reset it to the configured width; the dragged width is remembered across restarts.
 
 `sidebar_collapsed_mode` controls what remains visible after toggling the sidebar closed. The default, `compact`, keeps the narrow status rail. Set it to `hidden` to make the collapsed sidebar zero-width; reopen it with `keys.toggle_sidebar`.
 

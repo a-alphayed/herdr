@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Added a resizable hosts rail: drag its right-edge divider to resize it, double-click that divider to reset it, and set its default width with the new `ui.host_rail_width`. The width is clamped to 8-24 columns and persists across restarts.
 - Added `ui.sidebar_collapsed_mode = "hidden"` to make a collapsed sidebar use zero width while keeping the existing compact rail as the default. (#842)
 - Added `herdr completion <shell>` / `herdr completions <shell>` to generate shell completion scripts for bash, elvish, fish, PowerShell, and zsh. (#435)
 - Added `session.snapshot` to bootstrap client runtime state in one socket API response before subscribing to events.

@@ -2943,8 +2943,8 @@ last_pane = "prefix+tab"
             &bravo,
             crate::remote_source::RemoteConnectionStatus::Connected,
         );
-        state.view.host_rail_rect =
-            ratatui::layout::Rect::new(0, 0, crate::ui::host_rail_width(), 20);
+        let rail_width = crate::ui::host_rail_width(&state);
+        state.view.host_rail_rect = ratatui::layout::Rect::new(0, 0, rail_width, 20);
         state.sidebar_source = crate::app::state::SidebarSource::Local;
 
         // local -> alpha -> bravo.
@@ -3032,8 +3032,8 @@ last_pane = "prefix+tab"
         );
 
         // When the rail returns, no hidden remote selection is surfaced.
-        state.view.host_rail_rect =
-            ratatui::layout::Rect::new(0, 0, crate::ui::host_rail_width(), 20);
+        let rail_width = crate::ui::host_rail_width(&state);
+        state.view.host_rail_rect = ratatui::layout::Rect::new(0, 0, rail_width, 20);
         assert_eq!(
             state.effective_sidebar_source(),
             crate::app::state::SidebarSource::Local

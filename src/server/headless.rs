@@ -1058,6 +1058,7 @@ impl HeadlessServer {
             self.app.state.active,
             self.app.state.selected,
             self.app.state.sidebar_width,
+            self.app.state.host_rail_width,
             self.app.state.sidebar_section_split,
             self.app.state.collapsed_space_keys.clone(),
         );
@@ -8349,14 +8350,12 @@ new_tab = "prefix+t"
 
         server.render_and_stream();
 
-        assert_eq!(
-            server.app.state.view.host_rail_rect.width,
-            crate::ui::host_rail_width()
-        );
+        let rail_width = crate::ui::host_rail_width(&server.app.state);
+        assert_eq!(server.app.state.view.host_rail_rect.width, rail_width);
         assert!(!server.app.state.view.host_rail_visually_suppressed);
         assert_eq!(
             server.app.state.view.sidebar_panel_rect.x,
-            server.app.state.view.sidebar_rect.x + crate::ui::host_rail_width()
+            server.app.state.view.sidebar_rect.x + rail_width
         );
     }
 

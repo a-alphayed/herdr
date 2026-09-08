@@ -329,6 +329,28 @@ impl App {
             }
         }
 
+        // Same double-click-to-reset affordance on the rail's own divider.
+        // `on_host_rail_divider` never fires on the outer sidebar divider's
+        // column, so the two resets can never both claim one click.
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.state.on_host_rail_divider(mouse.column, mouse.row)
+        {
+            let now = std::time::Instant::now();
+            let is_double_click = self
+                .last_host_rail_divider_click
+                .is_some_and(|last| now.duration_since(last) <= super::SIDEBAR_DOUBLE_CLICK_WINDOW);
+            self.last_host_rail_divider_click = Some(now);
+
+            if is_double_click {
+                self.state.host_rail_width = self.state.default_host_rail_width;
+                self.state.host_rail_width_source =
+                    crate::app::state::SidebarWidthSource::ConfigDefault;
+                self.state.mark_session_dirty();
+                self.state.drag = None;
+                return;
+            }
+        }
+
         if self.handle_modified_url_click(mouse) {
             return;
         }
@@ -716,6 +738,7 @@ fn capture_snapshot(state: &AppState) -> crate::persist::SessionSnapshot {
         state.active,
         state.selected,
         state.sidebar_width,
+        state.host_rail_width,
         state.sidebar_section_split,
         state.collapsed_space_keys.clone(),
     )

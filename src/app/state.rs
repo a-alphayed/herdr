@@ -1064,6 +1064,9 @@ pub(crate) enum DragTarget {
     },
     SidebarDivider,
     SidebarSectionDivider,
+    /// The host rail's own right-edge divider, which resizes the rail. Distinct
+    /// from `SidebarDivider`, which resizes the Spaces/Agents panel.
+    HostRailDivider,
 }
 
 /// Active mouse drag on a split border or sidebar divider.
@@ -1474,6 +1477,18 @@ pub struct AppState {
     pub mobile_width_threshold: u16,
     pub sidebar_width_source: SidebarWidthSource,
     pub sidebar_width_auto: bool,
+    /// Width the host rail resets to on a divider double-click; follows
+    /// `ui.host_rail_width`.
+    pub default_host_rail_width: u16,
+    /// Current host rail width. `crate::ui::host_rail_width()` is the clamped
+    /// authority every geometry path reads.
+    pub host_rail_width: u16,
+    /// Structural rail bounds. Unlike the sidebar's, these are not config
+    /// surface: they come from the rail's own legibility floor and ceiling, so
+    /// `min <= max` always holds and the clamp can never panic.
+    pub host_rail_min_width: u16,
+    pub host_rail_max_width: u16,
+    pub host_rail_width_source: SidebarWidthSource,
     pub sidebar_collapsed: bool,
     pub sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig,
     /// Ratio of sidebar height allocated to the workspaces section.
@@ -2025,6 +2040,11 @@ impl AppState {
             mobile_width_threshold: crate::config::DEFAULT_MOBILE_WIDTH_THRESHOLD,
             sidebar_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_width_auto: false,
+            default_host_rail_width: crate::ui::DEFAULT_HOST_RAIL_WIDTH,
+            host_rail_width: crate::ui::DEFAULT_HOST_RAIL_WIDTH,
+            host_rail_min_width: crate::ui::HOST_RAIL_MIN_WIDTH,
+            host_rail_max_width: crate::ui::HOST_RAIL_MAX_WIDTH,
+            host_rail_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_collapsed: false,
             sidebar_collapsed_mode: crate::config::SidebarCollapsedModeConfig::Compact,
             sidebar_section_split: 0.5,

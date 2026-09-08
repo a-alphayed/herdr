@@ -18,11 +18,21 @@ const WORKSPACE_SECTION_HEADER_ROWS: u16 = 2;
 const AGENT_PANEL_HEADER_ROWS: u16 = 3;
 const HOST_RAIL_HEADER_ROWS: u16 = 2;
 const HOST_ROW_LEADING_GUTTER: u16 = 1;
-/// Fixed width of the dedicated host-selection rail beside the Spaces/Agents
+/// Default width of the dedicated host-selection rail beside the Spaces/Agents
 /// panel, matching the established pre-existing rail pattern
 /// (`SOURCE_RAIL_WIDTH`). The rail is always full sidebar height on expanded
-/// desktop; it is never sized to the current host count.
-const HOST_RAIL_WIDTH: u16 = 10;
+/// desktop; it is never sized to the current host count, but the user can drag
+/// its right-edge divider — or set `ui.host_rail_width` — to resize it.
+pub(crate) const DEFAULT_HOST_RAIL_WIDTH: u16 = 10;
+/// Narrowest legible rail. The rail spends one column on its own internal
+/// divider, one on each row's leading gutter and one on the right-edge status
+/// marker, so 8 columns is the narrowest width that still fits the ` hosts`
+/// header (6 of the 7 content columns) and leaves a 4-column host label even
+/// once the scrollbar takes a column.
+pub(crate) const HOST_RAIL_MIN_WIDTH: u16 = 8;
+/// Widest rail. The rail only ever lists short host aliases and is nested
+/// inside the sidebar, so past this it just starves the Spaces/Agents panel.
+pub(crate) const HOST_RAIL_MAX_WIDTH: u16 = 24;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentPanelEntryLocation {
@@ -155,9 +165,13 @@ fn host_status_marker(
     }
 }
 
-/// Fixed width of the dedicated host-selection rail.
-pub(crate) fn host_rail_width() -> u16 {
-    HOST_RAIL_WIDTH
+/// Current width of the dedicated host-selection rail, clamped to the rail's
+/// structural bounds. This is the single authority for the rail's width: the
+/// stored `AppState::host_rail_width` is what drag/config/persistence write,
+/// this is what geometry reads.
+pub(crate) fn host_rail_width(app: &AppState) -> u16 {
+    app.host_rail_width
+        .clamp(app.host_rail_min_width, app.host_rail_max_width)
 }
 
 /// Content rect for the host rail: rail width minus the right-edge column
@@ -1243,9 +1257,10 @@ fn render_host_rail(app: &AppState, frame: &mut Frame, area: Rect) {
     let p = &app.palette;
 
     // The rail's own internal divider separates it from the adjacent
-    // Spaces/Agents panel. Unlike the outer sidebar/main-area divider (drawn
-    // by `render_sidebar`), it is a static visual element: it never reflects
-    // Navigate-mode accent styling and is never draggable.
+    // Spaces/Agents panel, and dragging it resizes the rail. It stays visually
+    // distinct from the outer sidebar/main-area divider (drawn by
+    // `render_sidebar`), which resizes the Spaces/Agents panel instead: this
+    // one never reflects Navigate-mode accent styling.
     let divider_x = area.x + area.width.saturating_sub(1);
     let buf = frame.buffer_mut();
     for y in area.y..area.y + area.height {

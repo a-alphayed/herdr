@@ -85,7 +85,8 @@ pub(crate) use self::{
         workspace_list_footer_rect, workspace_list_local_actions_rect,
         workspace_list_menu_button_rect, workspace_list_new_button_rect, workspace_list_rect,
         workspace_list_scroll_metrics, workspace_list_scrollbar_rect, workspace_parent_group_state,
-        AgentPanelEntry, WorkspaceListEntry,
+        AgentPanelEntry, WorkspaceListEntry, DEFAULT_HOST_RAIL_WIDTH, HOST_RAIL_MAX_WIDTH,
+        HOST_RAIL_MIN_WIDTH,
     },
 };
 pub(crate) use self::{
@@ -260,20 +261,22 @@ fn compute_view_internal(
     let desired_panel_w = app
         .sidebar_width
         .clamp(app.sidebar_min_width, app.sidebar_max_width);
-    // Ahmed's 2026-07-20 correction restores a dedicated, fixed-width
-    // full-height host-selection rail beside the Spaces/Agents panel (the
-    // pre-existing `SOURCE_RAIL_WIDTH = 10` rail pattern), replacing the
-    // full-width Hosts section that briefly lived above the panel. Unlike the
-    // old compact rail, the new rail is never gated by remote-cache state or
-    // by width: it is always present on expanded desktop (only collapsed
-    // sidebar and mobile layout drop it), so ordinary narrow expanded-desktop
-    // widths and local-only setups both keep it visible.
+    // Ahmed's 2026-07-20 correction restores a dedicated, full-height
+    // host-selection rail beside the Spaces/Agents panel (the pre-existing
+    // `SOURCE_RAIL_WIDTH = 10` rail pattern), replacing the full-width Hosts
+    // section that briefly lived above the panel. Unlike the old compact rail,
+    // the new rail is never gated by remote-cache state or by width: it is
+    // always present on expanded desktop (only collapsed sidebar and mobile
+    // layout drop it), so ordinary narrow expanded-desktop widths and
+    // local-only setups both keep it visible. Its width is user-owned
+    // (`ui.host_rail_width` plus divider drag), never derived from the host
+    // count.
     let host_rail_visually_suppressed =
         !app.sidebar_collapsed && view_context == ViewContext::Embedded;
     let rail_w = if app.sidebar_collapsed || host_rail_visually_suppressed {
         0
     } else {
-        host_rail_width()
+        host_rail_width(app)
     };
 
     // Glass-sidebar-yield: when the host glass is active and the sidebar is
@@ -1683,7 +1686,7 @@ test in the suite would fail. If you need to suppress the rail for a reason that
         let single_tab_terminal_area = app.view.terminal_area;
         assert_eq!(app.view.tab_bar_rect, Rect::default());
         // Main area starts right after the rail-plus-panel sidebar
-        // (`host_rail_width()` wider than the panel alone).
+        // (a rail width wider than the panel alone).
         assert_eq!(single_tab_terminal_area, Rect::new(36, 0, 44, 20));
         assert!(app.view.tab_hit_areas.is_empty());
         assert_eq!(app.view.new_tab_hit_area, Rect::default());
@@ -1827,8 +1830,8 @@ test in the suite would fail. If you need to suppress the rail for a reason that
         // Spaces/Agents panel: the panel itself still clamps to the
         // configured max, but the rail adds its own fixed width on top.
         assert_eq!(app.view.sidebar_panel_rect.width, 30);
-        assert_eq!(app.view.host_rail_rect.width, host_rail_width());
-        assert_eq!(app.view.sidebar_rect.width, host_rail_width() + 30);
+        assert_eq!(app.view.host_rail_rect.width, host_rail_width(&app));
+        assert_eq!(app.view.sidebar_rect.width, host_rail_width(&app) + 30);
     }
 
     #[test]
@@ -1846,8 +1849,148 @@ test in the suite would fail. If you need to suppress the rail for a reason that
         // Same rail-plus-panel total as the max-width case above, clamped to
         // the configured min on the panel side.
         assert_eq!(app.view.sidebar_panel_rect.width, 22);
-        assert_eq!(app.view.host_rail_rect.width, host_rail_width());
-        assert_eq!(app.view.sidebar_rect.width, host_rail_width() + 22);
+        assert_eq!(app.view.host_rail_rect.width, host_rail_width(&app));
+        assert_eq!(app.view.sidebar_rect.width, host_rail_width(&app) + 22);
+    }
+
+    /// Fresh state must still lay out exactly as the old fixed-width rail did,
+    /// so the default rail width can never drift from the released geometry.
+    #[test]
+    fn default_host_rail_width_matches_the_previous_fixed_width() {
+        let app = crate::app::state::AppState::test_new();
+
+        assert_eq!(app.host_rail_width, DEFAULT_HOST_RAIL_WIDTH);
+        assert_eq!(host_rail_width(&app), 10);
+    }
+
+    #[test]
+    fn compute_view_uses_the_configured_host_rail_width() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.sidebar_width = 26;
+        app.host_rail_width = 16;
+
+        compute_view(&mut app, Rect::new(0, 0, 100, 20));
+
+        // The rail takes its configured width, the panel keeps its own, and the
+        // sidebar total is still rail + panel.
+        assert_eq!(app.view.host_rail_rect.width, 16);
+        assert_eq!(app.view.sidebar_panel_rect.width, 26);
+        assert_eq!(app.view.sidebar_rect.width, 42);
+        assert_eq!(app.view.sidebar_panel_rect.x, app.view.sidebar_rect.x + 16);
+    }
+
+    #[test]
+    fn compute_view_clamps_host_rail_width_to_max() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.host_rail_max_width = 14;
+        app.host_rail_width = 999;
+
+        compute_view(&mut app, Rect::new(0, 0, 100, 20));
+
+        assert_eq!(app.view.host_rail_rect.width, 14);
+    }
+
+    #[test]
+    fn compute_view_clamps_host_rail_width_to_min() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.host_rail_min_width = 9;
+        app.host_rail_width = 1;
+
+        compute_view(&mut app, Rect::new(0, 0, 100, 20));
+
+        assert_eq!(app.view.host_rail_rect.width, 9);
+    }
+
+    /// A collapsed sidebar drops the rail entirely; a resized rail must not
+    /// resurrect it or leave a stray drag target behind.
+    #[test]
+    fn collapsed_sidebar_keeps_a_zero_width_host_rail_at_any_configured_width() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.host_rail_width = 20;
+        app.sidebar_collapsed = true;
+
+        compute_view(&mut app, Rect::new(0, 0, 100, 20));
+
+        assert_eq!(app.view.host_rail_rect, Rect::default());
+        assert!(!app.view.host_rail_visually_suppressed);
+    }
+
+    /// The embedded/glass render suppresses the rail the same way regardless of
+    /// the width the local user picked.
+    #[test]
+    fn embedded_render_keeps_a_zero_width_host_rail_at_any_configured_width() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.host_rail_width = 20;
+
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
+        compute_view_with_context(
+            &mut app,
+            &terminal_runtimes,
+            Rect::new(0, 0, 100, 20),
+            false,
+            crate::kitty_graphics::HostCellSize::default(),
+            ViewContext::Embedded,
+        );
+
+        assert_eq!(app.view.host_rail_rect, Rect::default());
+        assert!(app.view.host_rail_visually_suppressed);
+        // The whole sidebar is the panel; the rail contributes nothing.
+        assert_eq!(
+            app.view.sidebar_rect.width,
+            app.view.sidebar_panel_rect.width
+        );
+    }
+
+    /// Buffer-level proof that a resized rail actually redraws wider: the
+    /// ` hosts` header still reads, and the rail's own divider moves to the new
+    /// right edge instead of staying at the old fixed one.
+    #[test]
+    fn widened_host_rail_redraws_its_divider_at_the_new_right_edge() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.host_rail_width = 18;
+
+        let area = Rect::new(0, 0, 100, 20);
+        compute_view(&mut app, area);
+        let rail = app.view.host_rail_rect;
+        assert_eq!(rail.width, 18);
+
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let header_row = buffer_row_text(&buf, rail, rail.y);
+        assert!(
+            header_row.contains("hosts"),
+            "widened rail must still draw its header: {header_row:?}"
+        );
+        let divider_x = rail.x + rail.width - 1;
+        assert_eq!(buf[(divider_x, rail.y + 3)].symbol(), "│");
+        // The old fixed-width edge is now interior rail space, not a divider.
+        assert_ne!(buf[(rail.x + 9, rail.y + 3)].symbol(), "│");
     }
 
     #[test]
@@ -1951,16 +2094,16 @@ test in the suite would fail. If you need to suppress the rail for a reason that
         assert_eq!(app.view.sidebar_panel_rect.x, standalone_sidebar.x);
         assert_eq!(app.view.sidebar_panel_rect.width, standalone_panel.width);
         assert_eq!(
-            app.view.sidebar_rect.width + host_rail_width(),
+            app.view.sidebar_rect.width + host_rail_width(&app),
             standalone_sidebar.width
         );
         assert_eq!(
-            app.view.terminal_area.x + host_rail_width(),
+            app.view.terminal_area.x + host_rail_width(&app),
             standalone_main.x
         );
         assert_eq!(
             app.view.terminal_area.width,
-            standalone_main.width + host_rail_width()
+            standalone_main.width + host_rail_width(&app)
         );
         assert_eq!(app.host_list_scroll, 0);
         assert_eq!(host_target_at(&app, standalone_rail.x, 2), None);
@@ -3023,12 +3166,12 @@ switch_workspace = "ctrl+1..9"
         );
         assert_eq!(
             app.view.sidebar_rect.width,
-            host_rail_width(),
+            host_rail_width(&app),
             "sidebar collapses to rail width when yielded"
         );
         assert_eq!(
             app.view.host_rail_rect,
-            Rect::new(0, 0, host_rail_width(), area.height),
+            Rect::new(0, 0, host_rail_width(&app), area.height),
             "host rail occupies the entire (shrunken) sidebar"
         );
         assert_eq!(
@@ -3083,12 +3226,12 @@ switch_workspace = "ctrl+1..9"
         );
         assert_eq!(
             app.view.host_rail_rect.width,
-            host_rail_width(),
+            host_rail_width(&app),
             "host rail present when glass is inactive"
         );
         // sidebar = rail + panel + separator
         assert!(
-            app.view.sidebar_rect.width > host_rail_width(),
+            app.view.sidebar_rect.width > host_rail_width(&app),
             "sidebar wider than just the rail when glass is inactive"
         );
     }

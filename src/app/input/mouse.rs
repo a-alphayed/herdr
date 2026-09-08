@@ -439,6 +439,17 @@ impl AppState {
                     return None;
                 }
 
+                // Checked after the outer sidebar divider so a coinciding
+                // column (glass-yielded sidebar) keeps its existing owner;
+                // `on_host_rail_divider` refuses that column anyway.
+                if self.on_host_rail_divider(mouse.column, mouse.row) {
+                    self.drag = Some(DragState {
+                        target: DragTarget::HostRailDivider,
+                    });
+                    self.set_manual_host_rail_width(mouse.column);
+                    return None;
+                }
+
                 if self.on_sidebar_section_divider(mouse.column, mouse.row) {
                     self.drag = Some(DragState {
                         target: DragTarget::SidebarSectionDivider,
@@ -858,6 +869,9 @@ impl AppState {
                         }
                         DragTarget::SidebarDivider => {
                             self.set_manual_sidebar_width(mouse.column);
+                        }
+                        DragTarget::HostRailDivider => {
+                            self.set_manual_host_rail_width(mouse.column);
                         }
                         DragTarget::SidebarSectionDivider => {
                             self.set_sidebar_section_split(mouse.row);

@@ -269,6 +269,41 @@ impl AppState {
         self.mark_session_dirty();
     }
 
+    /// The host rail's own right-edge divider column — the one `render_host_rail`
+    /// draws, not the outer sidebar/main-area divider `render_sidebar` draws.
+    ///
+    /// A hidden rail (collapsed sidebar, or an embedded/glass render where
+    /// `host_rail_visually_suppressed` zeroes it) has a default rect, so it
+    /// offers no drag target at all. When the host glass yields the sidebar the
+    /// rail *is* the whole sidebar and the two dividers land on the same
+    /// column; the outer sidebar divider keeps that column, so one column never
+    /// means two things.
+    pub(super) fn on_host_rail_divider(&self, col: u16, row: u16) -> bool {
+        if self.sidebar_collapsed {
+            return false;
+        }
+        let rail = self.view.host_rail_rect;
+        if rail.width == 0 || rail.height == 0 {
+            return false;
+        }
+        let sidebar = self.view.sidebar_rect;
+        let rail_divider_col = rail.x + rail.width.saturating_sub(1);
+        let sidebar_divider_col = sidebar.x + sidebar.width.saturating_sub(1);
+        sidebar.width > 0
+            && rail_divider_col != sidebar_divider_col
+            && col == rail_divider_col
+            && row >= rail.y
+            && row < rail.y + rail.height
+    }
+
+    pub(super) fn set_manual_host_rail_width(&mut self, divider_col: u16) {
+        let rail = self.view.host_rail_rect;
+        let width = divider_col.saturating_sub(rail.x).saturating_add(1);
+        self.host_rail_width = width.clamp(self.host_rail_min_width, self.host_rail_max_width);
+        self.host_rail_width_source = crate::app::state::SidebarWidthSource::Manual;
+        self.mark_session_dirty();
+    }
+
     pub(super) fn on_sidebar_section_divider(&self, col: u16, row: u16) -> bool {
         if self.sidebar_collapsed {
             return false;
@@ -1867,12 +1902,10 @@ mod tests {
         app.state.selected = 0;
         app.state.tab_scroll = usize::MAX;
         app.state.tab_scroll_follow_active = false;
-        // Widen by the host rail's fixed width so the tab bar/main area gets
-        // the same usable width this test was originally calibrated against.
-        crate::ui::compute_view(
-            &mut app.state,
-            Rect::new(0, 0, 65 + crate::ui::host_rail_width(), 20),
-        );
+        // Widen by the host rail's width so the tab bar/main area gets the
+        // same usable width this test was originally calibrated against.
+        let rail_width = crate::ui::host_rail_width(&app.state);
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 65 + rail_width, 20));
 
         let last_idx = app.state.workspaces[0].tabs.len() - 1;
         let target = app.state.view.tab_hit_areas[last_idx];
@@ -2210,6 +2243,216 @@ mod tests {
         assert!(app.state.drag.is_none());
         let snapshot = capture_snapshot(&app.state);
         assert_eq!(snapshot.sidebar_width, Some(26));
+    }
+
+    /// A real desktop view so the host rail actually has a rect, and therefore
+    /// a right-edge divider distinct from the outer sidebar divider.
+    fn app_with_host_rail() -> crate::app::App {
+        let mut app = app_for_mouse_test();
+        app.state.workspaces = vec![Workspace::test_new("one")];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        compute_desktop_view(&mut app);
+        app
+    }
+
+    fn host_rail_divider_col(app: &crate::app::App) -> u16 {
+        let rail = app.state.view.host_rail_rect;
+        rail.x + rail.width - 1
+    }
+
+    #[test]
+    fn dragging_host_rail_divider_sets_manual_width() {
+        let mut app = app_with_host_rail();
+        let divider_col = host_rail_divider_col(&app);
+        let sidebar_width_before = app.state.sidebar_width;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            divider_col,
+            5,
+        ));
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(DragTarget::HostRailDivider)
+        ));
+
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 15, 5));
+
+        assert_eq!(app.state.host_rail_width, 16);
+        assert_eq!(
+            app.state.host_rail_width_source,
+            crate::app::state::SidebarWidthSource::Manual
+        );
+        // The rail divider is not the sidebar divider: the panel width is
+        // untouched.
+        assert_eq!(app.state.sidebar_width, sidebar_width_before);
+
+        let snapshot = capture_snapshot(&app.state);
+        assert_eq!(snapshot.host_rail_width, Some(16));
+
+        // The next render honours the dragged width.
+        compute_desktop_view(&mut app);
+        assert_eq!(app.state.view.host_rail_rect.width, 16);
+    }
+
+    #[test]
+    fn dragging_host_rail_past_max_clamps_to_max() {
+        let mut app = app_with_host_rail();
+        let divider_col = host_rail_divider_col(&app);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            divider_col,
+            5,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 90, 5));
+
+        assert_eq!(app.state.host_rail_width, app.state.host_rail_max_width);
+        assert_eq!(app.state.host_rail_width, crate::ui::HOST_RAIL_MAX_WIDTH);
+    }
+
+    #[test]
+    fn dragging_host_rail_below_min_clamps_to_min() {
+        let mut app = app_with_host_rail();
+        let divider_col = host_rail_divider_col(&app);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            divider_col,
+            5,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 5));
+
+        assert_eq!(app.state.host_rail_width, app.state.host_rail_min_width);
+        assert_eq!(app.state.host_rail_width, crate::ui::HOST_RAIL_MIN_WIDTH);
+    }
+
+    #[test]
+    fn double_clicking_host_rail_divider_resets_default_width() {
+        let mut app = app_with_host_rail();
+        app.state.host_rail_width = 18;
+        app.state.host_rail_width_source = crate::app::state::SidebarWidthSource::Manual;
+        compute_desktop_view(&mut app);
+        app.state.default_host_rail_width = 10;
+        let divider_col = host_rail_divider_col(&app);
+        assert_eq!(divider_col, 17);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            divider_col,
+            5,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), divider_col, 5));
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            divider_col,
+            5,
+        ));
+
+        assert_eq!(app.state.host_rail_width, 10);
+        assert_eq!(
+            app.state.host_rail_width_source,
+            crate::app::state::SidebarWidthSource::ConfigDefault
+        );
+        assert!(app.state.drag.is_none());
+        let snapshot = capture_snapshot(&app.state);
+        assert_eq!(snapshot.host_rail_width, Some(10));
+    }
+
+    #[test]
+    fn dragging_sidebar_divider_does_not_resize_the_host_rail() {
+        let mut app = app_with_host_rail();
+        let sidebar = app.state.view.sidebar_rect;
+        let sidebar_divider_col = sidebar.x + sidebar.width - 1;
+        assert_ne!(sidebar_divider_col, host_rail_divider_col(&app));
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            sidebar_divider_col,
+            5,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            sidebar_divider_col + 4,
+            5,
+        ));
+
+        assert!(matches!(
+            app.state.drag.as_ref().map(|drag| &drag.target),
+            Some(DragTarget::SidebarDivider)
+        ));
+        assert_eq!(app.state.host_rail_width, 10);
+    }
+
+    #[test]
+    fn collapsed_sidebar_offers_no_host_rail_drag_target() {
+        let mut app = app_with_host_rail();
+        let divider_col = host_rail_divider_col(&app);
+        app.state.sidebar_collapsed = true;
+        compute_desktop_view(&mut app);
+
+        assert_eq!(app.state.view.host_rail_rect, Rect::default());
+        for row in 0..app.state.view.sidebar_rect.height {
+            assert!(!app.state.on_host_rail_divider(divider_col, row));
+        }
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            divider_col,
+            5,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 20, 5));
+
+        assert_eq!(app.state.host_rail_width, 10);
+    }
+
+    #[test]
+    fn embedded_render_offers_no_host_rail_drag_target() {
+        let mut app = app_with_host_rail();
+        let divider_col = host_rail_divider_col(&app);
+        let terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
+        crate::ui::compute_view_with_context(
+            &mut app.state,
+            &terminal_runtimes,
+            Rect::new(0, 0, 106, 32),
+            false,
+            crate::kitty_graphics::HostCellSize::default(),
+            crate::protocol::ViewContext::Embedded,
+        );
+
+        assert!(app.state.view.host_rail_visually_suppressed);
+        assert_eq!(app.state.view.host_rail_rect, Rect::default());
+        for row in 0..app.state.view.sidebar_rect.height {
+            assert!(!app.state.on_host_rail_divider(divider_col, row));
+        }
+    }
+
+    /// When the host glass yields the sidebar, the rail IS the whole sidebar
+    /// and both dividers would land on the same column. That column keeps its
+    /// existing owner, the outer sidebar divider, so one column never means two
+    /// things.
+    #[test]
+    fn glass_yielded_sidebar_keeps_the_shared_divider_column() {
+        let mut app = app_with_host_rail();
+        let host = RemoteHostKey::new("jafar", crate::session::DEFAULT_SESSION_NAME);
+        app.state.remote_sources.mark_status(
+            &host,
+            crate::remote_source::RemoteConnectionStatus::Connected,
+        );
+        app.state
+            .select_sidebar_source(crate::app::state::SidebarSource::Remote(host));
+        compute_desktop_view(&mut app);
+
+        assert!(app.state.view.glass_sidebar_yielded);
+        let sidebar = app.state.view.sidebar_rect;
+        assert_eq!(sidebar.width, app.state.view.host_rail_rect.width);
+
+        let shared_col = sidebar.x + sidebar.width - 1;
+        assert!(app.state.on_sidebar_divider(shared_col, 5));
+        assert!(!app.state.on_host_rail_divider(shared_col, 5));
     }
 
     #[test]

@@ -798,6 +798,9 @@ pub struct UiConfig {
     pub sidebar_min_width: u16,
     /// Maximum sidebar width (columns) when expanded. Default: 36.
     pub sidebar_max_width: u16,
+    /// Width (columns) of the host rail beside the Spaces/Agents panel.
+    /// Clamped to the rail's structural bounds (8-24). Default: 10.
+    pub host_rail_width: u16,
     /// Collapsed sidebar presentation. Default: compact.
     pub sidebar_collapsed_mode: SidebarCollapsedModeConfig,
     /// Terminal width at or below which Herdr uses the mobile single-column layout. Default: 64.
@@ -987,6 +990,7 @@ impl Default for UiConfig {
             sidebar_width: 26,
             sidebar_min_width: 18,
             sidebar_max_width: 36,
+            host_rail_width: crate::ui::DEFAULT_HOST_RAIL_WIDTH,
             sidebar_collapsed_mode: SidebarCollapsedModeConfig::Compact,
             mobile_width_threshold: DEFAULT_MOBILE_WIDTH_THRESHOLD,
             mouse_capture: true,
@@ -1475,6 +1479,22 @@ mobile_width_threshold = 96
         assert_eq!(config.ui.sidebar_min_width, 12);
         assert_eq!(config.ui.sidebar_max_width, 80);
         assert_eq!(config.ui.mobile_width_threshold, 96);
+    }
+
+    #[test]
+    fn host_rail_width_default_and_parse() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.ui.host_rail_width,
+            crate::ui::DEFAULT_HOST_RAIL_WIDTH
+        );
+
+        let toml = r#"
+[ui]
+host_rail_width = 16
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.host_rail_width, 16);
     }
 
     #[test]
