@@ -52,11 +52,13 @@ Shared integration landing remains Ahmed/opt-in controlled. When Ahmed explicitl
 
 If the current session is already inside an isolated task worktree, keep using it. Do not create nested worktrees.
 
-After a non-roadmap shared `dev` integration, remove the clean task worktree and delete the merged task branch locally/remotely only if Ahmed explicitly approves that specific cleanup, or if cleanup is covered by a future effective trunk/shared opt-in and all global checks pass. Otherwise leave cleanup for Ahmed. Release promotion, stable tagging, post-release `dev` synchronization, and release-worktree cleanup follow the separately gated release flow below.
+After a shared `dev` integration, remove the clean task worktree and delete the merged task branch locally/remotely only if Ahmed explicitly approves that specific cleanup, or if cleanup is covered by a future effective trunk/shared opt-in and all global checks pass. Otherwise leave cleanup for Ahmed. Release promotion, stable tagging, post-release `dev` synchronization, and release-worktree cleanup follow the separately gated release flow below.
 
 ## Federated remote agents spike workflow
 
 Big-picture anchor: `docs/next/remote-agent-control-design.md` is the current federated remote agents design proposal. Use it as the architectural reference unless Ahmed supersedes it. The spike must stay aligned with these boundaries: remote hosts remain authoritative for PTYs, panes, hooks, persistence, and child processes; the local Herdr node only aggregates remote agent metadata, caches state, and routes/proxies allowed commands; transport is an SSH-bridged JSON API path, not local ownership of remote PTYs; MVP focus uses direct terminal attach rather than embedded remote panes. Do not drift into full multi-server workspace merging, broad destructive remote operations, or release/publishing work unless Ahmed explicitly expands the scope.
+
+A scratch/validation terminal pane may be opened when a real Herdr pane environment is needed; validation-only panes must never edit source. For federated-spike work that touches a live remote host or its transport, the plan is reviewed and passed before writable implementation starts.
 
 Testing guardrails for this spike:
 
