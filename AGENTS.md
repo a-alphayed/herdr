@@ -1,3 +1,5 @@
+Profile: software-dev
+
 # herdr
 
 Terminal workspace manager for AI coding agents. Rust + ratatui.
@@ -14,12 +16,6 @@ Terminal workspace manager for AI coding agents. Rust + ratatui.
 ## Multi-agent isolation
 
 Read-only investigation can happen in the shared checkout.
-
-## Local lane closeout policy
-
-This project has no standing opt-in for routine trunk/shared auto-land, default task-branch/worktree cleanup outside an active authorization, live install/deploy, or standing auto-continue. It inherits the global Agent Lane Workflow defaults. Runtime `lane auto-continue on/off` may still be used only through `.local/agent-lanes.md` and the global auto-continue preconditions.
-
-When Ahmed turns `lane auto-continue on` for a committed Herdr roadmap, the global roadmap-push regime applies exactly as written: the reviewed task commit may be pushed only to `refs/heads/roadmap/<name>` fast-forward/create-only with no force; `master`/shared refs remain unreachable by that regime; the successor branches from `origin/roadmap/<name>`; and reviewed task worktree/branch cleanup is allowed only after the roadmap-push is verified, using safe cleanup (`git branch -d`, never `-D`). There is no project hop cap; continuation is bounded by the committed-roadmap provenance guard and the global stop model (roadmap complete, substantive Ahmed-needed boundary, validation/review failure, all models consumed, dirty/unverified state, or another protected stop).
 
 ## Branch authority and Ahmed's production/dev installs
 
@@ -50,11 +46,9 @@ Use this layout:
 
 For normal Herdr work units, do code edits, tests, and validation inside the task worktree. Retained historical worktrees and unlanded refs are not rebased, retargeted, landed, or deleted merely because the branch model changed.
 
-Commit reviewed work on the task branch in that worktree. Do not add a project-specific per-commit human closeout gate on top of the Agent Lane Workflow: in lane workflow on, the global plan/diff/validation gates are the commit authority; in lane workflow off, follow the global per-commit approval rule.
+Commit reviewed work on the task branch in that worktree.
 
 Shared integration landing remains Ahmed/opt-in controlled. When Ahmed explicitly approves the specific current landing, or when a future effective project trunk/shared auto-land opt-in exists on the Ahmed-landed base branch and all global checks pass, fast-forward the shared `dev` checkout at `../herdr` to the reviewed task commit, then push `origin/dev` from `../herdr`. Otherwise closeout stops at the reviewed local task branch and receipt; do not treat the task branch as landed. Normal task work must not push or fast-forward `master`.
-
-The active auto-continue roadmap regime is separate and narrower: it never fast-forwards or pushes `dev`, `master`, or another shared ref. When `lane auto-continue on` is recorded, a committed roadmap and valid roadmap ref token are recorded, and all global preconditions pass, push only the exact reviewed task commit to `refs/heads/roadmap/<name>` fast-forward/create-only with no force. After the roadmap-push is verified, cleanup the task worktree/branch only through the global roadmap cleanup sequence (safe branch deletion via `git branch -d`; keep/report if refused; never `-D`).
 
 If the current session is already inside an isolated task worktree, keep using it. Do not create nested worktrees.
 
@@ -62,25 +56,7 @@ After a non-roadmap shared `dev` integration, remove the clean task worktree and
 
 ## Federated remote agents spike workflow
 
-When working on the federated remote agents spike, use Ahmed's Herdr mod workspace agent roles this way.
-
 Big-picture anchor: `docs/next/remote-agent-control-design.md` is the current federated remote agents design proposal. Use it as the architectural reference unless Ahmed supersedes it. The spike must stay aligned with these boundaries: remote hosts remain authoritative for PTYs, panes, hooks, persistence, and child processes; the local Herdr node only aggregates remote agent metadata, caches state, and routes/proxies allowed commands; transport is an SSH-bridged JSON API path, not local ownership of remote PTYs; MVP focus uses direct terminal attach rather than embedded remote panes. Do not drift into full multi-server workspace merging, broad destructive remote operations, or release/publishing work unless Ahmed explicitly expands the scope.
-
-- **Orchestrator / supervising assistant**: own the plan, task breakdown, architecture boundaries, review synthesis, test gate, and commit gate. Do not implement large code changes directly unless Ahmed asks. Keep checking for architectural drift against the principles above and the federated-agent design after every implementation slice and before every commit. If a decision affects UX, safety, scope, protocol compatibility, release behavior, or Ahmed's live setup, stop and ask Ahmed.
-- **SubAgent**: writable implementation lane. The SubAgent makes the requested code/doc/test changes for each slice from an approved packet. The SubAgent must not commit, push, stage, reset, clean, manage worktrees, or broaden scope. It reports what changed, what was tested, and any uncertainties.
-- **Reviewer A** and **Reviewer B**: independent read-only review lanes following the global formal reviewer seating/fallback policy. They are not backend-bound names; use the current global Reviewer A/B model assignment and diversity rules, and record actual resolved provider/model evidence. Reviews cover correctness, tests, safety, architecture drift, scope creep, and whether the slice still matches the spike goal.
-- **Terminal/Test Runner pane**: stable scratch/validation terminal if a real Herdr pane environment is needed. Prefer the tool shell for ordinary repo inspection and commands; validation-only panes must not edit source.
-
-Gate sequence for this spike:
-
-1. Orchestrator declares the narrow slice, topology, implementation packet, validation contract, and architecture boundaries.
-2. Reviewer A and Reviewer B review the plan and PASS before writable implementation starts.
-3. Orchestrator assigns the approved packet to the SubAgent.
-4. SubAgent implements and reports back without committing/staging/pushing/managing worktrees.
-5. Orchestrator runs or requests the relevant validation and captures status/diff/evidence.
-6. Reviewer A and Reviewer B review the diff before commit.
-7. If reviewers disagree or raise different fixes, the Orchestrator synthesizes the best path, routes agreed follow-up changes to the SubAgent, and repeats review for substantive follow-up changes.
-8. Orchestrator checks architecture drift, runs final validation, stages intended files, and commits locally to the task branch per global closeout. No extra per-commit human approval gate is added in lane workflow on; protected decisions, shared/trunk landing, push, live install/deploy, and cleanup still require the active global/project authorization.
 
 Testing guardrails for this spike:
 
